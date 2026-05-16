@@ -449,8 +449,11 @@ fn main() {
         "asym4" | "turbo4" => hipfire_arch_qwen35::speculative::KvMode::Asym4,
         "asym3" | "turbo3" | "turbo" => hipfire_arch_qwen35::speculative::KvMode::Asym3,
         "asym2" | "turbo2" => hipfire_arch_qwen35::speculative::KvMode::Asym2,
+        "fwht4" => hipfire_arch_qwen35::speculative::KvMode::Fwht4,
+        "fwht3" => hipfire_arch_qwen35::speculative::KvMode::Fwht3,
+        "fwht2" => hipfire_arch_qwen35::speculative::KvMode::Fwht2,
         other => {
-            eprintln!("unknown --kv-mode: {other}. Valid: q8, asym4, asym3, asym2");
+            eprintln!("unknown --kv-mode: {other}. Valid: q8, asym4, asym3, asym2, fwht4, fwht3, fwht2");
             std::process::exit(1);
         }
     };
