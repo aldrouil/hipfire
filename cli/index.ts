@@ -2682,7 +2682,27 @@ export function findModel(name: string): string | null {
         } catch {}
       }
     } catch {}
+
+  // Also check safetensors directories (ParoQuant, AWQ, etc.)
+  for (const dir of dirs) {
+    try {
+      const stEntries = readdirSync(dir);
+      for (const f of stEntries) {
+        if (!matchesName(f)) continue;
+        const full = join(dir, f);
+        let hasST = false;
+        try {
+          if (statSync(full).isDirectory()) {
+            const innerFiles = readdirSync(full);
+            hasST = innerFiles.some((n: string) => n.endsWith(".safetensors"));
+          }
+        } catch {}
+        if (hasST && !candidates.includes(full)) candidates.push(full);
+      }
+    } catch {}
   }
+
+
   if (candidates.length === 0) return null;
   // When the user had an explicit hint, any match is fine — return the first
   // (same behavior as before). Otherwise pick by preference order.
@@ -2710,6 +2730,50 @@ function listLocal() {
           const tag = Object.entries(REGISTRY).find(([_, e]) => e.file === f || e.file === fNorm)?.[0] || "";
           models.push({ name: f, tag, size: `${sz}GB` });
         } catch {}
+      } else if (!seen.has(f)) {
+        // Check for safetensors directories (ParoQuant, AWQ, etc.)
+        const full = join(dir, f);
+        let hasST = false;
+        try {
+          if (statSync(full).isDirectory()) {
+            const innerFiles = readdirSync(full);
+            hasST = innerFiles.some((n: string) => n.endsWith(".safetensors"));
+          }
+        } catch {}
+        if (hasST) {
+          seen.add(f);
+          try {
+            let totalBytes = 0;
+            const innerFiles = readdirSync(full).filter((n: string) => n.endsWith(".safetensors"));
+            for (const st of innerFiles) {
+              totalBytes += statSync(join(full, st)).size;
+            }
+            // Try to read config.json for metadata
+            let quantMethod = "";
+            let modelType = "";
+            try {
+              const cfgPath = join(full, "config.json");
+              if (existsSync(cfgPath)) {
+                const raw = readFileSync(cfgPath);
+                const cfg: any = JSON.parse(raw.toString());
+                modelType = cfg.model_type || "";
+                quantMethod = (cfg.quantization_config && cfg.quantization_config.quant_method) || "";
+              }
+            } catch {}
+            // Build a display label with metadata
+            let displayName = f;
+            if (quantMethod) {
+              const label = quantMethod + (modelType ? ", " + modelType : "");
+              const suffix = " [" + label + "]";
+              displayName = f.replace(/\[.*?\]$/, suffix);
+              if (!displayName.includes("[")) {
+                displayName += suffix;
+              }
+            }
+            const sz = (totalBytes / 1e9).toFixed(1);
+            models.push({ name: displayName, tag: "", size: `${sz}GB` });
+          } catch {}
+        }
       }
     }
   }
