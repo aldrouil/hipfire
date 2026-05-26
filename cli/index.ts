@@ -2682,6 +2682,7 @@ export function findModel(name: string): string | null {
         } catch {}
       }
     } catch {}
+  }
 
   // Also check safetensors directories (ParoQuant, AWQ, etc.)
   for (const dir of dirs) {
