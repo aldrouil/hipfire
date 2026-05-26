@@ -5399,7 +5399,26 @@ Examples:
     if (firstArg && !["list", "get", "set", "reset", "cask-profile"].includes(firstArg)) {
       // If looks like a tag, scope to that model
       const resolved = resolveModelTag(firstArg);
-      if (REGISTRY[resolved] || firstArg.includes(":")) {
+      let foundInRegistryOrColon = REGISTRY[resolved] || firstArg.includes(":");
+      if (!foundInRegistryOrColon) {
+        // Fallback: check for local-only models on disk (ParoQuant safetensors
+        // dirs, hand-installed .mq4/.hf4/... files not yet in the registry).
+        let modelPath: string | null = null;
+        for (const name of [firstArg, resolved]) {
+          const p = join(MODELS_DIR, name);
+          if (!existsSync(p)) continue;
+          try {
+            const st = statSync(p);
+            // Valid local model: a known quant file, or a directory containing .safetensors
+            if (!st.isDirectory() || readdirSync(p).some((n: string) => n.endsWith(".safetensors"))) {
+              modelPath = p;
+              break;
+            }
+          } catch { /* dangling symlink — skip */ }
+        }
+        foundInRegistryOrColon = !!modelPath;
+      }
+      if (foundInRegistryOrColon) {
         modelScope = resolved;
         [firstArg, maybeKey, ...valueArgs] = rest.slice(1);
       }
