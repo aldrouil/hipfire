@@ -427,11 +427,10 @@ function buildLoadMessage(path: string, tag?: string | null): any {
   // prefers params.kv_mode over the HIPFIRE_KV_MODE env var.
   const baseMode = resolveKvMode(resolved);
   const effectiveMode = sizeAwareKvMode(baseMode, resolved, tag);
-  if (effectiveMode !== baseMode) {
+  if (baseMode !== effectiveMode) {
     console.error(`[hipfire] kv_mode bumped for ${tag}: ${baseMode} → ${effectiveMode} (deep stack, asym3 layer-count compounding)`);
   }
   params.kv_mode = effectiveMode;
-
   // Optional DFlash draft. The daemon wires this into a greedy speculative-
   // decode fast path that triggers on temperature==0 requests. Two sources:
   //
@@ -777,7 +776,7 @@ function archDefaults(arch: string): ArchDefaults {
 // Legacy aliases: turbo→asym3, turbo2→asym2, turbo3→asym3, turbo4→asym4
 // (plus "auto" → arch default).
 function resolveKvMode(cfg: HipfireConfig): string {
-  const raw = process.env.HIPFIRE_KV_MODE || cfg.kv_cache;
+  const raw = cfg.kv_cache || process.env.HIPFIRE_KV_MODE;
   if (raw === "auto") return ARCH_DEFAULTS.kv_cache;
   if (raw === "turbo" || raw === "turbo3") return "asym3";
   if (raw === "turbo2") return "asym2";
