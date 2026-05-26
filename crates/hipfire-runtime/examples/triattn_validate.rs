@@ -308,6 +308,9 @@ fn main() {
         if calib_profile {
             eprintln!("[CALIB_PROFILE] chunk_idx,n_tokens,memset_ms,forward_ms,total_ms,cumulative_tokens");
         }
+        // Graph capture is incompatible with the D2H copies inside
+        // TriAttn GPU finalize. Disable it before calibrating.
+        std::env::set_var("HIPFIRE_GRAPH", "0");
         let calib_t0 = Instant::now();
         let mut total_tokens = 0usize;
         'outer: for (pi, tokens) in prompt_tokens.iter().enumerate() {
