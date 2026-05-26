@@ -29,6 +29,7 @@ fn main() {
     use hipfire_runtime::tokenizer::Tokenizer;
     use hipfire_runtime::triattn::{self, BandCenter, TriAttnCalibState, TriAttnCapture, TriAttnCenters};
     use std::path::Path;
+    use hipfire_runtime::safetensors_source::SafetensorsSource;
     use std::time::Instant;
 
     // Per-chunk CSV timing breakdown for calibration optimization sessions.
@@ -154,14 +155,38 @@ fn main() {
         );
     }
 
-    // ── Load model ─────────────────────────────────────────────────────
-    let mut hfq = HfqFile::open(Path::new(&model_path)).expect("open model");
-    let config = qwen35::config_from_hfq(&hfq).expect("config");
-    let tok = Tokenizer::from_hfq_metadata(&hfq.metadata_json).expect("tokenizer");
-
+    // ── Load weights (HFQ file or ParoQuant safetensors dir) ─────────────
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
-    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("weights");
 
+    let config: qwen35::Qwen35Config;
+    let weights: qwen35::Qwen35Weights;
+    if Path::new(&model_path).is_dir() {
+        // ParoQuant safetensors directory path
+        eprintln!("  loading as ParoQuant safetensors dir...");
+        let source = SafetensorsSource::open(Path::new(&model_path))
+            .expect("open safetensors model");
+        config = qwen35::config_from_safetensors(&source).expect("config");
+        weights = qwen35::load_weights_paroquant(&source, &config, &mut gpu)
+            .expect("weights (paroquant)");
+    } else {
+        // HFQ file path
+        eprintln!("  loading as HFQ file...");
+        let mut hfq = HfqFile::open(Path::new(&model_path)).expect("open model");
+        config = qwen35::config_from_hfq(&hfq).expect("config");
+        weights = qwen35::load_weights(&mut hfq, &config, &mut gpu)
+            .expect("weights (hfq)");
+    };
+
+    // Tokenizer — from metadata (HFQ) or tokenizer.json file (safetensors)
+    let tok = if Path::new(&model_path).is_dir() {
+        eprintln!("  loading tokenizer from tokenizer.json...");
+        Tokenizer::from_tokenizer_json(&Path::new(&model_path).join("tokenizer.json"))
+            .expect("tokenizer")
+            .expect("tokenizer.json")
+    } else {
+        let hfq = HfqFile::open(Path::new(&model_path)).expect("open model");
+        Tokenizer::from_hfq_metadata(&hfq.metadata_json).expect("tokenizer")
+    };
     let kv_seq = 512usize;
     let mut kv = KvCache::new_gpu_q8(
         &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq,
