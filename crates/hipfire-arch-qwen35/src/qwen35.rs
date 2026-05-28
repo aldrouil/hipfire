@@ -5444,7 +5444,21 @@ pub fn prefill_batch_pbs_eligible(
         // A3B engine policy quantizes attention as Q8 (admitted alongside MQ4).
         && weights.layers.iter().all(|lw| match lw {
             LayerWeights::DeltaNet(l) =>
-                is_batchable_la(l.wqkv.gpu_dtype, arch)
+                // Dense DeltaNet does not have PARO dispatch arms in the
+                // batched prefill body (those are only wired for DeltaNetMoe
+                // and FullAttnMoe). Admitting ParoQ4G128/F32 here would route
+                // dense PARO models through the wrong GEMM kernels and emit
+                // garbage (exclamation-point-only output). Fall back to the
+                // per-token path, which has full PARO support.
+                !matches!(l.wqkv.gpu_dtype, DType::ParoQ4G128)
+                    && !matches!(l.wz.gpu_dtype, DType::ParoQ4G128)
+                    && !matches!(l.w_beta.gpu_dtype, DType::ParoQ4G128 | DType::F32)
+                    && !matches!(l.w_alpha.gpu_dtype, DType::ParoQ4G128 | DType::F32)
+                    && !matches!(l.wo.gpu_dtype, DType::ParoQ4G128)
+                    && !matches!(l.w_gate.gpu_dtype, DType::ParoQ4G128)
+                    && !matches!(l.w_up.gpu_dtype, DType::ParoQ4G128)
+                    && !matches!(l.w_down.gpu_dtype, DType::ParoQ4G128)
+                    && is_batchable_la(l.wqkv.gpu_dtype, arch)
                     && is_batchable_la(l.wz.gpu_dtype, arch)
                     && is_batchable_la(l.w_beta.gpu_dtype, arch)
                     && is_batchable_la(l.w_alpha.gpu_dtype, arch)
@@ -5452,7 +5466,18 @@ pub fn prefill_batch_pbs_eligible(
                     && is_batchable_la(l.w_gate.gpu_dtype, arch)
                     && is_batchable_la(l.w_up.gpu_dtype, arch)
                     && is_batchable_la(l.w_down.gpu_dtype, arch),
-            LayerWeights::FullAttn(_) => true,
+            LayerWeights::FullAttn(l) =>
+                // Dense FullAttn does not have PARO dispatch arms in the
+                // batched prefill body (those are only wired for FullAttnMoe).
+                // Admitting ParoQ4G128 here would route dense PARO models
+                // through the wrong GEMM kernels. Fall back to per-token.
+                !matches!(l.wq.gpu_dtype, DType::ParoQ4G128)
+                    && !matches!(l.wk.gpu_dtype, DType::ParoQ4G128)
+                    && !matches!(l.wv.gpu_dtype, DType::ParoQ4G128)
+                    && !matches!(l.wo.gpu_dtype, DType::ParoQ4G128)
+                    && !matches!(l.w_gate.gpu_dtype, DType::ParoQ4G128)
+                    && !matches!(l.w_up.gpu_dtype, DType::ParoQ4G128)
+                    && !matches!(l.w_down.gpu_dtype, DType::ParoQ4G128),
             LayerWeights::DeltaNetMoe(l) =>
                 moe_topk_ok
                     && moe_router_logits_present
