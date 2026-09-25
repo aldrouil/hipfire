@@ -19,6 +19,7 @@
 //!   HIPFIRE_VMM_SMOKE_DEVICE=2 cargo run -p rdna-compute --example vmm_tensor_smoke
 //! Optional knobs: HIPFIRE_VMM_CHUNK_BYTES (default 2 MiB)
 
+use hip_bridge::{HIP_MEM_LOCATION_TYPE_DEVICE, HIP_MEM_LOCATION_TYPE_HOST};
 use rdna_compute::{DType, Gpu};
 
 const DEFAULT_CHUNK_BYTES: usize = 2 << 20;
@@ -205,6 +206,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(gpu.vmm_allocation_count(), 0);
     println!("vmm_tensor_smoke: CLEANUP_AFTER_FAILURE PASS");
 
+    // --- Partial-offload host-location verification ---
+    // Negative control: a device-resident VMM tensor must read back as NOT
+    // host-located, and its handle must report DEVICE to ROCm. This proves
+    // vmm_host_located() is not trivially always-true before the positive case.
+    let host_elems = 1 << 10; // 1024 F32 = 4 KiB, fully mapped up front
+    let dev_tensor =
+        unsafe { gpu.alloc_vmm_tensor(&[host_elems], DType::F32, host_elems * 4, &access)? };
+    assert_eq!(gpu.vmm_allocation_count(), 1);
+    assert!(!gpu.vmm_host_located(&dev_tensor), "device tensor must not be HostPinned");
+    let dev_handle = gpu
+        .vmm_handle(&dev_tensor)
+        .expect("device tensor exposes a primary handle");
+    let dev_prop = gpu.hip.mem_get_handle_properties(dev_handle)?;
+    assert_eq!(
+        dev_prop.location.type_,
+        HIP_MEM_LOCATION_TYPE_DEVICE,
+        "device VMM handle must report DEVICE to ROCm"
+    );
+    gpu.free_tensor(dev_tensor)?;
+    assert_eq!(gpu.vmm_allocation_count(), 0);
+
+    // Positive control: a host-located (offloaded) tensor must read back as
+    // HostPinned, survive a PCIe H2D/D2H round-trip through its mapped VA, and
+    // report HOST to ROCm — fail-closed if installed ROCm ever rejects it.
+    let host_tensor =
+        unsafe { gpu.alloc_vmm_tensor_host(&[host_elems], DType::F32, host_elems * 4, &access)? };
+    assert_eq!(gpu.vmm_allocation_count(), 1);
+    assert!(gpu.vmm_host_located(&host_tensor), "offloaded tensor must be HostPinned");
+    let w = pattern(host_elems * 4, 3, 1);
+    gpu.hip.memcpy_htod(&host_tensor.buf, &w)?;
+    let mut rb = vec![0u8; host_elems * 4];
+    gpu.hip.memcpy_dtoh(&mut rb, &host_tensor.buf)?;
+    assert_eq!(rb, w, "host-located tensor must survive a PCIe read/write round-trip");
+    let host_handle = gpu
+        .vmm_handle(&host_tensor)
+        .expect("offloaded tensor exposes a primary handle");
+    let host_prop = gpu.hip.mem_get_handle_properties(host_handle)?;
+    assert_eq!(
+        host_prop.location.type_,
+        HIP_MEM_LOCATION_TYPE_HOST,
+        "ROCm must report host-located (system-RAM) pages for an offloaded layer"
+    );
+    println!("vmm_tensor_smoke: HOST_OFFLOAD PASS");
+    gpu.free_tensor(host_tensor)?;
+    assert_eq!(gpu.vmm_allocation_count(), 0);
     println!("vmm_tensor_smoke: PASS");
     Ok(())
 }
