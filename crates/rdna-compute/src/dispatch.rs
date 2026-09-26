@@ -3508,6 +3508,35 @@ impl Gpu {
             hip.memcpy_htod(&tensor.buf, bytes)
         })
     }
+    /// Upload host-side **f32 data** into a **host-located** `F32` tensor — the
+    /// offload counterpart to [`Self::upload_f32`]. The physical pages are system
+    /// RAM that kernels read over PCIe, so this is how an offloaded layer's weights
+    /// land without pinning device memory.
+    ///
+    /// Mirrors [`Self::upload_f32`] except the allocation target is host: the whole
+    /// tensor is mapped for `self.device_id` at reserve time (the same proven pattern
+    /// `examples/vmm_tensor_smoke.rs` exercises — a PCIe H2D/D2H round-trip through the
+    /// mapped VA) and the f32 words are copied in via `memcpy_htod`, which ROCm routes
+    /// to the mapped VA regardless of direction. The result is a `GpuTensor` whose
+    /// `.buf` is host RAM readable by kernels — exactly what an offloaded layer's weight
+    /// read must dereference. Byte-for-byte identical contents to the device path; only
+    /// the physical location differs.
+    pub fn upload_f32_host(&mut self, data: &[f32], shape: &[usize]) -> HipResult<GpuTensor> {
+        let numel = shape
+            .iter()
+            .try_fold(1usize, |product, &dimension| product.checked_mul(dimension))
+            .ok_or_else(|| HipError::new(0, "upload_f32_host: element count overflowed"))?;
+        let byte_size = numel
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| HipError::new(0, "upload_f32_host: byte size overflowed"))?;
+        // Host-located: map the whole tensor for this device so kernels read it over PCIe.
+        let access = [self.device_id];
+        let mut tensor = unsafe { self.alloc_vmm_tensor_host(shape, DType::F32, byte_size, &access)? };
+        let bytes =
+            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
+        unsafe { self.hip.memcpy_htod(&tensor.buf, bytes)? }
+        Ok(tensor)
+    }
 
     /// Upload host-side **f16 bit patterns** straight into an `F16` tensor.
     ///
@@ -3616,6 +3645,19 @@ impl Gpu {
         self.upload_raw_with_copy(data, shape, HipRuntime::memcpy_htod)
     }
 
+    /// Upload raw bytes to a **host-located** tensor (for offloaded quantized weights).
+    ///
+    /// The offload counterpart to [`Self::upload_raw`]: the physical pages are system
+    /// RAM accessed by kernels over PCIe, so an offloaded layer's quantized codes live
+    /// in host memory instead of VRAM. Mirrors [`Self::upload_raw`] — same direct
+    /// `hip.malloc` + injectable copy step — except the allocation target is host (via
+    /// `alloc_vmm_tensor_host`, mapped for `self.device_id`) so the bytes leave the card.
+    /// Contents are byte-for-byte identical to the device path; only physical location
+    /// differs, which keeps numerics identical while freeing VRAM.
+    pub fn upload_raw_host(&mut self, data: &[u8], shape: &[usize]) -> HipResult<GpuTensor> {
+        self.upload_raw_with_copy_host(data, shape, HipRuntime::memcpy_htod)
+    }
+
     /// [`Self::upload_raw`] with an injectable copy step so regressions can
     /// force malloc-success / copy-failure without a production knob.
     fn upload_raw_with_copy(
@@ -3636,6 +3678,27 @@ impl Gpu {
             shape: shape.to_vec(),
             dtype: DType::Raw,
         })
+    }
+
+    /// [`Self::upload_raw_host`] with an injectable copy step so a regression can force
+    /// copy-failure without a production knob, verifying the host owner is released on error.
+    fn upload_raw_with_copy_host(
+        &mut self,
+        data: &[u8],
+        shape: &[usize],
+        copy: impl FnOnce(&HipRuntime, &DeviceBuffer, &[u8]) -> HipResult<()>,
+    ) -> HipResult<GpuTensor> {
+        // Host-located: map the whole tensor for this device so kernels read it over PCIe.
+        let access = [self.device_id];
+        let mut tensor =
+            unsafe { self.alloc_vmm_tensor_host(shape, DType::Raw, data.len(), &access)? };
+        if let Err(err) = copy(&self.hip, &tensor.buf, data) {
+            // VMM owner — free_tensor runs arena release (returns it to the free list), so a
+            // failed copy leaves no orphaned host page or dangling registration.
+            let _ = self.free_tensor(tensor);
+            return Err(err);
+        }
+        Ok(tensor)
     }
 
     /// Free a tensor. Contiguous buffers return to the pool. VMM owners run
