@@ -651,7 +651,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         Some("HIPFIRE_GPU_LAYER_BUDGET"),
-        "Resident-layer budget for partial GPU offload: N keeps the last N layers on the GPU and spills the rest to system RAM; unset keeps every layer on the GPU. The number counts layers ON the GPU, not layers offloaded — 3 on a 64-layer model spills 61. The auto setting is not available yet; use a plain count."
+        "Resident-layer budget for partial GPU offload: N keeps the last N layers on the GPU and spills the rest to system RAM; unset keeps every layer on the GPU. The number counts layers ON the GPU, not layers offloaded — 3 on a 64-layer model spills 61. 'auto' (-1) is not implemented yet and also keeps every layer on the GPU."
     ),
     // Process-scoped: the preflight guards snapshot this once at startup, and
     // a mid-serve flip would make the refusal policy depend on which load ran
@@ -5684,15 +5684,20 @@ pub mod memory {
     /// * [`GpuLayerBudget::Full`] is the unset default: keep every layer
     ///   resident, never offload — byte-identical to a pure-VRAM run and the
     ///   regression guard for the whole feature.
-    /// * [`GpuLayerBudget::Auto`] (`-1`) admits the largest contiguous tail of
-    ///   layers that fits device memory with headroom (see [`largest_fitting_tail`]).
+    /// * [`GpuLayerBudget::Auto`] (`-1`) is **not implemented yet** and currently
+    ///   behaves like [`GpuLayerBudget::Full`] (every layer stays on the GPU),
+    ///   logging that it was not honoured. Its intended meaning is the largest
+    ///   contiguous tail that fits device memory with headroom (see
+    ///   [`largest_fitting_tail`]), which needs a measured device and per-layer
+    ///   weight bytes and so belongs where a `Gpu` is in hand.
     /// * [`GpuLayerBudget::Layers`] pins exactly this many resident layers; the
-    ///   prefix before them spills to host RAM.
+    ///   layers before them spill to host RAM.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum GpuLayerBudget {
         /// Fully resident — never offload (the zero-diff default).
         Full,
-        /// Compute the largest resident tail that fits device memory with headroom.
+        /// Not implemented yet: currently keeps every layer on the GPU (like `Full`)
+        /// and logs that it was not honoured. Intended: fit the largest resident tail.
         Auto,
         /// Pin exactly this many resident layers; spill everything before them.
         Layers(usize),

@@ -7,6 +7,7 @@
 
 use hip_bridge::HipError;
 use hip_bridge::HipResult;
+use hipfire_config::memory::GpuLayerBudget;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::model_source::ModelSource;
 use hipfire_runtime::tp_shard::ShardConfig;
@@ -960,9 +961,36 @@ fn from_config_value(config: &serde_json::Value) -> Result<Qwen35Config, String>
     // of getting collapsed into a generic "bad metadata" fallback.
     apply_reap_plan(&mut config)?;
 
-    apply_offload_policy(&mut config)?;
+    apply_offload_policy(&mut config);
 
     Ok(config)
+}
+
+/// Resident-tail split point for a configured budget.
+///
+/// Returns `i_gpu_start`, where layers `[0 .. i_gpu_start)` spill to host RAM and
+/// `[i_gpu_start .. n_layers)` stay on the GPU.
+///
+/// A resident count above the model's layer count keeps everything on the GPU
+/// (`saturating_sub` saturates). That is not an error, but it is not what was
+/// asked for either, so [`apply_offload_policy`] reports it rather than letting a
+/// configured budget do nothing in silence.
+fn offload_split(n_layers: usize, budget: GpuLayerBudget) -> usize {
+    match budget {
+        GpuLayerBudget::Full => 0,
+        GpuLayerBudget::Layers(resident) => n_layers.saturating_sub(resident),
+        // PLACEHOLDER mapping, not this value's intended meaning. `auto` cannot be
+        // resolved here: it needs measured device capacity and per-layer weight
+        // bytes, and at config construction there is no `Gpu` (the arch trait hands
+        // us `&Config`). It previously failed the load, which reads to a user as
+        // "the model is broken"; it now keeps every layer on the GPU — the
+        // pre-offload behaviour — and says so in the log. Note that `auto` means
+        // "the engine decides" for every other config key, and the design intends
+        // it to pick the largest resident tail that fits
+        // (`hipfire_config::memory::largest_fitting_tail`), so this mapping has to
+        // change when that is wired.
+        GpuLayerBudget::Auto => 0,
+    }
 }
 
 /// Resolve partial-GPU-offload placement for this config, in place.
@@ -973,49 +1001,67 @@ fn from_config_value(config: &serde_json::Value) -> Result<Qwen35Config, String>
 /// i_gpu_start)` to host-mapped system RAM; `load_layer_into` turns that into a
 /// per-layer `host_local` flag.
 ///
-/// `Full` (the default, and the zero-diff regression guard) leaves
+/// `Full` (the default, and the zero-diff regression guard) and `Auto` leave
 /// `i_gpu_start = 0`, so every layer stays device-resident and the load is
 /// byte-identical to stock. `Layers(n)` is pure arithmetic on `n_layers` and
 /// needs no device measurement, which is why it can be resolved here.
 ///
-/// `Auto` deliberately FAILS CLOSED: it needs measured device capacity and the
-/// per-layer weight bytes, neither of which exists at config-construction time
-/// (the arch trait hands us `&Config`, and no `Gpu`). Guessing would silently
-/// pick a split the user never asked for, so we ask for an explicit layer count
-/// instead. Wiring `Auto` belongs where a `Gpu` is in hand.
-fn apply_offload_policy(config: &mut Qwen35Config) -> Result<(), String> {
-    use hipfire_config::memory::{gpu_layer_budget, GpuLayerBudget};
+/// Infallible. Nothing a user can put in this key fails the load any more; the
+/// cases where a *configured* budget ends up having no effect are reported
+/// instead, because a configured no-op with no log line is what made this knob
+/// confusing. Silence still means exactly one thing — nothing was configured and
+/// every layer is resident — so stock-vs-branch log diffs stay clean.
+fn apply_offload_policy(config: &mut Qwen35Config) {
+    use hipfire_config::memory::gpu_layer_budget;
 
-    let n_layers = config.n_layers;
     let budget = gpu_layer_budget();
-    config.i_gpu_start = match budget {
-        GpuLayerBudget::Full => 0,
-        GpuLayerBudget::Layers(resident) => n_layers.saturating_sub(resident),
-        GpuLayerBudget::Auto => {
-            return Err(
-                "memory.gpu_layer_budget=-1 (auto) is not supported yet: it needs measured \
-                 device memory and per-layer weight bytes, which are not available when the \
-                 config is built. Set an explicit resident layer count instead \
-                 (HIPFIRE_GPU_LAYER_BUDGET=<n>)."
-                    .to_string(),
-            )
-        }
-    };
+    let n_layers = config.n_layers;
+    config.i_gpu_start = offload_split(n_layers, budget);
 
-    // Only announce when something is actually spilled. Printing this on the
-    // default `Full` path would put a "0 offloaded" line in every load log, which
-    // both muddies stock-vs-branch log diffs and defeats the point: absence of the
-    // line must unambiguously mean fully resident.
-    if config.i_gpu_start == 0 {
-        return Ok(());
+    if let Some(line) = residency_report(n_layers, budget, config.i_gpu_start) {
+        eprintln!("{line}");
     }
-    eprintln!(
-        "  partial offload: {} resident / {} offloaded, i_gpu_start={}",
-        n_layers - config.i_gpu_start,
-        config.i_gpu_start,
-        config.i_gpu_start
-    );
-    Ok(())
+}
+
+/// The load-time residency report for a resolved placement.
+///
+/// `None` means "print nothing", and only the unset default may produce it: the
+/// absence of this line has to keep meaning exactly "nothing was configured,
+/// every layer is resident", or stock-vs-branch log diffs stop being readable.
+///
+/// Every other case is a user who configured something, so it is reported — the
+/// point of the function being separable is that these are testable without a
+/// GPU or a daemon. A configured budget that silently did nothing (a resident
+/// count above the model's layer count saturating to fully resident) is exactly
+/// what made this knob confusing.
+fn residency_report(
+    n_layers: usize,
+    budget: GpuLayerBudget,
+    i_gpu_start: usize,
+) -> Option<String> {
+    if i_gpu_start != 0 {
+        return Some(format!(
+            "  partial offload: {} resident / {} offloaded, i_gpu_start={}",
+            n_layers - i_gpu_start,
+            i_gpu_start,
+            i_gpu_start
+        ));
+    }
+    match budget {
+        GpuLayerBudget::Full => None,
+        GpuLayerBudget::Auto => Some(
+            "  partial offload: 'auto' (-1) is not available yet; keeping every layer on the GPU \
+             — set a layer count to offload"
+                .to_string(),
+        ),
+        GpuLayerBudget::Layers(resident) if resident > n_layers => Some(format!(
+            "  partial offload: gpu_layer_budget={resident} is more than this model's {n_layers} \
+             layers; keeping every layer on the GPU"
+        )),
+        GpuLayerBudget::Layers(_) => Some(format!(
+            "  partial offload: 0 offloaded ({n_layers} resident), i_gpu_start=0"
+        )),
+    }
 }
 
 /// Apply an optional REAP keep-map to a freshly parsed `Qwen35Config`.
@@ -1699,5 +1745,57 @@ mod tests {
         });
         let cfg4 = from_config_value(&inner4).unwrap();
         assert!(dense_tp_rank_layouts(&cfg4, &shard).is_err());
+    }
+
+    /// The placement arithmetic, which had no test at all. `resident` counts
+    /// layers LEFT ON the GPU; `i_gpu_start` is where the spilled prefix ends, so
+    /// `offload_split(64, Layers(3)) == 61` is the contract the help text states.
+    #[test]
+    fn offload_split_maps_resident_count_to_spill_point() {
+        use hipfire_config::memory::GpuLayerBudget as B;
+        assert_eq!(offload_split(64, B::Full), 0, "unset keeps every layer resident");
+        assert_eq!(offload_split(64, B::Auto), 0, "auto is a placeholder = all resident");
+        assert_eq!(offload_split(64, B::Layers(64)), 0, "asking for all of them");
+        assert_eq!(offload_split(64, B::Layers(62)), 2, "2 spilled");
+        assert_eq!(offload_split(64, B::Layers(32)), 32, "32 spilled");
+        assert_eq!(offload_split(64, B::Layers(3)), 61, "3 on GPU, 61 spilled");
+        assert_eq!(offload_split(64, B::Layers(0)), 64, "0 resident spills everything");
+        // Overshoot saturates to fully resident instead of indexing out of range.
+        assert_eq!(offload_split(64, B::Layers(200)), 0, "more layers than the model has");
+        assert_eq!(offload_split(1, B::Layers(999)), 0, "single-layer model, large request");
+        // A model with no layers must not underflow either.
+        assert_eq!(offload_split(0, B::Layers(0)), 0, "degenerate model");
+    }
+
+    /// Every reported case, offline. The unset default must stay silent, and each
+    /// configured case must say something — a configured budget that does nothing
+    /// with no log line is the confusing behaviour this guards against.
+    #[test]
+    fn residency_report_covers_every_case() {
+        use hipfire_config::memory::GpuLayerBudget as B;
+        assert_eq!(residency_report(64, B::Full, 0), None, "unset must stay silent");
+
+        let spilling = residency_report(64, B::Layers(32), 32).unwrap();
+        assert!(spilling.contains("32 resident / 32 offloaded"), "{spilling}");
+        assert!(spilling.contains("i_gpu_start=32"), "{spilling}");
+
+        let all_spilled = residency_report(64, B::Layers(0), 64).unwrap();
+        assert!(all_spilled.contains("0 resident / 64 offloaded"), "{all_spilled}");
+
+        let auto = residency_report(64, B::Auto, 0).unwrap();
+        assert!(auto.contains("not available yet"), "auto is reported, not silent: {auto}");
+        assert!(!auto.contains("error"), "auto is a note, not a failure: {auto}");
+
+        let overshoot = residency_report(64, B::Layers(200), 0).unwrap();
+        assert!(
+            overshoot.contains("more than this model's 64 layers"),
+            "an overshoot must say so rather than silently doing nothing: {overshoot}"
+        );
+
+        let all_resident = residency_report(64, B::Layers(64), 0).unwrap();
+        assert!(
+            all_resident.contains("0 offloaded"),
+            "explicitly keeping them all is reported; only unset is silent: {all_resident}"
+        );
     }
 }
