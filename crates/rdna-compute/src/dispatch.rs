@@ -5701,13 +5701,32 @@ mod tests {
         );
     }
 
-    fn try_gpu() -> Option<super::Gpu> {
-        super::Gpu::init().ok()
+    /// One device is shared by every GPU test in this module, and several assert on
+    /// allocator/VRAM bookkeeping. `upload_raw_copy_failure_hip_frees_owner` demands
+    /// byte-exact `hipMemGetInfo` free across its window, which a sibling test
+    /// allocating or freeing VRAM in that window breaks — observed as a failure on
+    /// roughly one `cargo test -p rdna-compute --lib` run in three with no source
+    /// change. Holding this lock for each GPU test's duration makes the suite
+    /// deterministic without weakening any assertion. Poisoning is ignored: a panic
+    /// in one test must not fail the rest.
+    static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Serialized GPU handle for a test. The guard must be *bound* for the test's
+    /// duration — `let Some((mut gpu, _guard)) = try_gpu() else { … }` — because
+    /// dropping it immediately would release the lock.
+    fn try_gpu() -> Option<(super::Gpu, std::sync::MutexGuard<'static, ()>)> {
+        let guard = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match super::Gpu::init() {
+            Ok(gpu) => Some((gpu, guard)),
+            Err(_) => None,
+        }
     }
 
     #[test]
     fn ensure_vmm_cleaned_never_releases_a_live_owner() {
-        let Some(mut gpu) = try_gpu() else {
+        let Some((mut gpu, _guard)) = try_gpu() else {
             eprintln!("skip: no GPU");
             return;
         };
@@ -5751,7 +5770,7 @@ mod tests {
 
     #[test]
     fn vmm_fullmap_covers_unaligned_reservation() {
-        let Some(mut gpu) = try_gpu() else {
+        let Some((mut gpu, _guard)) = try_gpu() else {
             eprintln!("skip: no GPU");
             return;
         };
@@ -5826,7 +5845,7 @@ mod tests {
     /// measured window; a leaked owner still forces a fresh malloc on retry.
     #[test]
     fn alloc_then_init_failure_returns_pool_owner() {
-        let Some(mut gpu) = try_gpu() else {
+        let Some((mut gpu, _guard)) = try_gpu() else {
             eprintln!("skip: no GPU");
             return;
         };
@@ -5871,7 +5890,7 @@ mod tests {
     /// `free_tensor`/pool). Soft-skip without GPU like the other leaf tests.
     #[test]
     fn upload_raw_copy_failure_hip_frees_owner() {
-        let Some(mut gpu) = try_gpu() else {
+        let Some((mut gpu, _guard)) = try_gpu() else {
             eprintln!("skip: no GPU");
             return;
         };
@@ -5921,7 +5940,7 @@ mod tests {
 
     #[test]
     fn free_tensor_unmap_failure_retains_owner_for_retry() {
-        let Some(mut gpu) = try_gpu() else {
+        let Some((mut gpu, _guard)) = try_gpu() else {
             eprintln!("skip: no GPU");
             return;
         };
@@ -5970,7 +5989,7 @@ mod tests {
 
     #[test]
     fn free_tensor_release_failure_retains_owner_for_retry() {
-        let Some(mut gpu) = try_gpu() else {
+        let Some((mut gpu, _guard)) = try_gpu() else {
             eprintln!("skip: no GPU");
             return;
         };
@@ -6002,7 +6021,7 @@ mod tests {
 
     #[test]
     fn access_reset_failure_does_not_publish_live_owner() {
-        let Some(mut gpu) = try_gpu() else {
+        let Some((mut gpu, _guard)) = try_gpu() else {
             eprintln!("skip: no GPU");
             return;
         };
@@ -6040,7 +6059,7 @@ mod tests {
 
     #[test]
     fn ensure_vmm_cleaned_refuses_while_pending() {
-        let Some(mut gpu) = try_gpu() else {
+        let Some((mut gpu, _guard)) = try_gpu() else {
             eprintln!("skip: no GPU");
             return;
         };
