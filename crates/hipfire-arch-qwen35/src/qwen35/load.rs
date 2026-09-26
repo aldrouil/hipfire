@@ -2798,7 +2798,12 @@ impl WeightSource for ParoSource<'_> {
 
 /// Construct an `HfqBackend` with qwen35's defaults baked in: `QWEN35_NORM_BIAS`,
 /// the qwen35 tensor-name resolver, and the standard pread+awq weight reader.
-fn qwen35_hfq_backend<'a>(hfq: &'a HfqFile, gpu: &'a mut Gpu, layer: usize) -> HfqBackend<'a> {
+fn qwen35_hfq_backend<'a>(
+    hfq: &'a HfqFile,
+    gpu: &'a mut Gpu,
+    layer: usize,
+    host_local: bool,
+) -> HfqBackend<'a> {
     HfqBackend {
         hfq,
         gpu,
@@ -2809,7 +2814,7 @@ fn qwen35_hfq_backend<'a>(hfq: &'a HfqFile, gpu: &'a mut Gpu, layer: usize) -> H
         // Offload plumbing. `host_local` drives `norm`/`raw_f32`/`bias`; `proj` routes
         // through `read_proj_host`, which — unlike `read_proj` — receives `&mut Gpu` and
         // can therefore register a host VMM arena. Both default to the resident path.
-        host_local: false,
+        host_local,
         read_proj_host: Some(load_weight_tensor_host),
     }
 }
@@ -2843,7 +2848,10 @@ fn load_layer_into(
     gpu: &mut Gpu,
 ) -> HipResult<LayerWeights> {
     debug_assert_eq!(p, &format!("layers.{layer_idx}"));
-    let mut b = qwen35_hfq_backend(hfq, gpu, layer_idx);
+    // Partial GPU offload: layers before the resident-tail split point load their
+    // weights into host-located VMM. `i_gpu_start` defaults to 0, so an unset
+    // budget keeps every layer device-resident (the zero-diff regression guard).
+    let mut b = qwen35_hfq_backend(hfq, gpu, layer_idx, layer_idx < config.i_gpu_start);
     let moe = |bk: &mut HfqBackend, cfg: &Qwen35Config, li: usize| {
         load_moe_ffn(bk.hfq, bk.gpu, &format!("layers.{li}"), cfg, li as u16)
     };
@@ -6066,7 +6074,13 @@ fn load_weights_ep_rank_inner(
     staging.lm_head_aliases_embd = aliases_embd;
     for layer_idx in 0..config.n_layers {
         let layer = {
-            let mut backend = qwen35_hfq_backend(hfq, gpu, layer_idx);
+            // EP is deliberately NOT offloadable, even when a budget is set. This layer's
+            // DENSE components would go host-located while its expert weights stay in VRAM
+            // (`load_moe_ffn_ep` allocates device-side unconditionally and never sees the
+            // backend), so the layer would be half-offloaded and an `offloaded=N` count
+            // would still report it as spilled — the silent-partial shape the design doc
+            // flags. Pin resident until MoE offload is designed deliberately.
+            let mut backend = qwen35_hfq_backend(hfq, gpu, layer_idx, false);
             crate::layer_driver::load_layer(&mut backend, config, layer_idx, |bk, cfg, li| {
                 load_moe_ffn_ep(
                     bk.hfq,
