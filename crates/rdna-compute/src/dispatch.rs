@@ -5957,15 +5957,16 @@ mod tests {
         assert!(warm.buf.is_hip_allocation());
         gpu.free_tensor(warm).expect("free warm into pool");
 
-        // Signal the release with a payload big enough that the assertion cannot
-        // be perturbed by another process's driver accounting settling. Byte-exact
-        // equality was flaky across a multi-package `cargo test` run: a preceding
-        // test binary's VRAM release is not instantaneous, so `free_before` and
-        // `free_after` could straddle a settling step and fail a correct
-        // implementation. 64 MiB leaked vs 8 MiB tolerated keeps the check
-        // decisive (a leak of this owner is 64 MiB) while tolerating noise.
-        const PROBE_BYTES: usize = 64 * 1024 * 1024;
-        const TOLERANCE_BYTES: usize = 8 * 1024 * 1024;
+        // Global free VRAM cannot verify a release byte-exactly on this driver.
+        // Measured (`free_retention` probe, gfx1201): the owner's own bytes always
+        // return exactly, but the driver intermittently charges extra overhead at
+        // allocation that `hipFree` never returns — 0 or 28 MiB for a 64 MiB
+        // request, up to 56 MiB at 2 GiB. Byte-exact equality therefore failed a
+        // correct implementation in roughly 2 of 5 runs. Use a payload far above
+        // that measured overhead (a leak of this owner drops free by 512 MiB) and
+        // tolerate an absolute 64 MiB, which no observed overhead reaches.
+        const PROBE_BYTES: usize = 512 * 1024 * 1024;
+        const TOLERANCE_BYTES: usize = 64 * 1024 * 1024;
         let payload = vec![7u8; PROBE_BYTES];
 
         let (free_before, total) = gpu.hip.get_vram_info().expect("vram before");
