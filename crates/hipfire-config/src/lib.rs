@@ -641,6 +641,18 @@ pub static FIELDS: &[ConfigField] = &[
         Some("HIPFIRE_KV_ADAPTIVE"),
         "Runtime VRAM-fit KV precision policy."
     ),
+    field!(
+        "memory.gpu_layer_budget",
+        "gpu_layer_budget",
+        Memory,
+        ModelLoad,
+        DefaultValue::Null,
+        ValueRule::NullableInteger { min: -1, max: 65536 },
+        true,
+        false,
+        Some("HIPFIRE_GPU_LAYER_BUDGET"),
+        "Resident-layer budget for partial GPU offload; null=full resident (zero-diff), -1=auto-fit largest tail that fits VRAM, else pin N resident layers."
+    ),
     // Process-scoped: the preflight guards snapshot this once at startup, and
     // a mid-serve flip would make the refusal policy depend on which load ran
     // last — dishonest for a long-lived daemon.
@@ -5653,6 +5665,217 @@ mod tests {
                 raw.parse::<Deepseek4ComputePlacement>().is_err(),
                 "expected rejection for {raw}"
             );
+        }
+    }
+}
+
+/// Placement policy for partial GPU offload — decides which layers stay in
+/// device VRAM versus spill to host RAM, resolved once at load so placement is
+/// fixed for the model's lifetime and never thrashes per request. This module is
+/// intentionally pure and GPU-independent: it owns the configuration vocabulary
+/// ([`GpuLayerBudget`]) and the admission arithmetic ([`largest_fitting_tail`]);
+/// the qwen35 load path consumes them to pick `i_gpu_start`.
+pub mod memory {
+    use super::process_value;
+
+    /// Resident-layer budget for partial GPU offload (`memory.gpu_layer_budget`,
+    /// compat env `HIPFIRE_GPU_LAYER_BUDGET`). Resolved once at load.
+    ///
+    /// * [`GpuLayerBudget::Full`] is the unset default: keep every layer
+    ///   resident, never offload — byte-identical to a pure-VRAM run and the
+    ///   regression guard for the whole feature.
+    /// * [`GpuLayerBudget::Auto`] (`-1`) admits the largest contiguous tail of
+    ///   layers that fits device memory with headroom (see [`largest_fitting_tail`]).
+    /// * [`GpuLayerBudget::Layers`] pins exactly this many resident layers; the
+    ///   prefix before them spills to host RAM.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum GpuLayerBudget {
+        /// Fully resident — never offload (the zero-diff default).
+        Full,
+        /// Compute the largest resident tail that fits device memory with headroom.
+        Auto,
+        /// Pin exactly this many resident layers; spill everything before them.
+        Layers(usize),
+    }
+
+    impl std::fmt::Display for GpuLayerBudget {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                GpuLayerBudget::Full => write!(f, "full"),
+                GpuLayerBudget::Auto => write!(f, "auto"),
+                GpuLayerBudget::Layers(n) => write!(f, "{n}"),
+            }
+        }
+    }
+
+    /// Pure truth table behind [`gpu_layer_budget`], split out so unit tests can
+    /// pin the contract without touching the process-global snapshot. Unset,
+    /// empty, and unparseable inputs all fail closed to fully resident (so a bad
+    /// or absent setting never forces offload); `"auto"`/`"-1"` selects auto; any
+    /// other non-negative integer pins that many resident layers. A negative value
+    /// other than `-1` is treated as unset rather than an error.
+    pub fn parse_gpu_layer_budget(raw: Option<&str>) -> GpuLayerBudget {
+        match raw.map(|v| v.trim().to_ascii_lowercase()) {
+            None => GpuLayerBudget::Full,
+            Some(v) if v.is_empty() => GpuLayerBudget::Full,
+            Some(v) if v == "auto" || v == "-1" => GpuLayerBudget::Auto,
+            Some(v) => match v.parse::<i64>() {
+                Ok(n) if n >= 0 => GpuLayerBudget::Layers(n as usize),
+                _ => GpuLayerBudget::Full,
+            },
+        }
+    }
+
+    /// The configured [`GpuLayerBudget`] from the process snapshot. Reads exactly
+    /// one resolved value: unset or `"auto"`/`"-1"` selects auto-fit; a non-negative
+    /// integer pins that many resident layers; anything else fails closed to full
+    /// residency (the zero-diff baseline).
+    pub fn gpu_layer_budget() -> GpuLayerBudget {
+        parse_gpu_layer_budget(process_value("HIPFIRE_GPU_LAYER_BUDGET").as_deref())
+    }
+
+    /// Largest contiguous resident tail `[i_gpu_start .. n_layers)` such that the
+    /// bytes of those layers' weights plus the fully-resident KV footprint fit
+    /// within `effective_capacity_bytes` (device memory minus headroom and minus
+    /// any always-resident base overhead, already subtracted by the caller).
+    ///
+    /// Returns the *smallest* `i_gpu_start` that fits — keeping as many layers
+    /// resident as possible while still fitting — which is exactly the partial
+    /// offload objective: spill only the prefix that must. As `i_gpu_start` grows,
+    /// resident weight bytes shrink monotonically, so a linear scan from zero
+    /// finds the optimum on the first hit. Returns `None` when even offloading
+    /// every layer leaves KV over budget, in which case the load refuses cleanly
+    /// rather than OOM mid-generation.
+    pub fn largest_fitting_tail(
+        n_layers: usize,
+        per_layer_weight_bytes: &[usize],
+        kv_bytes: usize,
+        always_resident_bytes: usize,
+        effective_capacity_bytes: usize,
+    ) -> Option<usize> {
+        assert!(
+            per_layer_weight_bytes.len() == n_layers,
+            "per_layer_weight_bytes must have exactly n_layers entries"
+        );
+        // resident(i_gpu_start) = always-resident base (embed + lm_head) + the
+        // weight bytes of the resident tail [i_gpu_start..n] + fully-resident KV.
+        // Walk from the most-resident candidate (i_gpu_start=0, whose weight tail
+        // is the whole array) and shrink VRAM one layer at a time until the
+        // footprint fits within effective_capacity_bytes (= device memory minus
+        // headroom). The first fit is the largest resident tail; if even
+        // offloading every layer still overshoots, None — the load refuses rather
+        // than OOM mid-generation.
+        let mut resident: usize =
+            always_resident_bytes + per_layer_weight_bytes.iter().sum::<usize>() + kv_bytes;
+        if resident <= effective_capacity_bytes {
+            return Some(0);
+        }
+        for i_gpu_start in 1..=n_layers {
+            resident = resident.saturating_sub(per_layer_weight_bytes[i_gpu_start - 1]);
+            if resident <= effective_capacity_bytes {
+                return Some(i_gpu_start);
+            }
+        }
+        None
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn gpu_layer_budget_roundtrip() {
+            // Unset resolves to full residency — the zero-diff baseline.
+            assert_eq!(parse_gpu_layer_budget(None), GpuLayerBudget::Full);
+            // Empty string is unset, not auto.
+            assert_eq!(parse_gpu_layer_budget(Some("")), GpuLayerBudget::Full);
+            // "auto" and "-1" both select auto-fit (case-insensitive).
+            assert_eq!(parse_gpu_layer_budget(Some("auto")), GpuLayerBudget::Auto);
+            assert_eq!(parse_gpu_layer_budget(Some("-1")), GpuLayerBudget::Auto);
+            assert_eq!(parse_gpu_layer_budget(Some("AUTO")), GpuLayerBudget::Auto);
+            // A non-negative integer pins that many resident layers (trimmed).
+            assert_eq!(
+                parse_gpu_layer_budget(Some("3")),
+                GpuLayerBudget::Layers(3)
+            );
+            assert_eq!(
+                parse_gpu_layer_budget(Some(" 12 ")),
+                GpuLayerBudget::Layers(12)
+            );
+            // Garbage, negatives other than -1, and anything unparseable fail
+            // closed to full residency rather than forcing an offload.
+            assert_eq!(
+                parse_gpu_layer_budget(Some("banana")),
+                GpuLayerBudget::Full
+            );
+            assert_eq!(parse_gpu_layer_budget(Some("-2")), GpuLayerBudget::Full);
+        }
+
+        #[test]
+        fn gpu_layer_budget_display() {
+            assert_eq!(GpuLayerBudget::Full.to_string(), "full");
+            assert_eq!(GpuLayerBudget::Auto.to_string(), "auto");
+            assert_eq!(GpuLayerBudget::Layers(5).to_string(), "5");
+        }
+
+        #[test]
+        fn largest_fitting_tail_keeps_largest_resident_tail() {
+            // Four layers of 10/20/30/40; KV footprint 20. Effective capacity 100
+            // -> weight-tail budget 80. Full resident weights=100 > 80; dropping
+            // L0 leaves 90 > 80; dropping L0,L1 leaves 70 <= 80 => i_gpu_start=2,
+            // keeping L2+L3 resident (the largest tail that fits).
+            let weights = [10usize, 20, 30, 40];
+            assert_eq!(largest_fitting_tail(4, &weights, 20, 0, 100), Some(2));
+        }
+
+        #[test]
+        fn largest_fitting_tail_full_when_everything_fits() {
+            // Weights + KV comfortably within capacity: keep all layers resident.
+            let weights = [10usize, 20, 30];
+            assert_eq!(largest_fitting_tail(3, &weights, 5, 0, 1000), Some(0));
+        }
+
+        #[test]
+        fn largest_fitting_tail_headroom_drives_offload() {
+            // Effective capacity 115: resident@0 = weights(100)+KV(20) = 120 > 115;
+            // dropping L0 leaves weights[1..]=90 + KV(20) = 110 <= 115 => i_gpu_start=1.
+            let weights = [10usize, 20, 30, 40];
+            assert_eq!(largest_fitting_tail(4, &weights, 20, 0, 115), Some(1));
+        }
+
+        #[test]
+        fn largest_fitting_tail_none_when_kv_alone_exceeds_budget() {
+            // Even offloading every layer leaves KV over capacity: refuse.
+            let weights = [10usize, 20];
+            assert_eq!(largest_fitting_tail(2, &weights, 5_000, 0, 1_000), None);
+        }
+
+        #[test]
+        fn largest_fitting_tail_all_but_last_offloaded() {
+            // Only the final layer fits after KV: i_gpu_start == n_layers-1.
+            let weights = [100usize, 100, 5];
+            let kv = 3;
+            // Effective capacity 8 -> weight-tail budget 5. sum([5])=5 <= 5 => keep
+            // only L2 resident.
+            assert_eq!(largest_fitting_tail(3, &weights, kv, 0, 8), Some(2));
+        }
+        #[test]
+        fn largest_fitting_tail_always_resident_reduces_fit() {
+            // Embed + lm_head stay resident in every mode (always_resident_bytes). With
+            // base=100, KV=10: resident@0 = 100+60+10 = 170 > 150; @1 = 160 > 150; @2 =
+            // 140 <= 150 => keep only L2 resident — the base alone leaves room for just
+            // one layer's weights.
+            let weights = [10usize, 20, 30];
+            assert_eq!(largest_fitting_tail(3, &weights, 10, 100, 150), Some(2));
+        }
+
+        #[test]
+        fn largest_fitting_tail_base_alone_exceeds_capacity() {
+            // Embed + lm_head alone overshoot capacity even with every layer offloaded:
+            // refuse rather than OOM mid-generation.
+            let weights = [10usize, 20];
+            // base=500 + KV=200 = 700 > 600 at i_gpu_start=n_layers => None.
+            assert_eq!(largest_fitting_tail(2, &weights, 200, 500, 600), None);
         }
     }
 }
