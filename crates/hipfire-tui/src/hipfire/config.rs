@@ -234,9 +234,11 @@ impl ConfigState {
                 "Precision/memory tradeoff for attention cache.",
             ),
             (
-                "Offload",
+                // Says GPU, not "offload": this value counts layers LEFT ON the
+                // GPU, and an "Offload" label invites reading it as the inverse.
+                "GPU layers",
                 {
-                    // Unset = every layer resident. The bare empty string would
+                    // Unset = every layer on the GPU. The bare empty string would
                     // read as "broken" in a value column, so name the state; the
                     // editor seeds its buffer from `values`, not from this label.
                     let v = self
@@ -245,12 +247,12 @@ impl ConfigState {
                         .cloned()
                         .unwrap_or_default();
                     if v.is_empty() {
-                        "all resident".into()
+                        "all on GPU".into()
                     } else {
-                        format!("{v} resident")
+                        format!("{v} on GPU")
                     }
                 },
-                "Layers kept in VRAM; the rest spill to system RAM. Frees VRAM, but much slower.",
+                "How many layers stay on the GPU; the rest spill to system RAM. Frees VRAM, but much slower.",
             ),
             (
                 "Thinking",
@@ -417,6 +419,22 @@ mod tests {
         assert_eq!(st.easy_keys().len(), n);
         assert_eq!(st.easy_override_state().len(), n);
         assert_eq!(st.easy_help_keys().len(), n);
+    }
+
+    /// A row marked inline-editable (`Some(key)`) that has no `EDITABLE_FIELDS`
+    /// spec cannot actually be edited: `App::handle_settings_key` looks the spec up
+    /// and, on `None`, refuses — Enter never opens a buffer and no value can be
+    /// typed. `gpu_layer_budget` and `reasoning_effort` both shipped that way, in
+    /// `easy_keys()` with no spec, and nothing failed.
+    #[test]
+    fn every_inline_editable_easy_row_has_a_field_spec() {
+        for key in state_with(&[]).easy_keys().into_iter().flatten() {
+            assert!(
+                crate::hipfire::writer::field_spec(key).is_some(),
+                "easy row {key} is marked inline-editable but has no EDITABLE_FIELDS \
+                 spec, so the editor refuses to type a value into it"
+            );
+        }
     }
 
     #[test]

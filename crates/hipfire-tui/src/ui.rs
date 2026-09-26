@@ -1636,17 +1636,17 @@ mod render_tests {
             app.settings_easy = true;
             app.settings_selected = idx;
         });
-        // Match the LABEL+VALUE pair, not the bare label: `contains("Offload")`
-        // also matches a mangled label like "OffloadXX", which makes the guard
-        // pass on exactly the regression it exists to catch. Verified by renaming
-        // the row and watching this fail.
+        // Match the LABEL+VALUE pair, not the bare label: a bare
+        // `contains("GPU layers")` also matches a mangled label like
+        // "GPU layersXX", which makes the guard pass on exactly the regression it
+        // exists to catch. Verified by renaming the row and watching this fail.
         let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
-            flat.contains("Offload all resident"),
-            "the Offload easy row must be drawn with a readable value when unset"
+            flat.contains("GPU layers all on GPU"),
+            "the GPU-layers easy row must be drawn with a readable value when unset"
         );
         assert!(
-            text.contains("Layer offload to system RAM"),
+            text.contains("Layers kept on the GPU"),
             "selecting the row must render its curated explainer"
         );
     }

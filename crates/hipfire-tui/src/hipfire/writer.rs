@@ -81,6 +81,13 @@ pub const EDITABLE_FIELDS: &[FieldSpec] = &[
         key: "thinking_budget",
         kind: FieldKind::Enum(THINKING_BUDGET),
     },
+    // Also an easy row with no spec, so it was equally uneditable. The values come
+    // from the schema's own list rather than a local copy, so this cannot drift
+    // from what `set_cli` accepts.
+    FieldSpec {
+        key: "reasoning_effort",
+        kind: FieldKind::Enum(hipfire_config::REASONING_EFFORTS),
+    },
     FieldSpec {
         key: "chat_template",
         kind: FieldKind::FreeStr {
@@ -107,6 +114,18 @@ pub const EDITABLE_FIELDS: &[FieldSpec] = &[
         kind: FieldKind::Int {
             min: 512,
             max: 524288,
+        },
+    },
+    // Present in `config::easy_keys()`, so the Settings editor offers it as an
+    // inline-editable row; without a spec here Enter falls through to "not
+    // editable from the TUI" and no value can be typed. `min: -1` matches the
+    // schema (negative is the reserved auto spelling), and the editor's buffer is
+    // seeded from the raw value, so typing `null` clears the override.
+    FieldSpec {
+        key: "gpu_layer_budget",
+        kind: FieldKind::Int {
+            min: -1,
+            max: 65536,
         },
     },
     FieldSpec {
