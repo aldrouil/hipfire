@@ -651,7 +651,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         Some("HIPFIRE_GPU_LAYER_BUDGET"),
-        "Resident-layer budget for partial GPU offload; null=full resident (zero-diff), -1=auto-fit largest tail that fits VRAM, else pin N resident layers."
+        "Resident-layer budget for partial GPU offload: N keeps the last N layers in VRAM and spills the prefix to host RAM; null=all resident (the zero-diff default). -1 (auto-fit) is not wired yet and fails closed at load, so set an explicit count."
     ),
     // Process-scoped: the preflight guards snapshot this once at startup, and
     // a mid-serve flip would make the refusal policy depend on which load ran
