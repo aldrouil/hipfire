@@ -147,7 +147,7 @@ fn load_norm_weight(
 ///
 /// `up` decides where the code blob lands: the device reader passes
 /// `Gpu::upload_raw`, the offloaded reader passes `Gpu::upload_raw_host`
-/// (host-located VMM, read over PCIe). Both hold byte-identical bytes, so the
+/// (host-mapped system RAM, read over PCIe). Both hold byte-identical bytes, so the
 /// numerics are unchanged and only the physical location differs. Injecting the
 /// uploader rather than passing a `host` flag keeps ONE copy of the match: the
 /// device path is reached through `&Gpu` (the `read_proj` fn-pointer contract,
@@ -974,7 +974,7 @@ pub fn load_weight_tensor(
 }
 
 /// Offloaded twin of [`load_weight_tensor`]: same name resolution, same AWQ
-/// sidecar, but the quantized codes land in host-located VMM instead of VRAM.
+/// sidecar, but the quantized codes land in host-mapped system RAM instead of VRAM.
 ///
 /// The AWQ scale deliberately stays on the device — it is a 1-D f16 vector of
 /// length K (kilobytes), so host-locating it would cost PCIe bandwidth on the
@@ -2824,7 +2824,7 @@ fn qwen35_hfq_backend<'a>(
         layer,
         // Offload plumbing. `host_local` drives `norm`/`raw_f32`/`bias`; `proj` routes
         // through `read_proj_host`, which — unlike `read_proj` — receives `&mut Gpu` and
-        // can therefore register a host VMM arena. Both default to the resident path.
+        // can therefore register a host-mapped owner. Both default to the resident path.
         host_local,
         read_proj_host: Some(load_weight_tensor_host),
     }
@@ -2860,7 +2860,7 @@ fn load_layer_into(
 ) -> HipResult<LayerWeights> {
     debug_assert_eq!(p, &format!("layers.{layer_idx}"));
     // Partial GPU offload: layers before the resident-tail split point load their
-    // weights into host-located VMM. `i_gpu_start` defaults to 0, so an unset
+    // weights into host-mapped system RAM. `i_gpu_start` defaults to 0, so an unset
     // budget keeps every layer device-resident (the zero-diff regression guard).
     let mut b = qwen35_hfq_backend(hfq, gpu, layer_idx, layer_idx < config.i_gpu_start);
     let moe = |bk: &mut HfqBackend, cfg: &Qwen35Config, li: usize| {

@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Can a shader read host-located VMM — and specifically the quantized path?
+//! Can a shader read host-mapped memory — and specifically the quantized path?
 //!
 //! The existing host-offload checks (`vmm_tensor_smoke`, `host_offload_smoke`)
 //! verify a host-located tensor with `memcpy_htod` / `memcpy_dtoh` plus a handle

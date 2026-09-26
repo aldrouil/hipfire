@@ -1279,7 +1279,7 @@ fn dequant_bq1_to_f32(data: &[u8], n: usize) -> Vec<f32> {
     /// Dequantize an HTQ weight tensor to a device `F32 [n]` tensor. The CPU dequant is
     /// factored into [`dequantize_to_f32`] so the host-located offload path stays byte for
     /// byte identical — the only difference from the device path is the upload target
-    /// (device memory vs host-VMM readable over PCIe).
+    /// (device memory vs host-mapped system RAM readable over PCIe).
     pub fn dequant_f32(
         gpu: &mut Gpu,
         quant_type: u8,
@@ -1325,7 +1325,7 @@ pub struct HfqBackend<'a> {
     pub read_proj:
         fn(&HfqFile, &Gpu, &str, usize, usize, fn(&str) -> Vec<String>) -> HipResult<WeightTensor>,
     pub layer: usize,
-    /// When true, this layer's weight tensors allocate on host-located VMM (system RAM
+    /// When true, this layer's weight tensors allocate on host-mapped system RAM (
     /// read over PCIe) instead of device memory — leaving VRAM free for a larger KV cache
     /// while keeping numerics byte-identical to resident mode. Set per-layer by the loader
     /// from the placement policy; `false` is the fully-resident, zero-diff default. See

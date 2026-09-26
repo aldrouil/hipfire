@@ -3402,10 +3402,11 @@ impl Gpu {
             .map(VmmArena::granularity)
     }
 
-    /// Whether a tensor's backing VMM arena is host-located (`HostPinned`) — its
-    /// pages are system RAM accessed over PCIe rather than the card's VRAM. Pure map
-    /// lookup; touches no device state. Offload tests and logs read this to prove a
-    /// spilled layer actually left VRAM (as opposed to being merely device-pinned).
+    /// Whether a tensor was allocated by [`Self::alloc_host_mapped_tensor`] — its pages
+    /// are system RAM the kernels read over PCIe rather than the card's VRAM. Pure
+    /// ownership check; touches no device state. Offload tests and logs read this to
+    /// prove a spilled layer actually left VRAM rather than being merely
+    /// device-pinned. Device-VMM tensors are not host-located by construction.
     pub fn host_located(&self, tensor: &GpuTensor) -> bool {
         tensor.buf.is_host_mapped()
     }

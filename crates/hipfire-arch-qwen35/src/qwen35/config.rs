@@ -121,7 +121,7 @@ pub struct Qwen35Config {
     pub dim: usize,
     pub n_layers: usize,
     /// Resident-tail split point for partial GPU offload. Layers `[0 .. i_gpu_start)`
-    /// spill to host-VMM; `[i_gpu_start .. n_layers)` stay device-resident. Set by the
+    /// spill to host-mapped system RAM; `[i_gpu_start .. n_layers)` stay device-resident. Set by the
     /// Step 3 loader from the placement policy; `0` = fully resident (zero-diff default).
     pub i_gpu_start: usize,
     pub vocab_size: usize,
@@ -970,7 +970,7 @@ fn from_config_value(config: &serde_json::Value) -> Result<Qwen35Config, String>
 /// Placement is fixed for the model's lifetime, so it is decided here — once, at
 /// config construction — rather than per request. The split keeps a contiguous
 /// resident TAIL `[i_gpu_start .. n_layers)` and spills the prefix `[0 ..
-/// i_gpu_start)` to host-located VMM; `load_layer_into` turns that into a
+/// i_gpu_start)` to host-mapped system RAM; `load_layer_into` turns that into a
 /// per-layer `host_local` flag.
 ///
 /// `Full` (the default, and the zero-diff regression guard) leaves
