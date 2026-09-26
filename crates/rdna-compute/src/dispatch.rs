@@ -3207,6 +3207,14 @@ impl Gpu {
         // over on-demand commit on the platform whose driver breaks growth.
         #[cfg(windows)]
         let initial_mapped_bytes = arena.reserved_bytes();
+        // `hipMemMap` requires a granularity-aligned size. Current callers all pass
+        // aligned lengths (the KV arenas), so this never tripped — but an arbitrary
+        // tensor length fails here, which is exactly how the host path broke on a
+        // real quantized code blob. Round up (the reservation is already rounded by
+        // `reserve`) so the latent device-side failure cannot surprise a later caller.
+        let initial_mapped_bytes = initial_mapped_bytes
+            .next_multiple_of(arena.granularity())
+            .min(arena.reserved_bytes());
         if initial_mapped_bytes > 0 {
             if let Err(err) = arena.map_next(&self.hip, initial_mapped_bytes, access_devices) {
                 return Err(self.retain_failed_vmm_arena(arena, err));
@@ -3263,6 +3271,15 @@ impl Gpu {
         let mut arena = VmmArena::reserve_host(&self.hip, byte_size)?;
         #[cfg(windows)]
         let initial_mapped_bytes = arena.reserved_bytes();
+        // `hipMemMap` requires a granularity-aligned size, but a quantized weight's
+        // code blob is an arbitrary byte length (a real MQ4 tensor maps 99840 bytes
+        // against a 4096-byte granularity). Round the MAP up — the reservation is
+        // already rounded by `reserve_host`, so the extra is address space the
+        // tensor simply never touches; `owner_buffer(byte_size)` still describes
+        // exactly the requested prefix, so no kernel can read past the data.
+        let initial_mapped_bytes = initial_mapped_bytes
+            .next_multiple_of(arena.granularity())
+            .min(arena.reserved_bytes());
         if initial_mapped_bytes > 0 {
             if let Err(err) = arena.map_next(&self.hip, initial_mapped_bytes, access_devices) {
                 return Err(self.retain_failed_vmm_arena(arena, err));
