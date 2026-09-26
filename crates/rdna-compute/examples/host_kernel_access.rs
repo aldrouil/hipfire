@@ -43,12 +43,6 @@ fn fwht_signs(seed: u32) -> Vec<f32> {
         .collect()
 }
 
-fn fill(gpu: &Gpu, t: &rdna_compute::GpuTensor, bytes: &[u8]) {
-    gpu.hip
-        .memcpy_htod(&t.buf, bytes)
-        .expect("memcpy_htod into mapped VA");
-}
-
 fn max_diff(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
 }
@@ -95,8 +89,6 @@ fn arm_f32(gpu: &mut Gpu) {
 
     let a_host: Vec<f32> = (0..M * K).map(|i| (i % 17) as f32 * 0.5).collect();
     let x: Vec<f32> = (0..K).map(|i| (i % 7) as f32).collect();
-    let bytes: &[u8] =
-        unsafe { std::slice::from_raw_parts(a_host.as_ptr() as *const u8, a_host.len() * 4) };
 
     let a_dev = gpu.upload_f32(&a_host, &[M, K]).unwrap();
     let xd = gpu.upload_f32(&x, &[K]).unwrap();
@@ -105,11 +97,10 @@ fn arm_f32(gpu: &mut Gpu) {
     let reference = gpu.download_f32(&yd).unwrap();
     assert!(any_nonzero(&reference), "device reference is all zero - arm is vacuous");
 
-    let access = [gpu.device_id];
-    let a_off =
-        unsafe { gpu.alloc_vmm_tensor_host(&[M, K], DType::F32, M * K * 4, &access).unwrap() };
+    // The production offload upload, not a hand-rolled host arena: this arm must
+    // fail if the path the loader actually uses stops being kernel-readable.
+    let a_off = gpu.upload_f32_host(&a_host, &[M, K]).unwrap();
     assert!(gpu.vmm_host_located(&a_off), "not host-located");
-    fill(gpu, &a_off, bytes);
     println!("arm1: host buffer at 0x{:x}", a_off.buf.as_ptr() as usize);
 
     println!("arm1: launching gemv_f32 over a host-located F32 buffer...");
@@ -166,34 +157,27 @@ fn arm_mq4(gpu: &mut Gpu) {
 
     let a_dev = gpu.upload_raw(&codes, &[codes.len()]).unwrap();
     let xd = gpu.upload_f32(&x, &[K]).unwrap();
-    let s1 = gpu.upload_f32(&s1v, &[256]).unwrap();
-    let s2 = gpu.upload_f32(&s2v, &[256]).unwrap();
     let mut yd = gpu.zeros(&[M], DType::F32).unwrap();
-    gpu.gemv_mq4g256(&a_dev, &xd, &yd, &s1, &s2, M, K).unwrap();
+    gpu.gemv_mq4g256(&a_dev, &xd, &yd, M, K).unwrap();
     let reference = gpu.download_f32(&yd).unwrap();
     assert!(any_nonzero(&reference), "device reference is all zero - arm is vacuous");
     println!("arm2: device-resident gemv_mq4g256 ok ({} outputs)", reference.len());
 
-    let access = [gpu.device_id];
-    let a_off =
-        unsafe { gpu.alloc_vmm_tensor_host(&[codes.len()], DType::Raw, codes.len(), &access).unwrap() };
+    let a_off = gpu.upload_raw_host(&codes, &[codes.len()]).unwrap();
     assert!(gpu.vmm_host_located(&a_off), "not host-located");
-    fill(gpu, &a_off, &codes);
     // Print the MAPPED VA the kernel is actually handed, not the source Vec —
     // otherwise a reader comparing it against a fault address is misled.
     println!(
-        "arm2: dev_A=0x{:x} host_A=0x{:x} x=0x{:x} s1=0x{:x} s2=0x{:x} host_byte_size={}",
+        "arm2: dev_A=0x{:x} host_A=0x{:x} x=0x{:x} host_byte_size={}",
         a_dev.buf.as_ptr() as usize,
         a_off.buf.as_ptr() as usize,
         xd.buf.as_ptr() as usize,
-        s1.buf.as_ptr() as usize,
-        s2.buf.as_ptr() as usize,
         a_off.byte_size(),
     );
 
     println!("arm2: launching gemv_mq4g256 over a host-located MQ4 code blob...");
     let mut yh = gpu.zeros(&[M], DType::F32).unwrap();
-    match gpu.gemv_mq4g256(&a_off, &xd, &yh, &s1, &s2, M, K) {
+    match gpu.gemv_mq4g256(&a_off, &xd, &yh, M, K) {
         Ok(()) => {
             let got = gpu.download_f32(&yh).unwrap();
             let d = max_diff(&reference, &got);
