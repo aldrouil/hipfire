@@ -39,36 +39,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Keep the mmap alive: both readers take the zero-copy mmap path first.
     let mut gpu = Gpu::init()?;
 
-    // Probe for a real projection tensor rather than hardcoding a name: qwen3.5
-    // checkpoints ship under several prefixes (`model.` / `model.language_model.`)
-    // and VL builds interleave linear-attention and full-attention layers, so a
-    // guessed name silently turns this into "tensor not found".
-    const PROBES: &[&str] = &[
-        "model.language_model.layers.3.self_attn.q_proj.weight",
-        "model.layers.3.self_attn.q_proj.weight",
-        "model.language_model.layers.3.self_attn.qkv_proj.weight",
-        "model.layers.3.self_attn.qkv_proj.weight",
-        "model.language_model.layers.4.mlp.up_proj.weight",
-        "model.layers.4.mlp.up_proj.weight",
-        "model.language_model.layers.4.mlp.gate_proj.weight",
-        "model.layers.4.mlp.gate_proj.weight",
-    ];
-    let name = PROBES
-        .iter()
-        .copied()
-        .find(|n| hfq.find_tensor_info(n).is_some())
-        .unwrap_or_else(|| {
-            panic!(
-                "no projection tensor found; tried {PROBES:?} against {}",
-                path
-            )
-        });
-    let info = hfq.find_tensor_info(name).expect("probed above");
-    // m = rows, k = columns for a 2-D projection; the loader validates these
-    // against the format's own K%256 / blob-length guards.
-    let m = info.shape.first().copied().unwrap_or(4096) as usize;
-    let k = info.shape.get(1).copied().unwrap_or(4096) as usize;
-    println!("picked {name} qt={} shape={:?}", info.quant_type, info.shape);
+    // Select from the file's own index rather than hardcoding a name or shape:
+    // qwen3.5 checkpoints ship under `model.` or `model.language_model.`, VL
+    // builds interleave linear- and full-attention layers, and layer dims differ
+    // per model. A guess here just yields "tensor not found" or, worse, silently
+    // reads the wrong tensor. RAW_CODE_QT lists quant types whose arms upload
+    // opaque code blobs (the ones that actually get offloaded).
+    const RAW_CODE_QT: &[u8] = &[44, 13, 17, 15, 14, 8, 7, 6];
+    // Own the name so the index borrow ends before the host reader takes `&mut hfq`.
+    let (name, m, k, qt) = {
+        // Prefer a transformer-layer weight: that is what actually gets offloaded.
+        // lm_head / embed_tokens are always resident, and lm_head is the largest
+        // tensor in the file, so taking the first match would allocate hundreds of
+        // MB of host memory to test something that never offloads.
+        // Require a realistically-sized weight: the first `layers.` match can be
+        // a degenerate 32-row linear-attention projection, which would exercise
+        // the plumbing over 68 KB and prove nothing about a real offload target.
+        let big = |t: &hipfire_runtime::hfq::HfqTensorInfo| {
+            RAW_CODE_QT.contains(&t.quant_type)
+                && t.shape.len() == 2
+                && t.shape[0] >= 1024
+                && t.shape[1] >= 1024
+        };
+        let info = hfq
+            .tensor_infos()
+            .iter()
+            .find(|t| big(t) && t.name.contains("layers."))
+            .or_else(|| hfq.tensor_infos().iter().find(|t| big(t)))
+            .or_else(|| {
+                hfq.tensor_infos()
+                    .iter()
+                    .find(|t| RAW_CODE_QT.contains(&t.quant_type) && t.shape.len() == 2)
+            })
+            .unwrap_or_else(|| panic!("no 2-D raw-code tensor in {path}"));
+        (
+            info.name.clone(),
+            info.shape[0] as usize,
+            info.shape[1] as usize,
+            info.quant_type,
+        )
+    };
+    let name = name.as_str();
+    println!("picked {name} qt={qt} shape={:?}", hfq.find_tensor_info(name).map(|i| &i.shape));
 
     let device = load_weight_tensor(
         &hfq,
@@ -99,6 +111,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         device.buf.byte_size()
     );
 
+    // Locality is the load-bearing assertion. Byte parity alone would still pass
+    // if `upload_raw_host` silently fell back to the device path, so the example
+    // would report PASS without having offloaded anything.
+    assert!(
+        gpu.vmm_host_located(&host.buf),
+        "host reader did not produce a host-located tensor - offload did not happen"
+    );
+    assert!(
+        !gpu.vmm_host_located(&device.buf),
+        "device reader unexpectedly produced a host-located tensor"
+    );
+    let (_, source) = hfq.tensor_data(name).expect("selected from the index above");
+    assert_eq!(
+        device.buf.byte_size(),
+        source.len(),
+        "device blob size != on-disk tensor size"
+    );
+    assert_eq!(
+        host.buf.byte_size(),
+        source.len(),
+        "host blob size != on-disk tensor size"
+    );
+    println!(
+        "locality: device=VRAM host=HostPinned (confirmed via Gpu::vmm_host_located)"
+    );
+
     let dev_bytes = gpu.download_raw_bytes(&device.buf)?;
     let host_bytes = gpu.download_raw_bytes(&host.buf)?;
     assert_eq!(
@@ -114,6 +152,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         dev_bytes.iter().zip(&host_bytes).position(|(a, b)| a != b)
     );
 
-    println!("HOST_OFFLOAD_PARITY PASS ({} bytes identical)", dev_bytes.len());
+    println!(
+        "HOST_OFFLOAD_PARITY PASS ({} bytes identical, host-located confirmed)",
+        dev_bytes.len()
+    );
     Ok(())
 }
