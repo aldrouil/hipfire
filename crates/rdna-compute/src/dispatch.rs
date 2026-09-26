@@ -3331,11 +3331,21 @@ impl Gpu {
     /// [`Self::release_registered_vmm`]. Returns the number still registered.
     fn release_registered_host_mapped(&mut self) -> HipResult<usize> {
         let mut first_error = None;
-        let pointers: Vec<usize> = self.host_mapped.drain().map(|(_, h)| h).collect();
-        for host_ptr in pointers {
-            if let Err(err) = self.hip.host_free(host_ptr as *mut std::ffi::c_void) {
-                if first_error.is_none() {
-                    first_error = Some(err);
+        // Remove only on success, mirroring `release_registered_vmm`: draining
+        // unconditionally would drop the sole record of a pointer whose
+        // `hipHostFree` failed, turning a retryable failure into an invisible
+        // leak that `host_mapped_count()` could no longer report.
+        let keys: Vec<usize> = self.host_mapped.keys().copied().collect();
+        for key in keys {
+            let host_ptr = self.host_mapped[&key];
+            match self.hip.host_free(host_ptr as *mut std::ffi::c_void) {
+                Ok(()) => {
+                    self.host_mapped.remove(&key);
+                }
+                Err(err) => {
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                    }
                 }
             }
         }
@@ -3448,6 +3458,19 @@ impl Gpu {
     /// is an error so unload/load cannot claim a clean handoff.
     pub fn ensure_vmm_cleaned(&mut self) -> HipResult<()> {
         self.bind_thread()?;
+        // Offloaded weights are a second owner class; without this check a leaked
+        // host-mapped tensor would let unload claim a clean handoff while holding
+        // pinned system RAM, which is exactly what this guard exists to prevent
+        // for VMM owners.
+        let live_host = self.host_mapped.len();
+        if live_host != 0 {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "refusing cleanup while {live_host} live host-mapped tensor owner(s) remain; unload the active model first"
+                ),
+            ));
+        }
         let live = self.vmm_arenas.len();
         if live != 0 {
             return Err(HipError::new(
@@ -5723,6 +5746,36 @@ mod tests {
             Ok(gpu) => Some((gpu, guard)),
             Err(_) => None,
         }
+    }
+
+    /// A leaked host-mapped owner must make teardown refuse, the way a leaked VMM
+    /// arena does. Offloaded weights are a second owner class, and without this
+    /// check an orphaned one would let unload report a clean handoff while still
+    /// holding pinned system RAM.
+    #[test]
+    fn ensure_vmm_cleaned_refuses_while_a_host_mapped_owner_is_live() {
+        let Some((mut gpu, _guard)) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        assert_eq!(gpu.host_mapped_count(), 0, "fresh GPU owns no host-mapped tensors");
+        gpu.ensure_vmm_cleaned().expect("idle GPU is clean");
+
+        let t = gpu
+            .upload_f32_host(&[1.0f32; 16], &[16])
+            .expect("host-mapped upload");
+        assert_eq!(gpu.host_mapped_count(), 1);
+        let err = gpu
+            .ensure_vmm_cleaned()
+            .expect_err("must refuse while a host-mapped owner is live");
+        assert!(
+            err.to_string().contains("host-mapped"),
+            "refusal must name the owner class: {err}"
+        );
+
+        gpu.free_tensor(t).expect("free the host-mapped owner");
+        assert_eq!(gpu.host_mapped_count(), 0);
+        gpu.ensure_vmm_cleaned().expect("clean again after the owner is freed");
     }
 
     #[test]
