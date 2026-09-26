@@ -5779,6 +5779,37 @@ pub mod memory {
         None
     }
 
+    /// Resolve the resident-tail split point from a placement [`GpuLayerBudget`].
+    ///
+    /// Returns `i_gpu_start`: layers `[0 .. i_gpu_start)` spill to host-VMM,
+    /// `[i_gpu_start .. n_layers)` stay device-resident. This is the single
+    /// policy→number call Step 3's loader uses; it never allocates or probes a
+    /// device, so it stays pure and unit-testable. Returns `None` only when the
+    /// budget is `Auto` and even offloading every layer leaves KV over capacity —
+    /// the caller refuses cleanly rather than OOM mid-generation.
+    pub fn resolve_i_gpu_start(
+        n_layers: usize,
+        per_layer_weight_bytes: &[usize],
+        kv_bytes: usize,
+        always_resident_bytes: usize,
+        effective_capacity_bytes: usize,
+        budget: GpuLayerBudget,
+    ) -> Option<usize> {
+        match budget {
+            // Fully resident — never offload (the zero-diff default).
+            GpuLayerBudget::Full => Some(0),
+            // Auto-fit: the largest resident tail that fits device memory with headroom.
+            GpuLayerBudget::Auto => largest_fitting_tail(
+                n_layers,
+                per_layer_weight_bytes,
+                kv_bytes,
+                always_resident_bytes,
+                effective_capacity_bytes,
+            ),
+            // Pin exactly this many resident layers; spill everything before them.
+            GpuLayerBudget::Layers(resident) => Some(n_layers - resident.min(n_layers)),
+        }
+    }
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -5876,6 +5907,59 @@ pub mod memory {
             let weights = [10usize, 20];
             // base=500 + KV=200 = 700 > 600 at i_gpu_start=n_layers => None.
             assert_eq!(largest_fitting_tail(2, &weights, 200, 500, 600), None);
+        }
+
+        // resolve_i_gpu_start: policy -> split point. Full never offloads; Layers
+        // pins exactly that many resident layers; Auto delegates to
+        // largest_fitting_tail (including the None-refuse path).
+        #[test]
+        fn resolve_i_gpu_start_full_is_zero() {
+            let weights = [10usize, 20];
+            assert_eq!(
+                resolve_i_gpu_start(2, &weights, 10, 5, 15, GpuLayerBudget::Full),
+                Some(0)
+            );
+        }
+
+        #[test]
+        fn resolve_i_gpu_start_layers_pins_resident_count() {
+            let weights = [10usize, 20, 30];
+            // Pin exactly 2 resident of 3 -> spill the first layer.
+            assert_eq!(
+                resolve_i_gpu_start(3, &weights, 10, 5, 15, GpuLayerBudget::Layers(2)),
+                Some(1)
+            );
+        }
+
+        #[test]
+        fn resolve_i_gpu_start_layers_at_or_above_total_is_full() {
+            let weights = [10usize, 20];
+            // Asking for more resident layers than exist keeps everything resident.
+            assert_eq!(
+                resolve_i_gpu_start(2, &weights, 10, 5, 15, GpuLayerBudget::Layers(9)),
+                Some(0)
+            );
+        }
+
+        #[test]
+        fn resolve_i_gpu_start_auto_refuses_when_nothing_fits() {
+            let weights = [10usize, 20];
+            // base + KV alone overshoot even with every layer offloaded.
+            assert_eq!(
+                resolve_i_gpu_start(2, &weights, 200, 500, 600, GpuLayerBudget::Auto),
+                None
+            );
+        }
+
+        #[test]
+        fn resolve_i_gpu_start_auto_matches_largest_fitting_tail() {
+            let weights = [10usize, 20, 30];
+            // base=50 + weights(60) + KV=40 = 150 > cap 90; every layer offloaded
+            // leaves 90 == cap => the whole table spills (Some(3)).
+            assert_eq!(
+                resolve_i_gpu_start(3, &weights, 40, 50, 90, GpuLayerBudget::Auto),
+                Some(3)
+            );
         }
     }
 }
