@@ -328,18 +328,26 @@ dense edit + routed-expert composition (v2).
   spilled — a real host-overhead hit on top of the PCIe cost. Even at an "acceptable" speed target,
   weighing A (simplest, correct) against B (mapped-host stable pointers, keeps graph) still matters;
   profile before committing.
-  **Measurement method matters more than it looks.** `hipfire bench` already pins greedy decoding
-  itself (`temperature: 0.0, top_p: 1.0` in the generated request, hipfire-cli/src/main.rs:4870),
-  so a bench A/B needs no flag and any bench run-to-run difference is a real signal. The `-t 0`
+- **Measurement method, and the resident VRAM control.**
+  `hipfire bench` already pins greedy decoding itself (`temperature: 0.0, top_p: 1.0` in the
+  generated request, hipfire-cli/src/main.rs:4870), so a bench A/B needs no flag — the `-t 0`
   requirement applies to `hipfire run`, which samples at the configured temperature by default.
   When comparing decode throughput, **interleave the arms** (branch, stock, branch, stock, …)
   across fresh processes: batching same-arm runs consecutively on this box lets them drift into a
   ~2x lower regime, which reads as a fake regression. Interleaved 6-per-arm, branch and stock
   medians were 40.25 vs 40.35 tok/s — 0.25% apart, no regression.
-  **Resident VRAM control, for the offload proof:** `qwen3.8-27b.mq3-xt` allocates 86% of 16304 MB
-  (~13.7 GiB) on gfx1201 — read via `rocm-smi --showmemuse --csv`, column `device=card0`, field
-  `GPU Memory Allocated (VRAM%)`. That is the number an offloaded run must measurably beat; an
-  `offloaded=N` log line is not evidence on its own.
+  **Caveat: do not eyeball bench output.** Bench also sets `max_think_tokens: 1` and
+  `assistant_prefix: "closed_think"` when reasoning is off (main.rs:4876-4878), so on a
+  reasoning checkpoint every bench run decodes through the empty-think template whose degraded
+  output is visible in the text. Bench is for rate/metadata only; the coherence eyeball must use
+  `hipfire run`.
+  **Resident VRAM control** — read it from the bench JSON, not by polling `rocm-smi`:
+  `vram_free_before_mb - vram_free_mb` is the model's own footprint at load time. For
+  `qwen3.8-27b.mq3-xt` on gfx1201 (16304 MB total) that is **13042 MB** on this branch and
+  **13098 MB** on stock, across three loads — call it **~13070 MB**. An offloaded run is only
+  proven if `vram_free_mb` lands meaningfully above ~3100 MB; an `offloaded=N` log line is not
+  evidence on its own. Branch ≈ stock on this number also means the resident path costs no extra
+  VRAM.
 - On unified-memory APUs the feature is mostly redundant — route those through the existing OOM
   guard instead.
 
