@@ -120,6 +120,10 @@ pub struct TreeVerifyCtx<'a> {
 pub struct Qwen35Config {
     pub dim: usize,
     pub n_layers: usize,
+    /// Resident-tail split point for partial GPU offload. Layers `[0 .. i_gpu_start)`
+    /// spill to host-VMM; `[i_gpu_start .. n_layers)` stay device-resident. Set by the
+    /// Step 3 loader from the placement policy; `0` = fully resident (zero-diff default).
+    pub i_gpu_start: usize,
     pub vocab_size: usize,
     pub norm_eps: f32,
     pub eos_token: u32,
@@ -911,6 +915,7 @@ fn from_config_value(config: &serde_json::Value) -> Result<Qwen35Config, String>
     let mut config = Qwen35Config {
         dim,
         n_layers: raw.num_hidden_layers,
+        i_gpu_start: 0,
         vocab_size: raw.vocab_size,
         norm_eps: raw.rms_norm_eps,
         eos_token: first_token_or(raw.eos_token_id.as_ref(), 248044),
