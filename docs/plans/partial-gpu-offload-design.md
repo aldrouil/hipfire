@@ -196,6 +196,34 @@ are more surface area than staging and buy nothing until speed matters.
 - Keep the resident code path byte-identical when no layer is spilled (zero-diff baseline). This is
   the regression guard: any offload change must not alter the non-spilled qwen3.8-27B dense trace.
 
+#### Implementation decisions settled during bring-up (do not re-litigate)
+
+- **`proj` needs a second reader seam; per-layer selection is impossible.** Quantized weights
+  upload raw codes through the arch-supplied `read_proj` fn pointer, whose `&Gpu` cannot
+  host-allocate: `Gpu::alloc_vmm_tensor_host` is `&mut self` because it registers the VMM arena
+  in `self.vmm_arenas`. Selecting a different `read_proj` per layer does not help either — the
+  backend is built per layer, but the parameter type is fixed across arches and cannot carry
+  `&mut Gpu`. Ship a twin instead: `read_proj_host: Option<fn(&HfqFile, &mut Gpu, …)>`, which
+  `proj` calls when `host_local` is set. `None` means the arch has no offload support, and an
+  offloaded layer without a host reader is a **hard error**, never a silent device allocation —
+  a half-configured offload must not masquerade as working. A `debug_assert!` is insufficient:
+  it does not fire in release builds.
+- **The f32-dequant fallback is fail-closed for offloaded layers.** `load_weight_tensor_raw`'s
+  catch-all `_ =>` arm and qt 1 `Native` mode route to `dequant_weight_raw`, which has no host
+  upload. Those arms refuse when the host path is requested, so f32-dequant quant types are
+  unsupported for offload. Threading a `host` flag into `dequant_weight_raw` instead would
+  change a signature shared with qwen2/llama/runtime for no gain on the dense target. The AWQ
+  sidecar stays device-resident deliberately: it is a 1-D f16 vector of length K, so spilling
+  it would cost PCIe bandwidth per GEMV to save kilobytes.
+- **MoE is structurally out of reach, but the log line is the only guard.** `load_moe_ffn(hfq,
+  gpu, …)` takes the raw `&HfqFile`/`&mut Gpu` and never sees an `HfqBackend`, so it cannot read
+  `host_local` — that is what keeps A3B-MoE out of v1. It also allocates device-side
+  unconditionally, so a *future* policy that offloaded a MoE layer would spill that layer's dense
+  weights to host while its expert weights stayed in VRAM, and `offloaded=N` would still count
+  the layer as offloaded. Unreachable in dense-only v1, but it is exactly the silent-partial
+  shape the `read_proj_host: None` hard error exists to prevent: report counts from what was
+  actually host-located, not from the policy that requested it.
+
 ### 6.2 Kernel paths for spilled weights
 - Option A: implement staging in the executor — copy HostPinned weight bytes → device scratch
   before the op's kernel call; device tensors skip the copy. Reuse existing kernels unchanged.
@@ -318,6 +346,22 @@ No single correctness gate applies; select by what changed:
   model md5 + binary md5 + prompt md5 (byte-identical prompts, AGENTS.md §0 rule 2).
 - **Eyeball check** is mandatory: a suspiciously tight stddev on the spilled path can hide single-
   token attractor failures (AGENTS.md §0 rule 3).
+- **Byte-identity requires greedy decoding (`-t 0`).** Measured on gfx1201: at default
+  temperature this engine is **nondeterministic** — the same binary, same prompt, same
+  settings produces different output across runs, on both the feature branch and stock.
+  A token-ID comparison at default temperature therefore fails even with zero regression,
+  and a *matching* digest is luck rather than evidence. Verified: qwen3.5-2b and
+  qwen3.5-9b are each self-deterministic under `-t 0` and byte-identical to stock
+  `master`. AGENTS.md §0 governs byte-identical *prompts*; it says nothing about decoding
+  determinism, which is the gap this closes.
+- **Target fixture:** `~/.hipfire/models/qwen3.6-27b.mq4` — 14984158208 B, sha256
+  `86a5f80fd29d545abb1093dead242725ced6d68b8607c6d566d897b1a82442dc`, an exact match to
+  the AGENTS.md canonical qwen3.6-27b pin, so its numbers are quotable. Do **not** use
+  `qwen3.8-27b.mq4-xt`: that name is not on disk. `qwen3.8-27b-mq3-xt`
+  (11777616896 B) is the **MQ3** tier, not the MQ4XT pin AGENTS.md cites (14980361216 B),
+  so its numbers are not comparable to that fixture — and being ~3 GiB smaller it leaves
+  enough headroom on a 17.1 GB card that the layer budget may never engage, making it a
+  weak subject for demonstrating VRAM relief.
 
 ---
 
