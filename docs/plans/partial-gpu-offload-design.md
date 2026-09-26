@@ -328,6 +328,18 @@ dense edit + routed-expert composition (v2).
   spilled — a real host-overhead hit on top of the PCIe cost. Even at an "acceptable" speed target,
   weighing A (simplest, correct) against B (mapped-host stable pointers, keeps graph) still matters;
   profile before committing.
+  **Measurement method matters more than it looks.** `hipfire bench` already pins greedy decoding
+  itself (`temperature: 0.0, top_p: 1.0` in the generated request, hipfire-cli/src/main.rs:4870),
+  so a bench A/B needs no flag and any bench run-to-run difference is a real signal. The `-t 0`
+  requirement applies to `hipfire run`, which samples at the configured temperature by default.
+  When comparing decode throughput, **interleave the arms** (branch, stock, branch, stock, …)
+  across fresh processes: batching same-arm runs consecutively on this box lets them drift into a
+  ~2x lower regime, which reads as a fake regression. Interleaved 6-per-arm, branch and stock
+  medians were 40.25 vs 40.35 tok/s — 0.25% apart, no regression.
+  **Resident VRAM control, for the offload proof:** `qwen3.8-27b.mq3-xt` allocates 86% of 16304 MB
+  (~13.7 GiB) on gfx1201 — read via `rocm-smi --showmemuse --csv`, column `device=card0`, field
+  `GPU Memory Allocated (VRAM%)`. That is the number an offloaded run must measurably beat; an
+  `offloaded=N` log line is not evidence on its own.
 - On unified-memory APUs the feature is mostly redundant — route those through the existing OOM
   guard instead.
 
