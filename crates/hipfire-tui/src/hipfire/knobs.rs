@@ -61,6 +61,16 @@ pub const KNOBS: &[KnobInfo] = &[
         options: &[],
     },
     KnobInfo {
+        key: "gpu_layer_budget",
+        title: "Layer offload to system RAM",
+        summary: "How many layers stay in VRAM. The prefix before them spills to system RAM.",
+        effect: "Frees VRAM for a longer context, but decode slows sharply: a spilled layer's weights are read over PCIe every step instead of from VRAM. Load also takes much longer.",
+        default: "",
+        when: "Set only when the model or context will not otherwise fit. Unset keeps every layer resident.",
+        note: Some("Counts RESIDENT layers: 32 on a 64-layer model offloads 32. -1 (auto) is not implemented and fails the load."),
+        options: &[],
+    },
+    KnobInfo {
         key: "kv_cache",
         title: "KV cache precision",
         summary: "Precision/memory tradeoff for the attention key/value cache.",

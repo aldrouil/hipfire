@@ -112,6 +112,7 @@ impl ConfigState {
             Some("dflash_mode"),
             Some("prefill_compression"), // Prefill (pflash)
             Some("kv_cache"),
+            Some("gpu_layer_budget"), // Offload
             Some("thinking"),
             Some("reasoning_effort"),
             Some("thinking_budget"),
@@ -157,6 +158,7 @@ impl ConfigState {
             self.is_override("dflash_mode"),                      // Spec decode
             self.is_override("prefill_compression"),              // Prefill
             self.is_override("kv_cache"),                         // KV cache
+            self.is_override("gpu_layer_budget"),                 // Offload
             self.is_override("thinking"),                         // Thinking
             self.is_override("reasoning_effort"),                 // Reasoning effort
             self.is_override("thinking_budget"),                  // Reasoning budget
@@ -175,6 +177,7 @@ impl ConfigState {
             "dflash_mode",         // Spec decode
             "prefill_compression", // Prefill
             "kv_cache",            // KV cache
+            "gpu_layer_budget",    // Offload
             "thinking",            // Thinking
             "reasoning_effort",    // Reasoning effort
             "thinking_budget",     // Reasoning budget
@@ -229,6 +232,25 @@ impl ConfigState {
                     .cloned()
                     .unwrap_or_else(|| "auto".into()),
                 "Precision/memory tradeoff for attention cache.",
+            ),
+            (
+                "Offload",
+                {
+                    // Unset = every layer resident. The bare empty string would
+                    // read as "broken" in a value column, so name the state; the
+                    // editor seeds its buffer from `values`, not from this label.
+                    let v = self
+                        .values
+                        .get("gpu_layer_budget")
+                        .cloned()
+                        .unwrap_or_default();
+                    if v.is_empty() {
+                        "all resident".into()
+                    } else {
+                        format!("{v} resident")
+                    }
+                },
+                "Layers kept in VRAM; the rest spill to system RAM. Frees VRAM, but much slower.",
             ),
             (
                 "Thinking",
