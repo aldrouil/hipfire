@@ -979,16 +979,17 @@ fn offload_split(n_layers: usize, budget: GpuLayerBudget) -> usize {
     match budget {
         GpuLayerBudget::Full => 0,
         GpuLayerBudget::Layers(resident) => n_layers.saturating_sub(resident),
-        // PLACEHOLDER mapping, not this value's intended meaning. `auto` cannot be
-        // resolved here: it needs measured device capacity and per-layer weight
-        // bytes, and at config construction there is no `Gpu` (the arch trait hands
-        // us `&Config`). It previously failed the load, which reads to a user as
-        // "the model is broken"; it now keeps every layer on the GPU — the
-        // pre-offload behaviour — and says so in the log. Note that `auto` means
-        // "the engine decides" for every other config key, and the design intends
-        // it to pick the largest resident tail that fits
-        // (`hipfire_config::memory::largest_fitting_tail`), so this mapping has to
-        // change when that is wired.
+        // `auto` means "the engine decides", exactly as it does for every other
+        // config key. The engine currently decides to offload nothing: a placement
+        // decision needs measured device capacity and per-layer weight bytes, and
+        // at config construction there is no `Gpu` (the arch trait hands us
+        // `&Config`). Once that measurement is in hand it feeds
+        // `hipfire_config::memory::largest_fitting_tail` and the engine decides a
+        // real split — `auto`'s meaning does not change, only what it decides.
+        //
+        // It deliberately does not fail the load: a config value that breaks a
+        // model reads to a user as "the model is broken", and the whole point of
+        // `auto` is that it is always a safe choice.
         GpuLayerBudget::Auto => 0,
     }
 }
@@ -1050,8 +1051,8 @@ fn residency_report(
     match budget {
         GpuLayerBudget::Full => None,
         GpuLayerBudget::Auto => Some(
-            "  partial offload: 'auto' (-1) is not available yet; keeping every layer on the GPU \
-             — set a layer count to offload"
+            "  partial offload: 'auto' defers placement to the engine, which currently keeps \
+             every layer on the GPU — set a layer count to offload"
                 .to_string(),
         ),
         GpuLayerBudget::Layers(resident) if resident > n_layers => Some(format!(
@@ -1783,7 +1784,10 @@ mod tests {
         assert!(all_spilled.contains("0 resident / 64 offloaded"), "{all_spilled}");
 
         let auto = residency_report(64, B::Auto, 0).unwrap();
-        assert!(auto.contains("not available yet"), "auto is reported, not silent: {auto}");
+        assert!(
+            auto.contains("defers placement to the engine"),
+            "auto must be reported as an engine decision, not silence: {auto}"
+        );
         assert!(!auto.contains("error"), "auto is a note, not a failure: {auto}");
 
         let overshoot = residency_report(64, B::Layers(200), 0).unwrap();

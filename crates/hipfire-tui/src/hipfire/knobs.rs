@@ -67,7 +67,7 @@ pub const KNOBS: &[KnobInfo] = &[
         effect: "Frees VRAM for a longer context, but decode slows sharply: a spilled layer's weights are read over PCIe every step instead of from VRAM. Load also takes much longer.",
         default: "",
         when: "Leave it unset for normal use — every layer then stays on the GPU. Set a count when the model or context will not otherwise fit.",
-        note: Some("The number counts layers ON THE GPU, not layers offloaded: 3 on a 64-layer model keeps 3 on the GPU and spills the other 61. 'auto' (-1) is not implemented yet and also keeps every layer on the GPU."),
+        note: Some("The number counts layers ON THE GPU, not layers offloaded: 3 on a 64-layer model keeps 3 on the GPU and spills the other 61. 'auto' (-1) lets the engine choose, and it currently keeps every layer on the GPU."),
         options: &[],
     },
     KnobInfo {

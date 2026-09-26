@@ -651,7 +651,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         Some("HIPFIRE_GPU_LAYER_BUDGET"),
-        "Resident-layer budget for partial GPU offload: N keeps the last N layers on the GPU and spills the rest to system RAM; unset keeps every layer on the GPU. The number counts layers ON the GPU, not layers offloaded — 3 on a 64-layer model spills 61. 'auto' (-1) is not implemented yet and also keeps every layer on the GPU."
+        "Resident-layer budget for partial GPU offload: N keeps the last N layers on the GPU and spills the rest to system RAM; unset keeps every layer on the GPU. The number counts layers ON the GPU, not layers offloaded — 3 on a 64-layer model spills 61. 'auto' (-1) defers placement to the engine, which currently keeps every layer on the GPU."
     ),
     // Process-scoped: the preflight guards snapshot this once at startup, and
     // a mid-serve flip would make the refusal policy depend on which load ran
@@ -5684,20 +5684,20 @@ pub mod memory {
     /// * [`GpuLayerBudget::Full`] is the unset default: keep every layer
     ///   resident, never offload — byte-identical to a pure-VRAM run and the
     ///   regression guard for the whole feature.
-    /// * [`GpuLayerBudget::Auto`] (`-1`) is **not implemented yet** and currently
-    ///   behaves like [`GpuLayerBudget::Full`] (every layer stays on the GPU),
-    ///   logging that it was not honoured. Its intended meaning is the largest
-    ///   contiguous tail that fits device memory with headroom (see
-    ///   [`largest_fitting_tail`]), which needs a measured device and per-layer
-    ///   weight bytes and so belongs where a `Gpu` is in hand.
+    /// * [`GpuLayerBudget::Auto`] (`-1`) defers placement to the engine, as `auto`
+    ///   does for every other key. The engine currently keeps every layer on the
+    ///   GPU, because a real placement needs a measured device and per-layer
+    ///   weight bytes (see [`largest_fitting_tail`]) and this is resolved where
+    ///   neither exists. `auto` will mean the same thing once that measurement is
+    ///   in hand — it will just decide a split instead of nothing.
     /// * [`GpuLayerBudget::Layers`] pins exactly this many resident layers; the
     ///   layers before them spill to host RAM.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum GpuLayerBudget {
         /// Fully resident — never offload (the zero-diff default).
         Full,
-        /// Not implemented yet: currently keeps every layer on the GPU (like `Full`)
-        /// and logs that it was not honoured. Intended: fit the largest resident tail.
+        /// Defers placement to the engine, as `auto` does everywhere else in the
+        /// config. The engine currently keeps every layer on the GPU.
         Auto,
         /// Pin exactly this many resident layers; spill everything before them.
         Layers(usize),
