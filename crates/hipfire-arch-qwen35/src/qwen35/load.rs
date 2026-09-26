@@ -73,7 +73,7 @@ const _: () = assert!(QWEN35_NORM_BIAS == 1.0);
 
 // ─── Weight loading ─────────────────────────────────────────────────────
 
-fn qwen35_tensor_name_candidates(name: &str) -> Vec<String> {
+pub fn qwen35_tensor_name_candidates(name: &str) -> Vec<String> {
     let mut out = Vec::with_capacity(4);
     let mut push = |s: String| {
         if !out.iter().any(|x| x == &s) {
@@ -907,7 +907,7 @@ fn load_weight_tensor_raw_host(
     )
 }
 
-pub(crate) fn load_weight_tensor(
+pub fn load_weight_tensor(
     hfq: &HfqFile,
     gpu: &Gpu,
     name: &str,
@@ -983,7 +983,7 @@ pub(crate) fn load_weight_tensor(
 /// Takes `&mut Gpu` (the `read_proj_host` contract) because the host upload
 /// registers a VMM arena; [`load_weight_tensor`] cannot, which is why these are
 /// two entry points over one shared match rather than one function and a flag.
-fn load_weight_tensor_host(
+pub fn load_weight_tensor_host(
     hfq: &HfqFile,
     gpu: &mut Gpu,
     name: &str,

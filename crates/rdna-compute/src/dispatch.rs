@@ -3624,6 +3624,20 @@ impl Gpu {
         Ok(data)
     }
 
+    /// Read a `DType::Raw` tensor back as raw bytes — no widening and no dtype
+    /// reinterpretation, so a caller can compare code blobs bit-for-bit.
+    ///
+    /// Works for host-located tensors too: `memcpy_dtoh` reads through the
+    /// mapped handle across PCIe, which is what makes the offload parity check
+    /// (device upload vs host upload) a plain `Vec<u8>` equality.
+    pub fn download_raw_bytes(&self, tensor: &GpuTensor) -> HipResult<Vec<u8>> {
+        self.bind_thread()?;
+        let n = tensor.byte_size();
+        let mut data = vec![0u8; n];
+        self.hip.memcpy_dtoh(&mut data, &tensor.buf)?;
+        Ok(data)
+    }
+
     pub fn zeros(&mut self, shape: &[usize], dtype: DType) -> HipResult<GpuTensor> {
         self.bind_thread()?;
         self.alloc_then_init(shape, dtype, |hip, stream, tensor| match stream {
