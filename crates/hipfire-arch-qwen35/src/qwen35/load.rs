@@ -2669,6 +2669,12 @@ fn qwen35_hfq_backend<'a>(hfq: &'a HfqFile, gpu: &'a mut Gpu, layer: usize) -> H
         candidates: qwen35_tensor_name_candidates,
         read_proj: load_weight_tensor,
         layer,
+        // Offload plumbing. `host_local` drives `norm`/`raw_f32`/`bias`; `proj` needs a
+        // host-allocating reader because `read_proj` only gets `&Gpu` and host VMM
+        // allocation registers an arena on the `Gpu`. No host reader is wired yet, so
+        // a layer marked `host_local` fails loudly rather than landing in VRAM.
+        host_local: false,
+        read_proj_host: None,
     }
 }
 
