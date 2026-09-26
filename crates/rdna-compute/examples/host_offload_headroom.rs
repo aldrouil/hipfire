@@ -65,7 +65,7 @@ fn main() {
 
     let payload = vec![0u8; SPILL_MB * 1024 * 1024];
     let host = gpu.upload_raw_host(&payload, &[payload.len()]).unwrap();
-    assert!(gpu.vmm_host_located(&host), "upload_raw_host did not host-locate");
+    assert!(gpu.host_located(&host), "upload_raw_host did not host-locate");
     assert_eq!(gpu.host_mapped_count(), 1, "host-mapped owner not registered");
 
     let with_spill = device_headroom_mb(&gpu);

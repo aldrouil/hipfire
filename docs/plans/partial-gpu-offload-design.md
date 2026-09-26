@@ -7,6 +7,15 @@
 **Related plans:** `docs/plans/dispatch_1.2_gpu_verify.md`, `docs/plans/multi-gpu-pp.md`,
 `docs/plans/2026-07-28-pr549-vmm-all-kv-adaptive-design.md`
 
+> **As-shipped note (2026-09-26).** §5 Option A (staging arena + drop graph capture) and the
+> `MemoryClass`/`HostPinned` vocabulary below were the *design-time* plan and are **not** what
+> shipped. What shipped reads host memory directly with the existing kernels, unchanged, via
+> `hipHostMalloc(hipHostMallocMapped)` — and the choice of host mechanism turned out to be the
+> single decision that makes the feature work at all. Read
+> §6.1 "Implementation decisions settled during bring-up" **before** implementing anything from
+> §5/§6.1's option list; it records the mechanism measurement, the reader seam, and the
+> fail-closed rules as built.
+
 > **Review ask.** This is a capability that does not currently exist in hipfire. The plan is
 > correctness-first: get models that do not fit in VRAM to *run*, then optimize. Speed is a
 > second-order concern and is explicitly bounded by PCIe bandwidth (see §7). Reviewers should
@@ -200,8 +209,9 @@ are more surface area than staging and buy nothing until speed matters.
 
 - **`proj` needs a second reader seam; per-layer selection is impossible.** Quantized weights
   upload raw codes through the arch-supplied `read_proj` fn pointer, whose `&Gpu` cannot
-  host-allocate: `Gpu::alloc_vmm_tensor_host` is `&mut self` because it registers the VMM arena
-  in `self.vmm_arenas`. Selecting a different `read_proj` per layer does not help either — the
+  host-allocate: `Gpu::alloc_host_mapped_tensor` is `&mut self` because it records the host
+  pointer in `self.host_mapped` (the registry `free_tensor` needs to `hipHostFree`). Selecting a
+  different `read_proj` per layer does not help either — the
   backend is built per layer, but the parameter type is fixed across arches and cannot carry
   `&mut Gpu`. Ship a twin instead: `read_proj_host: Option<fn(&HfqFile, &mut Gpu, …)>`, which
   `proj` calls when `host_local` is set. `None` means the arch has no offload support, and an
@@ -223,6 +233,29 @@ are more surface area than staging and buy nothing until speed matters.
   the layer as offloaded. Unreachable in dense-only v1, but it is exactly the silent-partial
   shape the `read_proj_host: None` hard error exists to prevent: report counts from what was
   actually host-located, not from the policy that requested it.
+- **The host memory class must be `hipHostMalloc(hipHostMallocMapped)`, not a host-located VMM
+  arena.** This is the one decision that determines whether the feature does anything. A
+  `hipMemCreate` PINNED/Host arena mapped into device VA — the primitive this branch was built
+  on (`1f7588008`) — is charged against the **device heap 1:1** on gfx1201. Measured with a
+  1 GiB `hipMalloc` ladder, holding 4096 MB:
+
+  | held | device headroom | cost |
+  |---|---|---|
+  | nothing (control) | 15360 MB | — |
+  | host-located VMM arena | 11264 MB | 4096 MB |
+  | `hipHostMalloc(mapped)` | 15360 MB | 0 MB |
+
+  So the VMM mechanism moved weight bytes to system RAM while charging the card for them
+  anyway: `hipMemGetInfo` free did not rise, and the allocatable device headroom fell by exactly
+  the spilled amount. Offload built on it was net-zero for the VRAM it exists to free, which is
+  what the "does offload actually free VRAM?" blocker in the bring-up handoff was really seeing —
+  it was not a measurement artifact. `hipHostMalloc` + `hipHostGetDevicePointer` gives the kernels
+  the same dereferenceable pointer (device alias == host pointer on this box) at zero device cost.
+  The VMM host primitive and `MemoryLocality::HostPinned` are therefore deleted, so the charging
+  mechanism cannot be re-adopted; `Gpu::host_located` now means "allocated by
+  `Gpu::alloc_host_mapped_tensor`". `examples/host_offload_headroom.rs` asserts the invariant,
+  because byte-identity and coherence tests cannot see it — output stays correct either way and
+  only the capacity win disappears.
 
 ### 6.2 Kernel paths for spilled weights
 - Option A: implement staging in the executor — copy HostPinned weight bytes → device scratch

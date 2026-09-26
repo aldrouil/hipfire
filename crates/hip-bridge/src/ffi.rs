@@ -215,19 +215,6 @@ impl HipMemAllocationProp {
             },
         }
     }
-    pub fn host_pinned() -> Self {
-        Self {
-            type_: HIP_MEM_ALLOCATION_TYPE_PINNED,
-            requested_handle_types: 0,
-            location: HipMemLocation::host(),
-            win32_handle_meta_data: ptr::null_mut(),
-            alloc_flags: HipMemAllocationFlags {
-                compression_type: 0,
-                gpu_direct_rdma_capable: 0,
-                usage: 0,
-            },
-        }
-    }
 }
 
 #[repr(C)]

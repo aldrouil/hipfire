@@ -115,11 +115,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // if `upload_raw_host` silently fell back to the device path, so the example
     // would report PASS without having offloaded anything.
     assert!(
-        gpu.vmm_host_located(&host.buf),
+        gpu.host_located(&host.buf),
         "host reader did not produce a host-located tensor - offload did not happen"
     );
     assert!(
-        !gpu.vmm_host_located(&device.buf),
+        !gpu.host_located(&device.buf),
         "device reader unexpectedly produced a host-located tensor"
     );
     let (_, source) = hfq.tensor_data(name).expect("selected from the index above");
@@ -134,7 +134,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "host blob size != on-disk tensor size"
     );
     println!(
-        "locality: device=VRAM host=HostPinned (confirmed via Gpu::vmm_host_located)"
+        "locality: device=VRAM host=HostPinned (confirmed via Gpu::host_located)"
     );
 
     let dev_bytes = gpu.download_raw_bytes(&device.buf)?;

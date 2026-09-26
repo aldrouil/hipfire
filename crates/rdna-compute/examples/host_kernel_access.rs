@@ -100,7 +100,7 @@ fn arm_f32(gpu: &mut Gpu) {
     // The production offload upload, not a hand-rolled host arena: this arm must
     // fail if the path the loader actually uses stops being kernel-readable.
     let a_off = gpu.upload_f32_host(&a_host, &[M, K]).unwrap();
-    assert!(gpu.vmm_host_located(&a_off), "not host-located");
+    assert!(gpu.host_located(&a_off), "not host-located");
     println!("arm1: host buffer at 0x{:x}", a_off.buf.as_ptr() as usize);
 
     println!("arm1: launching gemv_f32 over a host-located F32 buffer...");
@@ -164,7 +164,7 @@ fn arm_mq4(gpu: &mut Gpu) {
     println!("arm2: device-resident gemv_mq4g256 ok ({} outputs)", reference.len());
 
     let a_off = gpu.upload_raw_host(&codes, &[codes.len()]).unwrap();
-    assert!(gpu.vmm_host_located(&a_off), "not host-located");
+    assert!(gpu.host_located(&a_off), "not host-located");
     // Print the MAPPED VA the kernel is actually handed, not the source Vec —
     // otherwise a reader comparing it against a fault address is misled.
     println!(

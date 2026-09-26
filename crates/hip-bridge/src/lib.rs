@@ -35,7 +35,7 @@ pub use rocsolver::{
     RocblasDiagonal, RocblasFill, Rocsolver, RocsolverError, RocsolverResult,
     ROCSOLVER_STATUS_SUCCESS,
 };
-pub use vmm::{clear_vmm_faults, inject_vmm_fault, MemoryLocality, VmmArena, VmmFaultKind};
+pub use vmm::{clear_vmm_faults, inject_vmm_fault, VmmArena, VmmFaultKind};
 
 /// Re-export memory copy direction for callers.
 #[repr(u32)]

@@ -10,7 +10,7 @@ use crate::feature_flags::FeatureFlags;
 use crate::kernels;
 use hip_bridge::{
     DeviceBuffer, HipError, HipMemAllocationProp, HipMemGenericAllocationHandle, HipResult,
-    HipRuntime, MemoryLocality, Rocblas, VmmArena,
+    HipRuntime, Rocblas, VmmArena,
     HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED,
 };
 use std::collections::HashMap;
@@ -3217,7 +3217,7 @@ impl Gpu {
         let byte_size = numel
             .checked_mul(dtype.size())
             .ok_or_else(|| HipError::new(0, "VMM tensor byte size overflowed"))?;
-        let mut arena = VmmArena::reserve(&self.hip, self.device_id, byte_size, MemoryLocality::Device)?;
+        let mut arena = VmmArena::reserve(&self.hip, self.device_id, byte_size)?;
         if std::env::var_os("HIPFIRE_OFFLOAD_DEBUG").is_some() {
             eprintln!(
                 "[offload-debug] device-vmm base=0x{:x} req={} reserved={} gran={}",
@@ -3271,106 +3271,23 @@ impl Gpu {
         })
     }
 
-    /// Allocate a VMM-backed tensor whose physical pages are **host-located**
-    /// (system RAM pinned and mapped into GPU VA). Kernels dereference the mapped
-    /// VA directly over PCIe, so this spills a layer's weights to system RAM
-    /// without ever allocating VRAM for them — the primitive that powers partial
-    /// GPU offload. Shape/dtype/access agnostic; knows nothing about qwen or any
-    /// model. Spilled-weights tensors are static (allocated once at load, read
-    /// during inference), so pass `initial_mapped_bytes == byte_size` to map all
-    /// bytes in a single segment.
-    ///
-    /// Reuses the same overflow checks, arena registration, duplicate-base guard,
-    /// and `retain_failed_vmm_arena` cleanup as [`Gpu::alloc_vmm_tensor`]; only the
-    /// reservation prop differs (`reserve_host` builds a `HostPinned` handle).
-    ///
-    /// The mapped extent is always the full padded reservation, so
-    /// `initial_mapped_bytes` is accepted for signature parity but unused: host
-    /// weight tensors are static (allocated once at load, read during inference),
-    /// and the pad exists because kernels overread the tensor tail.
-    pub unsafe fn alloc_vmm_tensor_host(
-        &mut self,
-        shape: &[usize],
-        dtype: DType,
-        _initial_mapped_bytes: usize,
-        access_devices: &[i32],
-    ) -> HipResult<GpuTensor> {
-        self.bind_thread()?;
-        let numel = shape
-            .iter()
-            .try_fold(1usize, |product, &dimension| product.checked_mul(dimension))
-            .ok_or_else(|| HipError::new(0, "VMM tensor element count overflowed"))?;
-        let byte_size = numel
-            .checked_mul(dtype.size())
-            .ok_or_else(|| HipError::new(0, "VMM tensor byte size overflowed"))?;
-        // Host-located: physical pages are system RAM accessed over PCIe.
-        //
-        // The reservation is PADDED past the blob length on purpose. Kernels in
-        // the forward path overread the tensor tail — the first access past the
-        // last group (a phantom group header or a vector tail load). The device
-        // path makes the identical overread silently into hipMalloc slack, and
-        // the resident-path byte-identity run proves those overread values never
-        // affect output, so only the mapping must tolerate them. An exact-fit
-        // reservation makes the overread the FIRST UNMAPPED byte and faults with
-        // "Page not present": every real MQ3 blob observed here (21299200,
-        // 12779520, 36208640 bytes, …) is an exact multiple of the 4096-byte
-        // granularity, so slack is exactly zero precisely when it matters.
-        let mut arena =
-            VmmArena::reserve_host(&self.hip, byte_size.saturating_add(HOST_TAIL_PAD_BYTES))?;
-        if std::env::var_os("HIPFIRE_OFFLOAD_DEBUG").is_some() {
-            eprintln!(
-                "[offload-debug] host-vmm base=0x{:x} req={} reserved={} gran={}",
-                arena.base_address(),
-                byte_size,
-                arena.reserved_bytes(),
-                arena.granularity(),
-            );
-        }
-        // Static tensors: map the WHOLE padded reservation in one segment so both
-        // the data prefix and the tail pad are kernel-readable. The size is a
-        // granularity multiple by construction (reserve rounds the request up).
-        let initial_mapped_bytes = arena.reserved_bytes();
-        if initial_mapped_bytes > 0 {
-            if let Err(err) = arena.map_next(&self.hip, initial_mapped_bytes, access_devices) {
-                return Err(self.retain_failed_vmm_arena(arena, err));
-            }
-        }
-        let buf = match arena.owner_buffer(byte_size) {
-            Ok(buf) => buf,
-            Err(err) => {
-                return Err(self.retain_failed_vmm_arena(arena, err));
-            }
-        };
-        let key = buf.as_ptr() as usize;
-        if self.vmm_arenas.contains_key(&key) {
-            let duplicate =
-                HipError::new(0, &format!("duplicate VMM tensor base address 0x{key:x}"));
-            return Err(self.retain_failed_vmm_arena(arena, duplicate));
-        }
-        self.vmm_arenas.insert(key, arena);
-        Ok(GpuTensor {
-            buf,
-            shape: shape.to_vec(),
-            dtype,
-        })
-    }
 
     /// Allocate a **host-mapped** tensor: system RAM the GPU reads directly over PCIe.
     ///
     /// This is the primitive partial GPU offload uses for spilled weights, and the
-    /// mechanism is load-bearing rather than an implementation detail. A
-    /// host-located *VMM* arena (`hipMemCreate` PINNED/Host + `hipMemMap` into
-    /// device VA — see [`Self::alloc_vmm_tensor_host`]) is charged against the
-    /// device heap 1:1 on gfx1201: measured, a held 4 GiB host arena drops the
-    /// allocatable device headroom from 15360 MB to 11264 MB. Using it for offload
-    /// therefore made the feature net-zero for the VRAM it exists to free.
-    /// `hipHostMalloc(hipHostMallocMapped)` moves the same bytes for a measured
-    /// device cost of 0 MB, and `hipHostGetDevicePointer` hands back an address the
-    /// kernels dereference unchanged.
+    /// mechanism is load-bearing rather than an implementation detail. The obvious
+    /// alternative — a host-located VMM arena (`hipMemCreate` PINNED/Host +
+    /// `hipMemMap` into device VA) — is charged against the device heap 1:1 on
+    /// gfx1201: measured, a held 4 GiB host arena drops the allocatable device
+    /// headroom from 15360 MB to 11264 MB, which made offload net-zero for the VRAM
+    /// it exists to free. `hipHostMalloc(hipHostMallocMapped)` moves the same bytes
+    /// for a measured device cost of 0 MB, and `hipHostGetDevicePointer` hands back
+    /// an address the kernels dereference unchanged.
+    /// `examples/host_offload_headroom.rs` asserts this property.
     ///
     /// `byte_size` is the *logical* tensor size; the allocation is padded past it
-    /// because forward-path kernels overread the tensor tail (see the tail-pad
-    /// note on [`Self::alloc_vmm_tensor_host`]). The pad costs host RAM only.
+    /// because forward-path kernels overread the tensor tail (see
+    /// [`HOST_TAIL_PAD_BYTES`]). The pad costs host RAM only.
     fn alloc_host_mapped_tensor(
         &mut self,
         byte_size: usize,
@@ -3489,12 +3406,8 @@ impl Gpu {
     /// pages are system RAM accessed over PCIe rather than the card's VRAM. Pure map
     /// lookup; touches no device state. Offload tests and logs read this to prove a
     /// spilled layer actually left VRAM (as opposed to being merely device-pinned).
-    pub fn vmm_host_located(&self, tensor: &GpuTensor) -> bool {
+    pub fn host_located(&self, tensor: &GpuTensor) -> bool {
         tensor.buf.is_host_mapped()
-            || self
-                .vmm_arenas
-                .get(&(tensor.buf.as_ptr() as usize))
-                .is_some_and(|arena| arena.locality() == MemoryLocality::HostPinned)
     }
 
     /// The primary physical allocation handle backing a tensor's VMM arena, if any.
