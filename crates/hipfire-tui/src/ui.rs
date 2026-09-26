@@ -1614,6 +1614,43 @@ mod render_tests {
         buf.content().iter().map(|c| c.symbol()).collect()
     }
 
+    /// The easy settings list is only useful if its rows actually DRAW, and the
+    /// explainer pane only if the row's help key resolves to a curated entry.
+    /// `easy_mode_lists_stay_positionally_parallel` and
+    /// `easy_help_keys_have_explainers` both pass on data structures alone, so a
+    /// row that aligns and resolves but never renders would slip past both. This
+    /// is the render-level guard for the offload row specifically; the list
+    /// scrolls (`scroll_start`) so a row below the fold still counts as drawn
+    /// once selected.
+    #[test]
+    fn settings_easy_draws_the_offload_row_and_its_explainer() {
+        let idx = App::load()
+            .expect("App::load")
+            .config
+            .easy_keys()
+            .iter()
+            .position(|k| matches!(k, Some("gpu_layer_budget")))
+            .expect("offload row present in the easy list");
+        let text = render_with(|app| {
+            app.tab = Tab::Settings;
+            app.settings_easy = true;
+            app.settings_selected = idx;
+        });
+        // Match the LABEL+VALUE pair, not the bare label: `contains("Offload")`
+        // also matches a mangled label like "OffloadXX", which makes the guard
+        // pass on exactly the regression it exists to catch. Verified by renaming
+        // the row and watching this fail.
+        let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains("Offload all resident"),
+            "the Offload easy row must be drawn with a readable value when unset"
+        );
+        assert!(
+            text.contains("Layer offload to system RAM"),
+            "selecting the row must render its curated explainer"
+        );
+    }
+
     fn dash_with_system(system: SystemInfo) -> Dashboard {
         let mut d = Dashboard::offline(
             "127.0.0.1:11435".into(),
