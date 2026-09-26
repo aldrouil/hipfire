@@ -57,6 +57,34 @@ fn any_nonzero(v: &[f32]) -> bool {
     v.iter().any(|x| x.abs() > 1e-6)
 }
 
+
+/// In-place radix-2 Hadamard over one 256-element group, matching the kernel's
+/// expectation. `gemv_mq4g256` takes `x_rot` — x with the FWHT already applied —
+/// so a raw x is the wrong input and decodes to a null result.
+fn fwht256(x: &mut [f32], s1: &[f32], s2: &[f32]) {
+    assert_eq!(x.len(), 256);
+    for i in 0..256 {
+        x[i] *= s2[i];
+    }
+    let mut stride = 1;
+    while stride < 256 {
+        let mut i = 0;
+        while i < 256 {
+            for j in 0..stride {
+                let a = x[i + j];
+                let b = x[i + j + stride];
+                x[i + j] = a + b;
+                x[i + j + stride] = a - b;
+            }
+            i += stride * 2;
+        }
+        stride <<= 1;
+    }
+    for i in 0..256 {
+        x[i] *= 0.0625 * s1[i];
+    }
+}
+
 fn arm_f32(gpu: &mut Gpu) {
     // 390*64*4 = 99840 bytes: the exact size that faulted on the first real
     // offloaded load, and NOT a multiple of the 4096 VMM granularity, so this
@@ -120,10 +148,15 @@ fn arm_mq4(gpu: &mut Gpu) {
         }
     }
     assert_eq!(codes.len(), expected, "blob size != M*(K/256)*136");
-    let x: Vec<f32> = (0..K).map(|i| ((i % 13) as f32) * 0.25).collect();
+    let s1v = fwht_signs(42);
+    let s2v = fwht_signs(1042);
+    let mut x: Vec<f32> = (0..K).map(|i| ((i % 13) as f32) * 0.25).collect();
+    for chunk in x.chunks_mut(256) {
+        fwht256(chunk, &s1v, &s2v);
+    }
 
     println!(
-        "arm2: M={M} K={K} groups_per_row={} row_bytes={} expected={} actual={} base=0x{:x}",
+        "arm2: M={M} K={K} groups_per_row={} row_bytes={} expected={} actual={} src_ptr=0x{:x}",
         K / 256,
         (K / 256) * 136,
         expected,
@@ -133,8 +166,8 @@ fn arm_mq4(gpu: &mut Gpu) {
 
     let a_dev = gpu.upload_raw(&codes, &[codes.len()]).unwrap();
     let xd = gpu.upload_f32(&x, &[K]).unwrap();
-    let s1 = gpu.upload_f32(&fwht_signs(42), &[256]).unwrap();
-    let s2 = gpu.upload_f32(&fwht_signs(1042), &[256]).unwrap();
+    let s1 = gpu.upload_f32(&s1v, &[256]).unwrap();
+    let s2 = gpu.upload_f32(&s2v, &[256]).unwrap();
     let mut yd = gpu.zeros(&[M], DType::F32).unwrap();
     gpu.gemv_mq4g256(&a_dev, &xd, &yd, &s1, &s2, M, K).unwrap();
     let reference = gpu.download_f32(&yd).unwrap();
@@ -146,7 +179,17 @@ fn arm_mq4(gpu: &mut Gpu) {
         unsafe { gpu.alloc_vmm_tensor_host(&[codes.len()], DType::Raw, codes.len(), &access).unwrap() };
     assert!(gpu.vmm_host_located(&a_off), "not host-located");
     fill(gpu, &a_off, &codes);
-    println!("arm2: host buffer at 0x{:x}", a_off.buf.as_ptr() as usize);
+    // Print the MAPPED VA the kernel is actually handed, not the source Vec —
+    // otherwise a reader comparing it against a fault address is misled.
+    println!(
+        "arm2: dev_A=0x{:x} host_A=0x{:x} x=0x{:x} s1=0x{:x} s2=0x{:x} host_byte_size={}",
+        a_dev.buf.as_ptr() as usize,
+        a_off.buf.as_ptr() as usize,
+        xd.buf.as_ptr() as usize,
+        s1.buf.as_ptr() as usize,
+        s2.buf.as_ptr() as usize,
+        a_off.byte_size(),
+    );
 
     println!("arm2: launching gemv_mq4g256 over a host-located MQ4 code blob...");
     let mut yh = gpu.zeros(&[M], DType::F32).unwrap();

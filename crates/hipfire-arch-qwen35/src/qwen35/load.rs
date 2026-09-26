@@ -995,19 +995,30 @@ pub fn load_weight_tensor_host(
     {
         let mut wt: Option<WeightTensor> = None;
         let mut matched: Option<String> = None;
+        let mut qt_logged = 0u8;
         for candidate in candidates(name) {
             if let Some((info, data)) = hfq.tensor_data(&candidate) {
+                qt_logged = info.quant_type;
                 wt = Some(load_weight_tensor_raw_host(gpu, info.quant_type, data, m, k)?);
                 matched = Some(candidate);
                 break;
             }
             if let Some((info, buf)) = hfq.tensor_data_pread(&candidate) {
+                qt_logged = info.quant_type;
                 wt = Some(load_weight_tensor_raw_host(gpu, info.quant_type, &buf, m, k)?);
                 matched = Some(candidate);
                 break;
             }
         }
         let mut wt = wt.ok_or_else(|| HipError::new(0, &format!("tensor not found: {name}")))?;
+        if std::env::var_os("HIPFIRE_OFFLOAD_DEBUG").is_some() {
+            let p = wt.buf.buf.as_ptr() as usize;
+            eprintln!(
+                "[offload-debug] host tensor '{name}' qt={qt_logged} bytes={} va=0x{p:x}..0x{:x}",
+                wt.buf.byte_size(),
+                p + wt.buf.byte_size(),
+            );
+        }
         if wt.gpu_dtype.supports_awq_sidecar() {
             let gpu_ref: &Gpu = gpu;
             if let Some(matched_name) = matched.as_deref() {
