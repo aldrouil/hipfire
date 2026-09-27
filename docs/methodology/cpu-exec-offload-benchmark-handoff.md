@@ -47,7 +47,8 @@ md5sum benchmarks/prompts/gpu_offload_probe.txt benchmarks/prompts/humaneval_3_b
 
 | artifact | md5 | sha256 | notes |
 |---|---|---|---|
-| `target/release/daemon` | `904368995cddb8cda8e82a7f8d31ae96` | — | at handoff |
+| source tree (`git rev-parse HEAD`) | `924d7fd8f6b3c674b95a60ed3b45df0e75f08d30` | — | the binaries below are the build **of this tree**; record your own HEAD next to your digests, because a digest alone does not say *what* moved |
+| `target/release/daemon` | `904368995cddb8cda8e82a7f8d31ae96` | — | built at the HEAD above |
 | `target/release/hipfire` | `030f080ce4c3d68ca038a614059d21b2` | — | at handoff |
 | `~/.hipfire/models/qwen3.5-2b.mq4` | `9ed6628f2df83ef4b1c062afd4a85bfb` | `bb386f7bd24397db5ef6ba28aab5985053c9db319d1645a2ba4d732a77badc6a` | 24 layers, 30.4 MB/layer |
 | `~/.hipfire/models/qwen3.5-9b.mq4` | `31a8d8dc7603226801b08d8319015602` | `829a84c708eed3db785febfe80b9a46dab2bb52172b9ac40ab17856f8f1260b3` | 32 layers, 114.9 MB/layer |
@@ -116,6 +117,25 @@ run_arm() {  # <tag> <model> <budget> <pcie|cpu>
    record their md5. One newline moves τ by up to 17% (AGENTS.md §0 rule 2). Do
    not use the inline prompt from the implementation session — it has no file and
    therefore no digest.
+
+**Do not change knobs between the arms or against the 2026-09-26 reference.**
+In particular leave `HIPFIRE_VERIFY_GRAPH` alone: the reference sweep documented
+no override, and with `--spec off` there is no verify route for it to capture, so
+setting it only breaks comparability with the anchors in § 6. `--spec off
+--backend noslots --workload stateless` is the whole flag surface.
+
+### 3.1 · If you see this, your run is contaminated (or the measurement is void)
+
+| symptom | likely cause | what to check |
+|---|---|---|
+| `cpu` arm far below the § 6 anchors (I measured 3.1 instead of 24.1 tok/s) | another CPU-heavy job sharing the 16 threads — a concurrent `cargo build --release` cost ~300% | `uptime` (this box idles ≈ 0.5) and `ps -eo pcpu,cmd --sort=-pcpu \| head` |
+| every point after the first fails in ~1 s with no JSON, `FATAL: hipfire daemon already running` | a daemon survived; the pid file and the process disagree | `pgrep -f target/release/daemon`; kill **by path** and wait for exit before the next point |
+| the driver dies mid-run with no error at all | `kill -9 $(cat ~/.hipfire/daemon.pid)` signalled whatever now owns that *reused* pid | never signal from the pid file alone; first `ps -p <pid> -o comm= \| grep -q daemon` |
+| no `cpu exec: step` lines / `steps: 0` | `HIPFIRE_CPU_EXEC_TRACE` was not set — this is **not** a coverage failure | re-run with the env set; read the coverage line independently of the trace |
+| coverage line reads `uncovered quants: Q8HFQ` (or MQ8G256 / MFP4* / PARO*) | the model carries a format outside `CpuQuant`; those stay on PCIe by design | expected; the arm measures a partial spill — say so in the report |
+| `prefill_tok_s` moves a lot between arms | prefill is GPU-side, so the seam cannot cause it — something else changed | compare binary / model / prompt digests between the arms |
+| `vram_free_mb` differs between arms at the same budget | the host-mapped allocation path changed | re-measure; this is a pass-condition failure, not noise |
+| unusually tight stddev, or τ much higher than expected | single-token attractor | read the decoded text (AGENTS.md § 0 rule 3) |
 
 ## 4 · Scope of the run (what to actually measure)
 
