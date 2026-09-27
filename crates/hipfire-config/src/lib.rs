@@ -5781,7 +5781,7 @@ pub mod memory {
 
     /// Resolve the resident-tail split point from a placement [`GpuLayerBudget`].
     ///
-    /// Returns `i_gpu_start`: layers `[0 .. i_gpu_start)` spill to host-VMM,
+    /// Returns `i_gpu_start`: layers `[0 .. i_gpu_start)` spill to host-mapped RAM,
     /// `[i_gpu_start .. n_layers)` stay device-resident. This is the single
     /// policy→number call Step 3's loader uses; it never allocates or probes a
     /// device, so it stays pure and unit-testable. Returns `None` only when the

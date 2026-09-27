@@ -3331,11 +3331,21 @@ impl Gpu {
     /// [`Self::release_registered_vmm`]. Returns the number still registered.
     fn release_registered_host_mapped(&mut self) -> HipResult<usize> {
         let mut first_error = None;
-        let pointers: Vec<usize> = self.host_mapped.drain().map(|(_, h)| h).collect();
-        for host_ptr in pointers {
-            if let Err(err) = self.hip.host_free(host_ptr as *mut std::ffi::c_void) {
-                if first_error.is_none() {
-                    first_error = Some(err);
+        // Remove only on success, mirroring `release_registered_vmm`: draining
+        // unconditionally would drop the sole record of a pointer whose
+        // `hipHostFree` failed, turning a retryable failure into an invisible
+        // leak that `host_mapped_count()` could no longer report.
+        let keys: Vec<usize> = self.host_mapped.keys().copied().collect();
+        for key in keys {
+            let host_ptr = self.host_mapped[&key];
+            match self.hip.host_free(host_ptr as *mut std::ffi::c_void) {
+                Ok(()) => {
+                    self.host_mapped.remove(&key);
+                }
+                Err(err) => {
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                    }
                 }
             }
         }
@@ -3402,10 +3412,11 @@ impl Gpu {
             .map(VmmArena::granularity)
     }
 
-    /// Whether a tensor's backing VMM arena is host-located (`HostPinned`) — its
-    /// pages are system RAM accessed over PCIe rather than the card's VRAM. Pure map
-    /// lookup; touches no device state. Offload tests and logs read this to prove a
-    /// spilled layer actually left VRAM (as opposed to being merely device-pinned).
+    /// Whether a tensor was allocated by [`Self::alloc_host_mapped_tensor`] — its pages
+    /// are system RAM the kernels read over PCIe rather than the card's VRAM. Pure
+    /// ownership check; touches no device state. Offload tests and logs read this to
+    /// prove a spilled layer actually left VRAM rather than being merely
+    /// device-pinned. Device-VMM tensors are not host-located by construction.
     pub fn host_located(&self, tensor: &GpuTensor) -> bool {
         tensor.buf.is_host_mapped()
     }
@@ -3447,6 +3458,19 @@ impl Gpu {
     /// is an error so unload/load cannot claim a clean handoff.
     pub fn ensure_vmm_cleaned(&mut self) -> HipResult<()> {
         self.bind_thread()?;
+        // Offloaded weights are a second owner class; without this check a leaked
+        // host-mapped tensor would let unload claim a clean handoff while holding
+        // pinned system RAM, which is exactly what this guard exists to prevent
+        // for VMM owners.
+        let live_host = self.host_mapped.len();
+        if live_host != 0 {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "refusing cleanup while {live_host} live host-mapped tensor owner(s) remain; unload the active model first"
+                ),
+            ));
+        }
         let live = self.vmm_arenas.len();
         if live != 0 {
             return Err(HipError::new(
@@ -5701,13 +5725,62 @@ mod tests {
         );
     }
 
-    fn try_gpu() -> Option<super::Gpu> {
-        super::Gpu::init().ok()
+    /// One device is shared by every GPU test in this module, and several assert on
+    /// allocator/VRAM bookkeeping. `upload_raw_copy_failure_hip_frees_owner` demands
+    /// byte-exact `hipMemGetInfo` free across its window, which a sibling test
+    /// allocating or freeing VRAM in that window breaks — observed as a failure on
+    /// roughly one `cargo test -p rdna-compute --lib` run in three with no source
+    /// change. Holding this lock for each GPU test's duration makes the suite
+    /// deterministic without weakening any assertion. Poisoning is ignored: a panic
+    /// in one test must not fail the rest.
+    static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Serialized GPU handle for a test. The guard must be *bound* for the test's
+    /// duration — `let Some((mut gpu, _guard)) = try_gpu() else { … }` — because
+    /// dropping it immediately would release the lock.
+    fn try_gpu() -> Option<(super::Gpu, std::sync::MutexGuard<'static, ()>)> {
+        let guard = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match super::Gpu::init() {
+            Ok(gpu) => Some((gpu, guard)),
+            Err(_) => None,
+        }
+    }
+
+    /// A leaked host-mapped owner must make teardown refuse, the way a leaked VMM
+    /// arena does. Offloaded weights are a second owner class, and without this
+    /// check an orphaned one would let unload report a clean handoff while still
+    /// holding pinned system RAM.
+    #[test]
+    fn ensure_vmm_cleaned_refuses_while_a_host_mapped_owner_is_live() {
+        let Some((mut gpu, _guard)) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        assert_eq!(gpu.host_mapped_count(), 0, "fresh GPU owns no host-mapped tensors");
+        gpu.ensure_vmm_cleaned().expect("idle GPU is clean");
+
+        let t = gpu
+            .upload_f32_host(&[1.0f32; 16], &[16])
+            .expect("host-mapped upload");
+        assert_eq!(gpu.host_mapped_count(), 1);
+        let err = gpu
+            .ensure_vmm_cleaned()
+            .expect_err("must refuse while a host-mapped owner is live");
+        assert!(
+            err.to_string().contains("host-mapped"),
+            "refusal must name the owner class: {err}"
+        );
+
+        gpu.free_tensor(t).expect("free the host-mapped owner");
+        assert_eq!(gpu.host_mapped_count(), 0);
+        gpu.ensure_vmm_cleaned().expect("clean again after the owner is freed");
     }
 
     #[test]
     fn ensure_vmm_cleaned_never_releases_a_live_owner() {
-        let Some(mut gpu) = try_gpu() else {
+        let Some((mut gpu, _guard)) = try_gpu() else {
             eprintln!("skip: no GPU");
             return;
         };
@@ -5751,7 +5824,7 @@ mod tests {
 
     #[test]
     fn vmm_fullmap_covers_unaligned_reservation() {
-        let Some(mut gpu) = try_gpu() else {
+        let Some((mut gpu, _guard)) = try_gpu() else {
             eprintln!("skip: no GPU");
             return;
         };
@@ -5826,7 +5899,7 @@ mod tests {
     /// measured window; a leaked owner still forces a fresh malloc on retry.
     #[test]
     fn alloc_then_init_failure_returns_pool_owner() {
-        let Some(mut gpu) = try_gpu() else {
+        let Some((mut gpu, _guard)) = try_gpu() else {
             eprintln!("skip: no GPU");
             return;
         };
@@ -5871,7 +5944,7 @@ mod tests {
     /// `free_tensor`/pool). Soft-skip without GPU like the other leaf tests.
     #[test]
     fn upload_raw_copy_failure_hip_frees_owner() {
-        let Some(mut gpu) = try_gpu() else {
+        let Some((mut gpu, _guard)) = try_gpu() else {
             eprintln!("skip: no GPU");
             return;
         };
@@ -5884,10 +5957,21 @@ mod tests {
         assert!(warm.buf.is_hip_allocation());
         gpu.free_tensor(warm).expect("free warm into pool");
 
+        // Signal the release with a payload big enough that the assertion cannot
+        // be perturbed by another process's driver accounting settling. Byte-exact
+        // equality was flaky across a multi-package `cargo test` run: a preceding
+        // test binary's VRAM release is not instantaneous, so `free_before` and
+        // `free_after` could straddle a settling step and fail a correct
+        // implementation. 64 MiB leaked vs 8 MiB tolerated keeps the check
+        // decisive (a leak of this owner is 64 MiB) while tolerating noise.
+        const PROBE_BYTES: usize = 64 * 1024 * 1024;
+        const TOLERANCE_BYTES: usize = 8 * 1024 * 1024;
+        let payload = vec![7u8; PROBE_BYTES];
+
         let (free_before, total) = gpu.hip.get_vram_info().expect("vram before");
         let pool_before = gpu.pool_stats();
 
-        let err = match gpu.upload_raw_with_copy(&[7u8; 64], &[64], |_hip, _buf, _data| {
+        let err = match gpu.upload_raw_with_copy(&payload, &[PROBE_BYTES], |_hip, _buf, _data| {
             Err(hip_bridge::HipError::new(2, "injected raw H2D failure"))
         }) {
             Err(error) => error,
@@ -5902,9 +5986,10 @@ mod tests {
         );
 
         let (free_after, _) = gpu.hip.get_vram_info().expect("vram after");
-        assert_eq!(
-            free_after, free_before,
-            "copy-fail must hip.free the malloc owner (free VRAM {free_before} → {free_after}, total={total})"
+        assert!(
+            free_after + TOLERANCE_BYTES >= free_before,
+            "copy-fail must hip.free the malloc owner: {PROBE_BYTES} bytes came back short \
+             (free VRAM {free_before} → {free_after}, total={total}, tolerance={TOLERANCE_BYTES})"
         );
         // hip.free path must not touch pool counters (would if free_tensor'd).
         assert_eq!(
@@ -5921,7 +6006,7 @@ mod tests {
 
     #[test]
     fn free_tensor_unmap_failure_retains_owner_for_retry() {
-        let Some(mut gpu) = try_gpu() else {
+        let Some((mut gpu, _guard)) = try_gpu() else {
             eprintln!("skip: no GPU");
             return;
         };
@@ -5970,7 +6055,7 @@ mod tests {
 
     #[test]
     fn free_tensor_release_failure_retains_owner_for_retry() {
-        let Some(mut gpu) = try_gpu() else {
+        let Some((mut gpu, _guard)) = try_gpu() else {
             eprintln!("skip: no GPU");
             return;
         };
@@ -6002,7 +6087,7 @@ mod tests {
 
     #[test]
     fn access_reset_failure_does_not_publish_live_owner() {
-        let Some(mut gpu) = try_gpu() else {
+        let Some((mut gpu, _guard)) = try_gpu() else {
             eprintln!("skip: no GPU");
             return;
         };
@@ -6040,7 +6125,7 @@ mod tests {
 
     #[test]
     fn ensure_vmm_cleaned_refuses_while_pending() {
-        let Some(mut gpu) = try_gpu() else {
+        let Some((mut gpu, _guard)) = try_gpu() else {
             eprintln!("skip: no GPU");
             return;
         };

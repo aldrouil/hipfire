@@ -4,7 +4,8 @@
 //! Device-vs-host parity smoke for offloaded projection weights.
 //!
 //! Partial GPU offload loads an offloaded layer's quantized codes into
-//! host-located VMM instead of VRAM. The promise is that this changes *where*
+//! host-mapped memory (`hipHostMalloc`) instead of VRAM. The promise is that this
+//! changes *where*
 //! the bytes live and nothing else — same bytes, same dtype, same shape, so the
 //! GEMV numerics are unchanged. This example proves that promise on real data
 //! rather than by inspection: it loads the same tensor through both readers and
@@ -134,7 +135,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "host blob size != on-disk tensor size"
     );
     println!(
-        "locality: device=VRAM host=HostPinned (confirmed via Gpu::host_located)"
+        "locality: device=VRAM host=host-mapped (confirmed via Gpu::host_located)"
     );
 
     let dev_bytes = gpu.download_raw_bytes(&device.buf)?;
