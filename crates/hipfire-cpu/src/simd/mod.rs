@@ -62,8 +62,23 @@ fn features_for(q: CpuQuant) -> bool {
         | CpuQuant::Mq6G256V2
         | CpuQuant::Mq5G256V2
         | CpuQuant::Mq2G256V2
-        | CpuQuant::Mq3G256V2 => avx2_f16c_available(),
-        CpuQuant::Mq4G256 => avx2_available(),
+        | CpuQuant::Mq3G256V2
+        | CpuQuant::Mq4CG256
+        | CpuQuant::Tq2G128
+        | CpuQuant::Bq1G128 => avx2_f16c_available(),
+        // Kernels over a plain f32 header.
+        CpuQuant::Mq4G256
+        | CpuQuant::Hfq4G256
+        | CpuQuant::Hfq6G256
+        | CpuQuant::Mq6G256
+        | CpuQuant::Mq5G256
+        | CpuQuant::Hfq3G256
+        | CpuQuant::Mq3G256
+        | CpuQuant::Hfq2G256
+        | CpuQuant::Mq2G256
+        | CpuQuant::Hfq4G128
+        | CpuQuant::Hfq3G128
+        | CpuQuant::Hfq2G128 => avx2_available(),
         // No kernel ported yet: the format-generic scalar decode handles it.
         _ => false,
     }
@@ -113,7 +128,25 @@ pub(crate) fn row_dot_avx2(q: CpuQuant, row: &[u8], k: usize, x: &[f32]) -> Opti
     );
     let (p, xp) = (row.as_ptr(), x.as_ptr());
     let dot = match q {
+        // Flat f32 header, 256-element group.
         CpuQuant::Mq4G256 => unsafe { x86::mq4g256_row_dot(p, k, xp) },
+        CpuQuant::Hfq4G256 => unsafe { x86::hfq4g256_row_dot(p, k, xp) },
+        CpuQuant::Hfq6G256 => unsafe { x86::hfq6g256_row_dot(p, k, xp) },
+        CpuQuant::Mq6G256 => unsafe { x86::mq6g256_row_dot(p, k, xp) },
+        CpuQuant::Mq5G256 => unsafe { x86::mq5g256_row_dot(p, k, xp) },
+        CpuQuant::Hfq3G256 => unsafe { x86::hfq3g256_row_dot(p, k, xp) },
+        CpuQuant::Mq3G256 => unsafe { x86::mq3g256_row_dot(p, k, xp) },
+        CpuQuant::Hfq2G256 => unsafe { x86::hfq2g256_row_dot(p, k, xp) },
+        CpuQuant::Mq2G256 => unsafe { x86::mq2g256_row_dot(p, k, xp) },
+        // Flat f32 header, 128-element block.
+        CpuQuant::Hfq4G128 => unsafe { x86::hfq4g128_row_dot(p, k, xp) },
+        CpuQuant::Hfq3G128 => unsafe { x86::hfq3g128_row_dot(p, k, xp) },
+        CpuQuant::Hfq2G128 => unsafe { x86::hfq2g128_row_dot(p, k, xp) },
+        // fp16 header.
+        CpuQuant::Mq4CG256 => unsafe { x86::mq4cg256_row_dot(p, k, xp) },
+        CpuQuant::Tq2G128 => unsafe { x86::tq2g128_row_dot(p, k, xp) },
+        CpuQuant::Bq1G128 => unsafe { x86::bq1g128_row_dot(p, k, xp) },
+        // V2 family: per-128 fp16 header.
         CpuQuant::Mq4G256V2 => unsafe { x86::mq4g256v2_row_dot(p, k, xp) },
         CpuQuant::Mq6G256V2 => unsafe { x86::mq6g256v2_row_dot(p, k, xp) },
         CpuQuant::Mq5G256V2 => unsafe { x86::mq5g256v2_row_dot(p, k, xp) },

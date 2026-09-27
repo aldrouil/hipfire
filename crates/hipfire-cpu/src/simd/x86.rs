@@ -135,6 +135,23 @@ unsafe fn codes_dot_sum<const BITS: usize, const PAYLOAD: usize>(
     (hsum256(dot), hsum256(sum))
 }
 
+/// One group with a single `(scale, zero)` over all `CHUNKS` of its chunks:
+/// `scale·Σ(c·x) + zero·Σx`.
+///
+/// The header is read by the caller, which is what lets one group body serve an
+/// `f32` header, an `fp16` pair and TQ2/BQ1's *derived* `(d, -d)` / `(2d, -d)`.
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn uniform_group_dot<const BITS: usize, const PAYLOAD: usize, const CHUNKS: usize>(
+    gptr: *const u8,
+    xg: *const f32,
+    scale: f32,
+    zero: f32,
+) -> f32 {
+    let (dot, sum) = codes_dot_sum::<BITS, PAYLOAD>(gptr, xg, 0, CHUNKS);
+    scale * dot + zero * sum
+}
+
 /// One 256-element V2 group: `[s0 z0 s1 z1]` `fp16` (one pair per 128
 /// elements) then `256/BITS` payload bytes.
 ///
@@ -147,6 +164,21 @@ unsafe fn v2_group_dot<const BITS: usize>(gptr: *const u8, xg: *const f32) -> f3
     let (d0, s0) = codes_dot_sum::<BITS, 8>(gptr, xg, 0, 16);
     let (d1, s1) = codes_dot_sum::<BITS, 8>(gptr, xg, 16, 32);
     (h[0] * d0 + h[1] * s0) + (h[2] * d1 + h[3] * s1)
+}
+
+/// `(scale, zero)` from an `f32` header — the flat HFQ/MQ families, 8 B.
+#[inline]
+unsafe fn f32_pair(p: *const u8) -> (f32, f32) {
+    (f32_at(p), f32_at(p.add(4)))
+}
+
+/// `(scale, zero)` from an `fp16` pair — qt 45's packed header, and the `d` of
+/// the TQ2/BQ1 pair (whose zero the caller derives).
+#[inline]
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn f16_pair(p: *const u8) -> (f32, f32) {
+    let v = f16_quad(p);
+    (v[0], v[1])
 }
 
 /// The V2 family's per-128 header, `[s0 z0 s1 z1]`, widened with one
@@ -192,6 +224,23 @@ macro_rules! row_dot {
             }
             acc
         }
+    };
+}
+
+/// A format whose group is one `(scale, zero)` header over `BITS`-wide codes:
+/// the group body is [`uniform_group_dot`] with the header read by `$hdr`.
+///
+/// `{$ge / 8}` is the group's chunk count — a chunk is eight codes, so it is
+/// the element count over eight.
+macro_rules! affine_row_dot {
+    ($(#[$meta:meta])* $name:ident, $group:ident, $hdr:ident, $bits:literal, $payload:literal, $ge:literal, $gb:literal, $feat:literal) => {
+        #[inline]
+        #[target_feature(enable = $feat)]
+        unsafe fn $group(gptr: *const u8, xg: *const f32) -> f32 {
+            let (scale, zero) = $hdr(gptr);
+            uniform_group_dot::<$bits, $payload, { $ge / 8 }>(gptr, xg, scale, zero)
+        }
+        row_dot!($(#[$meta])* $name, $group, $ge, $gb, $feat);
     };
 }
 
@@ -295,3 +344,204 @@ row_dot!(
     136,
     "avx2,fma"
 );
+
+// ── one f32 (scale, zero) header per 256-element group ───────────────────────
+//
+// The qt 13 shape with a different payload width, plus its own unrotated twins:
+// the kernel only sees bytes, so `Hfq4G256` (qt 6) and `Mq4G256` (qt 13) are the
+// same geometry, and the same holds for 8/15, 11/17 and 9/18. Rotation is
+// applied to the activation by the caller, never here.
+
+affine_row_dot!(
+    /// qt 6 — `Hfq4G256`: nibbles, natural basis. Byte-identical geometry to
+    /// qt 13, minus the FWHT rotation the caller applies.
+    hfq4g256_row_dot,
+    hfq4g256_group,
+    f32_pair,
+    4,
+    8,
+    256,
+    136,
+    "avx2,fma"
+);
+
+affine_row_dot!(
+    /// qt 8 — `Hfq6G256`: 6-bit packs, natural basis (qt 15's geometry).
+    hfq6g256_row_dot,
+    hfq6g256_group,
+    f32_pair,
+    6,
+    8,
+    256,
+    200,
+    "avx2,fma"
+);
+
+affine_row_dot!(
+    /// qt 15 — `Mq6G256`: 6-bit cross-byte packs, FWHT-rotated. Ships in the
+    /// qwen3.8 dense ladder.
+    mq6g256_row_dot,
+    mq6g256_group,
+    f32_pair,
+    6,
+    8,
+    256,
+    200,
+    "avx2,fma"
+);
+
+affine_row_dot!(
+    /// qt 31 — `Mq5G256`: 5-bit packs, FWHT-rotated. Arch-loaded by qwen35, so
+    /// it reaches the CPU only when its layer is spilled.
+    mq5g256_row_dot,
+    mq5g256_group,
+    f32_pair,
+    5,
+    8,
+    256,
+    168,
+    "avx2,fma"
+);
+
+affine_row_dot!(
+    /// qt 11 — `Hfq3G256`: 3-bit cross-byte packs, natural basis (qt 17's
+    /// geometry).
+    hfq3g256_row_dot,
+    hfq3g256_group,
+    f32_pair,
+    3,
+    8,
+    256,
+    104,
+    "avx2,fma"
+);
+
+affine_row_dot!(
+    /// qt 17 — `Mq3G256`: the uniform 3-bit tier some checkpoints carry, as
+    /// opposed to qt 20's Lloyd-Max codebook.
+    mq3g256_row_dot,
+    mq3g256_group,
+    f32_pair,
+    3,
+    8,
+    256,
+    104,
+    "avx2,fma"
+);
+
+affine_row_dot!(
+    /// qt 9 — `Hfq2G256`: 2-bit packs, natural basis (qt 18's geometry).
+    hfq2g256_row_dot,
+    hfq2g256_group,
+    f32_pair,
+    2,
+    8,
+    256,
+    72,
+    "avx2,fma"
+);
+
+affine_row_dot!(
+    /// qt 18 — `Mq2G256`: FWHT-rotated 2-bit packs.
+    mq2g256_row_dot,
+    mq2g256_group,
+    f32_pair,
+    2,
+    8,
+    256,
+    72,
+    "avx2,fma"
+);
+
+// ── one f32 header per 128-element block ─────────────────────────────────────
+
+affine_row_dot!(
+    /// qt 7 — `Hfq4G128`: 128-weight blocks, nibbles. The block formats are what
+    /// the blocking tensors (norms, the embedding) use.
+    hfq4g128_row_dot,
+    hfq4g128_group,
+    f32_pair,
+    4,
+    8,
+    128,
+    72,
+    "avx2,fma"
+);
+
+affine_row_dot!(
+    /// qt 12 — `Hfq3G128`: 128-weight blocks, 3-bit cross-byte packs.
+    hfq3g128_row_dot,
+    hfq3g128_group,
+    f32_pair,
+    3,
+    8,
+    128,
+    56,
+    "avx2,fma"
+);
+
+affine_row_dot!(
+    /// qt 10 — `Hfq2G128`: 128-weight blocks, 2-bit packs.
+    hfq2g128_row_dot,
+    hfq2g128_group,
+    f32_pair,
+    2,
+    8,
+    128,
+    40,
+    "avx2,fma"
+);
+
+// ── an fp16 header, or an fp16 `d`, per group ────────────────────────────────
+
+affine_row_dot!(
+    /// qt 45 — `Mq4CG256`: nibbles under a *packed* `fp16` `[scale][zero]`
+    /// dword (plus 4 B of padding), i.e. qt 13's payload with qt 49's header
+    /// width.
+    mq4cg256_row_dot,
+    mq4cg256_group,
+    f16_pair,
+    4,
+    8,
+    256,
+    136,
+    "avx2,fma,f16c"
+);
+
+row_dot!(
+    /// qt 40 — `Tq2G128`: 2-bit ternary codes over a 128-element block, decoded
+    /// as `(code - 1)·d` — the affine form with `scale = d` and `zero = -d`, so
+    /// no separate kernel is needed.
+    tq2g128_row_dot,
+    tq2g128_group,
+    128,
+    34,
+    "avx2,fma,f16c"
+);
+
+/// qt 40's group: one fp16 `d` then 16 chunks of 2-bit codes.
+#[inline]
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn tq2g128_group(gptr: *const u8, xg: *const f32) -> f32 {
+    let (d, _) = f16_pair(gptr);
+    uniform_group_dot::<2, 2, 16>(gptr, xg, d, -d)
+}
+
+row_dot!(
+    /// qt 41 — `Bq1G128`: sign bits over a 128-element block, decoded as
+    /// `bit ? +d : -d`. That is `2d·bit - d` — the affine form with
+    /// `scale = 2d` and `zero = -d` over one-bit codes.
+    bq1g128_row_dot,
+    bq1g128_group,
+    128,
+    18,
+    "avx2,fma,f16c"
+);
+
+/// qt 41's group: one fp16 `d` then 16 chunks of 8 sign bits.
+#[inline]
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn bq1g128_group(gptr: *const u8, xg: *const f32) -> f32 {
+    let (d, _) = f16_pair(gptr);
+    uniform_group_dot::<1, 2, 16>(gptr, xg, 2.0 * d, -d)
+}

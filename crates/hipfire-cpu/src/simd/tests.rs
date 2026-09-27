@@ -31,11 +31,28 @@ fn dispatch_predicate_is_forced_only_where_supported() {
 /// [`row_dot_enabled_matches_each_kernels_feature_gate`].
 fn kernel_formats() -> Vec<(CpuQuant, bool)> {
     vec![
+        // Flat f32 header.
         (CpuQuant::Mq4G256, false),
-        (CpuQuant::Mq3G256V2, true),
+        (CpuQuant::Hfq4G256, false),
+        (CpuQuant::Hfq6G256, false),
+        (CpuQuant::Mq6G256, false),
+        (CpuQuant::Mq5G256, false),
+        (CpuQuant::Hfq3G256, false),
+        (CpuQuant::Mq3G256, false),
+        (CpuQuant::Hfq2G256, false),
+        (CpuQuant::Mq2G256, false),
+        (CpuQuant::Hfq4G128, false),
+        (CpuQuant::Hfq3G128, false),
+        (CpuQuant::Hfq2G128, false),
+        // fp16 header.
+        (CpuQuant::Mq4CG256, true),
+        (CpuQuant::Tq2G128, true),
+        (CpuQuant::Bq1G128, true),
+        // Per-128 fp16 header (the V2 family).
         (CpuQuant::Mq4G256V2, true),
         (CpuQuant::Mq6G256V2, true),
         (CpuQuant::Mq5G256V2, true),
+        (CpuQuant::Mq3G256V2, true),
         (CpuQuant::Mq2G256V2, true),
     ]
 }
@@ -68,20 +85,6 @@ fn formats_without_a_kernel_stay_scalar() {
         CpuQuant::Mq3G256Lloyd,
         CpuQuant::Mq4G256Lloyd,
         CpuQuant::Mq2G256LloydU,
-        CpuQuant::Mq4CG256,
-        CpuQuant::Mq6G256,
-        CpuQuant::Mq5G256,
-        CpuQuant::Mq3G256,
-        CpuQuant::Mq2G256,
-        CpuQuant::Hfq6G256,
-        CpuQuant::Hfq4G256,
-        CpuQuant::Hfq4G128,
-        CpuQuant::Hfq3G256,
-        CpuQuant::Hfq3G128,
-        CpuQuant::Hfq2G256,
-        CpuQuant::Hfq2G128,
-        CpuQuant::Tq2G128,
-        CpuQuant::Bq1G128,
         CpuQuant::Q8F16,
         CpuQuant::F16,
         CpuQuant::F32,
@@ -100,15 +103,32 @@ fn formats_without_a_kernel_stay_scalar() {
 fn awkward_headers(q: CpuQuant, packed: &mut [u8], m: usize, k: usize) {
     let (ge, gb) = (q.group_elems(), q.group_bytes());
     let groups = k / ge;
-    // fp16: 0.031311, -0.122986, 0.270996, -0.088684.
+    // f32: 0.0313, -0.4921. fp16: 0.031311, -0.122986, 0.270996, -0.088684.
     const F16X4: [u16; 4] = [0x2802, 0xafdf, 0x3456, 0xadad];
     for row in 0..m {
         for g in 0..groups {
             let at = (row * groups + g) * gb;
             match q {
-                CpuQuant::Mq4G256 => {
+                CpuQuant::Mq4G256
+                | CpuQuant::Hfq4G256
+                | CpuQuant::Hfq6G256
+                | CpuQuant::Mq6G256
+                | CpuQuant::Mq5G256
+                | CpuQuant::Hfq3G256
+                | CpuQuant::Mq3G256
+                | CpuQuant::Hfq2G256
+                | CpuQuant::Mq2G256
+                | CpuQuant::Hfq4G128
+                | CpuQuant::Hfq3G128
+                | CpuQuant::Hfq2G128 => {
                     packed[at..at + 4].copy_from_slice(&0.0313f32.to_le_bytes());
                     packed[at + 4..at + 8].copy_from_slice(&(-0.4921f32).to_le_bytes());
+                }
+                CpuQuant::Mq4CG256 | CpuQuant::Tq2G128 | CpuQuant::Bq1G128 => {
+                    packed[at..at + 2].copy_from_slice(&F16X4[0].to_le_bytes());
+                    if q == CpuQuant::Mq4CG256 {
+                        packed[at + 2..at + 4].copy_from_slice(&F16X4[1].to_le_bytes());
+                    }
                 }
                 CpuQuant::Mq4G256V2
                 | CpuQuant::Mq6G256V2
