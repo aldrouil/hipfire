@@ -47,8 +47,8 @@
 //! the GPU arms of the same model, which is why the check was not duplicated
 //! into the step representation.
 
-use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
 
@@ -89,23 +89,25 @@ pub fn cpu_exec_counters() -> (usize, usize) {
 }
 
 /// Per-step wall-time split, in nanoseconds: device→host, the GEMV itself,
-/// host→device. The structural risk of this feature is that a CPU step is a host
-/// sync point, so it serializes against the surrounding GPU work; these three
-/// numbers say whether a slow `cpu` arm is paying for copies or for arithmetic.
-/// Always accumulated (two `Instant::now` per step, ~50 ns against a step that
-/// costs tens of microseconds) and reported by the trace.
-static NS_D2H: AtomicU64 = AtomicU64::new(0);
-static NS_GEMV: AtomicU64 = AtomicU64::new(0);
-static NS_H2D: AtomicU64 = AtomicU64::new(0);
-
-/// (device→host ns, gemv ns, host→device ns) since process start.
-pub fn cpu_exec_time_ns() -> (u64, u64, u64) {
-    (
-        NS_D2H.load(Ordering::Relaxed),
-        NS_GEMV.load(Ordering::Relaxed),
-        NS_H2D.load(Ordering::Relaxed),
-    )
+/// host→device — keyed by step *shape*, not summed across the process.
+///
+/// The structural risk of this feature is that a CPU step is a host sync point,
+/// so it serializes against the surrounding GPU work; these three numbers say
+/// whether a slow `cpu` arm is paying for copies or for arithmetic. Keying them
+/// by shape is the whole point: a process-wide sum divided by the total step
+/// count is a *cumulative mean* that every shape reports identically (and that
+/// early cold steps inflate), which reads as per-shape attribution and is not.
+#[derive(Clone, Copy, Default)]
+struct StepStats {
+    calls: u64,
+    d2h_ns: u64,
+    gemv_ns: u64,
+    h2d_ns: u64,
 }
+
+/// `(quant, m, k, rotated, residual, awq)` → running per-shape totals.
+static SHAPES: LazyLock<Mutex<BTreeMap<(u8, usize, usize, bool, bool, bool), StepStats>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
 /// `DType` → the decoder for it, for exactly the formats `hipfire_cpu` can
 /// decode. `None` means the step stays on the GPU (over PCIe): not a correctness
@@ -235,21 +237,33 @@ pub fn run_host_mapped_gemv(
     let bytes = gpu
         .host_bytes(w.buf)
         .ok_or_else(|| cpu_err("weight tensor is host-mapped but has no host pointer"))?;
-    let x_host = prepare_activation(gpu, w, x, rotate_input)?;
+    let (x_host, d2h_ns) = prepare_activation(gpu, w, x, rotate_input)?;
     let mut y = vec![0.0f32; m];
     let t1 = Instant::now();
     gemv(q, bytes, m, k, &x_host, &mut y);
-    NS_GEMV.fetch_add(t1.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    let gemv_ns = t1.elapsed().as_nanos() as u64;
     let t2 = Instant::now();
     upload_f32(gpu, out, &y)?;
-    NS_H2D.fetch_add(t2.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    let h2d_ns = t2.elapsed().as_nanos() as u64;
     CPU_STEPS.fetch_add(1, Ordering::Relaxed);
-    trace_step(q, w, rotate_input, false);
+    trace_step(
+        q,
+        w,
+        rotate_input,
+        false,
+        StepTiming {
+            d2h_ns,
+            gemv_ns,
+            h2d_ns,
+        },
+    );
     Ok(())
 }
 
 /// Read the activation for a CPU step, applying the same pre-rotation
-/// transforms the launcher's rotate step would.
+/// transforms the launcher's rotate step would, and return it with the elapsed
+/// nanoseconds — the trace's `d2h` figure, which therefore covers the AWQ divide
+/// and the FWHT whenever they apply, not just the copy.
 ///
 /// * AWQ (`w.awq_scale`): the quantizer pre-scaled the weights by `s` and the
 ///   rotate kernel divides the activation by it (`(W·s)·(x/s) = W·x`). This
@@ -263,7 +277,7 @@ fn prepare_activation(
     w: &WeightRef,
     x: &GpuTensor,
     rotate_input: bool,
-) -> Result<Vec<f32>, DispatchError> {
+) -> Result<(Vec<f32>, u64), DispatchError> {
     let t0 = Instant::now();
     let mut host = download_f32(gpu, x, w.k)?;
     if rotate_input {
@@ -273,8 +287,7 @@ fn prepare_activation(
         }
         rotate_x(&mut host);
     }
-    NS_D2H.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-    Ok(host)
+    Ok((host, t0.elapsed().as_nanos() as u64))
 }
 
 /// `acc += W · x` on the CPU, over a host-mapped weight — the residual form the
@@ -295,18 +308,28 @@ pub fn run_host_mapped_gemv_residual(
     let bytes = gpu
         .host_bytes(w.buf)
         .ok_or_else(|| cpu_err("weight tensor is host-mapped but has no host pointer"))?;
-    let x_host = prepare_activation(gpu, w, x, rotate_input)?;
+    let (x_host, d2h_ns) = prepare_activation(gpu, w, x, rotate_input)?;
     let mut y = vec![0.0f32; m];
     let t1 = Instant::now();
     gemv(q, bytes, m, k, &x_host, &mut y);
-    NS_GEMV.fetch_add(t1.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    let gemv_ns = t1.elapsed().as_nanos() as u64;
     let t2 = Instant::now();
     let mut acc_host = download_f32(gpu, acc, m)?;
     residual_add(&mut acc_host, &y);
     upload_f32(gpu, acc, &acc_host)?;
-    NS_H2D.fetch_add(t2.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    let h2d_ns = t2.elapsed().as_nanos() as u64;
     CPU_STEPS.fetch_add(1, Ordering::Relaxed);
-    trace_step(q, w, rotate_input, true);
+    trace_step(
+        q,
+        w,
+        rotate_input,
+        true,
+        StepTiming {
+            d2h_ns,
+            gemv_ns,
+            h2d_ns,
+        },
+    );
     Ok(())
 }
 
@@ -455,35 +478,56 @@ fn upload_f32(gpu: &Gpu, t: &GpuTensor, v: &[f32]) -> Result<(), DispatchError> 
         .map_err(|e| cpu_err(&format!("H2D: {e}")))
 }
 
-/// One line per distinct step shape under `HIPFIRE_CPU_EXEC_TRACE=1`, followed by
-/// the running counters — so a shape that silently never reaches the seam shows
-/// up as a nonzero "still on GPU" count rather than as a mystery.
-fn trace_step(q: CpuQuant, w: &WeightRef, rotated: bool, residual: bool) {
+/// One step's own wall-time split, handed to [`trace_step`].
+struct StepTiming {
+    d2h_ns: u64,
+    gemv_ns: u64,
+    h2d_ns: u64,
+}
+
+/// Per-shape step accounting under `HIPFIRE_CPU_EXEC_TRACE=1`: one line per
+/// distinct step shape at its first call and then at every doubling of that
+/// shape's call count, followed by the running counters.
+///
+/// Both halves of that schedule matter. The `calls=1` line is the *cold* first
+/// step of the shape (host-mapped page first touch, rayon pool wake-up); the
+/// later lines are the shape's own steady state, which is the only number worth
+/// quoting. Printing the whole process-wide mean per shape — as this did before
+/// — gives every shape the same figure and inflates it with the cold steps of
+/// whatever ran first, which reads as attribution and is not.
+///
+/// The counters are the coverage signal: `host-mapped steps still on GPU` must be
+/// 0 for a model the CPU covers, so a shape that silently never reaches the seam
+/// shows up as a number rather than as a mystery.
+fn trace_step(q: CpuQuant, w: &WeightRef, rotated: bool, residual: bool, timing: StepTiming) {
     if hipfire_config::developer_var("HIPFIRE_CPU_EXEC_TRACE").is_err() {
         return;
     }
-    static SEEN: LazyLock<Mutex<BTreeSet<(u8, usize, usize, bool, bool, bool)>>> =
-        LazyLock::new(|| Mutex::new(BTreeSet::new()));
-    let awq = w.awq_scale.is_some();
-    let fresh = SEEN
-        .lock()
-        .map(|mut seen| seen.insert((q as u8, w.m, w.k, rotated, residual, awq)))
-        .unwrap_or(false);
-    if !fresh {
+    let key = (q as u8, w.m, w.k, rotated, residual, w.awq_scale.is_some());
+    let Ok(mut shapes) = SHAPES.lock() else {
+        return;
+    };
+    let stats = shapes.entry(key).or_default();
+    stats.calls += 1;
+    stats.d2h_ns += timing.d2h_ns;
+    stats.gemv_ns += timing.gemv_ns;
+    stats.h2d_ns += timing.h2d_ns;
+    let stats = *stats;
+    if !stats.calls.is_power_of_two() {
         return;
     }
     let (m, k) = (w.m, w.k);
     let (on_cpu, on_gpu) = cpu_exec_counters();
-    let (d2h, gemv_ns, h2d) = cpu_exec_time_ns();
-    // ns -> ms, averaged over the steps that have run so far (a running mean, so
-    // the first line is the cold first step and later lines are steady state).
-    let per_ms = |ns: u64| ns as f64 / 1e6 / on_cpu.max(1) as f64;
+    // ns -> ms, averaged over *this shape's* calls so far.
+    let per_ms = |ns: u64| ns as f64 / 1e6 / stats.calls as f64;
     eprintln!(
         "cpu exec: step gemv m={m} k={k} quant={q:?} rotated={rotated} residual={residual} \
-         awq={awq} | {on_cpu} steps on CPU, {on_gpu} host-mapped steps still on GPU | \
+         awq={} | {} calls | {on_cpu} steps on CPU, {on_gpu} host-mapped steps still on GPU | \
          mean per step: d2h={:.2}ms gemv={:.2}ms h2d={:.2}ms",
-        per_ms(d2h),
-        per_ms(gemv_ns),
-        per_ms(h2d)
+        w.awq_scale.is_some(),
+        stats.calls,
+        per_ms(stats.d2h_ns),
+        per_ms(stats.gemv_ns),
+        per_ms(stats.h2d_ns)
     );
 }
