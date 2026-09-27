@@ -54,6 +54,11 @@ fn kernel_formats() -> Vec<(CpuQuant, bool)> {
         (CpuQuant::Mq5G256V2, true),
         (CpuQuant::Mq3G256V2, true),
         (CpuQuant::Mq2G256V2, true),
+        // Per-group fp16 codebook.
+        (CpuQuant::Mq2G256Lloyd, true),
+        (CpuQuant::Mq2G256LloydU, true),
+        (CpuQuant::Mq3G256Lloyd, true),
+        (CpuQuant::Mq4G256Lloyd, true),
     ]
 }
 
@@ -81,10 +86,6 @@ fn row_dot_enabled_matches_each_kernels_feature_gate() {
 #[test]
 fn formats_without_a_kernel_stay_scalar() {
     for q in [
-        CpuQuant::Mq2G256Lloyd,
-        CpuQuant::Mq3G256Lloyd,
-        CpuQuant::Mq4G256Lloyd,
-        CpuQuant::Mq2G256LloydU,
         CpuQuant::Q8F16,
         CpuQuant::F16,
         CpuQuant::F32,
@@ -139,9 +140,36 @@ fn awkward_headers(q: CpuQuant, packed: &mut [u8], m: usize, k: usize) {
                         packed[at + 2 * i..at + 2 * i + 2].copy_from_slice(&bits.to_le_bytes());
                     }
                 }
+                // The Lloyd tier's header *is* the decode, so it is the
+                // codebook that has to carry awkward, pairwise-distinct values:
+                // the fixture's books are powers of two, and qt 30's repeats an
+                // eight-entry book into sixteen lanes, which would hide an
+                // off-by-eight table error.
+                CpuQuant::Mq2G256Lloyd | CpuQuant::Mq2G256LloydU => {
+                    write_cb(packed, at, 4)
+                }
+                CpuQuant::Mq3G256Lloyd => write_cb(packed, at, 8),
+                CpuQuant::Mq4G256Lloyd => write_cb(packed, at, 16),
                 _ => unreachable!("no AVX2 kernel for {q:?}"),
             }
         }
+    }
+}
+
+/// `n` `fp16` codebook entries at `at`: distinct values across four exponent
+/// classes, and non-power-of-two mantissas wherever the fixture's own tables
+/// would otherwise be exact.
+fn write_cb(packed: &mut [u8], at: usize, n: usize) {
+    /// 0.0625, -0.0708, 0.0876, -0.1073, 0.125, -0.1416, 0.1753, -0.2146,
+    /// 0.25, -0.2832, 0.3506, -0.4292, 0.5, -0.5664, 0.7012, -0.8584 — an
+    /// alternating sign and a distinct magnitude per entry, so a wrong index, a
+    /// dropped sign or a full-table shift all show up.
+    const CB16: [u16; 16] = [
+        0x2c00, 0xac89, 0x2d9b, 0xaedd, 0x3000, 0xb089, 0x319b, 0xb2dd, 0x3400, 0xb489, 0x359b,
+        0xb6dd, 0x3800, 0xb889, 0x399b, 0xbadd,
+    ];
+    for (i, bits) in CB16[..n].iter().enumerate() {
+        packed[at + 2 * i..at + 2 * i + 2].copy_from_slice(&bits.to_le_bytes());
     }
 }
 

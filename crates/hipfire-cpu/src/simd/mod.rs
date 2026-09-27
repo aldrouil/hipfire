@@ -65,7 +65,11 @@ fn features_for(q: CpuQuant) -> bool {
         | CpuQuant::Mq3G256V2
         | CpuQuant::Mq4CG256
         | CpuQuant::Tq2G128
-        | CpuQuant::Bq1G128 => avx2_f16c_available(),
+        | CpuQuant::Bq1G128
+        | CpuQuant::Mq2G256Lloyd
+        | CpuQuant::Mq2G256LloydU
+        | CpuQuant::Mq3G256Lloyd
+        | CpuQuant::Mq4G256Lloyd => avx2_f16c_available(),
         // Kernels over a plain f32 header.
         CpuQuant::Mq4G256
         | CpuQuant::Hfq4G256
@@ -152,6 +156,11 @@ pub(crate) fn row_dot_avx2(q: CpuQuant, row: &[u8], k: usize, x: &[f32]) -> Opti
         CpuQuant::Mq5G256V2 => unsafe { x86::mq5g256v2_row_dot(p, k, xp) },
         CpuQuant::Mq3G256V2 => unsafe { x86::mq3g256v2_row_dot(p, k, xp) },
         CpuQuant::Mq2G256V2 => unsafe { x86::mq2g256v2_row_dot(p, k, xp) },
+        // Lloyd-Max codebooks.
+        CpuQuant::Mq2G256Lloyd => unsafe { x86::mq2g256lloyd_row_dot(p, k, xp) },
+        CpuQuant::Mq2G256LloydU => unsafe { x86::mq2g256lloydu_row_dot(p, k, xp) },
+        CpuQuant::Mq3G256Lloyd => unsafe { x86::mq3g256lloyd_row_dot(p, k, xp) },
+        CpuQuant::Mq4G256Lloyd => unsafe { x86::mq4g256lloyd_row_dot(p, k, xp) },
         _ => return None,
     };
     Some(dot)

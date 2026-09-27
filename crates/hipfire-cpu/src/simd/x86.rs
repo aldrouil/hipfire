@@ -166,6 +166,58 @@ unsafe fn v2_group_dot<const BITS: usize>(gptr: *const u8, xg: *const f32) -> f3
     (h[0] * d0 + h[1] * s0) + (h[2] * d1 + h[3] * s1)
 }
 
+/// The `CB`-entry `fp16` codebook at the group's start, indexed per lane by
+/// `sel`.
+///
+/// A 4- or 8-entry book is one `vpermd`; a 16-entry book is two plus a blend on
+/// the index's top bit. `vpermd` only looks at an index's low three bits, which
+/// is what makes the two-table form work — both lookups are valid and the blend
+/// picks the half.
+#[inline]
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn codebook_lookup<const CB: usize>(gptr: *const u8, sel: __m256i) -> __m256 {
+    if CB == 16 {
+        let lo = _mm256_cvtph_ps(_mm_loadu_si128(gptr as *const __m128i));
+        let hi = _mm256_cvtph_ps(_mm_loadu_si128(gptr.add(16) as *const __m128i));
+        let top = _mm256_slli_epi32(_mm256_and_si256(sel, _mm256_set1_epi32(8)), 28);
+        _mm256_blendv_ps(
+            _mm256_permutevar8x32_ps(lo, sel),
+            _mm256_permutevar8x32_ps(hi, sel),
+            _mm256_castsi256_ps(top),
+        )
+    } else if CB == 8 {
+        let table = _mm256_cvtph_ps(_mm_loadu_si128(gptr as *const __m128i));
+        _mm256_permutevar8x32_ps(table, sel)
+    } else {
+        let table = _mm256_insertf128_ps(
+            _mm256_setzero_ps(),
+            _mm_cvtph_ps(_mm_loadl_epi64(gptr as *const __m128i)),
+            0,
+        );
+        _mm256_permutevar8x32_ps(table, sel)
+    }
+}
+
+/// One group of a Lloyd-codebook format: `CB` `fp16` entries at the group's
+/// start, then `PAYLOAD` bytes of `BITS`-wide indices.
+///
+/// There is no affine term — the codebook *is* the decode — so this needs one
+/// accumulator, not two.
+#[inline]
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn codebook_group_dot<const BITS: usize, const CB: usize, const PAYLOAD: usize>(
+    gptr: *const u8,
+    xg: *const f32,
+) -> f32 {
+    let mut dot = _mm256_setzero_ps();
+    for idx in 0..32 {
+        let sel = codes8::<BITS>(gptr.add(PAYLOAD + idx * BITS));
+        let vals = codebook_lookup::<CB>(gptr, sel);
+        dot = _mm256_fmadd_ps(vals, _mm256_loadu_ps(xg.add(idx * 8)), dot);
+    }
+    hsum256(dot)
+}
+
 /// `(scale, zero)` from an `f32` header — the flat HFQ/MQ families, 8 B.
 #[inline]
 unsafe fn f32_pair(p: *const u8) -> (f32, f32) {
@@ -545,3 +597,49 @@ unsafe fn bq1g128_group(gptr: *const u8, xg: *const f32) -> f32 {
     let (d, _) = f16_pair(gptr);
     uniform_group_dot::<1, 2, 16>(gptr, xg, 2.0 * d, -d)
 }
+
+// ── a per-group fp16 codebook instead of an affine header ────────────────────
+//
+// The Lloyd-Max tier: the group's `CB` codebook entries sit where the affine
+// header would be, and the payload indexes them, so there is no scale/zero to
+// apply.
+
+row_dot!(
+    /// qt 19 — `Mq2G256Lloyd`: 2-bit indices into a 4-entry `fp16` codebook.
+    mq2g256lloyd_row_dot,
+    codebook_group_dot::<2, 4, 8>,
+    256,
+    72,
+    "avx2,fma,f16c"
+);
+
+row_dot!(
+    /// qt 51 — `Mq2G256LloydU`: byte-identical to qt 19 and deliberately *not*
+    /// rotated (it carries native-ternary checkpoints losslessly), which is
+    /// again a caller-side difference, not a kernel one.
+    mq2g256lloydu_row_dot,
+    codebook_group_dot::<2, 4, 8>,
+    256,
+    72,
+    "avx2,fma,f16c"
+);
+
+row_dot!(
+    /// qt 20 — `Mq3G256Lloyd`: 3-bit indices into an 8-entry `fp16` codebook.
+    /// This is what the registry's `qwen3.5:2b-mq3` and the other `-mq3` tags
+    /// carry (measured, not assumed).
+    mq3g256lloyd_row_dot,
+    codebook_group_dot::<3, 8, 16>,
+    256,
+    112,
+    "avx2,fma,f16c"
+);
+
+row_dot!(
+    /// qt 30 — `Mq4G256Lloyd`: nibble indices into a 16-entry `fp16` codebook.
+    mq4g256lloyd_row_dot,
+    codebook_group_dot::<4, 16, 32>,
+    256,
+    160,
+    "avx2,fma,f16c"
+);
