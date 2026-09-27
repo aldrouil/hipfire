@@ -88,14 +88,44 @@ pub struct VmmArena {
     segments: Vec<VmmSegment>,
     access_devices: Vec<i32>,
     releasing: bool,
+    /// Physical placement of the backing pages. `Device` (default) keeps KV
+    /// and resident weights in VRAM; `HostPinned` spills to system RAM over
+    /// PCIe so offloaded layers actually leave the card's local memory.
+    locality: MemoryLocality,
 }
 
 // The HIP process address and allocation handles may move with model state.
 // Concurrent mutation is still excluded because VmmArena is not Sync.
 unsafe impl Send for VmmArena {}
 
+/// Physical placement of a VMM tensor's backing pages.
+///
+/// One extensible routing table for where allocated/spilled pages physically
+/// live. `Device` is the historical default (KV cache + resident weights in VRAM);
+/// `HostPinned` spills to system RAM pinned and mapped into GPU VA so kernels
+/// dereference it over PCIe — that is what actually leaves the card's local memory.
+/// A future unified-memory APU adds e.g. `Unified` here without touching any caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryLocality {
+    /// Device-local VRAM (the historical default; KV + resident weights).
+    Device,
+    /// System RAM pinned and mapped into GPU VA; kernels read it over PCIe.
+    HostPinned,
+}
+
+/// Build the HIP allocation property for a VMM tensor's physical pages from its
+/// routing locality. Pure and GPU-free so placement routing is unit-testable
+/// without loading ROCm: `Device` yields device-pinned VRAM, `HostPinned` yields
+/// system RAM pinned and mapped into GPU VA (location.id 0 on the host node).
+fn allocation_prop(locality: MemoryLocality, device: i32) -> HipMemAllocationProp {
+    match locality {
+        MemoryLocality::HostPinned => HipMemAllocationProp::host_pinned(),
+        MemoryLocality::Device => HipMemAllocationProp::device_pinned(device),
+    }
+}
+
 impl VmmArena {
-    pub fn reserve(hip: &HipRuntime, owner_device: i32, requested_bytes: usize) -> HipResult<Self> {
+    pub fn reserve(hip: &HipRuntime, owner_device: i32, requested_bytes: usize, locality: MemoryLocality) -> HipResult<Self> {
         if requested_bytes == 0 {
             return Err(HipError::new(
                 0,
@@ -111,7 +141,7 @@ impl VmmArena {
         }
 
         hip.set_device(owner_device)?;
-        let prop = HipMemAllocationProp::device_pinned(owner_device);
+        let prop = allocation_prop(locality, owner_device);
         let granularity =
             hip.mem_get_allocation_granularity(&prop, HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED)?;
         if granularity == 0 {
@@ -132,7 +162,18 @@ impl VmmArena {
             segments: Vec::new(),
             access_devices: vec![owner_device],
             releasing: false,
+            locality,
         })
+    }
+
+    /// Reserve a host-located VMM range whose backing pages are system RAM
+    /// pinned and mapped into GPU VA, so kernels read spilled weights over PCIe
+    /// without touching the card's local memory. Convenience for
+    /// `reserve(hip, 0, requested_bytes, MemoryLocality::HostPinned)`; device id
+    /// is 0 (the host node) while set_device in map_next/release still targets
+    /// this box's GPU so access grants resolve correctly.
+    pub fn reserve_host(hip: &HipRuntime, requested_bytes: usize) -> HipResult<Self> {
+        Self::reserve(hip, 0, requested_bytes, MemoryLocality::HostPinned)
     }
 
     pub const fn owner_device(&self) -> i32 {
@@ -147,6 +188,21 @@ impl VmmArena {
         self.reserved_bytes
     }
 
+
+    /// Physical placement of this arena's backing pages — `Device` for KV and
+    /// resident weights (VRAM), `HostPinned` for spilled layers (system RAM over
+    /// PCIe). Read by `Gpu::vmm_host_located` to prove offload actually moved a
+    /// layer out of VRAM.
+    pub const fn locality(&self) -> MemoryLocality {
+        self.locality
+    }
+
+    /// The primary physical allocation handle backing this arena, if any mapped
+    /// segment exists. Exposed so callers can query the handle's placement with
+    /// `HipRuntime::mem_get_handle_properties` (fail-closed host-located check).
+    pub fn primary_handle(&self) -> Option<HipMemGenericAllocationHandle> {
+        self.segments.first().and_then(|seg| seg.handle)
+    }
     pub const fn mapped_bytes(&self) -> usize {
         self.mapped_bytes
     }
@@ -230,7 +286,7 @@ impl VmmArena {
             .collect();
 
         hip.set_device(self.owner_device)?;
-        let prop = HipMemAllocationProp::device_pinned(self.owner_device);
+        let prop = allocation_prop(self.locality, self.owner_device);
         let handle = hip.mem_create(size, &prop)?;
         let address = offset_ptr(self.base, self.mapped_bytes);
         if let Err(err) = unsafe { hip.mem_map(address, size, handle) } {
@@ -478,6 +534,37 @@ fn cleanup_segments(
         Some(err) => Err(err),
         None => Ok(()),
     }
+}
+
+/// Placement routing for host-located VMM pages. Pure and GPU-free: asserts that
+/// `host_pinned()` selects system RAM mapped into GPU VA (never device VRAM), that
+/// `device_pinned()` still targets a device, and that the shared `allocation_prop`
+/// router returns HostPinned vs Device correctly — the unit gate for partial offload.
+#[test]
+#[cfg(test)]
+fn host_location_props() {
+    use crate::ffi::{
+        HIP_MEM_ALLOCATION_TYPE_PINNED, HIP_MEM_LOCATION_TYPE_DEVICE, HIP_MEM_LOCATION_TYPE_HOST,
+    };
+    // host_pinned(): pinned type + HOST location on the host node (id 0).
+    let hp = HipMemAllocationProp::host_pinned();
+    assert_eq!(hp.type_, HIP_MEM_ALLOCATION_TYPE_PINNED);
+    assert_eq!(hp.location.type_, HIP_MEM_LOCATION_TYPE_HOST);
+    assert_eq!(hp.location.id, 0);
+
+    // device_pinned(): pinned type + DEVICE location with the given device id.
+    let dp = HipMemAllocationProp::device_pinned(3);
+    assert_eq!(dp.type_, HIP_MEM_ALLOCATION_TYPE_PINNED);
+    assert_eq!(dp.location.type_, HIP_MEM_LOCATION_TYPE_DEVICE);
+    assert_eq!(dp.location.id, 3);
+
+    // allocation_prop router: HostPinned -> host location; Device -> device id.
+    let routed_host = allocation_prop(MemoryLocality::HostPinned, 0);
+    assert_eq!(routed_host.location.type_, HIP_MEM_LOCATION_TYPE_HOST);
+
+    let routed_device = allocation_prop(MemoryLocality::Device, 7);
+    assert_eq!(routed_device.location.type_, HIP_MEM_LOCATION_TYPE_DEVICE);
+    assert_eq!(routed_device.location.id, 7);
 }
 
 #[cfg(test)]

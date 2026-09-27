@@ -25,6 +25,7 @@ pub use ffi::{
     HipMemGenericAllocationHandle, HipMemLocation, HipPointerAttribute, HipRuntime, Module, Stream,
     HIP_ERROR_NOT_READY, HIP_EVENT_DISABLE_TIMING, HIP_EVENT_RELEASE_TO_SYSTEM,
     HIP_MEM_ALLOCATION_GRANULARITY_MINIMUM, HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED,
+    HIP_MEM_LOCATION_TYPE_DEVICE, HIP_MEM_LOCATION_TYPE_HOST,
 };
 pub use kernarg::KernargBlob;
 pub use rccl::{RcclComms, RcclDataType, RcclError, RcclRedOp, RcclResult, NCCL_SUCCESS};
@@ -33,7 +34,7 @@ pub use rocsolver::{
     RocblasDiagonal, RocblasFill, Rocsolver, RocsolverError, RocsolverResult,
     ROCSOLVER_STATUS_SUCCESS,
 };
-pub use vmm::{clear_vmm_faults, inject_vmm_fault, VmmArena, VmmFaultKind};
+pub use vmm::{clear_vmm_faults, inject_vmm_fault, MemoryLocality, VmmArena, VmmFaultKind};
 
 /// Re-export memory copy direction for callers.
 #[repr(u32)]

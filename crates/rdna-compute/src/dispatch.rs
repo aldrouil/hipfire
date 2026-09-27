@@ -9,7 +9,8 @@ use crate::compiler::KernelCompiler;
 use crate::feature_flags::FeatureFlags;
 use crate::kernels;
 use hip_bridge::{
-    DeviceBuffer, HipError, HipMemAllocationProp, HipResult, HipRuntime, Rocblas, VmmArena,
+    DeviceBuffer, HipError, HipMemAllocationProp, HipMemGenericAllocationHandle, HipResult,
+    HipRuntime, MemoryLocality, Rocblas, VmmArena,
     HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED,
 };
 use std::collections::HashMap;
@@ -3194,7 +3195,7 @@ impl Gpu {
         let byte_size = numel
             .checked_mul(dtype.size())
             .ok_or_else(|| HipError::new(0, "VMM tensor byte size overflowed"))?;
-        let mut arena = VmmArena::reserve(&self.hip, self.device_id, byte_size)?;
+        let mut arena = VmmArena::reserve(&self.hip, self.device_id, byte_size, MemoryLocality::Device)?;
         // WINDOWS FIX (2026-09-09): hipMemCreate/hipMemMap on Windows/ROCm 7.2
         // (gfx1100) maps a second, later segment onto the SAME physical pages as
         // the first (vmm_arena_smoke boundary-growth assert fails; every
@@ -3204,6 +3205,62 @@ impl Gpu {
         // segments; grow_vmm_tensor then becomes a no-op (already fully
         // mapped). Costs up-front VRAM for the whole reservation; correctness
         // over on-demand commit on the platform whose driver breaks growth.
+        #[cfg(windows)]
+        let initial_mapped_bytes = arena.reserved_bytes();
+        if initial_mapped_bytes > 0 {
+            if let Err(err) = arena.map_next(&self.hip, initial_mapped_bytes, access_devices) {
+                return Err(self.retain_failed_vmm_arena(arena, err));
+            }
+        }
+        let buf = match arena.owner_buffer(byte_size) {
+            Ok(buf) => buf,
+            Err(err) => {
+                return Err(self.retain_failed_vmm_arena(arena, err));
+            }
+        };
+        let key = buf.as_ptr() as usize;
+        if self.vmm_arenas.contains_key(&key) {
+            let duplicate =
+                HipError::new(0, &format!("duplicate VMM tensor base address 0x{key:x}"));
+            return Err(self.retain_failed_vmm_arena(arena, duplicate));
+        }
+        self.vmm_arenas.insert(key, arena);
+        Ok(GpuTensor {
+            buf,
+            shape: shape.to_vec(),
+            dtype,
+        })
+    }
+
+    /// Allocate a VMM-backed tensor whose physical pages are **host-located**
+    /// (system RAM pinned and mapped into GPU VA). Kernels dereference the mapped
+    /// VA directly over PCIe, so this spills a layer's weights to system RAM
+    /// without ever allocating VRAM for them — the primitive that powers partial
+    /// GPU offload. Shape/dtype/access agnostic; knows nothing about qwen or any
+    /// model. Spilled-weights tensors are static (allocated once at load, read
+    /// during inference), so pass `initial_mapped_bytes == byte_size` to map all
+    /// bytes in a single segment.
+    ///
+    /// Reuses the same overflow checks, arena registration, duplicate-base guard,
+    /// and `retain_failed_vmm_arena` cleanup as [`Gpu::alloc_vmm_tensor`]; only the
+    /// reservation prop differs (`reserve_host` builds a `HostPinned` handle).
+    pub unsafe fn alloc_vmm_tensor_host(
+        &mut self,
+        shape: &[usize],
+        dtype: DType,
+        initial_mapped_bytes: usize,
+        access_devices: &[i32],
+    ) -> HipResult<GpuTensor> {
+        self.bind_thread()?;
+        let numel = shape
+            .iter()
+            .try_fold(1usize, |product, &dimension| product.checked_mul(dimension))
+            .ok_or_else(|| HipError::new(0, "VMM tensor element count overflowed"))?;
+        let byte_size = numel
+            .checked_mul(dtype.size())
+            .ok_or_else(|| HipError::new(0, "VMM tensor byte size overflowed"))?;
+        // Host-located: physical pages are system RAM accessed over PCIe.
+        let mut arena = VmmArena::reserve_host(&self.hip, byte_size)?;
         #[cfg(windows)]
         let initial_mapped_bytes = arena.reserved_bytes();
         if initial_mapped_bytes > 0 {
@@ -3286,6 +3343,25 @@ impl Gpu {
         self.vmm_arenas
             .get(&(tensor.buf.as_ptr() as usize))
             .map(VmmArena::granularity)
+    }
+
+    /// Whether a tensor's backing VMM arena is host-located (`HostPinned`) — its
+    /// pages are system RAM accessed over PCIe rather than the card's VRAM. Pure map
+    /// lookup; touches no device state. Offload tests and logs read this to prove a
+    /// spilled layer actually left VRAM (as opposed to being merely device-pinned).
+    pub fn vmm_host_located(&self, tensor: &GpuTensor) -> bool {
+        self.vmm_arenas
+            .get(&(tensor.buf.as_ptr() as usize))
+            .map_or(false, |arena| arena.locality() == MemoryLocality::HostPinned)
+    }
+
+    /// The primary physical allocation handle backing a tensor's VMM arena, if any.
+    /// Exposed so callers can query the handle's placement with
+    /// `HipRuntime::mem_get_handle_properties` (fail-closed host-located check).
+    pub fn vmm_handle(&self, tensor: &GpuTensor) -> Option<HipMemGenericAllocationHandle> {
+        self.vmm_arenas
+            .get(&(tensor.buf.as_ptr() as usize))
+            .and_then(|arena| arena.primary_handle())
     }
 
     /// Return the driver's recommended physical mapping granularity without

@@ -119,6 +119,7 @@ const HIP_SUCCESS: u32 = 0;
 /// treats exactly this code as "not yet", every other nonzero code as failure.
 pub const HIP_ERROR_NOT_READY: u32 = 600;
 pub const HIP_MEM_LOCATION_TYPE_DEVICE: u32 = 1;
+pub const HIP_MEM_LOCATION_TYPE_HOST: u32 = 2;
 pub const HIP_MEM_ALLOCATION_TYPE_PINNED: u32 = 1;
 pub const HIP_MEM_ACCESS_FLAGS_PROT_READ_WRITE: u32 = 3;
 pub const HIP_MEM_ALLOCATION_GRANULARITY_MINIMUM: u32 = 0;
@@ -167,6 +168,12 @@ impl HipMemLocation {
             id,
         }
     }
+    pub fn host() -> Self {
+        Self {
+            type_: HIP_MEM_LOCATION_TYPE_HOST,
+            id: 0,
+        }
+    }
 }
 
 #[repr(C)]
@@ -193,6 +200,19 @@ impl HipMemAllocationProp {
             type_: HIP_MEM_ALLOCATION_TYPE_PINNED,
             requested_handle_types: 0,
             location: HipMemLocation::device(device),
+            win32_handle_meta_data: ptr::null_mut(),
+            alloc_flags: HipMemAllocationFlags {
+                compression_type: 0,
+                gpu_direct_rdma_capable: 0,
+                usage: 0,
+            },
+        }
+    }
+    pub fn host_pinned() -> Self {
+        Self {
+            type_: HIP_MEM_ALLOCATION_TYPE_PINNED,
+            requested_handle_types: 0,
+            location: HipMemLocation::host(),
             win32_handle_meta_data: ptr::null_mut(),
             alloc_flags: HipMemAllocationFlags {
                 compression_type: 0,
@@ -267,6 +287,9 @@ pub struct HipRuntime {
     >,
     fn_mem_get_allocation_granularity:
         Option<unsafe extern "C" fn(*mut usize, *const HipMemAllocationProp, u32) -> u32>,
+    fn_mem_get_handle_properties: Option<
+        unsafe extern "C" fn(*mut HipMemAllocationProp, HipMemGenericAllocationHandle) -> u32,
+    >,
     fn_mem_map: Option<
         unsafe extern "C" fn(*mut c_void, usize, usize, HipMemGenericAllocationHandle, u64) -> u32,
     >,
@@ -523,6 +546,14 @@ impl HipRuntime {
                     lib,
                     "hipMemGetAllocationGranularity",
                     unsafe extern "C" fn(*mut usize, *const HipMemAllocationProp, u32) -> u32
+                ),
+                fn_mem_get_handle_properties: load_optional_fn!(
+                    lib,
+                    "hipMemGetAllocationPropertiesFromHandle",
+                    unsafe extern "C" fn(
+                        *mut HipMemAllocationProp,
+                        HipMemGenericAllocationHandle,
+                    ) -> u32
                 ),
                 fn_mem_map: load_optional_fn!(
                     lib,
@@ -951,6 +982,24 @@ impl HipRuntime {
         Ok(granularity)
     }
 
+    /// Query the physical placement of a VMM allocation handle. Callers read
+    /// `prop.location.type_`: a host-located page reports
+    /// `HIP_MEM_LOCATION_TYPE_HOST` (system RAM accessed over PCIe) — exactly what
+    /// partial offload requires. Fail-closed: if this ROCm build lacks the symbol,
+    /// returns an error instead of pretending the pages left VRAM.
+    pub fn mem_get_handle_properties(
+        &self,
+        handle: HipMemGenericAllocationHandle,
+    ) -> HipResult<HipMemAllocationProp> {
+        let func = self.missing_vmm_symbol(
+            "hipMemGetAllocationPropertiesFromHandle",
+            self.fn_mem_get_handle_properties,
+        )?;
+        let mut prop: HipMemAllocationProp = unsafe { std::mem::zeroed() };
+        let code = unsafe { func(&mut prop as *mut HipMemAllocationProp, handle) };
+        self.check(code, "hipMemGetAllocationPropertiesFromHandle")?;
+        Ok(prop)
+    }
     pub fn mem_address_reserve(&self, size: usize, alignment: usize) -> HipResult<*mut c_void> {
         let func = self.missing_vmm_symbol("hipMemAddressReserve", self.fn_mem_address_reserve)?;
         let mut ptr: *mut c_void = ptr::null_mut();
