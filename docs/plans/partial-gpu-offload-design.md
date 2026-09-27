@@ -298,6 +298,12 @@ PCIe link (27.1 GB/s measured, §7) instead of device DRAM: this is llama.cpp's
   (`cpu_offload_active(i_gpu_start)`), logged once
   (`cpu exec: hipGraph capture disabled (CPU-executed steps present)`). The slot
   decode graph takes the same decision.
+- **Footprint recipe for a large spilled prefix.** `hipHostMalloc` memory is
+  pinned, so it is host RAM the kernel cannot reclaim: on this host a 16-layer
+  spill of an 11.8 GB MQ3 checkpoint (≈2.5 GB pinned) stalled twice in load while
+  the box had 0 GB free, and the same model at an 8-layer spill (≈1.2 GB) loaded
+  and reported `8/8 spilled layers fully covered; uncovered quants: none`. Use
+  the smallest spilled prefix that frees the VRAM you actually need.
 - **Redline refused.** `memory.offload_exec=cpu` together with a retained-replay
   backend is a load error naming both keys: the tape records GPU launches, would
   omit the CPU-executed steps, and would replay stale activations (§6.7).
