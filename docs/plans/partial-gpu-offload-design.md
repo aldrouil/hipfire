@@ -264,13 +264,84 @@ are more surface area than staging and buy nothing until speed matters.
   `.gfxNNNN` files exactly like existing WMMA/GEMM splits — **do not** branch residency inside one
   kernel file (per `hipfire-arch-port`: family macros need concrete atoms).
 
+#### 6.2.1 CPU execution of the spilled-weight ops (`memory.offload_exec=cpu`)
+
+Shipped 2026-09-27. Placement is untouched — the same contiguous spilled prefix,
+the same `hipHostMalloc` host-mapped weights, the same KV residency. What changes
+is *who multiplies*, which is what bounds a spilled layer's per-token cost by the
+PCIe link (27.1 GB/s measured, §7) instead of device DRAM: this is llama.cpp's
+`-ngl` CPU backend, in hipfire's shape.
+
+- **Config.** `memory.offload_exec` = `pcie` (default: byte-for-byte the
+  behaviour above, and the zero-diff guard) | `cpu` (env
+  `HIPFIRE_OFFLOAD_EXEC`). Unset, empty and unknown all fail closed to `pcie`.
+  With `i_gpu_start == 0` it prints one informational line and changes nothing:
+  no weight is host-mapped, so no step can move.
+- **Seam.** One arch-agnostic place: `hipfire-dispatch`'s `execute_steps`. With
+  CPU execution on, a fused entry that spans a CPU step is not matched (a fusion
+  is one launch over several weights and cannot half-land on the CPU), and each
+  `Step::Gemv` / `Step::GemvResidual` over a host-mapped weight runs on the CPU:
+  D2H input → [AWQ divide] → FWHT → GEMV → H2D out, or in-place residual
+  accumulate (the residual is the destination; a residual step never writes its
+  `out` scratch). `weight_gemv_swiglu_residual` — the one op family that fuses a
+  GEMV into a kernel the seam cannot see — splits itself: GPU `silu_mul_f32`,
+  then the CPU GEMV plus residual.
+- **Two launcher properties the CPU path must reproduce exactly**, both of which
+  fail *silently* rather than erroring, and both now pinned by parity arms in
+  `crates/hipfire-arch-qwen35/tests/gpu_gemv_parity.rs`: the per-channel **AWQ**
+  divide happens *inside the rotation* (`(W·s)·(x/s) = W·x`, 138 sidecars in the
+  fixtures), and a **`Prerotated`** input must never be rotated again (the
+  launcher checks the rotation tag; a CPU step cannot, since a bare `GpuTensor`
+  carries no tag).
+- **Graph capture.** A CPU step is a host sync point, so hipGraph capture is
+  disabled for the model's lifetime whenever CPU steps are possible
+  (`cpu_offload_active(i_gpu_start)`), logged once
+  (`cpu exec: hipGraph capture disabled (CPU-executed steps present)`). The slot
+  decode graph takes the same decision.
+- **Redline refused.** `memory.offload_exec=cpu` together with a retained-replay
+  backend is a load error naming both keys: the tape records GPU launches, would
+  omit the CPU-executed steps, and would replay stale activations (§6.7).
+- **Coverage.** Every dense-decode projection of both layer types routes through
+  the seam — DeltaNet `in_proj_qkv/z/a/b` and `out_proj`, FullAttn `q/k/v/o`,
+  FFN `gate/up/down` — 7 distinct shapes on the 2B. Formats: qt 13/44/15/8/17/20
+  plus the F16/F32/BF16/Q8 block formats used for norms and structural tensors.
+  Anything else (mq4c, PARO, Lloyd 19/30, the HFP4 family, `tq2`/`bq1`, GL
+  codebooks) stays on the GPU over PCIe and is *named* by the load-time line
+  `cpu exec: {covered}/{spilled} spilled layers fully covered; uncovered quants: …`.
+  `HIPFIRE_CPU_EXEC_TRACE=1` reports one line per distinct step shape plus the
+  running counters, whose second number ("host-mapped steps still on GPU") must
+  be 0 for a fully covered model — a fused launch the guard missed or a call site
+  that bypasses `execute_steps` shows up there instead of as a mystery.
+- **Not covered, deliberately.** The slots/serve body (`forward_batch_slots` →
+  `dense_ffn_body_slots`) and prefill run batched GEMM kernels that never enter
+  `execute_steps`, so their spilled weights are still read over PCIe; the seam
+  covers their per-slot lm_head `Step::Gemv` only. The lm_head itself can never
+  be host-mapped — it is part of `largest_fitting_tail`'s always-resident base.
+- **Numerical contract.** llama.cpp-level, not bit-identity (the same record's
+  "Correctness gate"): the two engines are independent implementations with
+  different accumulation orders. Acceptance is coherence plus task-correct output
+  plus a *measured* divergence — so the CPU kernels use ordinary f32 `expf`
+  arithmetic where they need it and an AVX2 `Mq4G256` kernel that is
+  intentionally not bit-equal to the scalar path (`crates/hipfire-cpu/src/simd`).
+- **Evidence** (gfx1201, HIP 7.2, 2026-09-27): `hipfire_cpu::dequant_group`
+  reproduces the canonical decoder bit-for-bit over 1695 real tensors of the
+  2B/9B fixtures; launcher-vs-CPU parity worst case 6.7e-7 relative across 8
+  formats plus AWQ and pre-rotated arms; greedy output byte-identical to the
+  parent-commit build for `pcie` with and without a spill (2B 1343 chars, 9B
+  2734 chars), while the `cpu` arm stays coherent and shares a 652 (2B) / 723
+  (9B) character prefix with `pcie` before diverging.
+
 ### 6.3 Dispatch substrate (`hipfire-dispatch/.../superop.rs`)
 - The executor binds by index today; add a residency-aware bind step: for each `WeightSlot`, pick
   the device pointer (resident) or staging scratch pointer (spilled). `OpBinding` stays POD; the
   bind resolves against live tensor residency.
 
 ### 6.4 Graph capture (§3 risk #2)
-- First pass: gate on spill — when any layer is HostPinned, force the non-captured hand path.
+- **Implemented:** capture stays ON for the default direct-PCIe spill (the weights' addresses are
+  stable host-mapped pointers, so a captured graph replays correctly — verified byte-identical to a
+  fully resident run). Only `memory.offload_exec=cpu` forces the non-captured path, for the model's
+  lifetime, because a CPU step is a host sync point that can neither be recorded nor replayed
+  (§6.2.1; `cpu_offload_active`, logged once).
 - Later: if Option B, verify mapped-host pointer stability and re-enable capture with in-graph
   copy nodes; add a regression guard that fails loudly if a captured graph's pointers ever move.
 
@@ -357,6 +428,11 @@ dense edit + routed-expert composition (v2).
   same PCIe-bound factor regardless of which scenario motivated the spill.
 - This is a "can run" capability. The acceptance criterion is correctness + fit, not tok/s parity
   (the user explicitly accepts llama.cpp's `-ngl` slowdown as the price for capacity).
+- **CPU execution changes the bound, not the shape.** `memory.offload_exec=cpu` replaces "every
+  spilled byte crosses PCIe once per token" with "every spilled byte is read from system DRAM and
+  multiplied on the CPU", so the ceiling becomes the host's memory bandwidth plus one D2H/H2D pair
+  per step (a few tens of microseconds each) rather than 27.1 GB/s over the link. It buys nothing
+  when the spill is empty and nothing for the batched (slots/prefill) bodies, which bypass the seam.
 - **Graph-capture loss compounds the penalty.** Option A drops hipGraph capture when any layer is
   spilled — a real host-overhead hit on top of the PCIe cost. Even at an "acceptable" speed target,
   weighing A (simplest, correct) against B (mapped-host stable pointers, keeps graph) still matters;

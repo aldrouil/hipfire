@@ -259,6 +259,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `dflash_ngram_block` | `HIPFIRE_DFLASH_NGRAM_BLOCK` |
 | `experimental_budget_alert` | `HIPFIRE_EXPERIMENTAL_BUDGET_ALERT` |
 | `max_total_think_tokens` | `HIPFIRE_MAX_TOTAL_THINK_TOKENS` |
+| `memory.offload_exec` | `HIPFIRE_OFFLOAD_EXEC` |
 | `mtp_mode` / `mtp_k` | `HIPFIRE_MTP_MODE` / `HIPFIRE_MTP_K` |
 | `chat_template` | `HIPFIRE_CHAT_TEMPLATE_FILE` |
 | `default_chatml=false` | `HIPFIRE_DEFAULT_CHATML=0` |
@@ -1104,5 +1105,7 @@ When adding a user-facing knob:
 |---|---|---|
 | `HIPFIRE_ATTN_TILE_SIZE` | `128` | Tile size for the batched attention tile+reduce path. Must be a positive multiple of 32; anything else falls back to 128. Resolved once via `Gpu::attn_tile_size()`. **Raising it is safe; lowering it increases `max_tiles` and therefore the `partials` bytes per query row, which can exceed buffers sized elsewhere against the 128 default.** |
 | `HIPFIRE_VRAM_BUDGET_BYTES` | 32 GiB | Deployment-target VRAM ceiling used by the SP1 benchmark harnesses' preflight. Read by `examples/`, not by production code. |
+| `HIPFIRE_OFFLOAD_EXEC` | `pcie` | Typed key `memory.offload_exec`, the sibling of `memory.gpu_layer_budget`. Decides **who multiplies** a spilled layer's weights: `pcie` (default) runs the GPU kernels against host-mapped weights over the link, `cpu` executes those GEMVs on the CPU (`crates/hipfire-cpu`). Unset, empty and unknown all fail closed to `pcie`. Placement, VRAM accounting and KV residency are unchanged; with nothing spilled it prints one informational line and changes nothing. Refused at load together with a retained-replay (Redline) backend. Per-step diagnostics: `HIPFIRE_CPU_EXEC_TRACE=1`. Full write-up: [`plans/partial-gpu-offload-design.md`](plans/partial-gpu-offload-design.md#621-cpu-execution-of-the-spilled-weight-ops-memoryoffload_execcpu). |
+| `HIPFIRE_OFFLOAD_EXEC` | crates/hipfire-config/src/lib.rs |
 | `HIPFIRE_OOM_GUARD` | `auto` | Typed key `memory.oom_guard`. Gates **only** the host `MemAvailable` headroom half of `kv_slots::preflight_alloc` / `SlotPool` / CLI bench-sweep preflight. The R9700 deployment-target VRAM-budget check **always runs**. `auto`: on for unified-memory APU archs (gfx1035/1036/1103/1150/1151/1152), off for recognized discrete GPUs, and for processes with no known GPU arch by host swap state (no swap → on; unreadable → on). `1`/`true`/`0`/`false` force either way. The auto decision is logged once to stderr with its reason. `scripts/run-bounded.sh` remains the hard backstop. Full write-up: [`CONFIG.md`](CONFIG.md#memoryoom_guard). |
 | `HIPFIRE_MEM_CAP` | `24G` | Read by `scripts/run-bounded.sh`, not by the binaries: cgroup `MemoryMax` for a gated run. Exit 137 means the cap fired — shrink the configuration rather than raising it. |

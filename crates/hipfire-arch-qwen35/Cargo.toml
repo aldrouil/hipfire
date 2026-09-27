@@ -25,6 +25,13 @@ saddle-core = { path = "../saddle-core" }
 sha2 = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+
+[dev-dependencies]
+# `tests/gpu_gemv_parity.rs`: drives the production GEMV launcher against the
+# CPU transcription on identical inputs. Lives here (not in hipfire-cpu) so the
+# CPU crate keeps a GPU-free dependency list.
+hipfire-cpu = { path = "../hipfire-cpu" }
+
 [[example]]
 name = "test_qwen35_load_multi"
 path = "examples/test_qwen35_load_multi.rs"

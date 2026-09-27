@@ -1011,7 +1011,7 @@ pub fn load_weight_tensor_host(
             }
         }
         let mut wt = wt.ok_or_else(|| HipError::new(0, &format!("tensor not found: {name}")))?;
-        if std::env::var_os("HIPFIRE_OFFLOAD_DEBUG").is_some() {
+        if hipfire_config::developer_var("HIPFIRE_OFFLOAD_DEBUG").is_ok() {
             let p = wt.buf.buf.as_ptr() as usize;
             eprintln!(
                 "[offload-debug] host tensor '{name}' qt={qt_logged} bytes={} va=0x{p:x}..0x{:x}",
@@ -2498,6 +2498,71 @@ fn attach_lm_head_awq_sidecar(hfq: &HfqFile, gpu: &Gpu, output: &mut WeightTenso
 // ── Layout (re-exported from runtime) ─────────────────────────────────────
 
 pub use hipfire_runtime::model_load::Layout;
+
+// ── CPU-exec offload coverage report ──────────────────────────────────────
+
+/// The load-time CPU-exec coverage line for `memory.offload_exec=cpu`.
+///
+/// Reads the *file's* tensor index rather than the loaded weights: the question
+/// is which quant formats the spilled prefix contains, which is a property of
+/// the artifact, so this can be emitted before the sweep and needs no device.
+/// A layer counts as covered only when every projection/norm tensor the loader
+/// resolves to a DType has a CPU decoder; the uncovered set names the formats
+/// that therefore keep reading their weights over PCIe.
+///
+/// Follows the same silence contract as the residency report in
+/// [`super::config::apply_offload_policy`]: nothing is printed unless
+/// `memory.offload_exec` was actually configured to `cpu`, so a stock-vs-branch
+/// log diff stays readable.
+pub fn report_cpu_exec_coverage(hfq: &HfqFile, config: &Qwen35Config) {
+    use hipfire_config::memory::{offload_exec, OffloadExec};
+    use std::collections::BTreeSet;
+
+    if offload_exec() != OffloadExec::Cpu {
+        return;
+    }
+    let spilled = config.i_gpu_start;
+    if spilled == 0 {
+        eprintln!(
+            "cpu exec: memory.offload_exec=cpu but nothing is spilled \
+             (memory.gpu_layer_budget leaves every layer resident) — every step stays on the GPU"
+        );
+        return;
+    }
+
+    let mut covered = 0usize;
+    let mut uncovered: BTreeSet<String> = BTreeSet::new();
+    for layer in 0..spilled {
+        let mut layer_covered = true;
+        for t in hfq.tensors() {
+            if crate::serve_engine::tensor_layer_index(&t.name) != Some(layer) {
+                continue;
+            }
+            // `hfq_weight_dtype` is the passthrough table: F16/F32/BF16 norms
+            // return `None` and are excluded on purpose — the loader host-decodes
+            // those to f32 at load time, so no kernel reads them per token.
+            let Some(dtype) = hipfire_runtime::weight_backend::hfq_weight_dtype(t.quant_type)
+            else {
+                continue;
+            };
+            if hipfire_dispatch::cpu_quant_for(dtype).is_none() {
+                layer_covered = false;
+                uncovered.insert(format!("{dtype:?}"));
+            }
+        }
+        if layer_covered {
+            covered += 1;
+        }
+    }
+    let list = if uncovered.is_empty() {
+        "none".to_string()
+    } else {
+        uncovered.into_iter().collect::<Vec<_>>().join(", ")
+    };
+    eprintln!(
+        "cpu exec: {covered}/{spilled} spilled layers fully covered; uncovered quants: {list}"
+    );
+}
 
 // ── load_weights (thin assembler over runtime orchestrator) ───────────────
 

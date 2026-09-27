@@ -2313,6 +2313,59 @@ impl Gpu {
         }
     }
 
+    /// Blocking D→H copy of `src`'s first `dst.len()` bytes.
+    ///
+    /// Deliberately **not** capture-aware, unlike [`Self::memcpy_htod_auto`]: a
+    /// device→host copy is a host sync point, so it can never be part of a
+    /// captured graph. Reaching this during capture is a bug in whoever decided
+    /// to capture a graph containing a CPU-executed step, and it is reported as
+    /// an error rather than enqueued onto the capturing stream (where it would
+    /// either fail the capture or silently produce a replay that returns stale
+    /// activations).
+    pub fn memcpy_dtoh_auto(
+        &self,
+        dst: &mut [u8],
+        src: &hip_bridge::DeviceBuffer,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if self.graphs.capture_mode {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "memcpy_dtoh_auto during hipGraph capture: a CPU-executed step cannot be \
+                 captured; the capture decision must be disabled when host-mapped weights \
+                 are executed on the CPU",
+            ));
+        }
+        self.hip.memcpy_dtoh(dst, src)
+    }
+
+    /// Raw host bytes of a host-mapped tensor ([`Self::host_located`]), for the
+    /// CPU-executed offload path.
+    ///
+    /// `None` unless this `Gpu` owns the allocation: the buffer's own pointer is
+    /// the *device-visible* alias, which `hipHostGetDevicePointer` may place
+    /// anywhere relative to the `hipHostMalloc` pointer `hipHostFree` needs, so
+    /// the registry is the only sound source of the host address.
+    ///
+    /// The returned slice borrows the tensor, not the `Gpu`: the allocation lives
+    /// until the model unloads (`release_registered_host_mapped`), and callers
+    /// need `&mut Gpu` for the copies around a CPU step while still holding it.
+    /// `HOST_TAIL_PAD_BYTES` of slack past the logical size is included in the
+    /// allocation but *not* in the returned slice.
+    pub fn host_bytes<'a>(&self, tensor: &'a GpuTensor) -> Option<&'a [u8]> {
+        // bind_thread: skip — pure map lookup on host memory, no device state.
+        if !tensor.buf.is_host_mapped() {
+            return None;
+        }
+        let host_ptr = *self.host_mapped.get(&(tensor.buf.as_ptr() as usize))?;
+        // Safety: registered by `alloc_host_mapped_tensor` as a live
+        // `hipHostMalloc` of `tensor.buf.size() + HOST_TAIL_PAD_BYTES` bytes,
+        // freed exactly once on unload.
+        Some(unsafe {
+            std::slice::from_raw_parts(host_ptr as *const u8, tensor.buf.size())
+        })
+    }
+
     /// Helper: launch a kernel using the blob path during graph capture,
     /// or the normal kernelParams path otherwise. The `blob_builder` closure
     /// constructs the KernargBlob; it's only called when capturing.
@@ -3218,7 +3271,7 @@ impl Gpu {
             .checked_mul(dtype.size())
             .ok_or_else(|| HipError::new(0, "VMM tensor byte size overflowed"))?;
         let mut arena = VmmArena::reserve(&self.hip, self.device_id, byte_size)?;
-        if std::env::var_os("HIPFIRE_OFFLOAD_DEBUG").is_some() {
+        if hipfire_config::developer_var("HIPFIRE_OFFLOAD_DEBUG").is_ok() {
             eprintln!(
                 "[offload-debug] device-vmm base=0x{:x} req={} reserved={} gran={}",
                 arena.base_address(),
@@ -5746,6 +5799,71 @@ mod tests {
             Ok(gpu) => Some((gpu, guard)),
             Err(_) => None,
         }
+    }
+
+    /// The CPU-executed offload path reads spilled weight bytes through
+    /// `host_bytes`, which resolves the *host* pointer from the registry — the
+    /// device-visible alias `hipHostGetDevicePointer` returns need not be the
+    /// address `hipHostFree` needs, so guessing costs a read of unrelated
+    /// memory. Pin the identity instead: the bytes' device view and host view
+    /// are the same allocation, and a device tensor has no host view at all.
+    #[test]
+    fn host_bytes_aliases_the_uploaded_allocation() {
+        let Some((mut gpu, _guard)) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let payload: Vec<u8> = (0..64u8).map(|i| i.wrapping_mul(3).wrapping_add(1)).collect();
+        let t = gpu
+            .upload_raw_host(&payload, &[payload.len()])
+            .expect("host-mapped raw upload");
+        assert!(gpu.host_located(&t), "upload_raw_host must host-locate");
+        assert_eq!(
+            gpu.host_bytes(&t).expect("registered host pointer"),
+            &payload[..],
+            "the host view must be the allocation the upload filled"
+        );
+
+        let dev = gpu.alloc_tensor(&[8], DType::F32).expect("device tensor");
+        assert!(
+            gpu.host_bytes(&dev).is_none(),
+            "a device-resident tensor has no host view"
+        );
+
+        // The D2H helper reads through the device alias, so both views must agree.
+        let mut back = vec![0u8; payload.len()];
+        gpu.memcpy_dtoh_auto(&mut back, &t.buf).expect("dtoh");
+        assert_eq!(back, payload);
+
+        gpu.free_tensor(t).ok();
+        gpu.free_tensor(dev).ok();
+    }
+
+    /// A D→H copy is a host sync point and can never be part of a captured
+    /// graph. Entering capture with one pending is a bug in whoever decided to
+    /// capture a CPU-executed step, so it must fail loudly rather than enqueue
+    /// onto the capturing stream (where replay would silently return stale
+    /// activations).
+    #[test]
+    fn memcpy_dtoh_auto_refuses_under_capture() {
+        let Some((mut gpu, _guard)) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let t = gpu.upload_f32(&[1.0f32; 4], &[4]).expect("upload");
+        let mut back = vec![0u8; 16];
+        gpu.graphs.capture_mode = true;
+        let err = gpu
+            .memcpy_dtoh_auto(&mut back, &t.buf)
+            .expect_err("must refuse during capture");
+        gpu.graphs.capture_mode = false;
+        assert!(
+            err.to_string().contains("capture"),
+            "refusal must name capture: {err}"
+        );
+        gpu.memcpy_dtoh_auto(&mut back, &t.buf)
+            .expect("works outside capture");
+        gpu.free_tensor(t).ok();
     }
 
     /// A leaked host-mapped owner must make teardown refuse, the way a leaked VMM
