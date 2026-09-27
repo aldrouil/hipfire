@@ -59,6 +59,7 @@ use hipfire_runtime::weight_backend::reupload_f16_as_f32;
 use hipfire_runtime::weight_backend::HfqBackend;
 use hipfire_runtime::weight_backend::ParoBackend;
 use rdna_compute::DType;
+use hip_bridge::DeviceBuffer;
 use rdna_compute::Gpu;
 use rdna_compute::GpuTensor;
 use std::sync::Arc;
@@ -72,7 +73,7 @@ const _: () = assert!(QWEN35_NORM_BIAS == 1.0);
 
 // ─── Weight loading ─────────────────────────────────────────────────────
 
-fn qwen35_tensor_name_candidates(name: &str) -> Vec<String> {
+pub fn qwen35_tensor_name_candidates(name: &str) -> Vec<String> {
     let mut out = Vec::with_capacity(4);
     let mut push = |s: String| {
         if !out.iter().any(|x| x == &s) {
@@ -142,16 +143,36 @@ fn load_norm_weight(
     dequant_norm(gpu, info.quant_type, &data, shape, QWEN35_NORM_BIAS)
 }
 
-fn load_weight_tensor_raw(
-    gpu: &Gpu,
+/// Shared quant-type dispatch for a projection weight.
+///
+/// `up` decides where the code blob lands: the device reader passes
+/// `Gpu::upload_raw`, the offloaded reader passes `Gpu::upload_raw_host`
+/// (host-located VMM, read over PCIe). Both hold byte-identical bytes, so the
+/// numerics are unchanged and only the physical location differs. Injecting the
+/// uploader rather than passing a `host` flag keeps ONE copy of the match: the
+/// device path is reached through `&Gpu` (the `read_proj` fn-pointer contract,
+/// which cannot hand out `&mut Gpu`) while the host path needs `&mut Gpu` to
+/// register its VMM arena — a signature no single parameter can satisfy.
+///
+/// `fallback` covers the quant types that dequantize to f32 instead of uploading
+/// raw codes. Only the device reader implements it; the offloaded reader refuses,
+/// because the f32 path has no host upload and would otherwise quietly consume
+/// the VRAM the offload exists to free.
+fn load_weight_tensor_raw_with<U, F>(
     quant_type: u8,
     data: &[u8],
     m: usize,
     k: usize,
-) -> HipResult<WeightTensor> {
+    mut up: U,
+    fallback: F,
+) -> HipResult<WeightTensor>
+where
+    U: FnMut(&[u8], &[usize]) -> HipResult<GpuTensor>,
+    F: FnOnce(u8, &[u8], usize, usize) -> HipResult<WeightTensor>,
+{
     match quant_type {
         6 => {
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            let buf = up(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::HFQ4G256,
@@ -163,7 +184,7 @@ fn load_weight_tensor_raw(
             })
         }
         7 => {
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            let buf = up(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::HFQ4G128,
@@ -175,7 +196,7 @@ fn load_weight_tensor_raw(
             })
         }
         8 => {
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            let buf = up(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::HFQ6G256,
@@ -187,7 +208,7 @@ fn load_weight_tensor_raw(
             })
         }
         11 => {
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            let buf = up(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::HFQ3G256,
@@ -199,7 +220,7 @@ fn load_weight_tensor_raw(
             })
         }
         12 => {
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            let buf = up(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::HFQ3G128,
@@ -212,7 +233,7 @@ fn load_weight_tensor_raw(
         }
         13 => {
             // MQ4-G256
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            let buf = up(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ4G256,
@@ -225,7 +246,7 @@ fn load_weight_tensor_raw(
         }
         14 => {
             // MQ8-G256
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            let buf = up(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ8G256,
@@ -238,7 +259,7 @@ fn load_weight_tensor_raw(
         }
         15 => {
             // MQ6-G256
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            let buf = up(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ6G256,
@@ -251,7 +272,7 @@ fn load_weight_tensor_raw(
         }
         17 => {
             // MQ3-G256
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            let buf = up(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ3G256,
@@ -264,7 +285,7 @@ fn load_weight_tensor_raw(
         }
         18 => {
             // MQ2-G256
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            let buf = up(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ2G256,
@@ -277,7 +298,7 @@ fn load_weight_tensor_raw(
         }
         19 => {
             // MQ2-G256-Lloyd — 2-bit + 4-entry fp16 codebook (72 bytes/group)
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            let buf = up(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ2G256Lloyd,
@@ -290,7 +311,7 @@ fn load_weight_tensor_raw(
         }
         20 => {
             // MQ3-G256-Lloyd — 3-bit + 8-entry fp16 codebook (112 bytes/group)
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            let buf = up(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ3G256Lloyd,
@@ -304,7 +325,7 @@ fn load_weight_tensor_raw(
         30 => {
             // MQ4-G256-Lloyd — 4-bit + 16-entry fp16 codebook (160 bytes/group)
             // Renumbered from qt 21 → 30 in mq4-lloyd merge to avoid HFP4G32=21 collision.
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            let buf = up(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ4G256Lloyd,
@@ -320,7 +341,7 @@ fn load_weight_tensor_raw(
             // Opaque raw buffer, same pattern as MQ4(13)/MQ6(15); the GEMV
             // dispatch FWHT-rotates x at use. AWQ sidecar attached by the
             // caller via DType::supports_awq_sidecar (already includes MQ5G256).
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            let buf = up(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ5G256,
@@ -340,7 +361,7 @@ fn load_weight_tensor_raw(
                 k % 256 == 0,
                 "HFP4G32 v1 lm_head has K={k} but kernel requires K%256==0"
             );
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            let buf = up(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::HFP4G32,
@@ -358,7 +379,7 @@ fn load_weight_tensor_raw(
                 k % 256 == 0,
                 "MFP4G32 lm_head has K={k} but kernel + FWHT both require K%256==0"
             );
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            let buf = up(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MFP4G32,
@@ -375,7 +396,7 @@ fn load_weight_tensor_raw(
                 k % 256 == 0,
                 "MFP4G32Lloyd lm_head has K={k} but kernel + FWHT both require K%256==0"
             );
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            let buf = up(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MFP4G32Lloyd,
@@ -393,7 +414,7 @@ fn load_weight_tensor_raw(
                 k % 256 == 0,
                 "MFP4G32P lm_head has K={k} but kernel + FWHT both require K%256==0"
             );
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            let buf = up(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MFP4G32P,
@@ -411,7 +432,7 @@ fn load_weight_tensor_raw(
                 k % 256 == 0,
                 "MFP4G32E8 lm_head has K={k} but kernel + FWHT both require K%256==0"
             );
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            let buf = up(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MFP4G32E8,
@@ -429,7 +450,7 @@ fn load_weight_tensor_raw(
                 k % 256 == 0,
                 "MFP3G32E8 has K={k} but FWHT requires K%256==0"
             );
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            let buf = up(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MFP3G32E8,
@@ -447,7 +468,7 @@ fn load_weight_tensor_raw(
                 k % 256 == 0,
                 "MFP2G32E8 has K={k} but FWHT requires K%256==0"
             );
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            let buf = up(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MFP2G32E8,
@@ -478,7 +499,7 @@ fn load_weight_tensor_raw(
                     ),
                 ));
             }
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            let buf = up(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ4G256V2,
@@ -517,7 +538,7 @@ fn load_weight_tensor_raw(
                     ),
                 ));
             }
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            let buf = up(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ4CG256,
@@ -551,7 +572,7 @@ fn load_weight_tensor_raw(
                     ),
                 ));
             }
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            let buf = up(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ6G256V2,
@@ -583,7 +604,7 @@ fn load_weight_tensor_raw(
                     ),
                 ));
             }
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            let buf = up(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ5G256V2,
@@ -615,7 +636,7 @@ fn load_weight_tensor_raw(
                     ),
                 ));
             }
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            let buf = up(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ3G256V2,
@@ -647,7 +668,7 @@ fn load_weight_tensor_raw(
                     ),
                 ));
             }
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            let buf = up(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ2G256V2,
@@ -675,7 +696,7 @@ fn load_weight_tensor_raw(
                 k % 256 == 0,
                 "MQ2G256GL has K={k} but the SoA region split requires K%256==0"
             );
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            let buf = up(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ2G256GL,
@@ -694,7 +715,7 @@ fn load_weight_tensor_raw(
                 k % 256 == 0,
                 "MQ3G256GL has K={k} but the SoA region split requires K%256==0"
             );
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            let buf = up(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ3G256GL,
@@ -706,7 +727,7 @@ fn load_weight_tensor_raw(
             })
         }
         40 => {
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            let buf = up(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::TQ2G128,
@@ -718,7 +739,7 @@ fn load_weight_tensor_raw(
             })
         }
         41 => {
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            let buf = up(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::BQ1G128,
@@ -730,7 +751,7 @@ fn load_weight_tensor_raw(
             })
         }
         3 => {
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            let buf = up(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::Q8_0,
@@ -742,7 +763,7 @@ fn load_weight_tensor_raw(
             })
         }
         1 => match f16_lm_head_mode_from_config() {
-            F16LmHeadMode::Native => dequant_weight_raw(gpu, quant_type, data, m, k),
+            F16LmHeadMode::Native => fallback(quant_type, data, m, k),
             F16LmHeadMode::F32 => {
                 let f32_data: Vec<f32> = data
                     .chunks_exact(2)
@@ -751,7 +772,7 @@ fn load_weight_tensor_raw(
                 let bytes: &[u8] = unsafe {
                     std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
                 };
-                let buf = gpu.upload_raw(bytes, &[m, k])?;
+                let buf = up(bytes, &[m, k])?;
                 Ok(WeightTensor {
                     buf,
                     gpu_dtype: DType::F32,
@@ -768,7 +789,7 @@ fn load_weight_tensor_raw(
             // bytes uploaded as-is; the engine forwards through gemv_f32 /
             // gemm_f32_batched / attention_f32. Part of the F1 native-bf16
             // reference path (no quantization).
-            let buf = gpu.upload_raw(data, &[m, k])?;
+            let buf = up(data, &[m, k])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::F32,
@@ -783,7 +804,7 @@ fn load_weight_tensor_raw(
             // Native BF16 storage, F32 accumulation. This is source-exact for
             // BF16 checkpoints while retaining the two-byte memory traffic;
             // the unified dispatcher routes it through GemvBf16.
-            let buf = gpu.upload_raw(data, &[m, k])?;
+            let buf = up(data, &[m, k])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::BF16,
@@ -800,7 +821,7 @@ fn load_weight_tensor_raw(
                 k % 256 == 0,
                 "MFP4G32E8SOA lm_head has K={k} but kernel + FWHT both require K%256==0"
             );
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            let buf = up(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MFP4G32E8SOA,
@@ -811,7 +832,7 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
             })
         }
-        _ => dequant_weight_raw(gpu, quant_type, data, m, k),
+        _ => fallback(quant_type, data, m, k),
     }
 }
 
@@ -838,7 +859,55 @@ fn load_weight_tensor_raw(
 /// the VL-friendly nested name) where qwen2 uses flat `model.{...}`.
 /// Pull into `hipfire_runtime::transformer::weights` with the prefix
 /// as a parameter during consolidation.
-pub(crate) fn load_weight_tensor(
+/// Device-resident projection weight (VRAM). The historical path.
+fn load_weight_tensor_raw(
+    gpu: &Gpu,
+    quant_type: u8,
+    data: &[u8],
+    m: usize,
+    k: usize,
+) -> HipResult<WeightTensor> {
+    load_weight_tensor_raw_with(
+        quant_type,
+        data,
+        m,
+        k,
+        |bytes, shape| gpu.upload_raw(bytes, shape),
+        |qt, d, mm, kk| dequant_weight_raw(gpu, qt, d, mm, kk),
+    )
+}
+
+/// Offloaded projection weight: codes live in host memory, not VRAM.
+///
+/// Needs `&mut Gpu` because host-locating a tensor registers a VMM arena on the
+/// Gpu — which is exactly why this is a separate entry point rather than a flag
+/// on [`load_weight_tensor_raw`]. Quant types that fall back to the f32 dequant
+/// path are refused rather than silently placed on the device.
+fn load_weight_tensor_raw_host(
+    gpu: &mut Gpu,
+    quant_type: u8,
+    data: &[u8],
+    m: usize,
+    k: usize,
+) -> HipResult<WeightTensor> {
+    load_weight_tensor_raw_with(
+        quant_type,
+        data,
+        m,
+        k,
+        |bytes, shape| gpu.upload_raw_host(bytes, shape),
+        |_, _, _, _| {
+            Err(HipError::new(
+                0,
+                "quantized weight falls back to the f32 dequant path, which has no \
+                 host-localized upload; refusing to silently place it in device memory \
+                 inside an offloaded layer",
+            ))
+        },
+    )
+}
+
+pub fn load_weight_tensor(
     hfq: &HfqFile,
     gpu: &Gpu,
     name: &str,
@@ -899,6 +968,74 @@ pub(crate) fn load_weight_tensor(
         if wt.gpu_dtype.supports_awq_sidecar() {
             wt.awq_scale = load_awq_scale_for(hfq, gpu, &matched_name, k)
                 .or_else(|| load_awq_scale_for(hfq, gpu, name, k));
+        }
+        Ok(wt)
+    }
+}
+
+/// Offloaded twin of [`load_weight_tensor`]: same name resolution, same AWQ
+/// sidecar, but the quantized codes land in host-located VMM instead of VRAM.
+///
+/// The AWQ scale deliberately stays on the device — it is a 1-D f16 vector of
+/// length K (kilobytes), so host-locating it would cost PCIe bandwidth on the
+/// hot path to save nothing. Only the multi-megabyte code blob is spilled.
+///
+/// Takes `&mut Gpu` (the `read_proj_host` contract) because the host upload
+/// registers a VMM arena; [`load_weight_tensor`] cannot, which is why these are
+/// two entry points over one shared match rather than one function and a flag.
+pub fn load_weight_tensor_host(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    name: &str,
+    m: usize,
+    k: usize,
+    candidates: fn(&str) -> Vec<String>,
+) -> HipResult<WeightTensor> {
+    #[cfg(unix)]
+    {
+        let mut wt: Option<WeightTensor> = None;
+        let mut matched: Option<String> = None;
+        for candidate in candidates(name) {
+            if let Some((info, data)) = hfq.tensor_data(&candidate) {
+                wt = Some(load_weight_tensor_raw_host(gpu, info.quant_type, data, m, k)?);
+                matched = Some(candidate);
+                break;
+            }
+            if let Some((info, buf)) = hfq.tensor_data_pread(&candidate) {
+                wt = Some(load_weight_tensor_raw_host(gpu, info.quant_type, &buf, m, k)?);
+                matched = Some(candidate);
+                break;
+            }
+        }
+        let mut wt = wt.ok_or_else(|| HipError::new(0, &format!("tensor not found: {name}")))?;
+        if wt.gpu_dtype.supports_awq_sidecar() {
+            let gpu_ref: &Gpu = gpu;
+            if let Some(matched_name) = matched.as_deref() {
+                wt.awq_scale = load_awq_scale_for(hfq, gpu_ref, matched_name, k)
+                    .or_else(|| load_awq_scale_for(hfq, gpu_ref, name, k));
+            } else {
+                wt.awq_scale = load_awq_scale_for(hfq, gpu_ref, name, k);
+            }
+        }
+        return Ok(wt);
+    }
+    #[cfg(not(unix))]
+    {
+        let (info, data, matched_name) = {
+            let mut found = None;
+            for candidate in candidates(name) {
+                if let Some((info, data)) = hfq.tensor_data(&candidate) {
+                    found = Some((info, data, candidate));
+                    break;
+                }
+            }
+            found.ok_or_else(|| HipError::new(0, &format!("tensor not found: {name}")))?
+        };
+        let mut wt = load_weight_tensor_raw_host(gpu, info.quant_type, data, m, k)?;
+        let gpu_ref: &Gpu = gpu;
+        if wt.gpu_dtype.supports_awq_sidecar() {
+            wt.awq_scale = load_awq_scale_for(hfq, gpu_ref, &matched_name, k)
+                .or_else(|| load_awq_scale_for(hfq, gpu_ref, name, k));
         }
         Ok(wt)
     }
@@ -2669,6 +2806,11 @@ fn qwen35_hfq_backend<'a>(hfq: &'a HfqFile, gpu: &'a mut Gpu, layer: usize) -> H
         candidates: qwen35_tensor_name_candidates,
         read_proj: load_weight_tensor,
         layer,
+        // Offload plumbing. `host_local` drives `norm`/`raw_f32`/`bias`; `proj` routes
+        // through `read_proj_host`, which — unlike `read_proj` — receives `&mut Gpu` and
+        // can therefore register a host VMM arena. Both default to the resident path.
+        host_local: false,
+        read_proj_host: Some(load_weight_tensor_host),
     }
 }
 
