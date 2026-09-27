@@ -3196,6 +3196,15 @@ impl Gpu {
             .checked_mul(dtype.size())
             .ok_or_else(|| HipError::new(0, "VMM tensor byte size overflowed"))?;
         let mut arena = VmmArena::reserve(&self.hip, self.device_id, byte_size, MemoryLocality::Device)?;
+        if std::env::var_os("HIPFIRE_OFFLOAD_DEBUG").is_some() {
+            eprintln!(
+                "[offload-debug] device-vmm base=0x{:x} req={} reserved={} gran={}",
+                arena.base_address(),
+                byte_size,
+                arena.reserved_bytes(),
+                arena.granularity(),
+            );
+        }
         // WINDOWS FIX (2026-09-09): hipMemCreate/hipMemMap on Windows/ROCm 7.2
         // (gfx1100) maps a second, later segment onto the SAME physical pages as
         // the first (vmm_arena_smoke boundary-growth assert fails; every
@@ -3207,6 +3216,14 @@ impl Gpu {
         // over on-demand commit on the platform whose driver breaks growth.
         #[cfg(windows)]
         let initial_mapped_bytes = arena.reserved_bytes();
+        // `hipMemMap` requires a granularity-aligned size. Current callers all pass
+        // aligned lengths (the KV arenas), so this never tripped — but an arbitrary
+        // tensor length fails here, which is exactly how the host path broke on a
+        // real quantized code blob. Round up (the reservation is already rounded by
+        // `reserve`) so the latent device-side failure cannot surprise a later caller.
+        let initial_mapped_bytes = initial_mapped_bytes
+            .next_multiple_of(arena.granularity())
+            .min(arena.reserved_bytes());
         if initial_mapped_bytes > 0 {
             if let Err(err) = arena.map_next(&self.hip, initial_mapped_bytes, access_devices) {
                 return Err(self.retain_failed_vmm_arena(arena, err));
@@ -3244,11 +3261,16 @@ impl Gpu {
     /// Reuses the same overflow checks, arena registration, duplicate-base guard,
     /// and `retain_failed_vmm_arena` cleanup as [`Gpu::alloc_vmm_tensor`]; only the
     /// reservation prop differs (`reserve_host` builds a `HostPinned` handle).
+    ///
+    /// The mapped extent is always the full padded reservation, so
+    /// `initial_mapped_bytes` is accepted for signature parity but unused: host
+    /// weight tensors are static (allocated once at load, read during inference),
+    /// and the pad exists because kernels overread the tensor tail.
     pub unsafe fn alloc_vmm_tensor_host(
         &mut self,
         shape: &[usize],
         dtype: DType,
-        initial_mapped_bytes: usize,
+        _initial_mapped_bytes: usize,
         access_devices: &[i32],
     ) -> HipResult<GpuTensor> {
         self.bind_thread()?;
@@ -3260,8 +3282,32 @@ impl Gpu {
             .checked_mul(dtype.size())
             .ok_or_else(|| HipError::new(0, "VMM tensor byte size overflowed"))?;
         // Host-located: physical pages are system RAM accessed over PCIe.
-        let mut arena = VmmArena::reserve_host(&self.hip, byte_size)?;
-        #[cfg(windows)]
+        //
+        // The reservation is PADDED past the blob length on purpose. Kernels in
+        // the forward path overread the tensor tail — the first access past the
+        // last group (a phantom group header or a vector tail load). The device
+        // path makes the identical overread silently into hipMalloc slack, and
+        // the resident-path byte-identity run proves those overread values never
+        // affect output, so only the mapping must tolerate them. An exact-fit
+        // reservation makes the overread the FIRST UNMAPPED byte and faults with
+        // "Page not present": every real MQ3 blob observed here (21299200,
+        // 12779520, 36208640 bytes, …) is an exact multiple of the 4096-byte
+        // granularity, so slack is exactly zero precisely when it matters.
+        const HOST_TAIL_PAD_BYTES: usize = 1024 * 1024;
+        let mut arena =
+            VmmArena::reserve_host(&self.hip, byte_size.saturating_add(HOST_TAIL_PAD_BYTES))?;
+        if std::env::var_os("HIPFIRE_OFFLOAD_DEBUG").is_some() {
+            eprintln!(
+                "[offload-debug] host-vmm base=0x{:x} req={} reserved={} gran={}",
+                arena.base_address(),
+                byte_size,
+                arena.reserved_bytes(),
+                arena.granularity(),
+            );
+        }
+        // Static tensors: map the WHOLE padded reservation in one segment so both
+        // the data prefix and the tail pad are kernel-readable. The size is a
+        // granularity multiple by construction (reserve rounds the request up).
         let initial_mapped_bytes = arena.reserved_bytes();
         if initial_mapped_bytes > 0 {
             if let Err(err) = arena.map_next(&self.hip, initial_mapped_bytes, access_devices) {

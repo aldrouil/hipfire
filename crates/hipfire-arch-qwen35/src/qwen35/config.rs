@@ -960,7 +960,62 @@ fn from_config_value(config: &serde_json::Value) -> Result<Qwen35Config, String>
     // of getting collapsed into a generic "bad metadata" fallback.
     apply_reap_plan(&mut config)?;
 
+    apply_offload_policy(&mut config)?;
+
     Ok(config)
+}
+
+/// Resolve partial-GPU-offload placement for this config, in place.
+///
+/// Placement is fixed for the model's lifetime, so it is decided here — once, at
+/// config construction — rather than per request. The split keeps a contiguous
+/// resident TAIL `[i_gpu_start .. n_layers)` and spills the prefix `[0 ..
+/// i_gpu_start)` to host-located VMM; `load_layer_into` turns that into a
+/// per-layer `host_local` flag.
+///
+/// `Full` (the default, and the zero-diff regression guard) leaves
+/// `i_gpu_start = 0`, so every layer stays device-resident and the load is
+/// byte-identical to stock. `Layers(n)` is pure arithmetic on `n_layers` and
+/// needs no device measurement, which is why it can be resolved here.
+///
+/// `Auto` deliberately FAILS CLOSED: it needs measured device capacity and the
+/// per-layer weight bytes, neither of which exists at config-construction time
+/// (the arch trait hands us `&Config`, and no `Gpu`). Guessing would silently
+/// pick a split the user never asked for, so we ask for an explicit layer count
+/// instead. Wiring `Auto` belongs where a `Gpu` is in hand.
+fn apply_offload_policy(config: &mut Qwen35Config) -> Result<(), String> {
+    use hipfire_config::memory::{gpu_layer_budget, GpuLayerBudget};
+
+    let n_layers = config.n_layers;
+    let budget = gpu_layer_budget();
+    config.i_gpu_start = match budget {
+        GpuLayerBudget::Full => 0,
+        GpuLayerBudget::Layers(resident) => n_layers.saturating_sub(resident),
+        GpuLayerBudget::Auto => {
+            return Err(
+                "memory.gpu_layer_budget=-1 (auto) is not supported yet: it needs measured \
+                 device memory and per-layer weight bytes, which are not available when the \
+                 config is built. Set an explicit resident layer count instead \
+                 (HIPFIRE_GPU_LAYER_BUDGET=<n>)."
+                    .to_string(),
+            )
+        }
+    };
+
+    // Only announce when something is actually spilled. Printing this on the
+    // default `Full` path would put a "0 offloaded" line in every load log, which
+    // both muddies stock-vs-branch log diffs and defeats the point: absence of the
+    // line must unambiguously mean fully resident.
+    if config.i_gpu_start == 0 {
+        return Ok(());
+    }
+    eprintln!(
+        "  partial offload: {} resident / {} offloaded, i_gpu_start={}",
+        n_layers - config.i_gpu_start,
+        config.i_gpu_start,
+        config.i_gpu_start
+    );
+    Ok(())
 }
 
 /// Apply an optional REAP keep-map to a freshly parsed `Qwen35Config`.
