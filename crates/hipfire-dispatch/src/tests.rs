@@ -2586,3 +2586,14 @@ fn cpu_quant_refuses_unimplemented_formats() {
         );
     }
 }
+
+/// The Redline refusal is a conjunction: it must fire for the configured
+/// conflict and for nothing else, or a plain CPU-exec run would fail to load.
+#[test]
+fn cpu_exec_redline_conflict_is_exactly_the_conjunction() {
+    use crate::cpu_exec_redline_conflict as conflict;
+    assert!(conflict(true, 12, true), "cpu + spill + replay is the conflict");
+    assert!(!conflict(false, 12, true), "pcie must never be refused");
+    assert!(!conflict(true, 0, true), "nothing spilled, nothing on the CPU");
+    assert!(!conflict(true, 12, false), "no replay controller: no conflict");
+}

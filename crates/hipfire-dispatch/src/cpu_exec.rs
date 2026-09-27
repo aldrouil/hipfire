@@ -126,6 +126,50 @@ pub fn cpu_offload_active(i_gpu_start: usize) -> bool {
     cpu_exec_enabled() && i_gpu_start > 0
 }
 
+/// Whether `memory.offload_exec=cpu` conflicts with a retained-replay backend.
+///
+/// Pure truth table (the CPU-exec decision, the resolved split, and whether a
+/// replay controller is in play) so it is testable without a process snapshot.
+pub fn cpu_exec_redline_conflict(
+    cpu_exec: bool,
+    i_gpu_start: usize,
+    replay_enabled: bool,
+) -> bool {
+    cpu_exec && i_gpu_start > 0 && replay_enabled
+}
+
+/// Refuse `memory.offload_exec=cpu` together with a retained-replay (Redline)
+/// backend, naming both keys.
+///
+/// Redline does not go through `execute_steps`' launch funnel: its tape records
+/// GPU launches and replays them, so a CPU-executed step would run while the
+/// tape is built and then be *absent* from every replay — the replayed route
+/// would keep computing from the activations that step should have refreshed.
+/// Nothing in the tape can express that, so the load fails instead of running a
+/// route whose output is silently stale.
+///
+/// `replay_enabled` is the controller's own predicate
+/// (`ReplayController::is_enabled`), not a config string: whether Redline is in
+/// play depends on the runtime route decision and certification state, so the
+/// caller with the `Gpu` supplies the fact. Shadow controllers are refused too
+/// (conservatively — shadow does not change the launch route, so the refusal is
+/// stricter than strictly necessary there).
+pub fn reject_cpu_exec_under_redline(
+    i_gpu_start: usize,
+    replay_enabled: bool,
+) -> Result<(), String> {
+    if cpu_exec_redline_conflict(cpu_exec_enabled(), i_gpu_start, replay_enabled) {
+        return Err(
+            "memory.offload_exec=cpu conflicts with the retained-replay (Redline) backend: the \
+             replay tape records GPU launches and does not execute the CPU-executed steps, so a \
+             replayed route would compute from stale activations. Set memory.offload_exec=pcie \
+             (HIPFIRE_OFFLOAD_EXEC=pcie) or replay.backend=hip"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Log the capture-disable decision once per process. A CPU-executed step is a
 /// host sync point (a D2H and an H2D around the multiplication), so a graph that
 /// contained one could neither be recorded nor replayed correctly.
