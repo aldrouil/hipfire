@@ -298,15 +298,39 @@ PCIe link (27.1 GB/s measured, §7) instead of device DRAM: this is llama.cpp's
   (`cpu_offload_active(i_gpu_start)`), logged once
   (`cpu exec: hipGraph capture disabled (CPU-executed steps present)`). The slot
   decode graph takes the same decision.
+- **Footprint recipe for a large spilled prefix.** `hipHostMalloc` memory is
+  pinned, so it is host RAM the kernel cannot reclaim: on this host a 16-layer
+  spill of an 11.8 GB MQ3 checkpoint (≈2.5 GB pinned) stalled twice in load while
+  the box had 0 GB free, and the same model at an 8-layer spill (≈1.2 GB) loaded
+  and reported `8/8 spilled layers fully covered; uncovered quants: none`. Use
+  the smallest spilled prefix that frees the VRAM you actually need.
 - **Redline refused.** `memory.offload_exec=cpu` together with a retained-replay
   backend is a load error naming both keys: the tape records GPU launches, would
   omit the CPU-executed steps, and would replay stale activations (§6.7).
 - **Coverage.** Every dense-decode projection of both layer types routes through
   the seam — DeltaNet `in_proj_qkv/z/a/b` and `out_proj`, FullAttn `q/k/v/o`,
-  FFN `gate/up/down` — 7 distinct shapes on the 2B. Formats: qt 13/44/15/8/17/20
-  plus the F16/F32/BF16/Q8 block formats used for norms and structural tensors.
-  Anything else (mq4c, PARO, Lloyd 19/30, the HFP4 family, `tq2`/`bq1`, GL
-  codebooks) stays on the GPU over PCIe and is *named* by the load-time line
+  FFN `gate/up/down` — 7 distinct shapes on the 2B. Formats: **28**, i.e. every
+  dense-capable entry in `docs/quant-formats/qt-register.txt` — qt 1/2/3/16
+  element and Q8 blocks, qt 6/7/8/9/10/11/12 HFQ, qt 13/15/17/18/31 flat MQ,
+  qt 19/20/30/51 Lloyd codebooks, qt 40/41 Bonsai ternary/binary, qt 44/45/47/48/49/50
+  Magnum V2 + MQ4C. Each is pinned by
+  `crates/hipfire-arch-qwen35/tests/gpu_gemv_parity.rs` in **both** arms of the
+  rotation contract — `Raw` (both sides rotate once) and `Prerotated` (neither
+  rotates again) — against the production launcher, and additionally bit-exactly
+  against the canonical `dequantize_to_f32` where that has an arm (19 formats).
+  qt 49 (`qwen3.8-27b.mq3-xt`'s only projection format) has no canonical arm, so
+  its oracle is a **real 27B tensor**: 2.4e-7 / 3.5e-7 relative at m=12288 k=5120
+  (`HIPFIRE_PARITY_EXTRA_MODEL=<path> HIPFIRE_PARITY_EXTRA_QT=49`).
+  Two formats decode but are arch-ineligible as `Step::Gemv` weights on gfx12 —
+  qt 11/12 have no production dense GEMV kernel (`MissingImpl`), which the
+  parity test reports rather than silently comparing nothing.
+  The exclusions are structural: qt 5 `Q8HFQ` (rows padded to a 128-byte stride),
+  qt 14 `MQ8G256` (`RotationPlan::Mq8Internal`: int8-quantized activations),
+  qt 21/24/32-37 HFP4/MFP4(+Lloyd/P/E8) (per-row 16 B header + per-32 block
+  scales/codewords, and an arch-owned upload path), qt 28/29 PARO (Givens
+  rotation on the activation), qt 0/4 GGUF-side formats, and qt 38/39 GL +
+  qt 22 `TidI32` (MoE-indexed only, no dense GEMV kernel exists / not a weight).
+  Each stays on the GPU over PCIe and is *named* by the load-time line
   `cpu exec: {covered}/{spilled} spilled layers fully covered; uncovered quants: …`.
   `HIPFIRE_CPU_EXEC_TRACE=1` reports one line per distinct step shape plus the
   running counters, whose second number ("host-mapped steps still on GPU") must

@@ -2538,11 +2538,13 @@ pub fn report_cpu_exec_coverage(hfq: &HfqFile, config: &Qwen35Config) {
             if crate::serve_engine::tensor_layer_index(&t.name) != Some(layer) {
                 continue;
             }
-            // `hfq_weight_dtype` is the passthrough table: F16/F32/BF16 norms
-            // return `None` and are excluded on purpose — the loader host-decodes
-            // those to f32 at load time, so no kernel reads them per token.
-            let Some(dtype) = hipfire_runtime::weight_backend::hfq_weight_dtype(t.quant_type)
-            else {
+            // Resolve through the *loader's own* map, not the passthrough table:
+            // `hfq_weight_dtype` is RAW_CODECS, which omits the `arch-loaded`
+            // formats (qt 31 per `docs/quant-formats/qt-register.txt`, the MFP4
+            // family, PARO), and a tensor skipped here would be reported as
+            // covered while nothing decodes it. F16/F32/BF16 do resolve, and are
+            // covered because the loader host-decodes them to f32 at load time.
+            let Ok(dtype) = dtype_from_quant_type(t.quant_type) else {
                 continue;
             };
             if hipfire_dispatch::cpu_quant_for(dtype).is_none() {
