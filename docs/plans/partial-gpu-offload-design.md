@@ -323,13 +323,23 @@ PCIe link (27.1 GB/s measured, §7) instead of device DRAM: this is llama.cpp's
   plus a *measured* divergence — so the CPU kernels use ordinary f32 `expf`
   arithmetic where they need it and an AVX2 `Mq4G256` kernel that is
   intentionally not bit-equal to the scalar path (`crates/hipfire-cpu/src/simd`).
+  **Fidelity is the per-step parity (6.7e-7 worst case) and the bit-exact decode
+  over 1695 tensors; the end-to-end text divergence is a downstream symptom of
+  greedy argmax over numbers that differ at the seventh digit, not an error rate
+  — read the shared-prefix length as a sensitivity, never as accuracy.**
 - **Evidence** (gfx1201, HIP 7.2, 2026-09-27): `hipfire_cpu::dequant_group`
   reproduces the canonical decoder bit-for-bit over 1695 real tensors of the
   2B/9B fixtures; launcher-vs-CPU parity worst case 6.7e-7 relative across 8
   formats plus AWQ and pre-rotated arms; greedy output byte-identical to the
   parent-commit build for `pcie` with and without a spill (2B 1343 chars, 9B
-  2734 chars), while the `cpu` arm stays coherent and shares a 652 (2B) / 723
-  (9B) character prefix with `pcie` before diverging.
+  2734 chars). The `cpu` arm is *deterministic* (byte-identical across two fresh
+  processes and across `RAYON_NUM_THREADS=1`, so the divergence is not CPU-side
+  scheduling) and its first divergence from `pcie` on the 9B at 8 spilled layers
+  is a **single whitespace token** after 723 characters (≈190 tokens) — a
+  near-tie under greedy decode, after which the histories diverge and so do the
+  completions. Numbers, method, fixture identity, ceilings and the superseded
+  first readings:
+  [`docs/perf-checkpoints/2026-09-27-gfx1201-cpu-exec-offload.md`](../perf-checkpoints/2026-09-27-gfx1201-cpu-exec-offload.md).
 
 ### 6.3 Dispatch substrate (`hipfire-dispatch/.../superop.rs`)
 - The executor binds by index today; add a residency-aware bind step: for each `WeightSlot`, pick
