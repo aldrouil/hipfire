@@ -126,6 +126,13 @@ pub const HIP_MEM_ALLOCATION_GRANULARITY_MINIMUM: u32 = 0;
 pub const HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED: u32 = 1;
 /// Dependency event: omit profiling state and retain the default system fence.
 pub const HIP_EVENT_DISABLE_TIMING: u32 = 0x2;
+
+/// `hipHostMalloc` flag: map the allocation into device address space so device
+/// code can dereference it (the zero-copy / mapped-pinned path). Without it the
+/// pages are pinned but only reachable by the copy engines, which is *not*
+/// enough for offloaded weights — the GEMV/GEMM kernels read them directly.
+pub const HIP_HOST_MALLOC_MAPPED: u32 = 0x2;
+
 /// Request an explicit system-scope release when recording an event.
 pub const HIP_EVENT_RELEASE_TO_SYSTEM: u32 = 0x8000_0000;
 
@@ -208,19 +215,6 @@ impl HipMemAllocationProp {
             },
         }
     }
-    pub fn host_pinned() -> Self {
-        Self {
-            type_: HIP_MEM_ALLOCATION_TYPE_PINNED,
-            requested_handle_types: 0,
-            location: HipMemLocation::host(),
-            win32_handle_meta_data: ptr::null_mut(),
-            alloc_flags: HipMemAllocationFlags {
-                compression_type: 0,
-                gpu_direct_rdma_capable: 0,
-                usage: 0,
-            },
-        }
-    }
 }
 
 #[repr(C)]
@@ -267,6 +261,10 @@ pub struct HipRuntime {
     fn_malloc: unsafe extern "C" fn(*mut *mut c_void, usize) -> u32,
     fn_ext_malloc_with_flags: Option<unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> u32>,
     fn_free: unsafe extern "C" fn(*mut c_void) -> u32,
+    fn_host_malloc: Option<unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> u32>,
+    fn_host_get_device_pointer:
+        Option<unsafe extern "C" fn(*mut *mut c_void, *mut c_void, c_uint) -> u32>,
+    fn_host_free: Option<unsafe extern "C" fn(*mut c_void) -> u32>,
     fn_mem_get_address_range:
         unsafe extern "C" fn(*mut *mut c_void, *mut usize, *mut c_void) -> u32,
     fn_memcpy: unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_uint) -> u32,
@@ -491,6 +489,21 @@ impl HipRuntime {
                     unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> u32
                 ),
                 fn_free: load_fn!(lib, "hipFree", unsafe extern "C" fn(*mut c_void) -> u32),
+                fn_host_malloc: load_optional_fn!(
+                    lib,
+                    "hipHostMalloc",
+                    unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> u32
+                ),
+                fn_host_get_device_pointer: load_optional_fn!(
+                    lib,
+                    "hipHostGetDevicePointer",
+                    unsafe extern "C" fn(*mut *mut c_void, *mut c_void, c_uint) -> u32
+                ),
+                fn_host_free: load_optional_fn!(
+                    lib,
+                    "hipHostFree",
+                    unsafe extern "C" fn(*mut c_void) -> u32
+                ),
                 fn_mem_get_address_range: load_fn!(
                     lib,
                     "hipMemGetAddressRange",
@@ -959,6 +972,39 @@ impl HipRuntime {
         }
         let code = unsafe { (self.fn_free)(buf.ptr) };
         self.check(code, "hipFree")
+    }
+
+    /// Allocate host-pinned memory the GPU can read directly over PCIe.
+    ///
+    /// `flags` are the HIP host-malloc flags; bit 1 (`hipHostMallocMapped`) is
+    /// what makes the pages reachable from device code, and the returned address
+    /// is then the *host* pointer — use [`Self::host_get_device_pointer`] for the
+    /// address to hand a kernel.
+    pub fn host_malloc(&self, size: usize, flags: u32) -> HipResult<*mut c_void> {
+        let func = self.missing_vmm_symbol("hipHostMalloc", self.fn_host_malloc)?;
+        let mut ptr: *mut c_void = ptr::null_mut();
+        let code = unsafe { func(&mut ptr, size, flags) };
+        self.check(code, "hipHostMalloc")?;
+        Ok(ptr)
+    }
+
+    /// Device-visible address of a `hipHostMalloc`'d buffer.
+    pub fn host_get_device_pointer(&self, host: *mut c_void, flags: u32) -> HipResult<*mut c_void> {
+        let func = self.missing_vmm_symbol(
+            "hipHostGetDevicePointer",
+            self.fn_host_get_device_pointer,
+        )?;
+        let mut dev: *mut c_void = ptr::null_mut();
+        let code = unsafe { func(&mut dev, host, flags) };
+        self.check(code, "hipHostGetDevicePointer")?;
+        Ok(dev)
+    }
+
+    /// Release a `hipHostMalloc`'d buffer. # Safety: must not be in use on GPU.
+    pub fn host_free(&self, host: *mut c_void) -> HipResult<()> {
+        let func = self.missing_vmm_symbol("hipHostFree", self.fn_host_free)?;
+        let code = unsafe { func(host) };
+        self.check(code, "hipHostFree")
     }
 
     pub fn mem_get_allocation_granularity(

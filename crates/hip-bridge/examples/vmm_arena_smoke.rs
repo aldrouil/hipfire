@@ -15,7 +15,7 @@
 //!   HIPFIRE_VMM_SMOKE_DEVICE=2 cargo run -p hip-bridge --example vmm_arena_smoke
 //! Optional knobs: HIPFIRE_VMM_ACCESS_DEVICE, HIPFIRE_VMM_FIRST_BYTES, HIPFIRE_VMM_SECOND_BYTES
 
-use hip_bridge::{HipRuntime, MemoryLocality, VmmArena};
+use hip_bridge::{HipRuntime, VmmArena};
 
 const DEFAULT_CHUNK_BYTES: usize = 2 << 20;
 
@@ -44,7 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let access = [access_device];
 
     let hip = HipRuntime::load()?;
-    let mut arena = VmmArena::reserve(&hip, device, first_bytes + second_bytes, MemoryLocality::Device)?;
+    let mut arena = VmmArena::reserve(&hip, device, first_bytes + second_bytes)?;
     println!(
         "reserved={} granularity={} owner={}",
         arena.reserved_bytes(),
@@ -126,7 +126,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("vmm_arena_smoke: OWNER_TEARDOWN PASS");
 
     // --- unload / recreate ---
-    let mut arena2 = VmmArena::reserve(&hip, device, first_bytes, MemoryLocality::Device)?;
+    let mut arena2 = VmmArena::reserve(&hip, device, first_bytes)?;
     arena2.map_next(&hip, first_bytes, &access)?;
     let buf2 = arena2.buffer(first_bytes)?;
     let p2 = pattern(first_bytes, 5, 9);

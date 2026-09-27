@@ -1333,7 +1333,7 @@ pub struct HfqBackend<'a> {
     ///
     /// `proj` needs its own seam: quantized weights upload raw codes through an
     /// arch-supplied fn pointer, and host-locating them requires `&mut Gpu`
-    /// (`Gpu::alloc_vmm_tensor_host` registers the arena in the `Gpu`, so it is
+    /// (`Gpu::alloc_host_mapped_tensor` records the host pointer in the `Gpu`, so it is
     /// not reachable through `read_proj`'s shared `&Gpu`). Hence the twin
     /// `read_proj_host` field below rather than branching here. This flag governs
     /// `norm`/`raw_f32`/`bias`, which run inline and do have `&mut Gpu`.
