@@ -3218,7 +3218,7 @@ impl Gpu {
             .checked_mul(dtype.size())
             .ok_or_else(|| HipError::new(0, "VMM tensor byte size overflowed"))?;
         let mut arena = VmmArena::reserve(&self.hip, self.device_id, byte_size)?;
-        if std::env::var_os("HIPFIRE_OFFLOAD_DEBUG").is_some() {
+        if hipfire_config::developer_var("HIPFIRE_OFFLOAD_DEBUG").is_ok() {
             eprintln!(
                 "[offload-debug] device-vmm base=0x{:x} req={} reserved={} gran={}",
                 arena.base_address(),

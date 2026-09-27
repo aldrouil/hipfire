@@ -1011,7 +1011,7 @@ pub fn load_weight_tensor_host(
             }
         }
         let mut wt = wt.ok_or_else(|| HipError::new(0, &format!("tensor not found: {name}")))?;
-        if std::env::var_os("HIPFIRE_OFFLOAD_DEBUG").is_some() {
+        if hipfire_config::developer_var("HIPFIRE_OFFLOAD_DEBUG").is_ok() {
             let p = wt.buf.buf.as_ptr() as usize;
             eprintln!(
                 "[offload-debug] host tensor '{name}' qt={qt_logged} bytes={} va=0x{p:x}..0x{:x}",

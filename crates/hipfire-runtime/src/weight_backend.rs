@@ -1290,6 +1290,24 @@ fn dequant_bq1_to_f32(data: &[u8], n: usize) -> Vec<f32> {
         gpu.upload_f32(&f32_data[..n], &[n])
     }
 
+/// Public delegation to the canonical per-tensor CPU decoder [`dequantize_to_f32`].
+///
+/// The decoder itself is deliberately private (it is an implementation detail
+/// of the weight-loading path); this wrapper exists for the two places that
+/// need to hold a *second* decoder to the same bytes:
+///
+/// * `crates/hipfire-runtime/tests/cpu_quant_cross_check.rs`, which asserts
+///   `hipfire_cpu::quant::dequant_group` reproduces this arithmetic bit-for-bit
+///   over the real tensors of the on-disk fixtures, and
+/// * whatever generated the literal expectation tables in that crate.
+///
+/// Integrating a second decoder is the real risk in the CPU-offload path, so
+/// the check is a test rather than a comment. See [`dequantize_to_f32`] for the
+/// per-quant byte layouts.
+pub fn dequantize_weight_to_f32(quant_type: u8, data: &[u8], n: usize) -> Vec<f32> {
+    dequantize_to_f32(quant_type, data, n)
+}
+
 // ── WeightBackend trait ─────────────────────────────────────────────────────
 
 use crate::augmentor::{try_augmentors, DEFAULT_AUGMENTORS};

@@ -1303,6 +1303,7 @@ dependencies = [
  "hip-bridge",
  "hipfire-arch-qwen35-vl",
  "hipfire-config",
+ "hipfire-cpu",
  "hipfire-dispatch",
  "hipfire-reap",
  "hipfire-runtime",
@@ -1390,6 +1391,14 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "toml",
+]
+
+[[package]]
+name = "hipfire-cpu"
+version = "0.3.1"
+dependencies = [
+ "half",
+ "rayon",
 ]
 
 [[package]]
@@ -1601,6 +1610,7 @@ dependencies = [
  "hipfire-arch-qwen35-vl",
  "hipfire-atlas",
  "hipfire-config",
+ "hipfire-cpu",
  "hipfire-detect",
  "hipfire-dispatch",
  "hipfire-engine",
