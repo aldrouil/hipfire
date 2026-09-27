@@ -81,12 +81,39 @@ const REAL: &[(&str, u8, DType, CpuQuant)] = &[
 const SYNTH: &[(u8, DType, CpuQuant)] = &[
     (13, DType::MQ4G256, CpuQuant::Mq4G256),
     (44, DType::MQ4G256V2, CpuQuant::Mq4G256V2),
+    (45, DType::MQ4CG256, CpuQuant::Mq4CG256),
     (15, DType::MQ6G256, CpuQuant::Mq6G256),
+    (47, DType::MQ6G256V2, CpuQuant::Mq6G256V2),
+    (31, DType::MQ5G256, CpuQuant::Mq5G256),
+    (48, DType::MQ5G256V2, CpuQuant::Mq5G256V2),
     (17, DType::MQ3G256, CpuQuant::Mq3G256),
+    (49, DType::MQ3G256V2, CpuQuant::Mq3G256V2),
     (20, DType::MQ3G256Lloyd, CpuQuant::Mq3G256Lloyd),
+    (18, DType::MQ2G256, CpuQuant::Mq2G256),
+    (50, DType::MQ2G256V2, CpuQuant::Mq2G256V2),
+    (19, DType::MQ2G256Lloyd, CpuQuant::Mq2G256Lloyd),
+    (51, DType::MQ2G256LloydU, CpuQuant::Mq2G256LloydU),
+    (30, DType::MQ4G256Lloyd, CpuQuant::Mq4G256Lloyd),
     (8, DType::HFQ6G256, CpuQuant::Hfq6G256),
     (6, DType::HFQ4G256, CpuQuant::Hfq4G256),
+    (7, DType::HFQ4G128, CpuQuant::Hfq4G128),
+    (11, DType::HFQ3G256, CpuQuant::Hfq3G256),
+    (12, DType::HFQ3G128, CpuQuant::Hfq3G128),
+    (9, DType::HFQ2G256, CpuQuant::Hfq2G256),
+    (10, DType::HFQ2G128, CpuQuant::Hfq2G128),
+    (40, DType::TQ2G128, CpuQuant::Tq2G128),
+    (41, DType::BQ1G128, CpuQuant::Bq1G128),
     (3, DType::Q8_0, CpuQuant::Q8F16),
+];
+
+/// A real-tensor row for a fixture outside `~/.hipfire/models`, covering formats
+/// no local artifact carries. `HIPFIRE_PARITY_EXTRA_MODEL=<path>` opts in;
+/// `HIPFIRE_PARITY_EXTRA_QT` (default 49) picks the quant type to compare. This
+/// is the oracle of record for a format with no canonical `dequantize_to_f32`
+/// arm — e.g. qt 49, which is what `qwen3.8-27b.mq3-xt` ships.
+const EXTRA: &[(u8, DType, CpuQuant)] = &[
+    (49, DType::MQ3G256V2, CpuQuant::Mq3G256V2),
+    (45, DType::MQ4CG256, CpuQuant::Mq4CG256),
 ];
 
 fn models_dir() -> PathBuf {
@@ -139,11 +166,32 @@ fn synth_weights(q: CpuQuant, m: usize, k: usize) -> Vec<u8> {
                     bytes[..8].copy_from_slice(&f32x2(0.0078125, -0.125))
                 }
                 CpuQuant::Mq3G256 => bytes[..8].copy_from_slice(&f32x2(0.015625, 0.25)),
-                CpuQuant::Mq4G256V2 => bytes[..8].copy_from_slice(&f16s(&[
+                CpuQuant::Mq4G256V2
+                | CpuQuant::Mq3G256V2
+                | CpuQuant::Mq5G256V2
+                | CpuQuant::Mq6G256V2
+                | CpuQuant::Mq2G256V2 => bytes[..8].copy_from_slice(&f16s(&[
                     0x2c00, 0xb400, 0x3800, 0x3a00, // 0.0625, -0.25, 0.5, 0.75
                 ])),
+                CpuQuant::Mq4CG256 => bytes[..4].copy_from_slice(&f16s(&[0x2c00, 0xb400])),
+                CpuQuant::Hfq3G256
+                | CpuQuant::Hfq2G256
+                | CpuQuant::Hfq4G128
+                | CpuQuant::Hfq3G128
+                | CpuQuant::Hfq2G128
+                | CpuQuant::Mq2G256
+                | CpuQuant::Mq5G256 => bytes[..8].copy_from_slice(&f32x2(0.03125, -0.5)),
+                CpuQuant::Tq2G128 | CpuQuant::Bq1G128 => {
+                    bytes[..2].copy_from_slice(&0x3800u16.to_le_bytes())
+                }
+                CpuQuant::Mq2G256Lloyd | CpuQuant::Mq2G256LloydU => bytes[..8]
+                    .copy_from_slice(&f16s(&[0xbc00, 0xb400, 0x3400, 0x3c00])),
                 CpuQuant::Mq3G256Lloyd => bytes[..16].copy_from_slice(&f16s(&[
                     0xbc00, 0xb800, 0xb400, 0xb000, 0x3000, 0x3400, 0x3800, 0x3c00,
+                ])),
+                CpuQuant::Mq4G256Lloyd => bytes[..32].copy_from_slice(&f16s(&[
+                    0xbc00, 0xb800, 0xb400, 0xb000, 0x3000, 0x3400, 0x3800, 0x3c00, 0xbc00, 0xb800,
+                    0xb400, 0xb000, 0x3000, 0x3400, 0x3800, 0x3c00,
                 ])),
                 CpuQuant::Q8F16 => bytes[..2].copy_from_slice(&0x3800u16.to_le_bytes()),
                 // The element formats are covered bit-exactly by the fixture
@@ -175,7 +223,7 @@ fn compare(
     k: usize,
     awq: Option<&GpuTensor>,
     worst: &mut BTreeMap<&'static str, Parity>,
-) {
+) -> bool {
     let w = gpu.upload_raw(bytes, &[bytes.len()]).expect("upload w");
     let x_host = activation(k, m);
     let x_dev = gpu.upload_f32(&x_host, &[k]).expect("upload x");
@@ -190,8 +238,24 @@ fn compare(
         rotation: None,
         awq_scale: awq,
     };
-    gemv.run_auto(&ctx, gpu, &wr, &x_dev, &y_dev)
-        .unwrap_or_else(|e| panic!("{label}: launcher failed: {e:?}"));
+    match gemv.run_auto(&ctx, gpu, &wr, &x_dev, &y_dev) {
+        Ok(()) => {}
+        Err(hipfire_dispatch::types::DispatchError::MissingImpl { key }) => {
+            // The *production launcher* has no dense GEMV for this dtype on this
+            // arch (e.g. `GemvHfq3G256` on gfx12): the format cannot appear as a
+            // `Step::Gemv` weight here, so there is nothing to compare against.
+            // Its decode is still pinned by `hipfire-cpu`'s expectation table
+            // where a canonical arm exists. Reported, never silently skipped.
+            eprintln!(
+                "{label:58} SKIP — production launcher has no kernel ({key:?}) on this arch"
+            );
+            gpu.free_tensor(w).ok();
+            gpu.free_tensor(x_dev).ok();
+            gpu.free_tensor(y_dev).ok();
+            return false;
+        }
+        Err(e) => panic!("{label}: launcher failed: {e:?}"),
+    }
     gpu.hip.device_synchronize().expect("sync");
     let mut gpu_y = vec![0.0f32; m];
     let gpu_y_bytes =
@@ -240,6 +304,7 @@ fn compare(
     gpu.free_tensor(w).ok();
     gpu.free_tensor(x_dev).ok();
     gpu.free_tensor(y_dev).ok();
+    true
 }
 
 /// The `Prerotated` arm: the launcher's per-row kernels take an activation that
@@ -372,6 +437,7 @@ fn gpu_cpu_gemv_parity_per_format() {
     let gemv = GemvFamily::new();
     let mut worst: BTreeMap<&'static str, Parity> = BTreeMap::new();
     let mut synthetic_formats = 0usize;
+    let mut ineligible: Vec<CpuQuant> = Vec::new();
 
     for (file, qt, dtype, q) in REAL {
         let path = dir.join(file);
@@ -428,8 +494,49 @@ fn gpu_cpu_gemv_parity_per_format() {
         let (m, k) = (64usize, 1024usize);
         let bytes = synth_weights(*q, m, k);
         let label = format!("synthetic qt={qt} {q:?}");
-        compare(&mut gpu, &gemv, &label, *q, *dtype, &bytes, m, k, None, &mut worst);
-        synthetic_formats += 1;
+        if compare(&mut gpu, &gemv, &label, *q, *dtype, &bytes, m, k, None, &mut worst) {
+            synthetic_formats += 1;
+        } else {
+            ineligible.push(*q);
+        }
+    }
+
+    // Opt-in real-tensor rows for formats no local artifact carries.
+    if let Some(path) = std::env::var_os("HIPFIRE_PARITY_EXTRA_MODEL") {
+        let hfq = HfqFile::open(std::path::Path::new(&path)).expect("open extra fixture");
+        let want: u8 = std::env::var("HIPFIRE_PARITY_EXTRA_QT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(49);
+        for (qt, dtype, q) in EXTRA {
+            if *qt != want {
+                continue;
+            }
+            let mut candidates: Vec<(usize, usize, String)> = hfq
+                .tensors()
+                .iter()
+                .filter(|i| {
+                    i.quant_type == *qt
+                        && i.shape.len() == 2
+                        && !i.name.contains("embed_tokens")
+                        && {
+                            let (m, k) = (i.shape[0] as usize, i.shape[1] as usize);
+                            k % 256 == 0 && m * k <= MAX_ELEMS
+                        }
+                })
+                .map(|i| (i.shape[0] as usize, i.shape[1] as usize, i.name.clone()))
+                .collect();
+            candidates.sort_by_key(|(m, k, _)| std::cmp::Reverse(m * k));
+            for (m, k, name) in candidates.into_iter().take(PER_FORMAT) {
+                let (_, bytes) = hfq.tensor_data_vec(&name).expect("extra tensor bytes");
+                let label = format!(
+                    "{} qt={qt} {}",
+                    path.to_string_lossy().rsplit('/').next().unwrap_or("extra"),
+                    name.rsplit('.').nth(1).unwrap_or(&name)
+                );
+                compare(&mut gpu, &gemv, &label, *q, *dtype, &bytes, m, k, None, &mut worst);
+            }
+        }
     }
 
     eprintln!("\nper-format worst case (max_abs, relative):");
@@ -437,9 +544,23 @@ fn gpu_cpu_gemv_parity_per_format() {
         eprintln!("  {fmt:<14} {:.3e}  {:.3e}", p.max_abs, p.rel);
     }
     assert_eq!(
-        synthetic_formats,
+        synthetic_formats + ineligible.len(),
         SYNTH.len(),
-        "every synthetic format must run"
+        "every synthetic format must either compare or be reported arch-ineligible"
+    );
+    if !ineligible.is_empty() {
+        eprintln!(
+            "arch-ineligible on {} (no production dense GEMV kernel; canonical-table oracle only): {ineligible:?}",
+            gpu.arch
+        );
+    }
+    // A format with no canonical decoder has no other oracle: state which ones
+    // were only checked synthetically, so the record is not read as if every row
+    // came from a real tensor.
+    eprintln!(
+        "\nnote: qt 45/47/48/49/50/9/10/31 have no canonical `dequantize_to_f32` arm; \
+         their rows are the production launcher vs the transcription (synthetic buffers, \
+         or a real tensor via HIPFIRE_PARITY_EXTRA_MODEL)."
     );
 }
 
@@ -450,8 +571,25 @@ fn q_format_name(q: CpuQuant) -> &'static str {
         CpuQuant::Mq6G256 => "Mq6G256",
         CpuQuant::Mq3G256 => "Mq3G256",
         CpuQuant::Mq3G256Lloyd => "Mq3G256Lloyd",
+        CpuQuant::Mq3G256V2 => "Mq3G256V2",
+        CpuQuant::Mq2G256 => "Mq2G256",
+        CpuQuant::Mq2G256V2 => "Mq2G256V2",
+        CpuQuant::Mq2G256Lloyd => "Mq2G256Lloyd",
+        CpuQuant::Mq2G256LloydU => "Mq2G256LloydU",
+        CpuQuant::Mq4G256Lloyd => "Mq4G256Lloyd",
+        CpuQuant::Mq4CG256 => "Mq4CG256",
+        CpuQuant::Mq5G256 => "Mq5G256",
+        CpuQuant::Mq5G256V2 => "Mq5G256V2",
+        CpuQuant::Mq6G256V2 => "Mq6G256V2",
         CpuQuant::Hfq6G256 => "Hfq6G256",
         CpuQuant::Hfq4G256 => "Hfq4G256",
+        CpuQuant::Hfq4G128 => "Hfq4G128",
+        CpuQuant::Hfq3G256 => "Hfq3G256",
+        CpuQuant::Hfq3G128 => "Hfq3G128",
+        CpuQuant::Hfq2G256 => "Hfq2G256",
+        CpuQuant::Hfq2G128 => "Hfq2G128",
+        CpuQuant::Tq2G128 => "Tq2G128",
+        CpuQuant::Bq1G128 => "Bq1G128",
         CpuQuant::F16 => "F16",
         CpuQuant::F32 => "F32",
         CpuQuant::Bf16 => "Bf16",

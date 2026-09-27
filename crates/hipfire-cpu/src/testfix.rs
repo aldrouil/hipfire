@@ -69,7 +69,43 @@ pub fn group_bytes(q: CpuQuant, salt: usize) -> Vec<u8> {
             }
             bytes[..16].copy_from_slice(&cb);
         }
-        CpuQuant::Mq4G256V2 => bytes[..8].copy_from_slice(&f16x4(F16_QUAD)),
+        CpuQuant::Mq4G256V2
+        | CpuQuant::Mq3G256V2
+        | CpuQuant::Mq5G256V2
+        | CpuQuant::Mq6G256V2
+        | CpuQuant::Mq2G256V2 => bytes[..8].copy_from_slice(&f16x4(F16_QUAD)),
+        CpuQuant::Mq4CG256 => {
+            // fp16 [scale][zero] + 4 B padding.
+            bytes[..4].copy_from_slice(&f16x4(F16_QUAD)[..4]);
+        }
+        CpuQuant::Hfq3G256
+        | CpuQuant::Hfq2G256
+        | CpuQuant::Hfq4G128
+        | CpuQuant::Hfq3G128
+        | CpuQuant::Hfq2G128
+        | CpuQuant::Mq2G256
+        | CpuQuant::Mq5G256 => bytes[..8].copy_from_slice(&f32x2(0.03125, -0.5)),
+        CpuQuant::Tq2G128 | CpuQuant::Bq1G128 => {
+            // fp16 `d`, then the packed codes.
+            bytes[..2].copy_from_slice(&0x3800u16.to_le_bytes());
+        }
+        CpuQuant::Mq2G256Lloyd | CpuQuant::Mq2G256LloydU => {
+            // 4-entry fp16 codebook: -1, -0.25, 0.25, 1.
+            bytes[..8].copy_from_slice(&f16x4([0xbc00, 0xb400, 0x3400, 0x3c00]));
+        }
+        CpuQuant::Mq4G256Lloyd => {
+            // 16-entry fp16 codebook: -1 .. 1 in 0.125 steps is overkill; use
+            // eight values duplicated so the index still varies.
+            let cb = [
+                0xbc00u16, 0xb800, 0xb400, 0xb000, 0x3000, 0x3400, 0x3800, 0x3c00, 0xbc00, 0xb800,
+                0xb400, 0xb000, 0x3000, 0x3400, 0x3800, 0x3c00,
+            ];
+            let mut hdr = [0u8; 32];
+            for (k, b) in cb.iter().enumerate() {
+                hdr[2 * k..2 * k + 2].copy_from_slice(&b.to_le_bytes());
+            }
+            bytes[..32].copy_from_slice(&hdr);
+        }
         CpuQuant::Q8F16 => bytes[..2].copy_from_slice(&0x3800u16.to_le_bytes()),
         CpuQuant::F16 => {
             for (j, b) in bytes.chunks_mut(2).enumerate() {

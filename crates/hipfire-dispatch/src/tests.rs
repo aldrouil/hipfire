@@ -2535,11 +2535,28 @@ fn cpu_quant_rotation_agrees_with_plan() {
     for dtype in [
         DType::MQ4G256,
         DType::MQ4G256V2,
+        DType::MQ4CG256,
         DType::MQ6G256,
+        DType::MQ6G256V2,
+        DType::MQ5G256,
+        DType::MQ5G256V2,
         DType::MQ3G256,
+        DType::MQ3G256V2,
         DType::MQ3G256Lloyd,
+        DType::MQ2G256,
+        DType::MQ2G256V2,
+        DType::MQ2G256Lloyd,
+        DType::MQ2G256LloydU,
+        DType::MQ4G256Lloyd,
         DType::HFQ6G256,
         DType::HFQ4G256,
+        DType::HFQ4G128,
+        DType::HFQ3G256,
+        DType::HFQ3G128,
+        DType::HFQ2G256,
+        DType::HFQ2G128,
+        DType::TQ2G128,
+        DType::BQ1G128,
         DType::Q8_0,
         DType::F16,
         DType::F32,
@@ -2563,21 +2580,17 @@ fn cpu_quant_rotation_agrees_with_plan() {
 #[test]
 fn cpu_quant_refuses_unimplemented_formats() {
     for dtype in [
-        DType::MQ4CG256,
-        DType::MQ4G256Lloyd,
-        DType::MQ2G256Lloyd,
-        DType::MQ2G256LloydU,
-        DType::MQ3G256V2,
-        DType::MQ4G128,
-        DType::MQ8G256,
+        DType::MQ8G256,     // RotationPlan::Mq8Internal: int8 activation, not FWHT-f32
+        DType::MQ4G128,     // RotationPlan::FwhtG128: a different transform
+        DType::HFP4G32,     // per-row 16 B header + per-32 block scales
         DType::MFP4G32,
-        DType::ParoQ4G128,
-        DType::Q4K,
-        DType::HFQ3G256,
-        DType::HFQ2G256,
-        DType::TQ2G128,
-        DType::BQ1G128,
-        DType::Q8HFQ,
+        DType::MFP4G32Lloyd,
+        DType::MFP4G32P,
+        DType::MFP4G32E8,
+        DType::MFP4G32E8SOA,
+        DType::ParoQ4G128,  // Givens rotation on the activation
+        DType::Q4K,         // no dense HFQ artifact uses it
+        DType::Q8HFQ,       // padded rows (row_stride), not expressible in the group model
         DType::Raw,
     ] {
         assert!(

@@ -64,6 +64,45 @@ pub enum CpuQuant {
     Mq3G256Lloyd,
     /// qt 8 — HFQ6-G256, no rotation, 200 B / 256.
     Hfq6G256,
+    /// qt 11 — HFQ3-G256, no rotation, 104 B / 256.
+    Hfq3G256,
+    /// qt 9 — HFQ2-G256, no rotation, 72 B / 256.
+    Hfq2G256,
+    /// qt 7 — HFQ4-G128, no rotation, 72 B / 128.
+    Hfq4G128,
+    /// qt 12 — HFQ3-G128, no rotation, 56 B / 128.
+    Hfq3G128,
+    /// qt 10 — HFQ2-G128, no rotation, 40 B / 128.
+    Hfq2G128,
+    /// qt 31 — FWHT-rotated 5-bit HFQ-G256 (f32 header), 168 B / 256.
+    Mq5G256,
+    /// qt 18 — FWHT-rotated HFQ2-G256, 72 B / 256.
+    Mq2G256,
+    /// qt 19 — FWHT-rotated 2-bit with a per-group 4-entry fp16 Lloyd codebook,
+    /// 72 B / 256.
+    Mq2G256Lloyd,
+    /// qt 51 — the *unrotated* sibling of qt 19 (byte-identical layout). Carries
+    /// native-ternary checkpoints losslessly, so it must never be rotated.
+    Mq2G256LloydU,
+    /// qt 30 — FWHT-rotated 4-bit with a per-group 16-entry fp16 Lloyd codebook,
+    /// 160 B / 256.
+    Mq4G256Lloyd,
+    /// qt 45 — FWHT-rotated HFQ4-G256 with an fp16 `[scale][zero]` header, 136 B / 256.
+    Mq4CG256,
+    /// qt 47 — FWHT-rotated 6-bit, per-128 fp16 scale/zero, 200 B / 256.
+    Mq6G256V2,
+    /// qt 48 — FWHT-rotated 5-bit, per-128 fp16 scale/zero, 168 B / 256.
+    Mq5G256V2,
+    /// qt 49 — FWHT-rotated 3-bit, per-128 fp16 scale/zero, 104 B / 256.
+    Mq3G256V2,
+    /// qt 50 — FWHT-rotated 2-bit, per-128 fp16 scale/zero, 72 B / 256.
+    Mq2G256V2,
+    /// qt 40 — TQ2G128 ternary: fp16 `d` + 32 B of 2-bit codes, `(code-1)*d`,
+    /// no rotation, 34 B / 128.
+    Tq2G128,
+    /// qt 41 — BQ1G128 binary: fp16 `d` + 16 B of sign bits, `±d`, no rotation,
+    /// 18 B / 128.
+    Bq1G128,
     /// qt 6 — HFQ4-G256, no rotation, 136 B / 256.
     Hfq4G256,
     /// qt 1 — f16, 2 B / element.
@@ -86,12 +125,30 @@ impl CpuQuant {
             2 => Some(Self::F32),
             3 => Some(Self::Q8F16),
             6 => Some(Self::Hfq4G256),
+            7 => Some(Self::Hfq4G128),
             8 => Some(Self::Hfq6G256),
+            9 => Some(Self::Hfq2G256),
+            10 => Some(Self::Hfq2G128),
+            11 => Some(Self::Hfq3G256),
+            12 => Some(Self::Hfq3G128),
+            16 => Some(Self::Bf16),
+            18 => Some(Self::Mq2G256),
+            19 => Some(Self::Mq2G256Lloyd),
+            30 => Some(Self::Mq4G256Lloyd),
+            31 => Some(Self::Mq5G256),
+            40 => Some(Self::Tq2G128),
+            41 => Some(Self::Bq1G128),
+            45 => Some(Self::Mq4CG256),
+            47 => Some(Self::Mq6G256V2),
+            48 => Some(Self::Mq5G256V2),
+            49 => Some(Self::Mq3G256V2),
+            50 => Some(Self::Mq2G256V2),
+            51 => Some(Self::Mq2G256LloydU),
             13 => Some(Self::Mq4G256),
             15 => Some(Self::Mq6G256),
             17 => Some(Self::Mq3G256),
             20 => Some(Self::Mq3G256Lloyd),
-            44 => Some(Self::Mq4G256V2),
+            44 => Some(Self::Mq4G256V2), // central entries above; see FORMATS in tests
             _ => None,
         }
     }
@@ -100,6 +157,9 @@ impl CpuQuant {
     pub fn group_elems(self) -> usize {
         match self {
             Self::Q8F16 => 32,
+            // The three G128 formats: TQ2/BQ1 are flat element formats with a
+            // 128-element block, and the HFQ G128 pair packs 128 weights.
+            Self::Hfq4G128 | Self::Hfq3G128 | Self::Hfq2G128 | Self::Tq2G128 | Self::Bq1G128 => 128,
             _ => 256,
         }
     }
@@ -107,10 +167,19 @@ impl CpuQuant {
     /// Bytes per group, including any per-group header.
     pub fn group_bytes(self) -> usize {
         match self {
-            Self::Mq4G256 | Self::Mq4G256V2 | Self::Hfq4G256 => 136,
-            Self::Mq6G256 | Self::Hfq6G256 => 200,
-            Self::Mq3G256 => 104,
+            Self::Mq4G256 | Self::Mq4G256V2 | Self::Hfq4G256 | Self::Mq4CG256 => 136,
+            Self::Mq6G256 | Self::Hfq6G256 | Self::Mq6G256V2 => 200,
+            Self::Mq5G256 | Self::Mq5G256V2 => 168,
+            Self::Mq3G256 | Self::Mq3G256V2 | Self::Hfq3G256 => 104,
             Self::Mq3G256Lloyd => 112,
+            Self::Mq2G256 | Self::Hfq2G256 | Self::Mq2G256Lloyd | Self::Mq2G256LloydU
+            | Self::Mq2G256V2 => 72,
+            Self::Mq4G256Lloyd => 160,
+            Self::Hfq4G128 => 72,
+            Self::Hfq3G128 => 56,
+            Self::Hfq2G128 => 40,
+            Self::Tq2G128 => 34,
+            Self::Bq1G128 => 18,
             Self::Q8F16 => 34,
             Self::F16 | Self::Bf16 => 512,
             Self::F32 => 1024,
@@ -126,8 +195,26 @@ impl CpuQuant {
     pub fn is_fwht_g256(self) -> bool {
         matches!(
             self,
-            Self::Mq4G256 | Self::Mq4G256V2 | Self::Mq6G256 | Self::Mq3G256 | Self::Mq3G256Lloyd
+            Self::Mq4G256
+                | Self::Mq4G256V2
+                | Self::Mq4CG256
+                | Self::Mq6G256
+                | Self::Mq6G256V2
+                | Self::Mq5G256
+                | Self::Mq5G256V2
+                | Self::Mq3G256
+                | Self::Mq3G256V2
+                | Self::Mq3G256Lloyd
+                | Self::Mq2G256
+                | Self::Mq2G256V2
+                | Self::Mq2G256Lloyd
+                | Self::Mq4G256Lloyd
         )
+        // NOT here, deliberately: `Mq2G256LloydU` (unrotated sibling — rotating
+        // it would destroy the native-ternary structure it exists to preserve),
+        // the HFQ/TQ2/BQ1 formats (encoded in the natural basis), and MQ8 (whose
+        // activation contract is `RotationPlan::Mq8Internal`, an int8-quantized
+        // variant this crate does not implement — see the coverage note).
     }
 }
 
@@ -252,6 +339,96 @@ pub fn divide_by_awq_scale(x: &mut [f32], scale: &[f32]) {
     for (v, s) in x.iter_mut().zip(scale) {
         *v /= *s;
     }
+}
+
+/// `(scale, zero)` from an f32 header (flat HFQ/MQ families, 8 B).
+#[inline]
+fn f32_hdr(packed: &[u8], off: usize) -> (f32, f32) {
+    (f32_at(packed, off), f32_at(packed, off + 4))
+}
+
+/// `(scale, zero)` for the i-th element of a V2 group: `[s0 z0 s1 z1]` as fp16,
+/// with half 0 covering elements `0..128` and half 1 `128..256` (the kernels
+/// select the half by thread id, i.e. by element index).
+#[inline]
+fn v2_hdr(packed: &[u8], off: usize, i: usize) -> (f32, f32) {
+    let h = 4 * (i / 128);
+    (f16_at(packed, off + h), f16_at(packed, off + h + 2))
+}
+
+/// 2-bit codes, LSB-first, 4 per byte.
+#[inline]
+fn code2(packed: &[u8], off: usize, i: usize) -> f32 {
+    ((packed[off + i / 4] >> (2 * (i % 4))) & 0x3) as f32
+}
+
+/// 3-bit codes, 8 per 3 bytes, the same cross-byte packing as HFQ3/MQ3-G256
+/// (written out here so a V2 group can use it without a second scratch pass).
+#[inline]
+fn code3(packed: &[u8], off: usize, chunk: usize) -> [u32; 8] {
+    let bo = off + chunk * 3;
+    let b0 = packed[bo] as u32;
+    let b1 = packed[bo + 1] as u32;
+    let b2 = packed[bo + 2] as u32;
+    [
+        b0 & 7,
+        (b0 >> 3) & 7,
+        ((b0 >> 6) | (b1 << 2)) & 7,
+        (b1 >> 1) & 7,
+        (b1 >> 4) & 7,
+        ((b1 >> 7) | (b2 << 1)) & 7,
+        (b2 >> 2) & 7,
+        (b2 >> 5) & 7,
+    ]
+}
+
+/// 4-bit codes, 2 per byte, low nibble first.
+#[inline]
+fn code4(packed: &[u8], off: usize, i: usize) -> f32 {
+    let b = packed[off + i / 2];
+    (if i % 2 == 0 { b & 0xF } else { b >> 4 }) as f32
+}
+
+/// 5-bit codes, 8 per 5 bytes — the packing the `gemv_mq*g256v2` kernels use
+/// (`DOG5` / `TAIL_DOG5`): the 40 bits run low-to-high across the five bytes.
+#[inline]
+fn code5(packed: &[u8], off: usize, i: usize) -> f32 {
+    let bo = off + (i / 8) * 5;
+    let b = &packed[bo..bo + 5];
+    let (b0, b1, b2, b3, b4) = (
+        b[0] as u32,
+        b[1] as u32,
+        b[2] as u32,
+        b[3] as u32,
+        b[4] as u32,
+    );
+    let codes = [
+        b0 & 0x1f,
+        ((b0 >> 5) & 0x07) | ((b1 & 0x03) << 3),
+        (b1 >> 2) & 0x1f,
+        ((b1 >> 7) & 0x01) | ((b2 & 0x0f) << 1),
+        ((b2 >> 4) & 0x0f) | ((b3 & 0x01) << 4),
+        (b3 >> 1) & 0x1f,
+        ((b3 >> 6) & 0x03) | ((b4 & 0x07) << 2),
+        (b4 >> 3) & 0x1f,
+    ];
+    codes[i % 8] as f32
+}
+
+/// 6-bit codes, 4 per 3 bytes (the packing HFQ6/MQ6-G256 use).
+#[inline]
+fn code6(packed: &[u8], off: usize, i: usize) -> f32 {
+    let bo = off + (i / 4) * 3;
+    let b0 = packed[bo] as u32;
+    let b1 = packed[bo + 1] as u32;
+    let b2 = packed[bo + 2] as u32;
+    let codes = [
+        b0 & 0x3F,
+        ((b0 >> 6) | (b1 << 2)) & 0x3F,
+        ((b1 >> 4) | (b2 << 4)) & 0x3F,
+        (b2 >> 2) & 0x3F,
+    ];
+    codes[i % 4] as f32
 }
 
 #[inline]
@@ -385,6 +562,113 @@ pub fn decode_group_codes(q: CpuQuant, packed: &[u8], out: &mut [f32]) {
                 }
             }
         }
+        CpuQuant::Hfq3G256 => {
+            // qt 11: f32 header + 96 B of 3-bit codes, natural basis.
+            let (scale, zero) = f32_hdr(packed, 0);
+            for chunk in 0..32 {
+                for (k, code) in code3(packed, 8, chunk).iter().enumerate() {
+                    out[chunk * 8 + k] = scale * *code as f32 + zero;
+                }
+            }
+        }
+        CpuQuant::Hfq2G256 | CpuQuant::Mq2G256 | CpuQuant::Mq2G256V2 => {
+            // qt 9 flat and qt 18 / qt 50 FWHT-rotated: 2-bit codes, 4 per byte.
+            for (i, o) in out[..ge].iter_mut().enumerate() {
+                let (scale, zero) = match q {
+                    CpuQuant::Mq2G256V2 => v2_hdr(packed, 0, i),
+                    _ => f32_hdr(packed, 0),
+                };
+                *o = scale * code2(packed, 8, i) + zero;
+            }
+        }
+        CpuQuant::Hfq4G128 => {
+            let (scale, zero) = f32_hdr(packed, 0);
+            for (i, o) in out[..ge].iter_mut().enumerate() {
+                *o = scale * code4(packed, 8, i) + zero;
+            }
+        }
+        CpuQuant::Hfq3G128 => {
+            let (scale, zero) = f32_hdr(packed, 0);
+            for chunk in 0..16 {
+                for (k, code) in code3(packed, 8, chunk).iter().enumerate() {
+                    out[chunk * 8 + k] = scale * *code as f32 + zero;
+                }
+            }
+        }
+        CpuQuant::Hfq2G128 => {
+            let (scale, zero) = f32_hdr(packed, 0);
+            for (i, o) in out[..ge].iter_mut().enumerate() {
+                *o = scale * code2(packed, 8, i) + zero;
+            }
+        }
+        CpuQuant::Tq2G128 => {
+            // fp16 `d` + 32 B of 2-bit codes; `(code - 1) * d` (ternary).
+            let d = f16_at(packed, 0);
+            for (i, o) in out[..ge].iter_mut().enumerate() {
+                *o = (code2(packed, 2, i) - 1.0) * d;
+            }
+        }
+        CpuQuant::Bq1G128 => {
+            // fp16 `d` + 16 B of sign bits, LSB-first; `bit ? +d : -d`.
+            let d = f16_at(packed, 0);
+            for (i, o) in out[..ge].iter_mut().enumerate() {
+                let bit = (packed[2 + i / 8] >> (i % 8)) & 1;
+                *o = if bit == 1 { d } else { -d };
+            }
+        }
+        CpuQuant::Mq5G256 | CpuQuant::Mq5G256V2 => {
+            // 5-bit codes, 8 per 5 bytes; f32 header (flat) or fp16 halves (V2).
+            for (i, o) in out[..ge].iter_mut().enumerate() {
+                let (scale, zero) = match q {
+                    CpuQuant::Mq5G256V2 => v2_hdr(packed, 0, i),
+                    _ => f32_hdr(packed, 0),
+                };
+                *o = scale * code5(packed, 8, i) + zero;
+            }
+        }
+        CpuQuant::Mq6G256V2 => {
+            for (i, o) in out[..ge].iter_mut().enumerate() {
+                let (scale, zero) = v2_hdr(packed, 0, i);
+                *o = scale * code6(packed, 8, i) + zero;
+            }
+        }
+        CpuQuant::Mq4CG256 => {
+            // fp16 `[scale][zero]`, 4 B of padding, then 128 B of nibbles.
+            let scale = f16_at(packed, 0);
+            let zero = f16_at(packed, 2);
+            for (i, o) in out[..ge].iter_mut().enumerate() {
+                *o = scale * code4(packed, 8, i) + zero;
+            }
+        }
+        CpuQuant::Mq3G256V2 => {
+            for chunk in 0..32 {
+                for (k, code) in code3(packed, 8, chunk).iter().enumerate() {
+                    let i = chunk * 8 + k;
+                    let (scale, zero) = v2_hdr(packed, 0, i);
+                    out[i] = scale * *code as f32 + zero;
+                }
+            }
+        }
+        CpuQuant::Mq2G256Lloyd | CpuQuant::Mq2G256LloydU => {
+            // 4-entry fp16 codebook + 64 B of 2-bit indices.
+            let mut cb = [0.0f32; 4];
+            for (k, c) in cb.iter_mut().enumerate() {
+                *c = f16_at(packed, 2 * k);
+            }
+            for (i, o) in out[..ge].iter_mut().enumerate() {
+                *o = cb[code2(packed, 8, i) as usize];
+            }
+        }
+        CpuQuant::Mq4G256Lloyd => {
+            // 16-entry fp16 codebook + 128 B of nibbles.
+            let mut cb = [0.0f32; 16];
+            for (k, c) in cb.iter_mut().enumerate() {
+                *c = f16_at(packed, 2 * k);
+            }
+            for (i, o) in out[..ge].iter_mut().enumerate() {
+                *o = cb[code4(packed, 32, i) as usize];
+            }
+        }
         CpuQuant::Mq3G256Lloyd => {
             // 16 B codebook (8 × fp16, ascending at quant time) then 96 B of
             // 3-bit indices in the same cross-byte packing as Mq3G256.
@@ -454,12 +738,14 @@ mod test {
     ];
 
     // ── expectation tables, generated from the canonical decoder ────────────
-    // Recipe (reproduce with a throwaway example in `hipfire-runtime`):
-    // for each format, run
+    // Recipe (a throwaway example in `hipfire-runtime`, deleted after use): for
+    // each format, run
     // `weight_backend::dequantize_weight_to_f32(qt, &testfix::group_bytes(q, 0), q.group_elems())`
     // and print `v.to_bits()` as `0x%08x`. Bit patterns rather than decimal
     // literals, so the comparison is exact and immune to float-literal
-    // round-tripping; the generator is deleted, the fixture is not.
+    // round-tripping. Only formats with a canonical `dequantize_to_f32` arm have a
+    // table: qt 45 / 47 / 48 / 49 / 50 and qt 9 / 10 / 31 have no arm there, so
+    // their oracle is the GPU launcher (`gpu_gemv_parity`), not this table.
     /// qt 13, 136 B / 256 elems.
     const EXPECTED_MQ4G256: [u32; 256] = [
         0x3df00000, 0x3e200000, 0xbd800000, 0xbe280000, 0xbe840000, 0xbed00000, 0xbd400000, 0x3eb40000,
@@ -635,7 +921,111 @@ mod test {
         0xbef80000, 0x3f300000, 0x3dc00000, 0x3e700000, 0x3d800000, 0x3e880000, 0xbd400000, 0xbdc00000,
         0xbe000000, 0x3d400000, 0x3ed80000, 0xbe600000, 0xbec80000, 0xbe400000, 0xbe200000, 0x3e300000,
     ];
-
+    /// qt 30, 160 B / 256 elems.
+    const EXPECTED_MQ4G256LLOYD: [u32; 256] = [
+        0x3f300000, 0xbe800000, 0xbf080000, 0xbed00000, 0x3e200000, 0x3dc00000, 0xbfa00000, 0x3ee00000,
+        0x3f480000, 0x3ed00000, 0x3e000000, 0x3f100000, 0xbea00000, 0xbf600000, 0xbf180000, 0xbf280000,
+        0xbd000000, 0x3f780000, 0xbf400000, 0x3d800000, 0x3d800000, 0xbec00000, 0xbeb00000, 0x3fa40000,
+        0xbf000000, 0xbea00000, 0x3e600000, 0xbf940000, 0x3dc00000, 0x3f8c0000, 0xbd800000, 0x3f200000,
+        0x3e400000, 0x3e800000, 0x3e900000, 0x3eb00000, 0x3ef00000, 0x3f080000, 0xbf200000, 0x3ee00000,
+        0xbf280000, 0x3e600000, 0x3ec00000, 0x3ea00000, 0xbee00000, 0x00000000, 0xbe200000, 0xbf580000,
+        0x3e200000, 0xbe600000, 0x3e000000, 0xbe400000, 0xbea00000, 0xbf400000, 0x3eb00000, 0x3eb00000,
+        0x3ec00000, 0xbe400000, 0xbe900000, 0xbe900000, 0x3ef00000, 0xbfb40000, 0xbf500000, 0x3f000000,
+        0xbe880000, 0xbf0c0000, 0x3e880000, 0xbe980000, 0x3e700000, 0x3e500000, 0xbe700000, 0x3e980000,
+        0xbe300000, 0x3e880000, 0xbea80000, 0x3c800000, 0xbea80000, 0xbef80000, 0xbea80000, 0x3c800000,
+        0xbe880000, 0xbee80000, 0xbe100000, 0xbe300000, 0x3ec80000, 0x3f540000, 0x3f040000, 0xbf4c0000,
+        0xbc800000, 0x3d400000, 0xbef80000, 0xbd400000, 0x3fe20000, 0x3ee80000, 0xbef80000, 0xbf0c0000,
+        0xbf540000, 0xbf240000, 0xbfb20000, 0xbf4c0000, 0x3e700000, 0x3faa0000, 0xbfca0000, 0xbf8e0000,
+        0x3ee80000, 0xbf9e0000, 0xbc800000, 0xbea80000, 0x3f820000, 0xbfb60000, 0xbed80000, 0xbf640000,
+        0xbc800000, 0xbf340000, 0x3e980000, 0x3f640000, 0xbf4c0000, 0x3f920000, 0xbeb80000, 0x3faa0000,
+        0xbfa60000, 0x3de00000, 0xbfbe0000, 0x3e500000, 0xbec80000, 0x3faa0000, 0x3d400000, 0x3f240000,
+        0xbeb80000, 0x3eb80000, 0xbe700000, 0x3eb80000, 0x3e300000, 0xbea80000, 0x3e500000, 0x3f140000,
+        0xbec80000, 0x3f920000, 0x3f340000, 0x3f140000, 0xbee80000, 0x3f340000, 0x3ec80000, 0x3e700000,
+        0xbe300000, 0xbf8a0000, 0xbf040000, 0x3e100000, 0xbd400000, 0x3e980000, 0xbf040000, 0xbf240000,
+        0x3de00000, 0x3ec80000, 0x3e880000, 0x3f1c0000, 0x3e100000, 0xbe100000, 0x3c800000, 0xbf240000,
+        0xbeb80000, 0xbc800000, 0x3d400000, 0x3e980000, 0x3f640000, 0xbc800000, 0xbd400000, 0x3d400000,
+        0x3f0c0000, 0xbe300000, 0x3f540000, 0x3e300000, 0xbf140000, 0x3e500000, 0x3ed80000, 0x3ea80000,
+        0x3e880000, 0x3e700000, 0x3e700000, 0x3f1c0000, 0x3e500000, 0xbe500000, 0x3ed80000, 0x3e980000,
+        0x3e700000, 0x3c800000, 0x3ea80000, 0x3ee80000, 0x3da00000, 0xbe300000, 0x3de00000, 0x3ef80000,
+        0xbd800000, 0xbd800000, 0xbf080000, 0x3ef00000, 0x80000000, 0xbec00000, 0xbed00000, 0x3dc00000,
+        0xbf800000, 0x3e000000, 0x3e200000, 0xbf680000, 0xbe800000, 0x3e000000, 0x3ed00000, 0x3f280000,
+        0xbee00000, 0xbf300000, 0xbf280000, 0x3e200000, 0x3e400000, 0xbee00000, 0xbf580000, 0xbf580000,
+        0x00000000, 0x3e000000, 0xbeb00000, 0x3f180000, 0x3d800000, 0xbf300000, 0x3ef00000, 0xbf380000,
+        0x3f400000, 0x3e000000, 0x3e200000, 0x3eb00000, 0xbd800000, 0xbee00000, 0xbe600000, 0xbe600000,
+        0x3fa80000, 0x3fd80000, 0x3f9c0000, 0x3ef00000, 0xbe400000, 0x3f300000, 0x3f580000, 0x3ed00000,
+        0x3f200000, 0xbe000000, 0x3dc00000, 0xbf780000, 0x80000000, 0x80000000, 0x3f180000, 0xbe900000,
+        0xbd800000, 0xbee00000, 0xbef00000, 0x3f180000, 0xbec00000, 0xbec00000, 0x3e600000, 0xbe200000,
+    ];
+    /// qt 18, 72 B / 256 elems.
+    const EXPECTED_MQ2G256: [u32; 256] = [
+        0x3e420000, 0x3f058000, 0xbe910000, 0xbe360000, 0xbea50000, 0xbe990000, 0x3dcc0000, 0x3e7e0000,
+        0xbe2a0000, 0xbe9f0000, 0x3f1d8000, 0x3ef10000, 0xbe7e0000, 0xbcd00000, 0xbd9c0000, 0x3ec50000,
+        0x3e970000, 0xbd8c0000, 0x3dc40000, 0xbd280000, 0x3f1b8000, 0x3f118000, 0x3f3b8000, 0x3ecd0000,
+        0x3d380000, 0x3dac0000, 0xbf388000, 0x3db40000, 0x3f048000, 0xbe950000, 0x3f038000, 0x3f758000,
+        0x3ef90000, 0xbebd0000, 0x3f248000, 0x3e3a0000, 0x3f268000, 0xbf378000, 0x3e160000, 0xbeb70000,
+        0x3ea50000, 0x3e7e0000, 0x3ec50000, 0x3e220000, 0xbddc0000, 0x3e4a0000, 0xbef10000, 0x3ec30000,
+        0xbd180000, 0x3e5e0000, 0xbf758000, 0xbf5c8000, 0x3e3a0000, 0xbf308000, 0x3d680000, 0xbea10000,
+        0xbeb30000, 0xbeb70000, 0x3d580000, 0x3f208000, 0xbe760000, 0xbec10000, 0x3edb0000, 0x3ebf0000,
+        0xbec50000, 0x3ea90000, 0x3d280000, 0x3e890000, 0x3ecb0000, 0xbe6e0000, 0x3e5a0000, 0x3f378000,
+        0x3dac0000, 0xbe420000, 0xbecb0000, 0xbef10000, 0x3f028000, 0xbd840000, 0x3f1e8000, 0xbec90000,
+        0x3f1e8000, 0x3e420000, 0x3d280000, 0x3f238000, 0x3e7e0000, 0xbf0a8000, 0x3f3f8000, 0xbe2a0000,
+        0x3f078000, 0xbf0e8000, 0x3e990000, 0xbe360000, 0x3f068000, 0x3da40000, 0xbdcc0000, 0xbf3b8000,
+        0xbda40000, 0x3f598000, 0x3ea70000, 0x3ebd0000, 0xbe520000, 0x3ebd0000, 0xbe810000, 0x3f4a8000,
+        0xbe990000, 0xbd940000, 0xbfedc000, 0x3f5a8000, 0x3d780000, 0x3d8c0000, 0x3ed70000, 0x3e850000,
+        0xbf1d8000, 0xbf8dc000, 0x3df40000, 0x3cf00000, 0x3c600000, 0xbf268000, 0xbe990000, 0x3e460000,
+        0xbf2f8000, 0xbdb40000, 0xbe870000, 0x3e2a0000, 0x3f758000, 0xbdbc0000, 0x3f1d8000, 0x3fb44000,
+        0xbf778000, 0x3edb0000, 0x3e720000, 0x3ed30000, 0x3c900000, 0xbf298000, 0x3f038000, 0x3bc00000,
+        0x3ea70000, 0xbf058000, 0x3b000000, 0x3df40000, 0xbf2b8000, 0x3e160000, 0x3f2b8000, 0xbeeb0000,
+        0xbe8f0000, 0x3e9b0000, 0xbe910000, 0x3f0a8000, 0xbe6a0000, 0x3d480000, 0xbd8c0000, 0x3ed10000,
+        0x3ea30000, 0xbf038000, 0xbe460000, 0x3f1b8000, 0xbe910000, 0xbe460000, 0x3d380000, 0x3f228000,
+        0x3edd0000, 0xbd080000, 0x3efb0000, 0xbe120000, 0xbe2a0000, 0xbf038000, 0x3ebb0000, 0x3ef90000,
+        0xbd680000, 0x3e320000, 0xbdac0000, 0x3d780000, 0xbf358000, 0x3f3f8000, 0x3f728000, 0xbea10000,
+        0xbf338000, 0x3f298000, 0x3d9c0000, 0x3e930000, 0x3d8c0000, 0xbe9f0000, 0x3d940000, 0x3da40000,
+        0x3edb0000, 0xbe3e0000, 0xbe8b0000, 0x3e620000, 0xbe420000, 0xbe5a0000, 0x3e890000, 0x3d280000,
+        0x3e7e0000, 0xbef30000, 0x3d480000, 0x3f0a8000, 0x3f258000, 0x3ec10000, 0x3e0a0000, 0xbeff0000,
+        0x3dcc0000, 0x3cf00000, 0x3e950000, 0x3ed70000, 0xbdc40000, 0xbe6a0000, 0xbec10000, 0xbeb50000,
+        0x3e9f0000, 0xbf098000, 0x3e3e0000, 0xbe660000, 0x3f2b8000, 0x3f258000, 0x3d780000, 0x3e660000,
+        0x3e320000, 0xbf0e8000, 0x3f85c000, 0x3cd00000, 0x3f348000, 0xbeed0000, 0x3ec10000, 0x3f0d8000,
+        0xbee70000, 0xbf4a8000, 0x3eb10000, 0xbf568000, 0xbf268000, 0x3f3b8000, 0x3efd0000, 0xbe0e0000,
+        0x3ebb0000, 0x3ec70000, 0xbf018000, 0x3e620000, 0x3e620000, 0x3ee50000, 0xbf088000, 0x3c200000,
+        0xbed30000, 0xbe2e0000, 0xbe260000, 0x3ea70000, 0x3dd40000, 0x3eaf0000, 0x3f198000, 0xbd480000,
+        0xbead0000, 0x3f408000, 0xbdcc0000, 0x3e5e0000, 0x3d580000, 0x3f1c8000, 0xbf768000, 0x3ecf0000,
+    ];
+    /// qt 19, 72 B / 256 elems.
+    const EXPECTED_MQ2G256LLOYD: [u32; 256] = [
+        0x3ed00000, 0x3e900000, 0x3d000000, 0xbe600000, 0xbf500000, 0xbec00000, 0x3f600000, 0xbf300000,
+        0x3d800000, 0xbf000000, 0xbe000000, 0xbf500000, 0xbfe40000, 0x3f380000, 0xbeb00000, 0xbe900000,
+        0x3ea00000, 0xbe000000, 0x3f400000, 0x3ea00000, 0xbeb00000, 0xbf840000, 0xbe200000, 0x3dc00000,
+        0xbe900000, 0x3f080000, 0x3e900000, 0x3f280000, 0x3e400000, 0xbe000000, 0x3e000000, 0xbd800000,
+        0xbf200000, 0xbfe80000, 0x3ea00000, 0x3e800000, 0x3ef00000, 0x3ed00000, 0xbed00000, 0x3f580000,
+        0x3f680000, 0x3fd40000, 0xbe900000, 0xbeb00000, 0xbf900000, 0x3f100000, 0x3f500000, 0xbec00000,
+        0xbffc0000, 0x3f680000, 0xbd000000, 0xbe900000, 0x3e000000, 0xbfb80000, 0x3d800000, 0xbf200000,
+        0x3f800000, 0x3f500000, 0xbd800000, 0x3e000000, 0x3f580000, 0x3eb00000, 0x3f180000, 0xbef00000,
+        0x3e000000, 0xbfb80000, 0xbea00000, 0xbec00000, 0xbd000000, 0xbfa40000, 0x3f580000, 0xbe900000,
+        0x3f080000, 0xbed00000, 0xbdc00000, 0x3f680000, 0x00000000, 0xbe400000, 0xbd800000, 0x3e000000,
+        0xbe200000, 0x3ed00000, 0xbeb00000, 0x3e900000, 0x3fd00000, 0xbf300000, 0x3ea00000, 0x80000000,
+        0x3ec00000, 0x3fa80000, 0x3ea00000, 0xbe000000, 0x3ed00000, 0x3ef00000, 0xbf680000, 0x3e200000,
+        0xbef00000, 0xbd000000, 0x3f580000, 0xbf080000, 0xbf100000, 0xbf200000, 0x3f000000, 0x3f880000,
+        0xbea00000, 0xbec00000, 0x3ec00000, 0x3e400000, 0x3e600000, 0x3e200000, 0x3ed00000, 0xbf180000,
+        0x3e400000, 0xbf200000, 0xbf900000, 0xbf100000, 0xbf680000, 0xbf180000, 0xbeb00000, 0x3ef00000,
+        0xbfb40000, 0xbf080000, 0x3ed00000, 0xbe200000, 0xbd800000, 0xbf400000, 0xbe000000, 0xbe400000,
+        0xbe200000, 0xbfdc0000, 0xbf780000, 0x3eb00000, 0xbf400000, 0xbf600000, 0x3d800000, 0xbf880000,
+        0x3f700000, 0xbea00000, 0xbf900000, 0x3fa00000, 0xbf680000, 0xbef00000, 0xbfb40000, 0x3f840000,
+        0x3d800000, 0x3ee00000, 0x00000000, 0x3f000000, 0x3f940000, 0xbe200000, 0xbe600000, 0x3e900000,
+        0x3f480000, 0xbd000000, 0xbef00000, 0xbe900000, 0x00000000, 0xbf000000, 0xbea00000, 0x3ea00000,
+        0xbfd80000, 0x3ee00000, 0xbec00000, 0x3f200000, 0x3dc00000, 0xbdc00000, 0xbf380000, 0xbf080000,
+        0xbd000000, 0xc00e0000, 0xbf080000, 0x3d000000, 0x3f000000, 0x3e800000, 0xbea00000, 0xbf300000,
+        0xbfdc0000, 0x3f580000, 0x3ed00000, 0x3d000000, 0x3e800000, 0xbf200000, 0x3ea00000, 0x3ee00000,
+        0x3f300000, 0xbea00000, 0x3e800000, 0x3f900000, 0xbf080000, 0xbf680000, 0xbe900000, 0xbed00000,
+        0xbf500000, 0x3f300000, 0xbe800000, 0x3f200000, 0x3ed00000, 0x3ffc0000, 0xbf380000, 0x3e200000,
+        0x3f680000, 0xbef00000, 0x3e200000, 0x3ef00000, 0xbf400000, 0x3f900000, 0x3ee00000, 0x3f500000,
+        0x3f080000, 0xbf080000, 0x3eb00000, 0xbf8c0000, 0x3f800000, 0x3f000000, 0x3d800000, 0xbf980000,
+        0x3d800000, 0x3fb80000, 0xbf200000, 0xbf200000, 0xbf280000, 0x3f680000, 0xbeb00000, 0x3f580000,
+        0xbf8c0000, 0xbf940000, 0xbf840000, 0x3e900000, 0xbf200000, 0xbe000000, 0xbea00000, 0x3f300000,
+        0xbf300000, 0xbe400000, 0x3e000000, 0x3f900000, 0x3f840000, 0x3f840000, 0xbef00000, 0xbf840000,
+        0xbea00000, 0x3d800000, 0x40200000, 0x3f600000, 0xbfac0000, 0x3f9c0000, 0xbef00000, 0x3e200000,
+        0xbf940000, 0x3e900000, 0xbf680000, 0xbfbc0000, 0xbe000000, 0xbe800000, 0xbd800000, 0x3d800000,
+    ];
     /// qt 8, 200 B / 256 elems.
     const EXPECTED_HFQ6G256: [u32; 256] = [
         0x3e8c0000, 0x3e000000, 0x3d200000, 0x3df00000, 0x3e100000, 0x3de00000, 0xbd000000, 0x3eac0000,
@@ -705,6 +1095,117 @@ mod test {
         0xbe900000, 0xbd000000, 0xbe000000, 0xbef00000, 0xbef00000, 0xbec00000, 0xbea00000, 0xbea00000,
         0xbe200000, 0xbe800000, 0xbf000000, 0xbe200000, 0xbeb00000, 0xbdc00000, 0xbe400000, 0xbd000000,
         0xbd000000, 0xbef00000, 0xbec00000, 0xbec00000, 0xbe600000, 0xbea00000, 0xbd800000, 0xbe800000,
+    ];
+    /// qt 11, 104 B / 256 elems.
+    const EXPECTED_HFQ3G256: [u32; 256] = [
+        0xbed00000, 0xbea00000, 0xbf000000, 0xbec00000, 0xbeb00000, 0xbee00000, 0xbe900000, 0xbed00000,
+        0xbee00000, 0xbec00000, 0xbea00000, 0xbed00000, 0xbec00000, 0xbef00000, 0xbed00000, 0xbe900000,
+        0xbef00000, 0xbee00000, 0xbf000000, 0xbed00000, 0xbed00000, 0xbea00000, 0xbea00000, 0xbee00000,
+        0xbf000000, 0xbf000000, 0xbea00000, 0xbee00000, 0xbee00000, 0xbeb00000, 0xbee00000, 0xbea00000,
+        0xbe900000, 0xbeb00000, 0xbed00000, 0xbee00000, 0xbef00000, 0xbee00000, 0xbea00000, 0xbef00000,
+        0xbea00000, 0xbed00000, 0xbeb00000, 0xbef00000, 0xbf000000, 0xbef00000, 0xbee00000, 0xbeb00000,
+        0xbeb00000, 0xbef00000, 0xbed00000, 0xbef00000, 0xbe900000, 0xbe900000, 0xbeb00000, 0xbf000000,
+        0xbec00000, 0xbe900000, 0xbec00000, 0xbf000000, 0xbea00000, 0xbec00000, 0xbef00000, 0xbec00000,
+        0xbed00000, 0xbeb00000, 0xbee00000, 0xbf000000, 0xbeb00000, 0xbed00000, 0xbeb00000, 0xbe900000,
+        0xbee00000, 0xbed00000, 0xbec00000, 0xbe900000, 0xbed00000, 0xbf000000, 0xbef00000, 0xbed00000,
+        0xbef00000, 0xbef00000, 0xbee00000, 0xbe900000, 0xbee00000, 0xbe900000, 0xbec00000, 0xbea00000,
+        0xbf000000, 0xbe900000, 0xbe900000, 0xbea00000, 0xbef00000, 0xbec00000, 0xbf000000, 0xbee00000,
+        0xbe900000, 0xbec00000, 0xbef00000, 0xbea00000, 0xbf000000, 0xbed00000, 0xbec00000, 0xbeb00000,
+        0xbea00000, 0xbee00000, 0xbe900000, 0xbeb00000, 0xbe900000, 0xbef00000, 0xbf000000, 0xbef00000,
+        0xbeb00000, 0xbf000000, 0xbef00000, 0xbeb00000, 0xbea00000, 0xbea00000, 0xbed00000, 0xbec00000,
+        0xbec00000, 0xbea00000, 0xbea00000, 0xbec00000, 0xbeb00000, 0xbeb00000, 0xbe900000, 0xbe900000,
+        0xbed00000, 0xbec00000, 0xbf000000, 0xbec00000, 0xbec00000, 0xbee00000, 0xbed00000, 0xbed00000,
+        0xbee00000, 0xbee00000, 0xbea00000, 0xbed00000, 0xbed00000, 0xbef00000, 0xbe900000, 0xbea00000,
+        0xbef00000, 0xbf000000, 0xbf000000, 0xbed00000, 0xbee00000, 0xbea00000, 0xbee00000, 0xbee00000,
+        0xbf000000, 0xbea00000, 0xbeb00000, 0xbee00000, 0xbef00000, 0xbeb00000, 0xbea00000, 0xbeb00000,
+        0xbe900000, 0xbed00000, 0xbed00000, 0xbee00000, 0xbf000000, 0xbee00000, 0xbee00000, 0xbef00000,
+        0xbea00000, 0xbef00000, 0xbeb00000, 0xbef00000, 0xbe900000, 0xbf000000, 0xbea00000, 0xbec00000,
+        0xbeb00000, 0xbe900000, 0xbee00000, 0xbef00000, 0xbea00000, 0xbe900000, 0xbef00000, 0xbf000000,
+        0xbec00000, 0xbeb00000, 0xbec00000, 0xbf000000, 0xbeb00000, 0xbec00000, 0xbeb00000, 0xbed00000,
+        0xbed00000, 0xbed00000, 0xbee00000, 0xbf000000, 0xbec00000, 0xbed00000, 0xbef00000, 0xbe900000,
+        0xbee00000, 0xbef00000, 0xbec00000, 0xbe900000, 0xbee00000, 0xbf000000, 0xbeb00000, 0xbee00000,
+        0xbef00000, 0xbe900000, 0xbef00000, 0xbe900000, 0xbef00000, 0xbe900000, 0xbf000000, 0xbea00000,
+        0xbf000000, 0xbeb00000, 0xbe900000, 0xbea00000, 0xbf000000, 0xbec00000, 0xbec00000, 0xbef00000,
+        0xbe900000, 0xbee00000, 0xbef00000, 0xbea00000, 0xbe900000, 0xbee00000, 0xbf000000, 0xbeb00000,
+        0xbea00000, 0xbf000000, 0xbe900000, 0xbeb00000, 0xbea00000, 0xbef00000, 0xbec00000, 0xbf000000,
+        0xbeb00000, 0xbea00000, 0xbf000000, 0xbeb00000, 0xbeb00000, 0xbea00000, 0xbe900000, 0xbed00000,
+        0xbec00000, 0xbec00000, 0xbea00000, 0xbec00000, 0xbec00000, 0xbeb00000, 0xbed00000, 0xbe900000,
+    ];
+    /// qt 7, 72 B / 128 elems.
+    const EXPECTED_HFQ4G128: [u32; 128] = [
+        0xbed00000, 0xbed00000, 0xbe800000, 0xbeb00000, 0xbdc00000, 0xbe900000, 0xbee00000, 0xbe400000,
+        0xbe900000, 0xbe000000, 0xbe000000, 0xbd800000, 0xbef00000, 0xbef00000, 0xbea00000, 0xbed00000,
+        0xbe200000, 0xbeb00000, 0xbf000000, 0xbe800000, 0xbeb00000, 0xbe400000, 0xbe400000, 0xbe000000,
+        0xbd000000, 0xbd800000, 0xbec00000, 0xbef00000, 0xbe600000, 0xbed00000, 0xbd800000, 0xbeb00000,
+        0xbed00000, 0xbe800000, 0xbe800000, 0xbe400000, 0xbdc00000, 0xbe000000, 0xbee00000, 0xbd000000,
+        0xbe900000, 0xbef00000, 0xbe000000, 0xbed00000, 0xbef00000, 0xbea00000, 0xbea00000, 0xbe800000,
+        0xbe200000, 0xbe400000, 0xbf000000, 0xbdc00000, 0xbeb00000, 0xbd000000, 0xbe400000, 0xbef00000,
+        0xbd000000, 0xbed00000, 0xbec00000, 0xbea00000, 0xbe600000, 0xbe800000, 0xbd800000, 0xbe400000,
+        0xbed00000, 0xbdc00000, 0xbe800000, 0xbd000000, 0xbdc00000, 0xbef00000, 0xbee00000, 0xbec00000,
+        0xbe900000, 0xbea00000, 0xbe000000, 0xbe800000, 0xbef00000, 0xbe200000, 0xbea00000, 0xbdc00000,
+        0xbe200000, 0xbd000000, 0xbf000000, 0xbee00000, 0xbeb00000, 0xbec00000, 0xbe400000, 0xbea00000,
+        0xbd000000, 0xbe800000, 0xbec00000, 0xbe200000, 0xbe600000, 0xbdc00000, 0xbd800000, 0xbd000000,
+        0xbed00000, 0xbee00000, 0xbe800000, 0xbec00000, 0xbdc00000, 0xbea00000, 0xbee00000, 0xbe600000,
+        0xbe900000, 0xbe200000, 0xbe000000, 0xbdc00000, 0xbef00000, 0xbf000000, 0xbea00000, 0xbee00000,
+        0xbe200000, 0xbec00000, 0xbf000000, 0xbe900000, 0xbeb00000, 0xbe600000, 0xbe400000, 0xbe200000,
+        0xbd000000, 0xbdc00000, 0xbec00000, 0xbf000000, 0xbe600000, 0xbee00000, 0xbd800000, 0xbec00000,
+    ];
+    /// qt 12, 56 B / 128 elems.
+    const EXPECTED_HFQ3G128: [u32; 128] = [
+        0xbed00000, 0xbea00000, 0xbf000000, 0xbec00000, 0xbeb00000, 0xbee00000, 0xbe900000, 0xbed00000,
+        0xbee00000, 0xbec00000, 0xbea00000, 0xbed00000, 0xbec00000, 0xbef00000, 0xbed00000, 0xbe900000,
+        0xbef00000, 0xbee00000, 0xbf000000, 0xbed00000, 0xbed00000, 0xbea00000, 0xbea00000, 0xbee00000,
+        0xbf000000, 0xbf000000, 0xbea00000, 0xbee00000, 0xbee00000, 0xbeb00000, 0xbee00000, 0xbea00000,
+        0xbe900000, 0xbeb00000, 0xbed00000, 0xbee00000, 0xbef00000, 0xbee00000, 0xbea00000, 0xbef00000,
+        0xbea00000, 0xbed00000, 0xbeb00000, 0xbef00000, 0xbf000000, 0xbef00000, 0xbee00000, 0xbeb00000,
+        0xbeb00000, 0xbef00000, 0xbed00000, 0xbef00000, 0xbe900000, 0xbe900000, 0xbeb00000, 0xbf000000,
+        0xbec00000, 0xbe900000, 0xbec00000, 0xbf000000, 0xbea00000, 0xbec00000, 0xbef00000, 0xbec00000,
+        0xbed00000, 0xbeb00000, 0xbee00000, 0xbf000000, 0xbeb00000, 0xbed00000, 0xbeb00000, 0xbe900000,
+        0xbee00000, 0xbed00000, 0xbec00000, 0xbe900000, 0xbed00000, 0xbf000000, 0xbef00000, 0xbed00000,
+        0xbef00000, 0xbef00000, 0xbee00000, 0xbe900000, 0xbee00000, 0xbe900000, 0xbec00000, 0xbea00000,
+        0xbf000000, 0xbe900000, 0xbe900000, 0xbea00000, 0xbef00000, 0xbec00000, 0xbf000000, 0xbee00000,
+        0xbe900000, 0xbec00000, 0xbef00000, 0xbea00000, 0xbf000000, 0xbed00000, 0xbec00000, 0xbeb00000,
+        0xbea00000, 0xbee00000, 0xbe900000, 0xbeb00000, 0xbe900000, 0xbef00000, 0xbf000000, 0xbef00000,
+        0xbeb00000, 0xbf000000, 0xbef00000, 0xbeb00000, 0xbea00000, 0xbea00000, 0xbed00000, 0xbec00000,
+        0xbec00000, 0xbea00000, 0xbea00000, 0xbec00000, 0xbeb00000, 0xbeb00000, 0xbe900000, 0xbe900000,
+    ];
+    /// qt 40, 34 B / 128 elems.
+    const EXPECTED_TQ2G128: [u32; 128] = [
+        0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x3f000000, 0x3f000000, 0x3f800000, 0x00000000,
+        0x3f800000, 0x3f800000, 0x00000000, 0x3f000000, 0xbf000000, 0x00000000, 0xbf000000, 0x3f800000,
+        0x00000000, 0x3f000000, 0x3f000000, 0x3f800000, 0x3f000000, 0x3f800000, 0xbf000000, 0xbf000000,
+        0x3f800000, 0xbf000000, 0x3f800000, 0xbf000000, 0xbf000000, 0x3f000000, 0x00000000, 0x00000000,
+        0x00000000, 0x3f800000, 0x3f800000, 0x00000000, 0x3f000000, 0xbf000000, 0x3f000000, 0x3f000000,
+        0x3f800000, 0x00000000, 0xbf000000, 0x3f800000, 0xbf000000, 0x3f800000, 0x3f000000, 0x3f800000,
+        0x00000000, 0xbf000000, 0x00000000, 0xbf000000, 0x3f000000, 0x00000000, 0x3f800000, 0xbf000000,
+        0x3f800000, 0x3f000000, 0x00000000, 0x00000000, 0xbf000000, 0xbf000000, 0xbf000000, 0x3f000000,
+        0x00000000, 0x00000000, 0x3f000000, 0x3f000000, 0x3f000000, 0x3f000000, 0xbf000000, 0x3f800000,
+        0x3f800000, 0x3f800000, 0x3f000000, 0x3f800000, 0xbf000000, 0x00000000, 0x00000000, 0xbf000000,
+        0x00000000, 0x3f000000, 0x3f800000, 0xbf000000, 0x3f000000, 0x3f800000, 0x00000000, 0x00000000,
+        0x3f800000, 0xbf000000, 0xbf000000, 0x3f000000, 0xbf000000, 0x3f000000, 0x3f000000, 0x3f000000,
+        0x00000000, 0x3f800000, 0xbf000000, 0x3f800000, 0x3f000000, 0xbf000000, 0x3f800000, 0x3f800000,
+        0x3f800000, 0x00000000, 0x00000000, 0xbf000000, 0xbf000000, 0x3f800000, 0x3f800000, 0xbf000000,
+        0x00000000, 0xbf000000, 0x3f000000, 0x00000000, 0x3f000000, 0x00000000, 0xbf000000, 0x3f000000,
+        0x3f800000, 0x3f000000, 0x3f000000, 0x3f000000, 0xbf000000, 0xbf000000, 0x00000000, 0x3f800000,
+    ];
+    /// qt 41, 18 B / 128 elems.
+    const EXPECTED_BQ1G128: [u32; 128] = [
+        0x3f000000, 0xbf000000, 0x3f000000, 0xbf000000, 0x3f000000, 0xbf000000, 0x3f000000, 0xbf000000,
+        0xbf000000, 0x3f000000, 0xbf000000, 0x3f000000, 0x3f000000, 0x3f000000, 0x3f000000, 0xbf000000,
+        0x3f000000, 0x3f000000, 0x3f000000, 0x3f000000, 0x3f000000, 0xbf000000, 0xbf000000, 0x3f000000,
+        0xbf000000, 0xbf000000, 0x3f000000, 0xbf000000, 0xbf000000, 0xbf000000, 0x3f000000, 0x3f000000,
+        0x3f000000, 0xbf000000, 0xbf000000, 0x3f000000, 0xbf000000, 0x3f000000, 0x3f000000, 0x3f000000,
+        0xbf000000, 0x3f000000, 0x3f000000, 0x3f000000, 0xbf000000, 0xbf000000, 0xbf000000, 0xbf000000,
+        0x3f000000, 0x3f000000, 0xbf000000, 0xbf000000, 0x3f000000, 0x3f000000, 0xbf000000, 0xbf000000,
+        0xbf000000, 0xbf000000, 0xbf000000, 0x3f000000, 0x3f000000, 0xbf000000, 0x3f000000, 0xbf000000,
+        0x3f000000, 0xbf000000, 0x3f000000, 0x3f000000, 0x3f000000, 0x3f000000, 0x3f000000, 0xbf000000,
+        0xbf000000, 0x3f000000, 0xbf000000, 0xbf000000, 0xbf000000, 0x3f000000, 0xbf000000, 0x3f000000,
+        0x3f000000, 0x3f000000, 0x3f000000, 0xbf000000, 0xbf000000, 0xbf000000, 0x3f000000, 0x3f000000,
+        0xbf000000, 0xbf000000, 0x3f000000, 0x3f000000, 0xbf000000, 0x3f000000, 0x3f000000, 0x3f000000,
+        0x3f000000, 0xbf000000, 0xbf000000, 0xbf000000, 0x3f000000, 0xbf000000, 0xbf000000, 0xbf000000,
+        0xbf000000, 0x3f000000, 0x3f000000, 0xbf000000, 0x3f000000, 0x3f000000, 0xbf000000, 0xbf000000,
+        0x3f000000, 0x3f000000, 0xbf000000, 0x3f000000, 0x3f000000, 0xbf000000, 0x3f000000, 0xbf000000,
+        0xbf000000, 0xbf000000, 0xbf000000, 0xbf000000, 0xbf000000, 0xbf000000, 0xbf000000, 0x3f000000,
     ];
     /// qt 1, 512 B / 256 elems.
     const EXPECTED_F16: [u32; 256] = [
@@ -840,8 +1341,16 @@ mod test {
             (CpuQuant::Mq6G256, &EXPECTED_MQ6G256[..]),
             (CpuQuant::Mq3G256, &EXPECTED_MQ3G256[..]),
             (CpuQuant::Mq3G256Lloyd, &EXPECTED_MQ3G256LLOYD[..]),
+            (CpuQuant::Mq4G256Lloyd, &EXPECTED_MQ4G256LLOYD[..]),
+            (CpuQuant::Mq2G256, &EXPECTED_MQ2G256[..]),
+            (CpuQuant::Mq2G256Lloyd, &EXPECTED_MQ2G256LLOYD[..]),
             (CpuQuant::Hfq6G256, &EXPECTED_HFQ6G256[..]),
             (CpuQuant::Hfq4G256, &EXPECTED_HFQ4G256[..]),
+            (CpuQuant::Hfq3G256, &EXPECTED_HFQ3G256[..]),
+            (CpuQuant::Hfq4G128, &EXPECTED_HFQ4G128[..]),
+            (CpuQuant::Hfq3G128, &EXPECTED_HFQ3G128[..]),
+            (CpuQuant::Tq2G128, &EXPECTED_TQ2G128[..]),
+            (CpuQuant::Bq1G128, &EXPECTED_BQ1G128[..]),
             (CpuQuant::F16, &EXPECTED_F16[..]),
             (CpuQuant::F32, &EXPECTED_F32[..]),
             (CpuQuant::Bf16, &EXPECTED_BF16[..]),
@@ -879,55 +1388,64 @@ mod test {
         assert_eq!(a, b);
     }
 
+    /// Every layout the crate decodes, pinned literally: `gemv`'s row stride is
+    /// `(k / group_elems) * group_bytes`, so a wrong row here is a wrong pointer,
+    /// not a rounding difference. `(qt, quant, group_elems, group_bytes, rotated)`.
+    const FORMATS: &[(u8, CpuQuant, usize, usize, bool)] = &[
+        (1, CpuQuant::F16, 256, 512, false),
+        (2, CpuQuant::F32, 256, 1024, false),
+        (3, CpuQuant::Q8F16, 32, 34, false),
+        (6, CpuQuant::Hfq4G256, 256, 136, false),
+        (7, CpuQuant::Hfq4G128, 128, 72, false),
+        (8, CpuQuant::Hfq6G256, 256, 200, false),
+        (9, CpuQuant::Hfq2G256, 256, 72, false),
+        (10, CpuQuant::Hfq2G128, 128, 40, false),
+        (11, CpuQuant::Hfq3G256, 256, 104, false),
+        (12, CpuQuant::Hfq3G128, 128, 56, false),
+        (13, CpuQuant::Mq4G256, 256, 136, true),
+        (15, CpuQuant::Mq6G256, 256, 200, true),
+        (16, CpuQuant::Bf16, 256, 512, false),
+        (17, CpuQuant::Mq3G256, 256, 104, true),
+        (18, CpuQuant::Mq2G256, 256, 72, true),
+        (19, CpuQuant::Mq2G256Lloyd, 256, 72, true),
+        (20, CpuQuant::Mq3G256Lloyd, 256, 112, true),
+        (30, CpuQuant::Mq4G256Lloyd, 256, 160, true),
+        (31, CpuQuant::Mq5G256, 256, 168, true),
+        (40, CpuQuant::Tq2G128, 128, 34, false),
+        (41, CpuQuant::Bq1G128, 128, 18, false),
+        (44, CpuQuant::Mq4G256V2, 256, 136, true),
+        (45, CpuQuant::Mq4CG256, 256, 136, true),
+        (47, CpuQuant::Mq6G256V2, 256, 200, true),
+        (48, CpuQuant::Mq5G256V2, 256, 168, true),
+        (49, CpuQuant::Mq3G256V2, 256, 104, true),
+        (50, CpuQuant::Mq2G256V2, 256, 72, true),
+        (51, CpuQuant::Mq2G256LloydU, 256, 72, false),
+    ];
+
     #[test]
     fn quant_type_round_trip_and_group_sizes() {
-        for (qt, q) in [
-            (1u8, CpuQuant::F16),
-            (2, CpuQuant::F32),
-            (3, CpuQuant::Q8F16),
-            (6, CpuQuant::Hfq4G256),
-            (8, CpuQuant::Hfq6G256),
-            (13, CpuQuant::Mq4G256),
-            (15, CpuQuant::Mq6G256),
-            (17, CpuQuant::Mq3G256),
-            (20, CpuQuant::Mq3G256Lloyd),
-            (44, CpuQuant::Mq4G256V2),
-        ] {
+        for &(qt, q, ge, gb, rotated) in FORMATS {
             assert_eq!(CpuQuant::from_quant_type(qt), Some(q), "qt {qt}");
+            assert_eq!((q.group_elems(), q.group_bytes()), (ge, gb), "qt {qt} {q:?}");
+            assert_eq!(q.is_fwht_g256(), rotated, "qt {qt} {q:?} rotation");
         }
-        // No CPU implementation: these stay on the GPU over PCIe.
-        for qt in [0u8, 4, 5, 7, 11, 12, 14, 18, 19, 30, 40, 41, 45, 47, 50, 255] {
-            assert_eq!(CpuQuant::from_quant_type(qt), None, "qt {qt}");
-        }
-        // The layout table, pinned literally: `gemv`'s row stride is
-        // `(k / group_elems) * group_bytes`, so a wrong entry here is a wrong
-        // row pointer, not a rounding difference.
-        for (q, ge, gb) in [
-            (CpuQuant::Mq4G256, 256usize, 136usize),
-            (CpuQuant::Mq4G256V2, 256, 136),
-            (CpuQuant::Mq6G256, 256, 200),
-            (CpuQuant::Mq3G256, 256, 104),
-            (CpuQuant::Mq3G256Lloyd, 256, 112),
-            (CpuQuant::Hfq6G256, 256, 200),
-            (CpuQuant::Hfq4G256, 256, 136),
-            (CpuQuant::F16, 256, 512),
-            (CpuQuant::F32, 256, 1024),
-            (CpuQuant::Bf16, 256, 512),
-            (CpuQuant::Q8F16, 32, 34),
+        // Deliberately NOT covered, each for a structural reason (see the crate
+        // and `docs/perf-checkpoints/2026-09-27-gfx1201-cpu-exec-offload.md`):
+        //   0/4   Q4F16G64 / Q4K — GGUF-side formats, not in the dense HFQ set
+        //   5     Q8HFQ — padded rows (`DType::row_stride`), which the group model
+        //         cannot express; needs the stride to be threaded through
+        //   14    MQ8G256 — `RotationPlan::Mq8Internal`, i.e. an int8-quantized
+        //         activation, not a plain FWHT of f32
+        //   21/24/32-37  HFP4/MFP4/... — per-ROW 16 B header + per-32 block
+        //         scales/codewords; also arch-loaded layouts
+        //   28/29 PARO4G128(-T) — a Givens rotation on the *activation*
+        //   38/39 MQ{2,3}G256GL — MoE-indexed only, no dense GEMV kernel exists
+        //   22    TidI32 — a routing table, not a weight
+        for qt in [
+            0u8, 4, 5, 14, 21, 22, 23, 24, 25, 26, 27, 28, 29, 32, 33, 34, 35, 36, 37, 38, 39, 43,
+            46, 255,
         ] {
-            assert_eq!((q.group_elems(), q.group_bytes()), (ge, gb), "{q:?}");
-            assert_eq!(
-                q.is_fwht_g256(),
-                matches!(
-                    q,
-                    CpuQuant::Mq4G256
-                        | CpuQuant::Mq4G256V2
-                        | CpuQuant::Mq6G256
-                        | CpuQuant::Mq3G256
-                        | CpuQuant::Mq3G256Lloyd
-                ),
-                "{q:?} rotation"
-            );
+            assert_eq!(CpuQuant::from_quant_type(qt), None, "qt {qt}");
         }
     }
 
