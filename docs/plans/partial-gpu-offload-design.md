@@ -323,6 +323,10 @@ PCIe link (27.1 GB/s measured, §7) instead of device DRAM: this is llama.cpp's
   plus a *measured* divergence — so the CPU kernels use ordinary f32 `expf`
   arithmetic where they need it and an AVX2 `Mq4G256` kernel that is
   intentionally not bit-equal to the scalar path (`crates/hipfire-cpu/src/simd`).
+  **Fidelity is the per-step parity (6.7e-7 worst case) and the bit-exact decode
+  over 1695 tensors; the end-to-end text divergence is a downstream symptom of
+  greedy argmax over numbers that differ at the seventh digit, not an error rate
+  — read the shared-prefix length as a sensitivity, never as accuracy.**
 - **Evidence** (gfx1201, HIP 7.2, 2026-09-27): `hipfire_cpu::dequant_group`
   reproduces the canonical decoder bit-for-bit over 1695 real tensors of the
   2B/9B fixtures; launcher-vs-CPU parity worst case 6.7e-7 relative across 8
