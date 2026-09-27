@@ -112,6 +112,7 @@ impl ConfigState {
             Some("dflash_mode"),
             Some("prefill_compression"), // Prefill (pflash)
             Some("kv_cache"),
+            Some("gpu_layer_budget"), // Offload
             Some("thinking"),
             Some("reasoning_effort"),
             Some("thinking_budget"),
@@ -157,6 +158,7 @@ impl ConfigState {
             self.is_override("dflash_mode"),                      // Spec decode
             self.is_override("prefill_compression"),              // Prefill
             self.is_override("kv_cache"),                         // KV cache
+            self.is_override("gpu_layer_budget"),                 // Offload
             self.is_override("thinking"),                         // Thinking
             self.is_override("reasoning_effort"),                 // Reasoning effort
             self.is_override("thinking_budget"),                  // Reasoning budget
@@ -175,6 +177,7 @@ impl ConfigState {
             "dflash_mode",         // Spec decode
             "prefill_compression", // Prefill
             "kv_cache",            // KV cache
+            "gpu_layer_budget",    // Offload
             "thinking",            // Thinking
             "reasoning_effort",    // Reasoning effort
             "thinking_budget",     // Reasoning budget
@@ -229,6 +232,27 @@ impl ConfigState {
                     .cloned()
                     .unwrap_or_else(|| "auto".into()),
                 "Precision/memory tradeoff for attention cache.",
+            ),
+            (
+                // Says GPU, not "offload": this value counts layers LEFT ON the
+                // GPU, and an "Offload" label invites reading it as the inverse.
+                "GPU layers",
+                {
+                    // Unset = every layer on the GPU. The bare empty string would
+                    // read as "broken" in a value column, so name the state; the
+                    // editor seeds its buffer from `values`, not from this label.
+                    let v = self
+                        .values
+                        .get("gpu_layer_budget")
+                        .cloned()
+                        .unwrap_or_default();
+                    if v.is_empty() {
+                        "all on GPU".into()
+                    } else {
+                        format!("{v} on GPU")
+                    }
+                },
+                "How many layers stay on the GPU; the rest spill to system RAM. Frees VRAM, but much slower.",
             ),
             (
                 "Thinking",
@@ -395,6 +419,22 @@ mod tests {
         assert_eq!(st.easy_keys().len(), n);
         assert_eq!(st.easy_override_state().len(), n);
         assert_eq!(st.easy_help_keys().len(), n);
+    }
+
+    /// A row marked inline-editable (`Some(key)`) that has no `EDITABLE_FIELDS`
+    /// spec cannot actually be edited: `App::handle_settings_key` looks the spec up
+    /// and, on `None`, refuses — Enter never opens a buffer and no value can be
+    /// typed. `gpu_layer_budget` and `reasoning_effort` both shipped that way, in
+    /// `easy_keys()` with no spec, and nothing failed.
+    #[test]
+    fn every_inline_editable_easy_row_has_a_field_spec() {
+        for key in state_with(&[]).easy_keys().into_iter().flatten() {
+            assert!(
+                crate::hipfire::writer::field_spec(key).is_some(),
+                "easy row {key} is marked inline-editable but has no EDITABLE_FIELDS \
+                 spec, so the editor refuses to type a value into it"
+            );
+        }
     }
 
     #[test]

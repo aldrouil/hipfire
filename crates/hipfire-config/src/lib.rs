@@ -500,7 +500,7 @@ const THINKING_BUDGETS: &[&str] = &["off", "low", "med", "high", "xhigh", "max",
 // Keep generic OpenAI-style values (`auto|none|high|max`) alongside it so
 // non-Qwen3.8 parents still validate. Values pass through as request strings;
 // model-specific mapping lives downstream of config validation.
-const REASONING_EFFORTS: &[&str] = &["auto", "none", "low", "medium", "high", "xhigh", "max"];
+pub const REASONING_EFFORTS: &[&str] = &["auto", "none", "low", "medium", "high", "xhigh", "max"];
 const SPECULATION_MODES: &[&str] = &["off", "auto", "ngram", "dflash", "mtp", "dspark"];
 
 macro_rules! field {
@@ -651,7 +651,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         Some("HIPFIRE_GPU_LAYER_BUDGET"),
-        "Resident-layer budget for partial GPU offload; null=full resident (zero-diff), -1=auto-fit largest tail that fits VRAM, else pin N resident layers."
+        "Resident-layer budget for partial GPU offload: N keeps the last N layers on the GPU and spills the rest to system RAM; unset keeps every layer on the GPU. The number counts layers ON the GPU, not layers offloaded — 3 on a 64-layer model spills 61. The auto setting is not available yet; use a plain count."
     ),
     // Process-scoped: the preflight guards snapshot this once at startup, and
     // a mid-serve flip would make the refusal policy depend on which load ran

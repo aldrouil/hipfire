@@ -2171,6 +2171,58 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The reported bug: the offload row appeared in the easy list but Enter did
+    /// nothing and no value could be typed, because it had no `EDITABLE_FIELDS`
+    /// spec. Drive the real key path end to end.
+    #[test]
+    fn easy_offload_row_accepts_a_typed_value() {
+        let (mut app, dir) = test_app();
+        app.settings_easy = true;
+        let idx = app
+            .config
+            .easy_keys()
+            .iter()
+            .position(|k| matches!(k, Some("gpu_layer_budget")))
+            .expect("offload row is in the easy list");
+        app.settings_selected = idx;
+
+        // Enter must open an edit buffer for this row, not refuse it.
+        app.handle_settings_key(key(KeyCode::Enter));
+        assert!(
+            app.settings_edit.is_some(),
+            "Enter on the offload row must start an edit; it was refusing before"
+        );
+
+        // Typed digits must reach the buffer.
+        for c in ['3', '2'] {
+            app.handle_settings_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(
+            app.settings_edit.as_ref().map(|e| e.buffer.as_str()),
+            Some("32"),
+            "typed characters must reach the edit buffer"
+        );
+
+        // Enter commits.
+        app.handle_settings_key(key(KeyCode::Enter));
+        assert!(app.settings_edit.is_none(), "a valid value must commit");
+        assert_eq!(
+            app.config
+                .values
+                .get("gpu_layer_budget")
+                .map(String::as_str),
+            Some("32"),
+            "the committed value must land in the in-memory config"
+        );
+        let on_disk = std::fs::read_to_string(&app.paths.config).unwrap();
+        assert!(
+            on_disk.contains("gpu_layer_budget") && on_disk.contains("32"),
+            "the value must be persisted to config.toml, got: {on_disk}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn failed_save_keeps_edit_buffer() {
         // F4: a rejected value (out of range) on Enter must KEEP settings_edit
