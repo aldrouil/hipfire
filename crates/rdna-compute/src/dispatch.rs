@@ -5957,15 +5957,19 @@ mod tests {
         assert!(warm.buf.is_hip_allocation());
         gpu.free_tensor(warm).expect("free warm into pool");
 
-        // Signal the release with a payload big enough that the assertion cannot
-        // be perturbed by another process's driver accounting settling. Byte-exact
-        // equality was flaky across a multi-package `cargo test` run: a preceding
-        // test binary's VRAM release is not instantaneous, so `free_before` and
-        // `free_after` could straddle a settling step and fail a correct
-        // implementation. 64 MiB leaked vs 8 MiB tolerated keeps the check
-        // decisive (a leak of this owner is 64 MiB) while tolerating noise.
-        const PROBE_BYTES: usize = 64 * 1024 * 1024;
-        const TOLERANCE_BYTES: usize = 8 * 1024 * 1024;
+        // Global free VRAM cannot verify a release byte-exactly on this driver.
+        // Measured (`free_retention` probe, gfx1201): the owner's own bytes always
+        // return exactly, but the driver intermittently charges extra overhead at
+        // allocation that `hipFree` never returns — 0 or 28 MiB for a 64 MiB
+        // request, up to 56 MiB at 2 GiB. Byte-exact equality therefore failed a
+        // correct implementation in roughly 2 of 5 runs. Use a payload far above
+        // that measured overhead (a leak of this owner drops free by 512 MiB) and
+        // tolerate an absolute 64 MiB, which no observed overhead reaches.
+        const PROBE_BYTES: usize = 512 * 1024 * 1024;
+        const TOLERANCE_BYTES: usize = 64 * 1024 * 1024;
+        /// How long to let a late reclaim land. Never-returned driver overhead is
+        /// covered by `TOLERANCE_BYTES` instead; this only absorbs lag.
+        const POLL_MILLIS: u64 = 500;
         let payload = vec![7u8; PROBE_BYTES];
 
         let (free_before, total) = gpu.hip.get_vram_info().expect("vram before");
@@ -5985,11 +5989,24 @@ mod tests {
             "unexpected error: {err}"
         );
 
-        let (free_after, _) = gpu.hip.get_vram_info().expect("vram after");
+        // Reclaim on this driver is occasionally LATE rather than lost (measured:
+        // the owner's bytes return exactly in 11 of 12 samples, with the "missing"
+        // 28 MiB appearing on a later pass), so a single instantaneous sample can't
+        // tell "reclaimed late" from "leaked" — which is precisely the distinction
+        // this test exists to make. Poll briefly, and fail only if free never
+        // recovers.
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(POLL_MILLIS);
+        let mut free_after = gpu.hip.get_vram_info().expect("vram after").0;
+        while free_after + TOLERANCE_BYTES < free_before && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(POLL_MILLIS / 10));
+            free_after = gpu.hip.get_vram_info().expect("vram after").0;
+        }
         assert!(
             free_after + TOLERANCE_BYTES >= free_before,
-            "copy-fail must hip.free the malloc owner: {PROBE_BYTES} bytes came back short \
-             (free VRAM {free_before} → {free_after}, total={total}, tolerance={TOLERANCE_BYTES})"
+            "copy-fail must hip.free the malloc owner: {PROBE_BYTES} bytes never came back \
+             (free VRAM {free_before} → {free_after} after {POLL_MILLIS}ms of polling, \
+             total={total}, tolerance={TOLERANCE_BYTES})"
         );
         // hip.free path must not touch pool counters (would if free_tensor'd).
         assert_eq!(
