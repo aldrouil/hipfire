@@ -48,8 +48,9 @@
 //! into the step representation.
 
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
+use std::time::Instant;
 
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -84,6 +85,25 @@ pub fn cpu_exec_counters() -> (usize, usize) {
     (
         CPU_STEPS.load(Ordering::Relaxed),
         HOST_MAPPED_GPU_STEPS.load(Ordering::Relaxed),
+    )
+}
+
+/// Per-step wall-time split, in nanoseconds: device→host, the GEMV itself,
+/// host→device. The structural risk of this feature is that a CPU step is a host
+/// sync point, so it serializes against the surrounding GPU work; these three
+/// numbers say whether a slow `cpu` arm is paying for copies or for arithmetic.
+/// Always accumulated (two `Instant::now` per step, ~50 ns against a step that
+/// costs tens of microseconds) and reported by the trace.
+static NS_D2H: AtomicU64 = AtomicU64::new(0);
+static NS_GEMV: AtomicU64 = AtomicU64::new(0);
+static NS_H2D: AtomicU64 = AtomicU64::new(0);
+
+/// (device→host ns, gemv ns, host→device ns) since process start.
+pub fn cpu_exec_time_ns() -> (u64, u64, u64) {
+    (
+        NS_D2H.load(Ordering::Relaxed),
+        NS_GEMV.load(Ordering::Relaxed),
+        NS_H2D.load(Ordering::Relaxed),
     )
 }
 
@@ -200,8 +220,12 @@ pub fn run_host_mapped_gemv(
         .ok_or_else(|| cpu_err("weight tensor is host-mapped but has no host pointer"))?;
     let x_host = prepare_activation(gpu, w, x, rotate_input)?;
     let mut y = vec![0.0f32; m];
+    let t1 = Instant::now();
     gemv(q, bytes, m, k, &x_host, &mut y);
+    NS_GEMV.fetch_add(t1.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    let t2 = Instant::now();
     upload_f32(gpu, out, &y)?;
+    NS_H2D.fetch_add(t2.elapsed().as_nanos() as u64, Ordering::Relaxed);
     CPU_STEPS.fetch_add(1, Ordering::Relaxed);
     trace_step(q, w, rotate_input, false);
     Ok(())
@@ -223,6 +247,7 @@ fn prepare_activation(
     x: &GpuTensor,
     rotate_input: bool,
 ) -> Result<Vec<f32>, DispatchError> {
+    let t0 = Instant::now();
     let mut host = download_f32(gpu, x, w.k)?;
     if rotate_input {
         if let Some(scale) = w.awq_scale {
@@ -231,6 +256,7 @@ fn prepare_activation(
         }
         rotate_x(&mut host);
     }
+    NS_D2H.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
     Ok(host)
 }
 
@@ -254,10 +280,14 @@ pub fn run_host_mapped_gemv_residual(
         .ok_or_else(|| cpu_err("weight tensor is host-mapped but has no host pointer"))?;
     let x_host = prepare_activation(gpu, w, x, rotate_input)?;
     let mut y = vec![0.0f32; m];
+    let t1 = Instant::now();
     gemv(q, bytes, m, k, &x_host, &mut y);
+    NS_GEMV.fetch_add(t1.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    let t2 = Instant::now();
     let mut acc_host = download_f32(gpu, acc, m)?;
     residual_add(&mut acc_host, &y);
     upload_f32(gpu, acc, &acc_host)?;
+    NS_H2D.fetch_add(t2.elapsed().as_nanos() as u64, Ordering::Relaxed);
     CPU_STEPS.fetch_add(1, Ordering::Relaxed);
     trace_step(q, w, rotate_input, true);
     Ok(())
@@ -427,8 +457,16 @@ fn trace_step(q: CpuQuant, w: &WeightRef, rotated: bool, residual: bool) {
     }
     let (m, k) = (w.m, w.k);
     let (on_cpu, on_gpu) = cpu_exec_counters();
+    let (d2h, gemv_ns, h2d) = cpu_exec_time_ns();
+    // ns -> ms, averaged over the steps that have run so far (a running mean, so
+    // the first line is the cold first step and later lines are steady state).
+    let per_ms = |ns: u64| ns as f64 / 1e6 / on_cpu.max(1) as f64;
     eprintln!(
         "cpu exec: step gemv m={m} k={k} quant={q:?} rotated={rotated} residual={residual} \
-         awq={awq} | {on_cpu} steps on CPU, {on_gpu} host-mapped steps still on GPU"
+         awq={awq} | {on_cpu} steps on CPU, {on_gpu} host-mapped steps still on GPU | \
+         mean per step: d2h={:.2}ms gemv={:.2}ms h2d={:.2}ms",
+        per_ms(d2h),
+        per_ms(gemv_ns),
+        per_ms(h2d)
     );
 }

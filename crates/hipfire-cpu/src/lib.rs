@@ -30,6 +30,7 @@
 pub mod epilogue;
 pub mod gemv;
 pub mod quant;
+pub mod simd;
 
 #[cfg(test)]
 pub(crate) mod testfix;

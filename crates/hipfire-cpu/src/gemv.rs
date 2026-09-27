@@ -22,6 +22,7 @@
 use rayon::prelude::*;
 
 use crate::quant::{decode_group_codes, CpuQuant};
+use crate::simd;
 
 /// Largest group size over [`CpuQuant`] (256 for every G256 format). The decode
 /// scratch is stack-local, so no allocation is on the inner loop.
@@ -40,6 +41,22 @@ pub fn row_bytes(q: CpuQuant, k: usize) -> usize {
 /// `packed` is the whole weight tensor's bytes, `m * row_bytes(q, k)` of them.
 /// `x` carries the format's rotation (see the module docs).
 pub fn gemv(q: CpuQuant, packed: &[u8], m: usize, k: usize, x: &[f32], y: &mut [f32]) {
+    gemv_with_simd(q, packed, m, k, x, y, None)
+}
+
+/// [`gemv`] with the SIMD decision forced (`Some(false)` = scalar, `None` =
+/// runtime detection). The vector path is a throughput choice with a tolerance
+/// contract, so the scalar path stays reachable and exact-testable, and
+/// `simd::tests` compares the two.
+pub fn gemv_with_simd(
+    q: CpuQuant,
+    packed: &[u8],
+    m: usize,
+    k: usize,
+    x: &[f32],
+    y: &mut [f32],
+    requested: Option<bool>,
+) {
     if m == 0 || k == 0 {
         return;
     }
@@ -64,8 +81,12 @@ pub fn gemv(q: CpuQuant, packed: &[u8], m: usize, k: usize, x: &[f32], y: &mut [
         packed.len()
     );
     let x = &x[..k];
+    // Resolve the vector/scalar decision once for the whole call rather than
+    // re-detecting the CPU feature per row (`m` is thousands on every real
+    // shape).
+    let use_simd = q == CpuQuant::Mq4G256 && simd::use_avx2(simd::avx2_available(), requested);
     y[..m].par_iter_mut().enumerate().for_each(|(row, out)| {
-        *out = dot_row(q, &packed[row * rb..], k, x);
+        *out = dot_row_simd(q, &packed[row * rb..], k, x, use_simd);
     });
 }
 
@@ -75,6 +96,20 @@ pub fn gemv(q: CpuQuant, packed: &[u8], m: usize, k: usize, x: &[f32], y: &mut [
 /// Parallel over every (row, output) pair. `n == 1` is [`gemv`]'s shape with the
 /// same work split, so a single-token batch does not serialize.
 pub fn gemm(q: CpuQuant, packed: &[u8], m: usize, k: usize, x: &[f32], n: usize, out: &mut [f32]) {
+    gemm_with_simd(q, packed, m, k, x, n, out, None)
+}
+
+/// [`gemm`] with the SIMD decision forced; see [`gemv_with_simd`].
+pub fn gemm_with_simd(
+    q: CpuQuant,
+    packed: &[u8],
+    m: usize,
+    k: usize,
+    x: &[f32],
+    n: usize,
+    out: &mut [f32],
+    requested: Option<bool>,
+) {
     if n == 0 || m == 0 || k == 0 {
         return;
     }
@@ -101,14 +136,33 @@ pub fn gemm(q: CpuQuant, packed: &[u8], m: usize, k: usize, x: &[f32], n: usize,
         packed.len()
     );
     let x = &x[..n * k];
+    let use_simd = q == CpuQuant::Mq4G256 && simd::use_avx2(simd::avx2_available(), requested);
     out[..n * m].par_iter_mut().enumerate().for_each(|(flat, o)| {
         let (token, row) = (flat / m, flat % m);
-        *o = dot_row(q, &packed[row * rb..], k, &x[token * k..]);
+        *o = dot_row_simd(q, &packed[row * rb..], k, &x[token * k..], use_simd);
     });
 }
 
 /// One output element: `Σ_j W[row][j] * x[j]`, accumulating one group at a time.
-fn dot_row(q: CpuQuant, row: &[u8], k: usize, x: &[f32]) -> f32 {
+///
+/// `use_simd` is resolved once per GEMV call by the caller; it is only ever true
+/// for `Mq4G256`, the dominant spilled format (`-mq4` fixtures and every `mq4v2`
+/// body), which has a hand-written AVX2 kernel. Everything else uses the
+/// format-generic decode below.
+fn dot_row_simd(q: CpuQuant, row: &[u8], k: usize, x: &[f32], use_simd: bool) -> f32 {
+    if use_simd {
+        return simd::mq4g256_row_dot_avx2(row, k, x);
+    }
+    dot_row_scalar(q, row, k, x)
+}
+
+/// The `Mq4G256` row dot on the scalar path — the SIMD fallback and the
+/// reference `simd::tests` compares against.
+pub(crate) fn mq4g256_row_dot_scalar(row: &[u8], k: usize, x: &[f32]) -> f32 {
+    dot_row_scalar(CpuQuant::Mq4G256, row, k, x)
+}
+
+fn dot_row_scalar(q: CpuQuant, row: &[u8], k: usize, x: &[f32]) -> f32 {
     let ge = q.group_elems();
     let gb = q.group_bytes();
     let mut scratch = [0.0f32; MAX_GROUP_ELEMS];
