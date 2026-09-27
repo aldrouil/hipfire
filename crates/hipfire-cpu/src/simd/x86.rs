@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
-//! AVX2 + FMA `Mq4G256` row dot.
+//! AVX2 + FMA row dots for the formats whose bytes the CPU offload path spills.
+//!
+//! `Mq4G256` (nibbles, f32 group header) and `Mq3G256V2` (3-bit cross-byte
+//! packs, per-128 fp16 scale/zero) — see each kernel's own doc for its layout.
+//!
+//! ## `Mq4G256`
 //!
 //! Layout reminder (see `crate::quant`): 136 B per 256-element group —
 //! `[f32 scale][f32 zero][128 B of paired nibbles]`, element `i` taking the low
@@ -81,6 +86,91 @@ pub unsafe fn mq4g256_row_dot(row: *const u8, k: usize, x: *const f32) -> f32 {
     let mut acc = 0.0f32;
     for g in 0..groups {
         acc += group_dot(row.add(g * 136), x.add(g * 256));
+    }
+    acc
+}
+
+/// Shifts that pull chunk `c`'s eight 3-bit codes out of one 32-bit load.
+///
+/// The load is four bytes at `3c + 7`, i.e. the chunk's three bytes prefixed by
+/// the byte before them: with `V = (load >> 8)` being the chunk's 24 bits
+/// little-endian, code `j` is `(V >> 3j) & 7`. Folding the `>> 8` into the shift
+/// vector makes that one `vpsrlvd` instead of a scalar shift plus a broadcast,
+/// and lets the compiler fold the load into the broadcast.
+const CODE3_SHIFTS: [i32; 8] = [8, 11, 14, 17, 20, 23, 26, 29];
+
+/// One 8-element chunk of a `Mq3G256V2` group: `dot += Σ_j code_j · x_j`,
+/// `sum += Σ_j x_j`.
+///
+/// The codes come out of one broadcast + one variable shift + one mask rather
+/// than a byte at a time: the three bytes are already a contiguous 24-bit
+/// little-endian field (`crate::quant::code3`, which this reproduces), so all
+/// eight codes are its 3-bit lanes.
+#[inline]
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn chunk(
+    gptr: *const u8,
+    xg: *const f32,
+    idx: usize,
+    shifts: __m256i,
+    mask: __m256i,
+    dot: __m256,
+    sum: __m256,
+) -> (__m256, __m256) {
+    // Bytes `3*idx+7 .. 3*idx+11`: the chunk's three payload bytes plus one
+    // preceding byte the shift discards. In bounds for every chunk — the last
+    // is 100..104 of a 104-byte group.
+    let w = (gptr.add(7 + 3 * idx) as *const u32).read_unaligned() as i32;
+    let codes = _mm256_and_si256(_mm256_srlv_epi32(_mm256_set1_epi32(w), shifts), mask);
+    let xv = _mm256_loadu_ps(xg.add(idx * 8));
+    (
+        _mm256_fmadd_ps(_mm256_cvtepi32_ps(codes), xv, dot),
+        _mm256_add_ps(sum, xv),
+    )
+}
+
+/// One 256-element `Mq3G256V2` group: 8 B of `[s0 z0 s1 z1]` fp16 header (each
+/// pair covering 128 elements) then 96 B of 3-bit codes, 8 per 3 bytes.
+///
+/// Written as `s·Σ(c·x) + z·Σx` per half — the same restructure the `Mq4G256`
+/// group dot uses, and the reason a half's affine header costs two vector FMAs
+/// at the end rather than an `fma` per element. Not bit-identical to the scalar
+/// path; `simd::tests` bounds it relative.
+#[inline]
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn mq3_group_dot(gptr: *const u8, xg: *const f32) -> f32 {
+    // The whole header widens with one F16C convert: lanes are `s0 z0 s1 z1`.
+    let hdr = _mm_cvtph_ps(_mm_loadl_epi64(gptr as *const __m128i));
+    let mut h = [0.0f32; 4];
+    _mm_storeu_ps(h.as_mut_ptr(), hdr);
+    let shifts = _mm256_loadu_si256(CODE3_SHIFTS.as_ptr() as *const __m256i);
+    let mask = _mm256_set1_epi32(7);
+    let zero_v = _mm256_setzero_ps();
+    let (mut dot0, mut sum0) = (zero_v, zero_v);
+    for idx in 0..16 {
+        (dot0, sum0) = chunk(gptr, xg, idx, shifts, mask, dot0, sum0);
+    }
+    let (mut dot1, mut sum1) = (zero_v, zero_v);
+    for idx in 16..32 {
+        (dot1, sum1) = chunk(gptr, xg, idx, shifts, mask, dot1, sum1);
+    }
+    (h[0] * hsum256(dot0) + h[1] * hsum256(sum0)) + (h[2] * hsum256(dot1) + h[3] * hsum256(sum1))
+}
+
+/// `Σ_j W[row][j] · x[j]` for a `Mq3G256V2` row.
+///
+/// # Safety
+///
+/// Requires AVX2 + FMA + F16C on the running CPU, `k % 256 == 0`, at least
+/// `(k / 256) * 104` readable bytes at `row`, and `k` readable `f32` at `x`.
+/// Callers reach this through [`super::mq3g256v2_row_dot_avx2`], which checks
+/// the CPU features first.
+#[target_feature(enable = "avx2,fma,f16c")]
+pub unsafe fn mq3g256v2_row_dot(row: *const u8, k: usize, x: *const f32) -> f32 {
+    let groups = k / 256;
+    let mut acc = 0.0f32;
+    for g in 0..groups {
+        acc += mq3_group_dot(row.add(g * 104), x.add(g * 256));
     }
     acc
 }

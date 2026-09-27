@@ -48,6 +48,15 @@ md5sum benchmarks/prompts/gpu_offload_probe.txt benchmarks/prompts/humaneval_3_b
 | artifact | md5 | sha256 | notes |
 |---|---|---|---|
 | source tree (`git rev-parse HEAD`) | `924d7fd8f6b3c674b95a60ed3b45df0e75f08d30` | — | the binaries below are the build **of this tree**; record your own HEAD next to your digests, because a digest alone does not say *what* moved |
+
+> **A daemon md5 is not stable across comment-only edits.** Release binaries
+> carry line-number-dependent `.llvm.<hash>` symbol suffixes, so adding a comment
+> moves the whole-binary md5 while changing no instruction: measured 2026-09-27,
+> `e39c3adb…` and `df4eacc0…` are the same code with a doc comment added, and
+> their `.text` sections are byte-identical (`objcopy -O binary --only-section=.text`
+> → md5 `a766f371c150cc961eed1a65ffd4971e`, 33,516,602 B). When a digest mismatch
+> needs adjudicating, compare the `.text` section, and say which binary the
+> numbers were actually measured on.
 | `target/release/daemon` | `904368995cddb8cda8e82a7f8d31ae96` | — | built at the HEAD above |
 | `target/release/hipfire` | `030f080ce4c3d68ca038a614059d21b2` | — | at handoff |
 | `~/.hipfire/models/qwen3.5-2b.mq4` | `9ed6628f2df83ef4b1c062afd4a85bfb` | `bb386f7bd24397db5ef6ba28aab5985053c9db319d1645a2ba4d732a77badc6a` | 24 layers, 30.4 MB/layer |
@@ -60,6 +69,15 @@ Host: 1× RX 9070 XT `gfx1201` (16304 MB), ROCm/HIP 7.2, Ryzen 7 7800X3D
 (8c/16t), 28 GB RAM, THP `[always]`. Copy this table into your report and fill in
 *your* binary digests; a rebuild changes them and invalidates comparison with
 anything above.
+
+> **Do not restate this host's ISA from a stale line — and do not specialise on
+> it.** It is Zen 4 and reports AVX-512F
+> (`is_x86_feature_detected!("avx512f") == true`, measured 2026-09-27); the base
+> record's "AVX-512 is not available on this host (Zen 3)" is wrong, and
+> `/proc/cpuinfo` alone has been misread here before. The CPU kernels are gated on
+> AVX2+FMA+F16C **for portability, not because of this box**: the fleet's `k9lin`
+> is a Zen 2 AM4 with no AVX-512, so an AVX-512 kernel without its own
+> `is_x86_feature_detected!` gate would be a win here and a `SIGILL` there.
 
 ## 2 · The two knobs
 
@@ -176,9 +194,20 @@ env HIPFIRE_GPU_LAYER_BUDGET=24 HIPFIRE_OFFLOAD_EXEC=cpu HIPFIRE_CPU_EXEC_TRACE=
   ./target/release/hipfire bench qwen3.5:9b "${COMMON[@]}" 2>&1 >/dev/null | grep "cpu exec: step"
 ```
 
-Each line gives the running-mean D2H / GEMV / H2D split for a step shape, and the
-second counter *must* be `0 host-mapped steps still on GPU`. A non-zero value
-means a step shape never reached the CPU — report it, do not average it away.
+Each line gives the D2H / GEMV / H2D split for a step shape, and the second
+counter *must* be `0 host-mapped steps still on GPU`. A non-zero value means a
+step shape never reached the CPU — report it, do not average it away.
+
+**Read the call count on the line before you quote a number.** A shape is printed
+at its first call and then at every doubling of that shape's call count, and each
+line's three means are over *that shape's* calls so far: the `calls=1` line is the
+cold first step (host-mapped page first touch, rayon pool wake-up) and the last
+line for the shape is its steady state. Quote the doubling line with the largest
+call count you have, and do not compare a `calls=1` figure against a `calls=1024`
+one. (Before 2026-09-27 the trace printed a single process-wide running mean on
+every shape's line, which is why older records list the *same* GEMV figure for
+every shape in a run and why small shapes look catastrophic — see the amendment
+in [`../perf-checkpoints/`](../perf-checkpoints/).)
 
 ## 5 · Reading the output, not just the numbers
 
@@ -189,10 +218,13 @@ means a step shape never reached the CPU — report it, do not average it away.
 - **Reasoning checkpoints fail closed.** On `qwen3.8-*`, `hipfire run` with a
   token budget smaller than the think block ends with
   `daemon error: … open think span at end of generation (validation)` and
-  releases **no text**. 600 tokens was not enough for the 27B; either raise
-  `-n` a lot, or set `reasoning.effort=none` (a config change — ask before
-  making it) — `hipfire run` has no reasoning flag, and the corresponding config
-  keys have no env spelling.
+  releases **no text**. 128 tokens is not enough for the 27B; **1024-3072 is**
+  (`-t 0 --spec off`, both measured 2026-09-27 on the humaneval prompt — the
+  model closes the block and stops naturally after ~150 answer tokens, so the
+  budget is a ceiling, not the stop). Raising `-n` is the whole fix;
+  `reasoning.effort=none` is the alternative but is a config change — ask first.
+  `hipfire run` has no reasoning flag, and the corresponding config keys have no
+  env spelling.
 - **A suspiciously tight stddev on a spec-decode bench is a warning, not a win**
   (AGENTS.md §0 rule 3). Eyeball the text whenever τ or the spread looks unusual.
 - **Do not trust a single `hipfire run` comparison for rate.** It samples at the
@@ -206,8 +238,15 @@ means a step shape never reached the CPU — report it, do not average it away.
 | 9B budget 16 (16 spilled), 1 pass | `pcie` 11.0 / `cpu` **14.0** tok/s | |
 | 2B, probe prompt, 64 gen | pcie/cpu: 0 → 252/259, 3 → 133/100, 6 → 91/65, 9 → 69/50, 12 → 57/40 tok/s | `cpu` **loses** on the 2B at every spill ≥3 |
 | 2026-09-26 `pcie` curve (same fixture, previous binaries) | 2B 250/128/86/65/52; 9B 101/35/21/15/12 tok/s | your `pcie` arm should land within ~5% of these |
-| 27B qt 49 step, m=12288 k=5120 | 5.70 ms (was 19.95 ms before the header hoist) | `HIPFIRE_CPU_EXEC_TRACE=1` |
+| 27B qt 49 step, m=12288 k=5120 | 5.70 ms (was 19.95 ms before the header hoist) — **a cumulative mean over the process's first 25 steps, not that shape's cost**; the corrected per-shape figure is 0.70 ms with the AVX2 kernel (see the amendment below) | `HIPFIRE_CPU_EXEC_TRACE=1` |
 | kernel ceiling, 195.8 MB host-mapped buffer, 16 threads | 44.5 GB/s (44.8 over a plain heap `Vec`) | the end-to-end ~23 GB/s is per-step serialization, not codegen |
+
+**Correction pointer (2026-09-27).** Every per-step figure in the table above was
+produced by a trace that printed one *process-wide cumulative mean* on each
+shape's line, so the numbers move with the line's step counter rather than with
+the shape; the qt 49 kernel that was this runbook's "expected next lever" now
+exists. Both are recorded, with the per-shape steady state, in
+[`../perf-checkpoints/2026-09-27-cpu-exec-mq3-avx2-kernel-27b-amendment.md`](../perf-checkpoints/2026-09-27-cpu-exec-mq3-avx2-kernel-27b-amendment.md).
 
 **Crossover to expect.** The CPU arm wins when a spilled layer's weight bytes
 dominate that layer's per-step copy+sync cost: 2B ~30 MB/layer loses, 9B
@@ -231,9 +270,15 @@ suspect host contention or a lingering daemon before suspecting the feature.
   HIPFIRE_PARITY_EXTRA_QT=49 cargo test -p hipfire-arch-qwen35 --release
   --test gpu_gemv_parity -- --ignored` → 2.391e-7 / 3.530e-7 at m=12288 k=5120.
   Run that before the sweep: it is 1 s and it separates "slow" from "wrong".
-- qt 49 currently uses the **scalar** decode (only `Mq4G256` has an AVX2 kernel),
-  so its step time is decode-bound (~11 GMAC/s) rather than bandwidth-bound. That
-  is the expected next lever, not a defect to chase in the sweep.
+- qt 49 has an **AVX2 kernel** since 2026-09-27 (`simd::mq3g256v2_row_dot_avx2`,
+  AVX2 + FMA + F16C, gated per format by `simd::row_dot_enabled`): 3.25-bit groups
+  stream at ~41 GB/s / ~100 GMAC/s on this host versus ~10 GMAC/s for the scalar
+  decode, so the 27B's step time is bandwidth-bound again. Before that kernel the
+  scalar decode was the binding constraint (~11 GMAC/s) and the whole `cpu` arm
+  was arithmetic-bound — that, not the per-step copy, is why `cpu` lost the 27B
+  sweep. `Mq4G256V2` (qt 44), `Mq5G256V2` (48), `Mq6G256V2` (47) and `Mq2G256V2`
+  (50) are the same gap, still scalar: a model that is all-qt 44 pays what the
+  27B paid, and the fix is the same shape of kernel.
 
 ## 8 · Reporting (this is the deliverable)
 
@@ -255,7 +300,20 @@ suspect host contention or a lingering daemon before suspecting the feature.
 ## 9 · Known open items you may be asked to close
 
 - 2B/9B sweep: 2B leg measured (three processes per point), **9B leg not**.
-- 27B sweep on `qwen3.8-27b.mq3-xt`: **not measured at all** (only per-step
-  timings and coverage).
-- 27B decoded-text read: **never done** — every attempt hit the reasoning-budget
-  gate (§ 5).
+- ~~27B sweep on `qwen3.8-27b.mq3-xt`: **not measured at all** (only per-step
+  timings and coverage).~~ **Closed 2026-09-27** at budget 56 (8 spilled), three
+  fresh interleaved processes per arm — see the amendment
+  [`../perf-checkpoints/2026-09-27-cpu-exec-mq3-avx2-kernel-27b-amendment.md`](../perf-checkpoints/2026-09-27-cpu-exec-mq3-avx2-kernel-27b-amendment.md).
+  Budget 48 (16 spilled) is still unmeasured here: it stalled in load for the
+  previous agent and this fixture's footprint has not changed.
+- ~~27B decoded-text read: **never done** — every attempt hit the reasoning-budget
+  gate (§ 5).~~ **Closed 2026-09-27** twice over: `hipfire run … --spec off
+  --temp 0 -n 1024` with `benchmarks/prompts/humaneval_3_below_zero.txt` closes the
+  think block and releases the answer on both arms (the model stops naturally
+  after ~150 answer tokens, so 1024-3072 is a ceiling and not the stop), and the
+  two completions were byte-identical (610 B) at budget 56 — see
+  [`../perf-checkpoints/2026-09-27-gfx1201-cpu-exec-offload-reproduction.md`](../perf-checkpoints/2026-09-27-gfx1201-cpu-exec-offload-reproduction.md)
+  § 2 (pre-change binary) and
+  [`../perf-checkpoints/2026-09-27-cpu-exec-mq3-avx2-kernel-27b-amendment.md`](../perf-checkpoints/2026-09-27-cpu-exec-mq3-avx2-kernel-27b-amendment.md)
+  (post-change, qt 49 AVX2 kernel). The same command is the template for a
+  per-genre read.

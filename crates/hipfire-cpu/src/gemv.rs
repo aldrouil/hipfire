@@ -84,7 +84,7 @@ pub fn gemv_with_simd(
     // Resolve the vector/scalar decision once for the whole call rather than
     // re-detecting the CPU feature per row (`m` is thousands on every real
     // shape).
-    let use_simd = q == CpuQuant::Mq4G256 && simd::use_avx2(simd::avx2_available(), requested);
+    let use_simd = simd::row_dot_enabled(q, requested);
     y[..m].par_iter_mut().enumerate().for_each(|(row, out)| {
         *out = dot_row_simd(q, &packed[row * rb..], k, x, use_simd);
     });
@@ -136,7 +136,7 @@ pub fn gemm_with_simd(
         packed.len()
     );
     let x = &x[..n * k];
-    let use_simd = q == CpuQuant::Mq4G256 && simd::use_avx2(simd::avx2_available(), requested);
+    let use_simd = simd::row_dot_enabled(q, requested);
     out[..n * m].par_iter_mut().enumerate().for_each(|(flat, o)| {
         let (token, row) = (flat / m, flat % m);
         *o = dot_row_simd(q, &packed[row * rb..], k, &x[token * k..], use_simd);
@@ -145,13 +145,18 @@ pub fn gemm_with_simd(
 
 /// One output element: `Σ_j W[row][j] * x[j]`, accumulating one group at a time.
 ///
-/// `use_simd` is resolved once per GEMV call by the caller; it is only ever true
-/// for `Mq4G256`, the dominant spilled format (`-mq4` fixtures and every `mq4v2`
-/// body), which has a hand-written AVX2 kernel. Everything else uses the
-/// format-generic decode below.
+/// `use_simd` is resolved once per GEMV call by the caller ([`simd::row_dot_enabled`],
+/// true only for the formats with a hand-written AVX2 row dot — `Mq4G256` and
+/// `Mq3G256V2`). Everything else uses the format-generic decode below.
 fn dot_row_simd(q: CpuQuant, row: &[u8], k: usize, x: &[f32], use_simd: bool) -> f32 {
     if use_simd {
-        return simd::mq4g256_row_dot_avx2(row, k, x);
+        match q {
+            CpuQuant::Mq4G256 => return simd::mq4g256_row_dot_avx2(row, k, x),
+            CpuQuant::Mq3G256V2 => return simd::mq3g256v2_row_dot_avx2(row, k, x),
+            // `row_dot_enabled` returns true only for the two arms above; a
+            // format added to it without a kernel here stays correct and slow.
+            _ => debug_assert!(false, "no AVX2 row dot for {q:?}"),
+        }
     }
     dot_row_scalar(q, row, k, x)
 }

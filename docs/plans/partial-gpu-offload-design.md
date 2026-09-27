@@ -332,10 +332,13 @@ PCIe link (27.1 GB/s measured, §7) instead of device DRAM: this is llama.cpp's
   qt 22 `TidI32` (MoE-indexed only, no dense GEMV kernel exists / not a weight).
   Each stays on the GPU over PCIe and is *named* by the load-time line
   `cpu exec: {covered}/{spilled} spilled layers fully covered; uncovered quants: …`.
-  `HIPFIRE_CPU_EXEC_TRACE=1` reports one line per distinct step shape plus the
-  running counters, whose second number ("host-mapped steps still on GPU") must
-  be 0 for a fully covered model — a fused launch the guard missed or a call site
-  that bypasses `execute_steps` shows up there instead of as a mystery.
+  `HIPFIRE_CPU_EXEC_TRACE=1` reports one line per distinct step shape (at the
+  shape's first call and at every doubling of its call count, each with that
+  shape's own mean D2H/GEMV/H2D) plus the running counters, whose second number
+  ("host-mapped steps still on GPU") must be 0 for a fully covered model — a
+  fused launch the guard missed or a call site that bypasses `execute_steps`
+  shows up there instead of as a mystery. The `calls=` field on the line is what
+  makes the number quotable: a shape's first line is its cold first step.
 - **Not covered, deliberately.** The slots/serve body (`forward_batch_slots` →
   `dense_ffn_body_slots`) and prefill run batched GEMM kernels that never enter
   `execute_steps`, so their spilled weights are still read over PCIe; the seam
@@ -345,8 +348,11 @@ PCIe link (27.1 GB/s measured, §7) instead of device DRAM: this is llama.cpp's
   "Correctness gate"): the two engines are independent implementations with
   different accumulation orders. Acceptance is coherence plus task-correct output
   plus a *measured* divergence — so the CPU kernels use ordinary f32 `expf`
-  arithmetic where they need it and an AVX2 `Mq4G256` kernel that is
-  intentionally not bit-equal to the scalar path (`crates/hipfire-cpu/src/simd`).
+  arithmetic where they need it and hand-written AVX2 row dots (`Mq4G256`,
+  `Mq3G256V2`) that are intentionally not bit-equal to the scalar path
+  (`crates/hipfire-cpu/src/simd`). Everything else decodes scalar; the seam's
+  cost model is weight bytes over host bandwidth, so a format without a kernel
+  is a throughput regression, never a correctness one.
   **Fidelity is the per-step parity (6.7e-7 worst case) and the bit-exact decode
   over 1695 tensors; the end-to-end text divergence is a downstream symptom of
   greedy argmax over numbers that differ at the seventh digit, not an error rate
