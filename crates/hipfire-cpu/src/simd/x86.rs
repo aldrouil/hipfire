@@ -643,3 +643,113 @@ row_dot!(
     160,
     "avx2,fma,f16c"
 );
+
+// ── element formats: no codes to unpack, only weights to widen ───────────────
+//
+// These carry one weight per element rather than a group header, so the group
+// is just a run of elements and the kernel is a plain widening dot. `F32` is the
+// only one that needs no widening at all, and `Bf16` the only one that needs no
+// F16C (a 16-bit shift is the whole conversion).
+
+/// Eight `fp16` elements at `p`, widened.
+#[inline]
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn widen8_f16(p: *const u8) -> __m256 {
+    _mm256_cvtph_ps(_mm_loadu_si128(p as *const __m128i))
+}
+
+/// Eight `bf16` elements at `p`: the zero-extended halfwords shifted into a
+/// float's high half — `bf16` is an f32 truncated to 16 bits, so scaling is the
+/// conversion.
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn widen8_bf16(p: *const u8) -> __m256 {
+    let v = _mm256_cvtepu16_epi32(_mm_loadu_si128(p as *const __m128i));
+    _mm256_castsi256_ps(_mm256_slli_epi32(v, 16))
+}
+
+/// Eight `f32` elements at `p`.
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn widen8_f32(p: *const u8) -> __m256 {
+    _mm256_loadu_ps(p as *const f32)
+}
+
+/// A row of an element format: `256`-element groups, `$elem` bytes per element
+/// and no header, with `$lane` widening eight elements at a time.
+macro_rules! dense_row_dot {
+    ($(#[$meta:meta])* $name:ident, $elem:literal, $feat:literal, $lane:ident) => {
+        $(#[$meta])*
+        ///
+        /// # Safety
+        ///
+        /// Same contract as the `row_dot!` drivers: the features above,
+        /// `k % 256 == 0`, `(k / 256) * 256 * $elem` readable bytes at `row`
+        /// and `k` readable `f32` at `x`.
+        #[target_feature(enable = $feat)]
+        pub unsafe fn $name(row: *const u8, k: usize, x: *const f32) -> f32 {
+            let mut acc = 0.0f32;
+            for g in 0..k / 256 {
+                let wp = row.add(g * 256 * $elem);
+                let xg = x.add(g * 256);
+                let mut dot = _mm256_setzero_ps();
+                for c in 0..32 {
+                    let xv = _mm256_loadu_ps(xg.add(c * 8));
+                    dot = _mm256_fmadd_ps($lane(wp.add(c * 8 * $elem)), xv, dot);
+                }
+                acc += hsum256(dot);
+            }
+            acc
+        }
+    };
+}
+
+dense_row_dot!(
+    /// qt 1 — `F16`: plain `fp16` weights, 2 B per element.
+    f16_row_dot,
+    2,
+    "avx2,fma,f16c",
+    widen8_f16
+);
+
+dense_row_dot!(
+    /// qt 16 — `Bf16`: plain `bf16`, the one format whose kernel needs no F16C.
+    bf16_row_dot,
+    2,
+    "avx2,fma",
+    widen8_bf16
+);
+
+dense_row_dot!(
+    /// qt 2 — `F32`: the weights are already the kernel's own type, so there is
+    /// no decode at all — only the accumulation order differs from scalar.
+    f32_row_dot,
+    4,
+    "avx2,fma",
+    widen8_f32
+);
+
+row_dot!(
+    /// qt 3 — `Q8F16` (`DType::Q8_0`): a 32-element block of one `fp16` scale
+    /// then 32 `i8` codes. The only signed-code format, and the only block
+    /// smaller than 128 elements.
+    q8f16_row_dot,
+    q8f16_group,
+    32,
+    34,
+    "avx2,fma,f16c"
+);
+
+/// qt 3's group: one `fp16` scale, then four chunks of eight signed bytes.
+#[inline]
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn q8f16_group(gptr: *const u8, xg: *const f32) -> f32 {
+    let (scale, _) = f16_pair(gptr);
+    let mut dot = _mm256_setzero_ps();
+    for c in 0..4 {
+        let bytes = _mm_loadl_epi64(gptr.add(2 + c * 8) as *const __m128i);
+        let v = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(bytes));
+        dot = _mm256_fmadd_ps(v, _mm256_loadu_ps(xg.add(c * 8)), dot);
+    }
+    scale * hsum256(dot)
+}

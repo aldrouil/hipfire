@@ -146,14 +146,12 @@ pub fn gemm_with_simd(
 /// One output element: `Σ_j W[row][j] * x[j]`, accumulating one group at a time.
 ///
 /// `use_simd` is resolved once per GEMV call by the caller
-/// ([`simd::row_dot_enabled`]); when it is set, the format's AVX2 kernel computes
-/// the row and a format this build has no kernel for falls through to the
-/// format-generic decode below.
+/// ([`simd::row_dot_enabled`]); every format has a vector kernel, so when it is
+/// set the row is the kernel's and the scalar decode below is the ARM and
+/// non-AVX2 fallback (and the reference `simd::tests` compares against).
 fn dot_row_simd(q: CpuQuant, row: &[u8], k: usize, x: &[f32], use_simd: bool) -> f32 {
     if use_simd {
-        if let Some(dot) = simd::row_dot_avx2(q, row, k, x) {
-            return dot;
-        }
+        return simd::row_dot_avx2(q, row, k, x);
     }
     dot_row_scalar(q, row, k, x)
 }

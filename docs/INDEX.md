@@ -102,6 +102,7 @@ Exactly one canonical owner (or explicit `BLOCKED`) per concern.
 | DeepSeek4 PR body archive | [`docs/deepseek4-pr-body.md`](deepseek4-pr-body.md) | historical | |
 | Multi-GPU bring-up lessons | [`docs/multi-gpu-bringup-lessons.md`](multi-gpu-bringup-lessons.md) | historical | |
 | HFP4 format note | [`docs/quant-formats/hfp4.md`](quant-formats/hfp4.md) | shipped / ref-pinned | Current HFP4/MFP4 owners are shipped / ref-pinned; some reserved aliases remain planned. Broader quant authority stays `QUANTIZATION.md`. |
+| CPU SIMD coverage map | [`docs/quant-formats/cpu-simd-coverage.md`](quant-formats/cpu-simd-coverage.md) | shipped / ref-pinned | Which AVX2 row dot each `CpuQuant` gets and under which gate. Authority for the CPU-exec offload path's vector coverage; the qt allocation itself stays `qt-register.txt`. |
 | MoE AWQ working notes | [`docs/moe-awq/`](moe-awq/) | historical | |
 | MI300X rental runbook | [`docs/rental/MI300X-RENTAL-RUNBOOK.md`](rental/MI300X-RENTAL-RUNBOOK.md) | historical | |
 | Relicense / governance records | [`docs/governance/`](governance/) | historical | Legal/historical; do not rewrite. |
