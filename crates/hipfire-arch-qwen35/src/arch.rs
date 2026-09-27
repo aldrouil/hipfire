@@ -76,6 +76,10 @@ impl Architecture for Qwen35 {
         cfg: &Self::Config,
         gpu: &mut Gpu,
     ) -> Result<Self::Weights, String> {
+        // One line when `memory.offload_exec=cpu`, naming which spilled formats
+        // the CPU can actually execute (silent otherwise; see the fn's docs).
+        // Before the source takes its mutable borrow of `hfq`.
+        crate::qwen35::load::report_cpu_exec_coverage(hfq, cfg);
         let mut source = HfqSource::new(hfq, cfg);
         let layout = Layout::single(cfg.n_layers);
         qwen35_load_weights(&mut source, std::slice::from_mut(gpu), &layout)

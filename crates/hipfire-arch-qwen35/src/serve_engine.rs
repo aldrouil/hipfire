@@ -249,7 +249,7 @@ fn resident_weight_bytes(hfq: &hipfire_runtime::hfq::HfqFile, i_gpu_start: usize
 /// `.`), so an unrelated name that merely contains the substring — `my_layers.4.w`
 /// — is not mistaken for a layer tensor and charged to the wrong side of the
 /// offload split.
-fn tensor_layer_index(name: &str) -> Option<usize> {
+pub(crate) fn tensor_layer_index(name: &str) -> Option<usize> {
     let at = name.find("layers.")?;
     if at != 0 && name.as_bytes()[at - 1] != b'.' {
         return None;

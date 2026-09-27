@@ -1437,6 +1437,7 @@ version = "0.3.1"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
+ "hipfire-cpu",
  "rdna-compute",
 ]
 

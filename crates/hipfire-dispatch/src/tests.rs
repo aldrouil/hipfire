@@ -2522,3 +2522,67 @@ fn codebook_grouped_gemm_kernarg_contract_is_the_uniform_nine() {
         }
     }
 }
+
+// ── CPU-executed offload (memory.offload_exec=cpu) ────────────────────────────
+
+/// The seam's coverage table and the launcher's rotation table must agree: the
+/// CPU path applies `rotate_x` to a `Raw` activation exactly when the launcher
+/// would, so a dtype that maps to a `CpuQuant` while `dtype_rotation_plan` says
+/// something else would silently feed unrotated activations to rotated weights
+/// (or double-rotate them) — the silent-garbage failure mode, not an error.
+#[test]
+fn cpu_quant_rotation_agrees_with_plan() {
+    for dtype in [
+        DType::MQ4G256,
+        DType::MQ4G256V2,
+        DType::MQ6G256,
+        DType::MQ3G256,
+        DType::MQ3G256Lloyd,
+        DType::HFQ6G256,
+        DType::HFQ4G256,
+        DType::Q8_0,
+        DType::F16,
+        DType::F32,
+        DType::BF16,
+    ] {
+        let q = crate::cpu_quant_for(dtype).unwrap_or_else(|| {
+            panic!("{dtype:?} has a CPU decoder and must be in cpu_quant_for")
+        });
+        assert_eq!(
+            q.is_fwht_g256(),
+            dtype_rotation_plan(dtype) == RotationPlan::FwhtG256,
+            "{dtype:?}: CPU rotation disagrees with dtype_rotation_plan"
+        );
+    }
+}
+
+/// Formats the CPU must refuse, including ones that look adjacent to a covered
+/// format. Each of these has its own layout (codebook size, bit width, or a
+/// non-FWHT rotation) that `hipfire-cpu` does not implement, so a step over one
+/// stays on the GPU over PCIe.
+#[test]
+fn cpu_quant_refuses_unimplemented_formats() {
+    for dtype in [
+        DType::MQ4CG256,
+        DType::MQ4G256Lloyd,
+        DType::MQ2G256Lloyd,
+        DType::MQ2G256LloydU,
+        DType::MQ3G256V2,
+        DType::MQ4G128,
+        DType::MQ8G256,
+        DType::MFP4G32,
+        DType::ParoQ4G128,
+        DType::Q4K,
+        DType::HFQ3G256,
+        DType::HFQ2G256,
+        DType::TQ2G128,
+        DType::BQ1G128,
+        DType::Q8HFQ,
+        DType::Raw,
+    ] {
+        assert!(
+            crate::cpu_quant_for(dtype).is_none(),
+            "{dtype:?} must not be CPU-executed until its decode is transcribed"
+        );
+    }
+}

@@ -17,6 +17,8 @@
 //! Two sources of weights:
 //!
 //! * real projection tensors out of the pulled fixtures ([`REAL`]), and
+//! * the fixture's own AWQ sidecar attached to the real tensors that have one
+//!   (the launcher applies that per-channel divide inside the rotation), and
 //! * synthetic buffers for the formats no fixture on disk carries ([`SYNTH`]).
 //!   A decode check does not care whether the bytes came from a quantizer, so
 //!   this keeps the matrix complete instead of "whatever the local model
@@ -25,7 +27,7 @@
 //!
 //! `#[ignore]`d: needs an RDNA GPU with a working HIP toolchain; the real-tensor
 //! rows additionally need `hipfire pull qwen3.5:2b`, `:2b-mq3`, `:2b-mq6`,
-//! `:2b-hf6`. Run explicitly:
+//! `:2b-hf6`. Run explicitly (both arms):
 //!
 //!   cargo test -p hipfire-arch-qwen35 --release --test gpu_gemv_parity -- --ignored --nocapture
 
@@ -33,11 +35,13 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use hipfire_cpu::gemv::gemv as cpu_gemv;
-use hipfire_cpu::quant::{rotate_x, CpuQuant};
+use hipfire_cpu::quant::{divide_by_awq_scale, rotate_x, CpuQuant};
 use hipfire_dispatch::context::DispatchCtx;
-use hipfire_dispatch::families::gemv::{GemvFamily, WeightRef};
+use hipfire_dispatch::families::gemv::{GemvFamily, GemvParams, WeightRef};
+use hipfire_dispatch::types::GemvVariant;
 use hipfire_runtime::hfq::HfqFile;
-use rdna_compute::{DType, Gpu};
+use hipfire_runtime::weight_backend::load_awq_scale_for;
+use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Relative tolerance against `max|reference|`.
 ///
@@ -159,6 +163,7 @@ struct Parity {
 
 /// Compare the production launcher against the CPU transcription on identical
 /// bytes and activation.
+#[allow(clippy::too_many_arguments)]
 fn compare(
     gpu: &mut Gpu,
     gemv: &GemvFamily,
@@ -168,6 +173,7 @@ fn compare(
     bytes: &[u8],
     m: usize,
     k: usize,
+    awq: Option<&GpuTensor>,
     worst: &mut BTreeMap<&'static str, Parity>,
 ) {
     let w = gpu.upload_raw(bytes, &[bytes.len()]).expect("upload w");
@@ -182,7 +188,7 @@ fn compare(
         k,
         row_stride: 0,
         rotation: None,
-        awq_scale: None,
+        awq_scale: awq,
     };
     gemv.run_auto(&ctx, gpu, &wr, &x_dev, &y_dev)
         .unwrap_or_else(|e| panic!("{label}: launcher failed: {e:?}"));
@@ -192,8 +198,18 @@ fn compare(
         unsafe { std::slice::from_raw_parts_mut(gpu_y.as_mut_ptr() as *mut u8, m * 4) };
     gpu.hip.memcpy_dtoh(gpu_y_bytes, &y_dev.buf).expect("dtoh");
 
+    // Mirror `cpu_exec::prepare_activation`: the AWQ divide happens *inside* the
+    // rotation (the quantizer pre-scaled the weights by `s`), so it must precede
+    // the FWHT — and must not be applied at all to a pre-rotated input.
     let mut x_cpu = x_host;
     if q.is_fwht_g256() {
+        if let Some(scale) = awq {
+            let mut sc = vec![0.0f32; k];
+            let sc_bytes =
+                unsafe { std::slice::from_raw_parts_mut(sc.as_mut_ptr() as *mut u8, k * 4) };
+            gpu.hip.memcpy_dtoh(sc_bytes, &scale.buf).expect("dtoh scale");
+            divide_by_awq_scale(&mut x_cpu, &sc);
+        }
         rotate_x(&mut x_cpu);
     }
     let mut cpu_y = vec![0.0f32; m];
@@ -224,6 +240,121 @@ fn compare(
     gpu.free_tensor(w).ok();
     gpu.free_tensor(x_dev).ok();
     gpu.free_tensor(y_dev).ok();
+}
+
+/// The `Prerotated` arm: the launcher's per-row kernels take an activation that
+/// was rotated by an earlier step, and the CPU path must then **not** rotate it
+/// again. A double rotation is a silent `R^2` error — the output still looks like
+/// activations (it is a norm-preserving transform of a real activation), so only
+/// this comparison catches it.
+///
+/// The rotation here is `hipfire_cpu::rotate_x`, verified against the GPU
+/// rotation kernel by construction of the same sign tables and by
+/// `hipfire_cpu`'s Walsh-Hadamard oracle; both arms get byte-identical input.
+#[test]
+#[ignore]
+fn gpu_cpu_gemv_parity_prerotated_input() {
+    let mut gpu = match Gpu::init() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("SKIP — no GPU ({e:?}).");
+            return;
+        }
+    };
+    gpu.ensure_mq_signs().expect("mq signs");
+    let dir = models_dir();
+    let gemv = GemvFamily::new();
+    let mut checked = 0usize;
+
+    for (file, qt, dtype, q) in REAL {
+        if !q.is_fwht_g256() {
+            continue;
+        }
+        let path = dir.join(file);
+        if !path.exists() {
+            eprintln!("skip: {} not present", path.display());
+            continue;
+        }
+        let hfq = HfqFile::open(&path).expect("open fixture");
+        let Some((name, m, k)) = hfq
+            .tensors()
+            .iter()
+            .filter(|i| {
+                i.quant_type == *qt
+                    && i.shape.len() == 2
+                    && !i.name.contains("embed_tokens")
+                    && {
+                        let k = i.shape[1] as usize;
+                        k % 256 == 0 && (i.shape[0] as usize) * k <= MAX_ELEMS
+                    }
+            })
+            .max_by_key(|i| (i.shape[0] as usize) * (i.shape[1] as usize))
+            .map(|i| (i.name.clone(), i.shape[0] as usize, i.shape[1] as usize))
+        else {
+            continue;
+        };
+        let (_, bytes) = hfq.tensor_data_vec(&name).expect("tensor bytes");
+
+        let w = gpu.upload_raw(&bytes, &[bytes.len()]).expect("upload w");
+        let x_raw = activation(k, m);
+        let mut x_rot_host = x_raw.clone();
+        rotate_x(&mut x_rot_host);
+        let x_dev = gpu.upload_f32(&x_rot_host, &[k]).expect("upload x_rot");
+        let y_dev = gpu.alloc_tensor(&[m], DType::F32).expect("alloc y");
+        let ctx = DispatchCtx::new(&gpu);
+        let wr = WeightRef {
+            buf: &w,
+            dtype: *dtype,
+            m,
+            k,
+            row_stride: 0,
+            rotation: None,
+            awq_scale: None,
+        };
+        gemv.run(
+            &ctx,
+            &mut gpu,
+            &GemvParams {
+                w: &wr,
+                x: &x_dev,
+                y: &y_dev,
+                variant: GemvVariant::Prerotated,
+                residual: None,
+                gate: None,
+                up: None,
+            },
+        )
+        .unwrap_or_else(|e| panic!("{file} {name}: prerotated launcher failed: {e:?}"));
+        gpu.hip.device_synchronize().expect("sync");
+        let mut gpu_y = vec![0.0f32; m];
+        let gpu_y_bytes =
+            unsafe { std::slice::from_raw_parts_mut(gpu_y.as_mut_ptr() as *mut u8, m * 4) };
+        gpu.hip.memcpy_dtoh(gpu_y_bytes, &y_dev.buf).expect("dtoh");
+
+        // CPU: same bytes, activation used exactly as handed over — no rotation.
+        let mut cpu_y = vec![0.0f32; m];
+        cpu_gemv(*q, &bytes, m, k, &x_rot_host, &mut cpu_y);
+
+        let max_abs = gpu_y
+            .iter()
+            .zip(&cpu_y)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let scale = cpu_y.iter().fold(0.0f32, |a, b| a.max(b.abs())).max(1e-6);
+        let rel = max_abs / scale;
+        eprintln!("{file:16} qt={qt:<3} {name:52} prerotated m={m} k={k} max_abs={max_abs:.3e} rel={rel:.3e}");
+        assert!(
+            rel <= TOL,
+            "{file} {name}: Prerotated parity {rel:.3e} exceeds {TOL:.0e} — the CPU path \
+             must not rotate an already-rotated activation"
+        );
+        checked += 1;
+        gpu.free_tensor(w).ok();
+        gpu.free_tensor(x_dev).ok();
+        gpu.free_tensor(y_dev).ok();
+    }
+    eprintln!("prerotated parity: {checked} tensors");
+    assert!(checked > 0, "no fixture was exercised");
 }
 
 #[test]
@@ -276,7 +407,17 @@ fn gpu_cpu_gemv_parity_per_format() {
                 .tensor_data_vec(&name)
                 .unwrap_or_else(|| panic!("{file}: no bytes for {name}"));
             let label = format!("{file} qt={qt} {}", name.rsplit('.').nth(1).unwrap_or(&name));
-            compare(&mut gpu, &gemv, &label, *q, *dtype, &bytes, m, k, &mut worst);
+            compare(&mut gpu, &gemv, &label, *q, *dtype, &bytes, m, k, None, &mut worst);
+            // AWQ arm (`RotateMqAwq`): the fixture's own sidecar, attached exactly
+            // when the loader would attach it. This is the arm that catches a
+            // dropped per-channel divide — the failure mode is `(W·s)·x`, which no
+            // tolerance on an unsclaed comparison can see.
+            if dtype.supports_awq_sidecar() && done == 1 {
+                if let Some(scale) = load_awq_scale_for(&hfq, &gpu, &name, k) {
+                    let label = format!("{label} +awq");
+                    compare(&mut gpu, &gemv, &label, *q, *dtype, &bytes, m, k, Some(&scale), &mut worst);
+                }
+            }
         }
         if done == 0 {
             eprintln!("note: {file} carries no 2-D qt {qt} tensor under {MAX_ELEMS} elements");
@@ -287,7 +428,7 @@ fn gpu_cpu_gemv_parity_per_format() {
         let (m, k) = (64usize, 1024usize);
         let bytes = synth_weights(*q, m, k);
         let label = format!("synthetic qt={qt} {q:?}");
-        compare(&mut gpu, &gemv, &label, *q, *dtype, &bytes, m, k, &mut worst);
+        compare(&mut gpu, &gemv, &label, *q, *dtype, &bytes, m, k, None, &mut worst);
         synthetic_formats += 1;
     }
 

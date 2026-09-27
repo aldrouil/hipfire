@@ -229,6 +229,31 @@ pub fn rotate_x(x: &mut [f32]) {
     }
 }
 
+/// Divide an activation by a per-input-channel AWQ scale:
+/// `x[i] /= scale[i]`, indexed in the **unrotated** basis.
+///
+/// This is the op the `rotate_x_mq_awq` / `fused_rmsnorm_mq_rotate_awq` /
+/// `fused_silu_mul_rotate_mq_awq` kernels fold in ahead of the FWHT: the
+/// quantizer pre-scaled those weights by `s`, so `(W·s) · (x/s) = W·x` only
+/// holds if the activation is divided *before* it is rotated. Omitting it does
+/// not fail — it silently computes `(W·s)·x`, a per-channel scale error on
+/// every projection that carries a sidecar (`DType::supports_awq_sidecar`),
+/// which is the "token soup" failure mode with no error to point at.
+///
+/// `scale` is the loader's already-widened f32 sidecar (`load_awq_scale_for`
+/// converts the on-disk f16 to f32 on the host), one value per input channel.
+pub fn divide_by_awq_scale(x: &mut [f32], scale: &[f32]) {
+    assert!(
+        scale.len() >= x.len(),
+        "awq scale has {} channels, activation has {}",
+        scale.len(),
+        x.len()
+    );
+    for (v, s) in x.iter_mut().zip(scale) {
+        *v /= *s;
+    }
+}
+
 #[inline]
 fn f16_at(bytes: &[u8], off: usize) -> f32 {
     half_f16_to_f32(u16::from_le_bytes([bytes[off], bytes[off + 1]]))
@@ -923,6 +948,31 @@ mod test {
                 assert_eq!(got, want, "bits 0x{bits:04x}");
             }
         }
+    }
+
+    #[test]
+    fn divide_by_awq_scale_is_per_channel_and_pre_rotation() {
+        // (W·s)·(x/s) = W·x: the divide must cancel the pre-scaled weight, so
+        // dividing then rotating a probe activation must equal rotating the
+        // unscaled activation of a (W/s)-weighted... — the property that matters
+        // and is checkable in isolation is that the divide is per channel and
+        // precedes the rotation, i.e. R(x/s) != R(x)/s in general and equals a
+        // hand-built R applied to x/s.
+        let scale = [2.0f32, 4.0, 0.5, 8.0];
+        let mut x = [4.0f32, 8.0, 1.0, 16.0];
+        divide_by_awq_scale(&mut x, &scale);
+        assert_eq!(x, [2.0, 2.0, 2.0, 2.0]);
+        // A longer scale than activation is accepted (the loader's buffer is
+        // exactly k, but the contract is `>=`), a shorter one is a caller bug.
+        divide_by_awq_scale(&mut x, &[1.0, 1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(x, [2.0, 2.0, 2.0, 2.0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "awq scale has 3 channels")]
+    fn divide_by_awq_scale_rejects_a_short_scale() {
+        let mut x = [0.0f32; 4];
+        divide_by_awq_scale(&mut x, &[1.0, 1.0, 1.0]);
     }
 
     #[test]

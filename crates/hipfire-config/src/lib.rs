@@ -653,6 +653,18 @@ pub static FIELDS: &[ConfigField] = &[
         Some("HIPFIRE_GPU_LAYER_BUDGET"),
         "Resident-layer budget for partial GPU offload: N keeps the last N layers on the GPU and spills the rest to system RAM; unset keeps every layer on the GPU. The number counts layers ON the GPU, not layers offloaded — 3 on a 64-layer model spills 61. 'auto' (-1) defers placement to the engine, which currently keeps every layer on the GPU."
     ),
+    field!(
+        "memory.offload_exec",
+        "offload_exec",
+        Memory,
+        ModelLoad,
+        DefaultValue::String("pcie"),
+        ValueRule::Enum(&["pcie", "cpu"]),
+        true,
+        false,
+        Some("HIPFIRE_OFFLOAD_EXEC"),
+        "Which engine executes the ops that read a spilled layer's weights: 'pcie' (default) runs the GPU kernels against host-mapped weights over the link, 'cpu' executes those GEMVs on the CPU instead. Decides who multiplies, never what is spilled — placement stays memory.gpu_layer_budget, and the KV cache stays in VRAM either way. Unset, empty and unknown values all fall back to 'pcie'."
+    ),
     // Process-scoped: the preflight guards snapshot this once at startup, and
     // a mid-serve flip would make the refusal policy depend on which load ran
     // last — dishonest for a long-lived daemon.
@@ -5669,13 +5681,13 @@ mod tests {
     }
 }
 
-/// Placement policy for partial GPU offload — decides which layers stay in
-/// device VRAM versus spill to host RAM, resolved once at load so placement is
-/// fixed for the model's lifetime and never thrashes per request. This module is
-/// intentionally pure and GPU-independent: it owns the configuration vocabulary
-/// ([`GpuLayerBudget`]) and the admission arithmetic ([`largest_fitting_tail`]);
-/// the qwen35 load path consumes them to pick `i_gpu_start`.
-pub mod memory {
+    /// Placement policy for partial GPU offload — decides which layers stay in
+    /// device VRAM versus spill to host RAM, resolved once at load so placement is
+    /// fixed for the model's lifetime and never thrashes per request. This module is
+    /// intentionally pure and GPU-independent: it owns the configuration vocabulary
+    /// ([`GpuLayerBudget`]) and the admission arithmetic ([`largest_fitting_tail`]);
+    /// the qwen35 load path consumes them to pick `i_gpu_start`.
+    pub mod memory {
     use super::process_value;
 
     /// Resident-layer budget for partial GPU offload (`memory.gpu_layer_budget`,
@@ -5737,6 +5749,50 @@ pub mod memory {
     /// residency (the zero-diff baseline).
     pub fn gpu_layer_budget() -> GpuLayerBudget {
         parse_gpu_layer_budget(process_value("HIPFIRE_GPU_LAYER_BUDGET").as_deref())
+    }
+
+    /// Which engine executes the ops that read a spilled layer's weights
+    /// (`memory.offload_exec`, compat env `HIPFIRE_OFFLOAD_EXEC`).
+    ///
+    /// [`OffloadExec::Pcie`] is the default and byte-for-byte today's behaviour:
+    /// the GPU kernels dereference a device alias of the host-mapped weights, so
+    /// every spilled byte crosses PCIe once per token. [`OffloadExec::Cpu`]
+    /// executes those GEMVs on the CPU instead, which bounds the per-token cost
+    /// of a spilled layer by the link rather than by device DRAM.
+    ///
+    /// This decides *who multiplies*, never *what is spilled* — placement stays
+    /// [`gpu_layer_budget`], and the KV cache stays in VRAM either way.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum OffloadExec {
+        /// GPU kernels read the host-mapped weights over PCIe (default).
+        Pcie,
+        /// CPU executes the steps whose weight tensor is host-mapped.
+        Cpu,
+    }
+
+    impl std::fmt::Display for OffloadExec {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                OffloadExec::Pcie => write!(f, "pcie"),
+                OffloadExec::Cpu => write!(f, "cpu"),
+            }
+        }
+    }
+
+    /// Pure truth table behind [`offload_exec`], split out so the contract is
+    /// unit-testable without the process-global snapshot. Unset, empty and
+    /// unknown all fail closed to [`OffloadExec::Pcie`] — a bad value must never
+    /// silently move work to the CPU.
+    pub fn parse_offload_exec(raw: Option<&str>) -> OffloadExec {
+        match raw.map(|v| v.trim().to_ascii_lowercase()) {
+            Some(v) if v == "cpu" => OffloadExec::Cpu,
+            _ => OffloadExec::Pcie,
+        }
+    }
+
+    /// The configured [`OffloadExec`] from the process snapshot.
+    pub fn offload_exec() -> OffloadExec {
+        parse_offload_exec(process_value("HIPFIRE_OFFLOAD_EXEC").as_deref())
     }
 
     /// Largest contiguous resident tail `[i_gpu_start .. n_layers)` such that the
@@ -5818,6 +5874,25 @@ pub mod memory {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn offload_exec_roundtrip() {
+            // Only "cpu" (trimmed, case-insensitive) selects CPU execution;
+            // everything else — including the absent value — is the pcie default,
+            // so a typo can never move work to the CPU silently.
+            assert_eq!(parse_offload_exec(Some("cpu")), OffloadExec::Cpu);
+            assert_eq!(parse_offload_exec(Some(" cpu ")), OffloadExec::Cpu);
+            assert_eq!(parse_offload_exec(Some("CPU")), OffloadExec::Cpu);
+            assert_eq!(parse_offload_exec(None), OffloadExec::Pcie);
+            assert_eq!(parse_offload_exec(Some("")), OffloadExec::Pcie);
+            assert_eq!(parse_offload_exec(Some("pcie")), OffloadExec::Pcie);
+            assert_eq!(parse_offload_exec(Some("PCIE")), OffloadExec::Pcie);
+            assert_eq!(parse_offload_exec(Some("banana")), OffloadExec::Pcie);
+            assert_eq!(parse_offload_exec(Some("cpu0")), OffloadExec::Pcie);
+            // Display is the wire spelling the registry/TOML round-trips.
+            assert_eq!(OffloadExec::Pcie.to_string(), "pcie");
+            assert_eq!(OffloadExec::Cpu.to_string(), "cpu");
+        }
 
         #[test]
         fn gpu_layer_budget_roundtrip() {
