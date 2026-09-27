@@ -316,6 +316,93 @@ fn compare(
 /// The rotation here is `hipfire_cpu::rotate_x`, verified against the GPU
 /// rotation kernel by construction of the same sign tables and by
 /// `hipfire_cpu`'s Walsh-Hadamard oracle; both arms get byte-identical input.
+/// The `Prerotated` half of a format's rotation contract: with an activation
+/// rotated by `rotate_x`, the per-row kernel must produce the same result the
+/// CPU gets by dotting the *decoded codes* against that already-rotated input —
+/// i.e. neither side may rotate again. `compare` covers the `Raw` half (both
+/// sides rotate exactly once); this covers the "already rotated" half, which the
+/// same wrong flag breaks in the same silent `R^2` way.
+///
+/// Returns `false` for a format that does not rotate at all (nothing to check)
+/// or whose launcher has no kernel on this arch.
+fn check_prerotated(
+    gpu: &mut Gpu,
+    gemv: &GemvFamily,
+    label: &str,
+    q: CpuQuant,
+    dtype: DType,
+    bytes: &[u8],
+    m: usize,
+    k: usize,
+) -> bool {
+    if !q.is_fwht_g256() {
+        return false;
+    }
+    let w = gpu.upload_raw(bytes, &[bytes.len()]).expect("upload w");
+    let mut x_rot_host = activation(k, m);
+    rotate_x(&mut x_rot_host);
+    let x_dev = gpu.upload_f32(&x_rot_host, &[k]).expect("upload x_rot");
+    let y_dev = gpu.alloc_tensor(&[m], DType::F32).expect("alloc y");
+    let ctx = DispatchCtx::new(gpu);
+    let wr = WeightRef {
+        buf: &w,
+        dtype,
+        m,
+        k,
+        row_stride: 0,
+        rotation: None,
+        awq_scale: None,
+    };
+    let launched = gemv.run(
+        &ctx,
+        gpu,
+        &GemvParams {
+            w: &wr,
+            x: &x_dev,
+            y: &y_dev,
+            variant: GemvVariant::Prerotated,
+            residual: None,
+            gate: None,
+            up: None,
+        },
+    );
+    if let Err(hipfire_dispatch::types::DispatchError::MissingImpl { key }) = &launched {
+        eprintln!("{label:58} SKIP prerotated — no kernel ({key:?}) on this arch");
+        gpu.free_tensor(w).ok();
+        gpu.free_tensor(x_dev).ok();
+        gpu.free_tensor(y_dev).ok();
+        return false;
+    }
+    launched.unwrap_or_else(|e| panic!("{label}: prerotated launcher failed: {e:?}"));
+    gpu.hip.device_synchronize().expect("sync");
+    let mut gpu_y = vec![0.0f32; m];
+    let gpu_y_bytes = unsafe { std::slice::from_raw_parts_mut(gpu_y.as_mut_ptr() as *mut u8, m * 4) };
+    gpu.hip.memcpy_dtoh(gpu_y_bytes, &y_dev.buf).expect("dtoh");
+
+    // CPU: the same rotated activation, used exactly as handed over.
+    let mut cpu_y = vec![0.0f32; m];
+    cpu_gemv(q, bytes, m, k, &x_rot_host, &mut cpu_y);
+    let max_abs = gpu_y
+        .iter()
+        .zip(&cpu_y)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let scale = cpu_y.iter().fold(0.0f32, |a, b| a.max(b.abs())).max(1e-6);
+    let rel = max_abs / scale;
+    eprintln!(
+        "{label:58} prerotated m={m:<6} k={k:<6} max_abs={max_abs:.3e} rel={rel:.3e}"
+    );
+    assert!(
+        rel <= TOL,
+        "{label}: Prerotated parity {rel:.3e} exceeds {TOL:.0e} — the CPU path must not \
+         rotate an already-rotated activation"
+    );
+    gpu.free_tensor(w).ok();
+    gpu.free_tensor(x_dev).ok();
+    gpu.free_tensor(y_dev).ok();
+    true
+}
+
 #[test]
 #[ignore]
 fn gpu_cpu_gemv_parity_prerotated_input() {
@@ -331,6 +418,7 @@ fn gpu_cpu_gemv_parity_prerotated_input() {
     let gemv = GemvFamily::new();
     let mut checked = 0usize;
 
+    // Real tensors from the fixtures …
     for (file, qt, dtype, q) in REAL {
         if !q.is_fwht_g256() {
             continue;
@@ -359,66 +447,21 @@ fn gpu_cpu_gemv_parity_prerotated_input() {
             continue;
         };
         let (_, bytes) = hfq.tensor_data_vec(&name).expect("tensor bytes");
-
-        let w = gpu.upload_raw(&bytes, &[bytes.len()]).expect("upload w");
-        let x_raw = activation(k, m);
-        let mut x_rot_host = x_raw.clone();
-        rotate_x(&mut x_rot_host);
-        let x_dev = gpu.upload_f32(&x_rot_host, &[k]).expect("upload x_rot");
-        let y_dev = gpu.alloc_tensor(&[m], DType::F32).expect("alloc y");
-        let ctx = DispatchCtx::new(&gpu);
-        let wr = WeightRef {
-            buf: &w,
-            dtype: *dtype,
-            m,
-            k,
-            row_stride: 0,
-            rotation: None,
-            awq_scale: None,
-        };
-        gemv.run(
-            &ctx,
-            &mut gpu,
-            &GemvParams {
-                w: &wr,
-                x: &x_dev,
-                y: &y_dev,
-                variant: GemvVariant::Prerotated,
-                residual: None,
-                gate: None,
-                up: None,
-            },
-        )
-        .unwrap_or_else(|e| panic!("{file} {name}: prerotated launcher failed: {e:?}"));
-        gpu.hip.device_synchronize().expect("sync");
-        let mut gpu_y = vec![0.0f32; m];
-        let gpu_y_bytes =
-            unsafe { std::slice::from_raw_parts_mut(gpu_y.as_mut_ptr() as *mut u8, m * 4) };
-        gpu.hip.memcpy_dtoh(gpu_y_bytes, &y_dev.buf).expect("dtoh");
-
-        // CPU: same bytes, activation used exactly as handed over — no rotation.
-        let mut cpu_y = vec![0.0f32; m];
-        cpu_gemv(*q, &bytes, m, k, &x_rot_host, &mut cpu_y);
-
-        let max_abs = gpu_y
-            .iter()
-            .zip(&cpu_y)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
-        let scale = cpu_y.iter().fold(0.0f32, |a, b| a.max(b.abs())).max(1e-6);
-        let rel = max_abs / scale;
-        eprintln!("{file:16} qt={qt:<3} {name:52} prerotated m={m} k={k} max_abs={max_abs:.3e} rel={rel:.3e}");
-        assert!(
-            rel <= TOL,
-            "{file} {name}: Prerotated parity {rel:.3e} exceeds {TOL:.0e} — the CPU path \
-             must not rotate an already-rotated activation"
-        );
-        checked += 1;
-        gpu.free_tensor(w).ok();
-        gpu.free_tensor(x_dev).ok();
-        gpu.free_tensor(y_dev).ok();
+        if check_prerotated(&mut gpu, &gemv, &format!("{file} {name}"), *q, *dtype, &bytes, m, k) {
+            checked += 1;
+        }
     }
-    eprintln!("prerotated parity: {checked} tensors");
+    // … and one synthetic buffer per rotating format, so a format with no local
+    // artifact still gets both halves of the contract.
+    for (qt, dtype, q) in SYNTH {
+        let (m, k) = (64usize, 1024usize);
+        let bytes = synth_weights(*q, m, k);
+        if check_prerotated(&mut gpu, &gemv, &format!("synthetic qt={qt} {q:?}"), *q, *dtype, &bytes, m, k)
+        {
+            checked += 1;
+        }
+    }
+    eprintln!("prerotated parity: {checked} checks");
     assert!(checked > 0, "no fixture was exercised");
 }
 

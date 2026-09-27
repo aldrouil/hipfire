@@ -347,13 +347,23 @@ fn f32_hdr(packed: &[u8], off: usize) -> (f32, f32) {
     (f32_at(packed, off), f32_at(packed, off + 4))
 }
 
-/// `(scale, zero)` for the i-th element of a V2 group: `[s0 z0 s1 z1]` as fp16,
-/// with half 0 covering elements `0..128` and half 1 `128..256` (the kernels
-/// select the half by thread id, i.e. by element index).
+/// The two per-128 halves of a V2 group's `[s0 z0 s1 z1]` fp16 header.
+///
+/// Widened **once per group**, not per element: `half_f16_to_f32` is a branchy
+/// widening, and calling it twice per weight made the V2 family
+/// conversion-bound (measured on `qwen3.8-27b.mq3-xt`: 19.9 ms/step at
+/// m=12288 k=5120, i.e. ~3 GMAC/s, versus ~30 GB/s of weight streaming).
 #[inline]
-fn v2_hdr(packed: &[u8], off: usize, i: usize) -> (f32, f32) {
-    let h = 4 * (i / 128);
-    (f16_at(packed, off + h), f16_at(packed, off + h + 2))
+fn v2_halves(packed: &[u8], off: usize) -> ((f32, f32), (f32, f32)) {
+    (
+        (f16_at(packed, off), f16_at(packed, off + 2)),
+        (f16_at(packed, off + 4), f16_at(packed, off + 6)),
+    )
+}
+
+#[inline]
+fn half_of(i: usize, halves: ((f32, f32), (f32, f32))) -> (f32, f32) {
+    if i < 128 { halves.0 } else { halves.1 }
 }
 
 /// 2-bit codes, LSB-first, 4 per byte.
@@ -513,10 +523,9 @@ pub fn decode_group_codes(q: CpuQuant, packed: &[u8], out: &mut [f32]) {
             }
         }
         CpuQuant::Mq4G256V2 => {
+            let halves = v2_halves(packed, 0);
             for (i, o) in out[..ge].iter_mut().enumerate() {
-                let h = i / 128;
-                let scale = f16_at(packed, 4 * h);
-                let zero = f16_at(packed, 4 * h + 2);
+                let (scale, zero) = half_of(i, halves);
                 let byte = packed[8 + i / 2];
                 let nibble = if i % 2 == 0 { byte & 0xF } else { byte >> 4 };
                 *o = scale * nibble as f32 + zero;
@@ -573,10 +582,12 @@ pub fn decode_group_codes(q: CpuQuant, packed: &[u8], out: &mut [f32]) {
         }
         CpuQuant::Hfq2G256 | CpuQuant::Mq2G256 | CpuQuant::Mq2G256V2 => {
             // qt 9 flat and qt 18 / qt 50 FWHT-rotated: 2-bit codes, 4 per byte.
+            let halves = v2_halves(packed, 0);
+            let flat = f32_hdr(packed, 0);
             for (i, o) in out[..ge].iter_mut().enumerate() {
                 let (scale, zero) = match q {
-                    CpuQuant::Mq2G256V2 => v2_hdr(packed, 0, i),
-                    _ => f32_hdr(packed, 0),
+                    CpuQuant::Mq2G256V2 => half_of(i, halves),
+                    _ => flat,
                 };
                 *o = scale * code2(packed, 8, i) + zero;
             }
@@ -618,22 +629,25 @@ pub fn decode_group_codes(q: CpuQuant, packed: &[u8], out: &mut [f32]) {
         }
         CpuQuant::Mq5G256 | CpuQuant::Mq5G256V2 => {
             // 5-bit codes, 8 per 5 bytes; f32 header (flat) or fp16 halves (V2).
+            let halves = v2_halves(packed, 0);
+            let flat = f32_hdr(packed, 0);
             for (i, o) in out[..ge].iter_mut().enumerate() {
                 let (scale, zero) = match q {
-                    CpuQuant::Mq5G256V2 => v2_hdr(packed, 0, i),
-                    _ => f32_hdr(packed, 0),
+                    CpuQuant::Mq5G256V2 => half_of(i, halves),
+                    _ => flat,
                 };
                 *o = scale * code5(packed, 8, i) + zero;
             }
         }
         CpuQuant::Mq6G256V2 => {
+            let halves = v2_halves(packed, 0);
             for (i, o) in out[..ge].iter_mut().enumerate() {
-                let (scale, zero) = v2_hdr(packed, 0, i);
+                let (scale, zero) = half_of(i, halves);
                 *o = scale * code6(packed, 8, i) + zero;
             }
         }
         CpuQuant::Mq4CG256 => {
-            // fp16 `[scale][zero]`, 4 B of padding, then 128 B of nibbles.
+            // fp16 `[scale][zero]` (widened once), 4 B of padding, then nibbles.
             let scale = f16_at(packed, 0);
             let zero = f16_at(packed, 2);
             for (i, o) in out[..ge].iter_mut().enumerate() {
@@ -641,10 +655,11 @@ pub fn decode_group_codes(q: CpuQuant, packed: &[u8], out: &mut [f32]) {
             }
         }
         CpuQuant::Mq3G256V2 => {
+            let halves = v2_halves(packed, 0);
             for chunk in 0..32 {
                 for (k, code) in code3(packed, 8, chunk).iter().enumerate() {
                     let i = chunk * 8 + k;
-                    let (scale, zero) = v2_hdr(packed, 0, i);
+                    let (scale, zero) = half_of(i, halves);
                     out[i] = scale * *code as f32 + zero;
                 }
             }
