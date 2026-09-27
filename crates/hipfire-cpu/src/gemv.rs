@@ -145,17 +145,14 @@ pub fn gemm_with_simd(
 
 /// One output element: `Σ_j W[row][j] * x[j]`, accumulating one group at a time.
 ///
-/// `use_simd` is resolved once per GEMV call by the caller ([`simd::row_dot_enabled`],
-/// true only for the formats with a hand-written AVX2 row dot — `Mq4G256` and
-/// `Mq3G256V2`). Everything else uses the format-generic decode below.
+/// `use_simd` is resolved once per GEMV call by the caller
+/// ([`simd::row_dot_enabled`]); when it is set, the format's AVX2 kernel computes
+/// the row and a format this build has no kernel for falls through to the
+/// format-generic decode below.
 fn dot_row_simd(q: CpuQuant, row: &[u8], k: usize, x: &[f32], use_simd: bool) -> f32 {
     if use_simd {
-        match q {
-            CpuQuant::Mq4G256 => return simd::mq4g256_row_dot_avx2(row, k, x),
-            CpuQuant::Mq3G256V2 => return simd::mq3g256v2_row_dot_avx2(row, k, x),
-            // `row_dot_enabled` returns true only for the two arms above; a
-            // format added to it without a kernel here stays correct and slow.
-            _ => debug_assert!(false, "no AVX2 row dot for {q:?}"),
+        if let Some(dot) = simd::row_dot_avx2(q, row, k, x) {
+            return dot;
         }
     }
     dot_row_scalar(q, row, k, x)

@@ -24,49 +24,68 @@ fn dispatch_predicate_is_forced_only_where_supported() {
     );
 }
 
+/// Every format this build has a kernel for, paired with whether that kernel
+/// widens `fp16` metadata (and therefore needs F16C on top of AVX2).
+///
+/// Kept in step with `simd::features_for` by
+/// [`row_dot_enabled_matches_each_kernels_feature_gate`].
+fn kernel_formats() -> Vec<(CpuQuant, bool)> {
+    vec![
+        (CpuQuant::Mq4G256, false),
+        (CpuQuant::Mq3G256V2, true),
+        (CpuQuant::Mq4G256V2, true),
+        (CpuQuant::Mq6G256V2, true),
+        (CpuQuant::Mq5G256V2, true),
+        (CpuQuant::Mq2G256V2, true),
+    ]
+}
+
 /// The per-format dispatch is a pure function of `(format, available,
-/// requested)`: only the formats with a hand-written kernel are ever
-/// vectorised, and a forced `Some(true)` must fall back to scalar — not fault —
-/// on hardware without the feature, which is what lets this test cover the
-/// decision on any runner.
+/// requested)`: a format's gate is exactly the features its kernel needs, a
+/// forced `Some(true)` must fall back to scalar — not fault — on hardware
+/// without them, and a forced `Some(false)` must always lose.
 #[test]
-fn row_dot_enabled_is_per_format_and_never_forces_unsupported_hardware() {
-    assert_eq!(row_dot_enabled(CpuQuant::Mq4G256, None), avx2_available());
-    assert_eq!(
-        row_dot_enabled(CpuQuant::Mq3G256V2, None),
-        avx2_f16c_available()
-    );
-    assert_eq!(
-        row_dot_enabled(CpuQuant::Mq4G256, Some(true)),
-        avx2_available(),
-        "forced on, unsupported: fall back rather than fault"
-    );
-    assert_eq!(
-        row_dot_enabled(CpuQuant::Mq3G256V2, Some(true)),
-        avx2_f16c_available(),
-        "the qt 49 kernel needs F16C on top of AVX2"
-    );
-    // Forced off wins everywhere, and a format with no kernel stays scalar even
-    // when the caller asks for the vector path: silently vectorising one would
-    // execute the Mq4 decode on foreign bytes.
-    for q in [
-        CpuQuant::Mq4G256,
-        CpuQuant::Mq3G256V2,
-        CpuQuant::Mq2G256V2,
-        CpuQuant::Mq4G256V2,
-        CpuQuant::Mq3G256,
-        CpuQuant::Mq3G256Lloyd,
-    ] {
+fn row_dot_enabled_matches_each_kernels_feature_gate() {
+    for (q, needs_f16c) in kernel_formats() {
+        let available = if needs_f16c {
+            avx2_f16c_available()
+        } else {
+            avx2_available()
+        };
+        assert_eq!(row_dot_enabled(q, None), available, "{q:?}: detection");
+        assert_eq!(row_dot_enabled(q, Some(true)), available, "{q:?}: forced on");
         assert!(!row_dot_enabled(q, Some(false)), "{q:?}: forced off");
     }
+}
+
+/// A format the build has no kernel for must stay scalar even when the caller
+/// forces the vector path: silently vectorising one would execute another
+/// format's decode on foreign bytes.
+#[test]
+fn formats_without_a_kernel_stay_scalar() {
     for q in [
-        CpuQuant::Mq2G256V2,
-        CpuQuant::Mq4G256V2,
-        CpuQuant::Mq5G256V2,
-        CpuQuant::Mq6G256V2,
-        CpuQuant::Mq3G256,
+        CpuQuant::Mq2G256Lloyd,
         CpuQuant::Mq3G256Lloyd,
+        CpuQuant::Mq4G256Lloyd,
+        CpuQuant::Mq2G256LloydU,
+        CpuQuant::Mq4CG256,
+        CpuQuant::Mq6G256,
+        CpuQuant::Mq5G256,
+        CpuQuant::Mq3G256,
+        CpuQuant::Mq2G256,
+        CpuQuant::Hfq6G256,
+        CpuQuant::Hfq4G256,
+        CpuQuant::Hfq4G128,
         CpuQuant::Hfq3G256,
+        CpuQuant::Hfq3G128,
+        CpuQuant::Hfq2G256,
+        CpuQuant::Hfq2G128,
+        CpuQuant::Tq2G128,
+        CpuQuant::Bq1G128,
+        CpuQuant::Q8F16,
+        CpuQuant::F16,
+        CpuQuant::F32,
+        CpuQuant::Bf16,
     ] {
         assert!(!row_dot_enabled(q, Some(true)), "{q:?}: no kernel to use");
     }
@@ -81,6 +100,8 @@ fn row_dot_enabled_is_per_format_and_never_forces_unsupported_hardware() {
 fn awkward_headers(q: CpuQuant, packed: &mut [u8], m: usize, k: usize) {
     let (ge, gb) = (q.group_elems(), q.group_bytes());
     let groups = k / ge;
+    // fp16: 0.031311, -0.122986, 0.270996, -0.088684.
+    const F16X4: [u16; 4] = [0x2802, 0xafdf, 0x3456, 0xadad];
     for row in 0..m {
         for g in 0..groups {
             let at = (row * groups + g) * gb;
@@ -89,9 +110,12 @@ fn awkward_headers(q: CpuQuant, packed: &mut [u8], m: usize, k: usize) {
                     packed[at..at + 4].copy_from_slice(&0.0313f32.to_le_bytes());
                     packed[at + 4..at + 8].copy_from_slice(&(-0.4921f32).to_le_bytes());
                 }
-                // fp16: 0.031311, -0.122986, 0.270996, -0.088684.
-                CpuQuant::Mq3G256V2 => {
-                    for (i, bits) in [0x2802u16, 0xafdf, 0x3456, 0xadad].iter().enumerate() {
+                CpuQuant::Mq4G256V2
+                | CpuQuant::Mq6G256V2
+                | CpuQuant::Mq5G256V2
+                | CpuQuant::Mq2G256V2
+                | CpuQuant::Mq3G256V2 => {
+                    for (i, bits) in F16X4.iter().enumerate() {
                         packed[at + 2 * i..at + 2 * i + 2].copy_from_slice(&bits.to_le_bytes());
                     }
                 }
@@ -104,20 +128,23 @@ fn awkward_headers(q: CpuQuant, packed: &mut [u8], m: usize, k: usize) {
 /// The AVX2 kernels and the scalar reference are different summations of the
 /// same products, so they are compared on a *relative* tolerance, not for
 /// equality: this bounds the vector paths' deviation and would catch a decode
-/// error (nibble order, 3-bit cross-byte packing, group stride, per-half affine
+/// error (code order within a chunk, cross-byte packing, group stride, group
 /// header) by orders of magnitude.
 ///
+/// Two things are asserted per format, and the second is what stops the first
+/// from passing vacuously: the dispatcher must hand the row to a kernel at all
+/// (a `None` would leave `gemv` silently on the scalar path, where the two
+/// outputs agree by construction), and the two paths must then agree within
+/// tolerance.
+///
 /// The fixture gives each group four *distinct* header values, so mixing up the
-/// two 128-element halves of a `Mq3G256V2` group — or the header's scale/zero
-/// order — is O(1) relative, not a rounding difference.
+/// two 128-element halves of a V2 group — or a header's scale/zero order — is
+/// O(1) relative, not a rounding difference.
 #[test]
 fn avx2_and_scalar_agree_within_tolerance() {
-    for (q, available) in [
-        (CpuQuant::Mq4G256, avx2_available()),
-        (CpuQuant::Mq3G256V2, avx2_f16c_available()),
-    ] {
-        if !available {
-            eprintln!("skip {q:?}: feature absent on this runner");
+    for (q, needs_f16c) in kernel_formats() {
+        if !row_dot_enabled(q, Some(true)) {
+            eprintln!("skip {q:?}: {} absent on this runner", needs_f16c.then(|| "F16C").unwrap_or("AVX2"));
             continue;
         }
         for (m, k) in [(1usize, 256usize), (3, 512), (2, 4096), (1, 12288)] {
@@ -126,6 +153,10 @@ fn avx2_and_scalar_agree_within_tolerance() {
             let x: Vec<f32> = (0..k)
                 .map(|i| ((i as u64 * 2654435761) % 4096) as f32 * 0.001 - 2.0)
                 .collect();
+            assert!(
+                row_dot_avx2(q, &packed, k, &x).is_some(),
+                "{q:?}: the gate admits it but the dispatcher has no kernel"
+            );
             let mut simd = vec![0.0f32; m];
             let mut scalar = vec![0.0f32; m];
             gemv_with_simd(q, &packed, m, k, &x, &mut simd, Some(true));
