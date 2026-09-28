@@ -2158,10 +2158,8 @@ mod tests {
             std::fs::set_permissions(&daemon, perms).unwrap();
         }
         let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
-        let process_config =
-            hipfire_config::ProcessConfig::from_resolved(&resolved).unwrap();
-        let engine =
-            Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config).unwrap();
+        let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved).unwrap();
+        let engine = Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config).unwrap();
         let paths = test_paths("clear-resident-paths");
         let mut runtime = ServeRuntime {
             engine,
@@ -2169,8 +2167,7 @@ mod tests {
             registry: hipfire_registry::bundled().unwrap(),
             current_path: Some(PathBuf::from("/models/old.mq4")),
             current_arch: Some("qwen3".to_owned()),
-            current_reasoning_contract:
-                saddle_core::caps::ReasoningContract::QwenJinja,
+            current_reasoning_contract: saddle_core::caps::ReasoningContract::QwenJinja,
             current_reasoning_effort_native: true,
             current_reasoning_efforts: vec!["xhigh".to_owned()],
             continuous_batch_capable: true,

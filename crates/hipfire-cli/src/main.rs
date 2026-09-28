@@ -1670,10 +1670,7 @@ pub(crate) fn list_local_models(paths: &Paths, registry: &RegistryV1) -> Result<
 /// diag`, and name resolution, all of which should still see a pulled draft or
 /// a vision tower. The serve discovery surface narrows it — see
 /// [`crate::serve::http`] and [`is_standalone_model`].
-pub(crate) fn local_model_paths(
-    paths: &Paths,
-    registry: &RegistryV1,
-) -> Result<Vec<PathBuf>> {
+pub(crate) fn local_model_paths(paths: &Paths, registry: &RegistryV1) -> Result<Vec<PathBuf>> {
     let entries = match fs::read_dir(&paths.models) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -1708,7 +1705,6 @@ pub(crate) fn local_model_paths(
     }
     Ok(models)
 }
-
 
 pub(crate) fn pull_command(paths: &Paths, args: PullArgs) -> Result<()> {
     let loaded = load_registry(&paths.registry);
@@ -7025,7 +7021,10 @@ mod tests {
             .models
             .values()
             .any(|entry| entry.file == "qwen38-27b-dflash-mq3.hfq"));
-        assert!(is_listable_model_file("qwen38-27b-dflash-mq3.hfq", &registry));
+        assert!(is_listable_model_file(
+            "qwen38-27b-dflash-mq3.hfq",
+            &registry
+        ));
         assert!(!is_standalone_model("qwen38-27b-dflash-mq3.hfq", &registry));
 
         assert!(!is_listable_model_file("README.md", &registry));
@@ -7060,7 +7059,10 @@ mod tests {
             "qwen38-27b-dflash-mq3.hfq",
             "qwen3.6-27b.mq4",
         ] {
-            assert!(listed.contains(&file.to_owned()), "{file} missing: {listed:?}");
+            assert!(
+                listed.contains(&file.to_owned()),
+                "{file} missing: {listed:?}"
+            );
         }
 
         // Serve discovery: the XT tier survives, sidecars do not.
@@ -7069,7 +7071,10 @@ mod tests {
             .filter(|name| is_standalone_model(name, &registry))
             .cloned()
             .collect();
-        assert!(served.contains(&"qwen3.8-27b.mq3-xt".to_owned()), "{served:?}");
+        assert!(
+            served.contains(&"qwen3.8-27b.mq3-xt".to_owned()),
+            "{served:?}"
+        );
         assert!(served.contains(&"qwen3.6-27b.mq4".to_owned()), "{served:?}");
         assert!(
             !served.contains(&"qwen3.8-27b-vision.hfq".to_owned()),
