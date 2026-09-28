@@ -14,7 +14,7 @@ use crate::serve::complete::{
 };
 use crate::serve::{is_batch_eligible_request, ServeShared};
 use crate::serve::{AdmissionError, AdmissionGuard};
-use crate::{list_local_models, unix_timestamp};
+use crate::{is_standalone_model, list_local_models, unix_timestamp};
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full};
@@ -533,13 +533,25 @@ async fn handle_request(
                 Ok(m) => m,
                 Err(e) => return openai_error(&e.to_string(), 500),
             };
+            // Discovery contract: every id advertised here must be able to
+            // serve a completion. A sidecar cannot — `qwen3.8-27b-vision.hfq`
+            // embeds `"tokenizer": "{}"` and dies with `tokenizer metadata
+            // field missing or wrong type: model` AFTER a full 64-layer load,
+            // and the DFlash drafts are arch 20/22/23, not serve trunks. An
+            // OpenAI-compatible client picks from this list, so a doomed id
+            // here is a load failure the operator sees as a server fault.
+            // They stay pullable/runnable by tag and still show in `hipfire list`.
             let body = serde_json::json!({
                 "object": "list",
-                "data": local.into_iter().map(|model| serde_json::json!({
-                    "id": model.registry_tag.unwrap_or(model.name),
-                    "object": "model",
-                    "owned_by": "hipfire",
-                })).collect::<Vec<_>>()
+                "data": local
+                    .into_iter()
+                    .filter(|model| is_standalone_model(&model.name, &runtime.registry))
+                    .map(|model| serde_json::json!({
+                        "id": model.registry_tag.unwrap_or(model.name),
+                        "object": "model",
+                        "owned_by": "hipfire",
+                    }))
+                    .collect::<Vec<_>>()
             });
             json_response(body, 200)
         }
