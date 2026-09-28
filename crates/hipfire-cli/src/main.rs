@@ -21,6 +21,7 @@ use hipfire_config::{
 };
 use hipfire_registry::{
     load as load_registry, LoadedRegistry, ModelEntry, RegistryPaths, RegistrySource, RegistryV1,
+    Sidecar,
 };
 use hipfire_runtime::prompt_frame::ToolCall;
 use saddle_core::caps::ReasoningContract;
@@ -1600,7 +1601,7 @@ fn list_command(paths: &Paths, args: ListArgs) -> Result<()> {
 }
 
 pub(crate) fn list_local_models(paths: &Paths, registry: &RegistryV1) -> Result<Vec<LocalModel>> {
-    let mut candidates = local_model_paths(paths)?;
+    let mut candidates = local_model_paths(paths, registry)?;
     if let Ok(catalog) = load_catalog(&paths.config) {
         candidates.extend(
             catalog
@@ -1624,7 +1625,12 @@ pub(crate) fn list_local_models(paths: &Paths, registry: &RegistryV1) -> Result<
             .and_then(|file| file.to_str())
             .unwrap_or_default()
             .to_owned();
-        if !is_model_file(&name) {
+        // Local listings (`hipfire list`, `hipfire diag`) keep sidecars: a
+        // pulled draft or a vision tower is a real file the operator may want
+        // to see and `hipfire rm`. The suffix test is the only gate here.
+        // `/v1/models` narrows this with `is_standalone_model` — see
+        // `serve::http`.
+        if !is_listable_model_file(&name, registry) {
             continue;
         }
         let registry_tag = registry
@@ -1642,7 +1648,19 @@ pub(crate) fn list_local_models(paths: &Paths, registry: &RegistryV1) -> Result<
     Ok(models)
 }
 
-pub(crate) fn local_model_paths(paths: &Paths) -> Result<Vec<PathBuf>> {
+/// Enumerate the model files in the models dir, plus the same one level down
+/// inside subdirectories.
+///
+/// The test is [`is_listable_model_file`], not a bare suffix match: several
+/// registry tiers ship files whose suffix is absent from `MODEL_SUFFIXES`
+/// (`qwen3.8-27b.mq3-xt`, `-pro`, `.bq1`, `.tq2`), and a suffix-only scan drops
+/// exactly those models — including the tier a client is looking for.
+///
+/// Sidecars are NOT filtered here. This scan backs `hipfire list`, `hipfire
+/// diag`, and name resolution, all of which should still see a pulled draft or
+/// a vision tower. The serve discovery surface narrows it — see
+/// [`crate::serve::http`] and [`is_standalone_model`].
+pub(crate) fn local_model_paths(paths: &Paths, registry: &RegistryV1) -> Result<Vec<PathBuf>> {
     let entries = match fs::read_dir(&paths.models) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -1655,7 +1673,7 @@ pub(crate) fn local_model_paths(paths: &Paths) -> Result<Vec<PathBuf>> {
             if path
                 .file_name()
                 .and_then(|file| file.to_str())
-                .is_some_and(is_model_file)
+                .is_some_and(|file| is_listable_model_file(file, registry))
             {
                 models.push(path);
             }
@@ -1672,7 +1690,7 @@ pub(crate) fn local_model_paths(paths: &Paths) -> Result<Vec<PathBuf>> {
                 && path
                     .file_name()
                     .and_then(|file| file.to_str())
-                    .is_some_and(is_model_file)
+                    .is_some_and(|file| is_listable_model_file(file, registry))
         }));
     }
     Ok(models)
@@ -2937,7 +2955,7 @@ pub(crate) fn find_model_path(
     // onto a different tier. An exact stem can only ever match the one file the
     // user actually spelled.
     let exact_stem = model.replace(':', "-").to_ascii_lowercase();
-    if let Ok(local) = local_model_paths(paths) {
+    if let Ok(local) = local_model_paths(paths, registry) {
         if let Some(hit) = local.iter().find(|path| {
             let name = path
                 .file_name()
@@ -2963,7 +2981,7 @@ pub(crate) fn find_model_path(
     }
     let search = model.replace(':', "-").to_ascii_lowercase();
     let explicit_quant = MODEL_SUFFIXES.iter().any(|suffix| search.ends_with(suffix));
-    let local = local_model_paths(paths).ok()?;
+    let local = local_model_paths(paths, registry).ok()?;
     // Two passes. The first matches the literal spelling and is what has always
     // run. The second retries with `-`, `.` and `_` stripped from both sides, so
     // an input and an on-disk file that differ only in separators still meet:
@@ -6717,6 +6735,70 @@ fn is_model_file(name: &str) -> bool {
     MODEL_SUFFIXES.iter().any(|suffix| lower.ends_with(suffix))
 }
 
+/// Every file the registry names as a *sidecar* of some entry — `dflash`,
+/// `vision`, `triattn`, `mtp`, `dspark`, the FLUX components, and the
+/// alternative `heads` carriers.
+///
+/// These share the model suffixes (`.hfq`), so a suffix test alone cannot
+/// tell them apart from a trunk. A sidecar is not a loadable model on its
+/// own: `qwen3.8-27b-vision.hfq` carries only tower tensors and embeds
+/// `"tokenizer": "{}"`, so loading it as a trunk fails with
+/// `tokenizer metadata field missing or wrong type: model`.
+fn registry_sidecar_files(registry: &RegistryV1) -> BTreeSet<&str> {
+    registry
+        .models
+        .values()
+        .flat_map(|entry| {
+            [
+                entry.triattn.as_ref(),
+                entry.mtp.as_ref(),
+                entry.dspark.as_ref(),
+                entry.t5.as_ref(),
+                entry.clip.as_ref(),
+                entry.qwen3.as_ref(),
+                entry.vae.as_ref(),
+                entry.dflash.as_ref(),
+                entry.vision.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .map(|sidecar: &Sidecar| sidecar.file.as_str())
+            .chain(entry.heads.values().map(|sidecar| sidecar.file.as_str()))
+        })
+        .collect()
+}
+
+/// True when `name` is a model file worth showing in a local listing.
+///
+/// A model suffix OR being some registry entry's own `file`. The second term
+/// is load-bearing: several registry tiers ship files whose suffix is absent
+/// from `MODEL_SUFFIXES` (`qwen3.8-27b.mq3-xt`, `-pro`, `.bq1`, `.tq2`), and a
+/// suffix-only test hides exactly those models.
+pub(crate) fn is_listable_model_file(name: &str, registry: &RegistryV1) -> bool {
+    is_model_file(name) || registry.models.values().any(|entry| entry.file == name)
+}
+
+/// True when `name` can actually serve a completion, as opposed to merely
+/// being a model-shaped file on disk.
+///
+/// This is the `/v1/models` discovery predicate and it is stricter than
+/// [`is_listable_model_file`] on purpose. A file the registry names in ANY
+/// sidecar slot is not a serve target, even when some entry also lists it as
+/// its own `file` — that overlap is exactly the DFlash drafts
+/// (`qwen38-27b-dflash-mq3.hfq` and friends), pullable by tag but arch
+/// 20/22/23 artifacts that `docs/architecture-ids.md` classes as "not primary
+/// `load_model` trunk targets". The vision tower (`qwen3.8-27b-vision.hfq`) is
+/// sidecar-only and embeds `"tokenizer": "{}"`, so selecting it loads all 64
+/// layers and then fails with `tokenizer metadata field missing or wrong
+/// type: model`.
+///
+/// Advertising either in `/v1/models` hands an OpenAI-compatible client an id
+/// that cannot answer. Both stay pullable and resolvable by tag, and both
+/// still appear in `hipfire list` — only the serve surface drops them.
+pub(crate) fn is_standalone_model(name: &str, registry: &RegistryV1) -> bool {
+    !registry_sidecar_files(registry).contains(name) && is_listable_model_file(name, registry)
+}
+
 fn source_label(source: &ConfigSource) -> String {
     match source {
         ConfigSource::BuiltIn => "built-in".into(),
@@ -6894,6 +6976,105 @@ mod tests {
         assert!(is_model_file("draft.hfq"));
         assert!(!is_model_file("model.triattn.bin"));
         assert!(!is_model_file("README.md"));
+    }
+
+    /// `/v1/models` is the discovery surface an OpenAI-compatible client reads
+    /// to choose a model. It must offer only files that load as a trunk.
+    ///
+    /// Two ways the old suffix-only scan got that wrong, both observed against
+    /// a real `~/.hipfire/models`:
+    ///   - it ADVERTISED `qwen3.8-27b-vision.hfq` and `qwen38-27b-dflash-mq3.hfq`,
+    ///     which are sidecars; selecting either fails at load with
+    ///     `tokenizer metadata field missing or wrong type: model`.
+    ///   - it DROPPED `qwen3.8-27b.mq3-xt`, whose `-xt` suffix is not in
+    ///     `MODEL_SUFFIXES`, so the tier the user actually wanted was invisible.
+    #[test]
+    fn standalone_model_classification_separates_sidecars_from_tiers() {
+        let registry = hipfire_registry::bundled().unwrap();
+
+        // The tier whose suffix is missing from MODEL_SUFFIXES: listable AND
+        // servable. This is the model the operator actually wants.
+        assert!(!is_model_file("qwen3.8-27b.mq3-xt"));
+        assert!(is_listable_model_file("qwen3.8-27b.mq3-xt", &registry));
+        assert!(is_standalone_model("qwen3.8-27b.mq3-xt", &registry));
+
+        // A sidecar-only file: listable (it is really on disk) but NOT
+        // servable. It embeds `"tokenizer": "{}"`.
+        assert!(is_listable_model_file("qwen3.8-27b-vision.hfq", &registry));
+        assert!(!is_standalone_model("qwen3.8-27b-vision.hfq", &registry));
+
+        // The overlap case: the DFlash draft is BOTH its own registry entry's
+        // `file` (the documented `hipfire pull qwen3.8:27b-draft-mq3` target)
+        // AND a `dflash` sidecar of three other entries. Arch 20 is not a serve
+        // trunk, so it must not be advertised — while staying pullable.
+        assert!(registry
+            .models
+            .values()
+            .any(|entry| entry.file == "qwen38-27b-dflash-mq3.hfq"));
+        assert!(is_listable_model_file(
+            "qwen38-27b-dflash-mq3.hfq",
+            &registry
+        ));
+        assert!(!is_standalone_model("qwen38-27b-dflash-mq3.hfq", &registry));
+
+        assert!(!is_listable_model_file("README.md", &registry));
+        assert!(!is_standalone_model("README.md", &registry));
+    }
+
+    /// The two surfaces deliberately disagree, and that is the point:
+    /// `hipfire list` shows what is on disk; `/v1/models` shows what can serve.
+    #[test]
+    fn local_listing_keeps_sidecars_that_serve_discovery_drops() {
+        let paths = test_paths("listing-sidecars");
+        fs::create_dir_all(&paths.models).unwrap();
+        for file in [
+            "qwen3.8-27b.mq3-xt",
+            "qwen3.8-27b-vision.hfq",
+            "qwen38-27b-dflash-mq3.hfq",
+            "qwen3.6-27b.mq4",
+        ] {
+            fs::write(paths.models.join(file), b"fixture").unwrap();
+        }
+        let registry = hipfire_registry::bundled().unwrap();
+
+        let listed: Vec<String> = list_local_models(&paths, &registry)
+            .unwrap()
+            .into_iter()
+            .map(|model| model.name)
+            .collect();
+        // Local listing: everything on disk is visible and rm-able.
+        for file in [
+            "qwen3.8-27b.mq3-xt",
+            "qwen3.8-27b-vision.hfq",
+            "qwen38-27b-dflash-mq3.hfq",
+            "qwen3.6-27b.mq4",
+        ] {
+            assert!(
+                listed.contains(&file.to_owned()),
+                "{file} missing: {listed:?}"
+            );
+        }
+
+        // Serve discovery: the XT tier survives, sidecars do not.
+        let served: Vec<String> = listed
+            .iter()
+            .filter(|name| is_standalone_model(name, &registry))
+            .cloned()
+            .collect();
+        assert!(
+            served.contains(&"qwen3.8-27b.mq3-xt".to_owned()),
+            "{served:?}"
+        );
+        assert!(served.contains(&"qwen3.6-27b.mq4".to_owned()), "{served:?}");
+        assert!(
+            !served.contains(&"qwen3.8-27b-vision.hfq".to_owned()),
+            "tower sidecar must not be offered as a model: {served:?}"
+        );
+        assert!(
+            !served.contains(&"qwen38-27b-dflash-mq3.hfq".to_owned()),
+            "DFlash draft must not be offered as a model: {served:?}"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
     }
 
     /// The Ornith artifacts shipped briefly as `ornith1.5-*` before being
