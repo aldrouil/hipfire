@@ -528,10 +528,20 @@ async fn handle_request(
             resp
         }
         (Method::GET, "/v1/models") => {
-            let runtime = shared.runtime.lock().unwrap_or_else(|e| e.into_inner());
-            let local = match list_local_models(&runtime.paths, &runtime.registry) {
-                Ok(m) => m,
-                Err(e) => return openai_error(&e.to_string(), 500),
+            let (local, registry, resident) = {
+                let runtime = shared.runtime.lock().unwrap_or_else(|e| e.into_inner());
+                let local = match list_local_models(&runtime.paths, &runtime.registry) {
+                    Ok(m) => m,
+                    Err(e) => return openai_error(&e.to_string(), 500),
+                };
+                let registry = runtime.registry.clone();
+                let resident = shared
+                    .meta
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .current_model
+                    .clone();
+                (local, registry, resident)
             };
             // Discovery contract: every id advertised here must be able to
             // serve a completion. A sidecar cannot — `qwen3.8-27b-vision.hfq`
@@ -541,17 +551,36 @@ async fn handle_request(
             // OpenAI-compatible client picks from this list, so a doomed id
             // here is a load failure the operator sees as a server fault.
             // They stay pullable/runnable by tag and still show in `hipfire list`.
-            let body = serde_json::json!({
-                "object": "list",
-                "data": local
+            //
+            // The resident model is always advertised first, even when it is
+            // not a standalone file (a vision tower loaded by path, an
+            // unlisted-suffix tier, a symlinked artifact): it IS loaded, so
+            // naming it is the one id guaranteed to answer without a model
+            // switch. Its validity was established at load time, not by this
+            // filter.
+            let mut data: Vec<serde_json::Value> = Vec::new();
+            if let Some(id) = resident.clone() {
+                data.push(serde_json::json!({
+                    "id": id,
+                    "object": "model",
+                    "owned_by": "hipfire",
+                }));
+            }
+            data.extend(
+                local
                     .into_iter()
-                    .filter(|model| is_standalone_model(&model.name, &runtime.registry))
-                    .map(|model| serde_json::json!({
-                        "id": model.registry_tag.unwrap_or(model.name),
+                    .filter(|model| is_standalone_model(&model.name, &registry))
+                    .map(|model| model.registry_tag.unwrap_or(model.name))
+                    .filter(|id| Some(id) != resident.as_ref())
+                    .map(|id| serde_json::json!({
+                        "id": id,
                         "object": "model",
                         "owned_by": "hipfire",
-                    }))
-                    .collect::<Vec<_>>()
+                    })),
+            );
+            let body = serde_json::json!({
+                "object": "list",
+                "data": data,
             });
             json_response(body, 200)
         }
