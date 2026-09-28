@@ -119,8 +119,11 @@ pub const EDITABLE_FIELDS: &[FieldSpec] = &[
     // Present in `config::easy_keys()`, so the Settings editor offers it as an
     // inline-editable row; without a spec here Enter falls through to "not
     // editable from the TUI" and no value can be typed. `min: -1` matches the
-    // schema (negative is the reserved auto spelling), and the editor's buffer is
-    // seeded from the raw value, so typing `null` clears the override.
+    // schema (negative is the reserved auto spelling). Clearing: the editor seeds
+    // its buffer from the *current* value, so an emptied buffer is the unset
+    // spelling — `write_value` maps empty input on a nullable field to clear — and
+    // a typed `null` is the config/CLI spelling rather than something the buffer
+    // can reach once a value exists (typing appends to the seed).
     FieldSpec {
         key: "gpu_layer_budget",
         kind: FieldKind::Int {
@@ -386,6 +389,12 @@ mod tests {
         );
         // And a genuinely bad value is still rejected.
         assert!(write_value(&path, "gpu_layer_budget", "3x").is_err());
+        // The empty-means-clear retry must not hand a non-nullable enum a clear
+        // spelling it does not have in the schema (`pcie|cpu`).
+        assert!(
+            write_value(&path, "offload_exec", "").is_err(),
+            "empty input must not make a non-nullable enum clearable"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
