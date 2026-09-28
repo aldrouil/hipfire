@@ -1530,6 +1530,9 @@ struct LocalModel {
     name: String,
     path: PathBuf,
     size_bytes: u64,
+    /// File mtime as a unix timestamp, the closest thing a local artifact has
+    /// to OpenAI's required `created`. `0` when the platform cannot report one.
+    created: u64,
     registry_tag: Option<String>,
 }
 
@@ -1637,10 +1640,17 @@ pub(crate) fn list_local_models(paths: &Paths, registry: &RegistryV1) -> Result<
             .models
             .iter()
             .find_map(|(tag, model)| (model.file == name).then(|| tag.clone()));
+        let created = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0);
         models.push(LocalModel {
             name,
             path: canonical,
             size_bytes: metadata.len(),
+            created,
             registry_tag,
         });
     }
@@ -10283,6 +10293,7 @@ mod tests {
                     current_reasoning_efforts: Vec::new(),
                     continuous_batch_capable: false,
                     current_max_seq: 0,
+                    loaded: crate::serve::LoadedInfo::default(),
                     cache_capable: false,
                     kv_override: None,
                     kv_backend_override: None,

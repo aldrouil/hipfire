@@ -76,6 +76,25 @@ pub(crate) struct ServePidRecord {
     pub(crate) legacy: bool,
 }
 
+/// Facts about the resident model taken from the daemon's load ack.
+///
+/// The ack has always carried these (`{"type":"loaded","arch":…,"dim":…,
+/// "layers":…,"vocab":…,"vl":…}`); serve read `arch`/`cache_capable`/
+/// `continuous_batch_capable` and dropped the rest. `vl` is the daemon's
+/// `LoadedModel::has_vision_encoder()` — a vision tower is present in this
+/// load (qwen3.5-VL tower, dots.ocr, or the lfm2-vl tower), the same
+/// carrier-level probe the generate path's image gate uses. A tower
+/// configured but skipped by `vision_mode=off` reports `false`; so does a
+/// text-only checkpoint of a VL-capable arch.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LoadedInfo {
+    pub(crate) vision: bool,
+    /// Hidden size (`dim`) — llama.cpp's `meta.n_embd`.
+    pub(crate) n_embd: u64,
+    /// Vocabulary size (`vocab`) — llama.cpp's `meta.n_vocab`.
+    pub(crate) n_vocab: u64,
+}
+
 pub(crate) struct ServeRuntime {
     pub(crate) engine: Engine,
     pub(crate) paths: Paths,
@@ -87,6 +106,10 @@ pub(crate) struct ServeRuntime {
     pub(crate) current_reasoning_efforts: Vec<String>,
     pub(crate) continuous_batch_capable: bool,
     pub(crate) current_max_seq: u64,
+    /// Model facts the daemon reports in the load ack (`dim`, `vocab`, `vl`).
+    /// `/v1/models` and `/health` publish them; the daemon already sends them
+    /// and serve used to discard the whole set.
+    pub(crate) loaded: LoadedInfo,
     pub(crate) cache_capable: bool,
     pub(crate) kv_override: Option<String>,
     pub(crate) kv_backend_override: Option<String>,
@@ -911,6 +934,7 @@ pub(crate) fn serve_foreground(
             current_reasoning_efforts: Vec::new(),
             continuous_batch_capable: false,
             current_max_seq: 0,
+            loaded: LoadedInfo::default(),
             cache_capable: false,
             kv_override: args.kv_mode.clone(),
             kv_backend_override: args.kv_backend.clone(),
@@ -1117,6 +1141,7 @@ impl ServeRuntime {
         self.current_reasoning_efforts = Vec::new();
         self.continuous_batch_capable = false;
         self.current_max_seq = 0;
+        self.loaded = LoadedInfo::default();
         self.cache_capable = false;
         meta.lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -1275,6 +1300,20 @@ impl ServeRuntime {
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
             self.current_max_seq = loaded_max_seq;
+            self.loaded = LoadedInfo {
+                vision: loaded
+                    .get("vl")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                n_embd: loaded
+                    .get("dim")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                n_vocab: loaded
+                    .get("vocab")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+            };
             // Report the model the way it was requested. A path-form
             // request now resolves its registry entry (for sidecars and
             // tag policy), but clients — serve_harness's warm probe among
@@ -2136,6 +2175,14 @@ mod tests {
             current_reasoning_efforts: vec!["xhigh".to_owned()],
             continuous_batch_capable: true,
             current_max_seq: 32768,
+            // Deliberately non-default: `clear_resident` must reset `loaded`
+            // too, and a default-constructed fixture would pass that assertion
+            // vacuously.
+            loaded: LoadedInfo {
+                vision: true,
+                n_embd: 5120,
+                n_vocab: 248320,
+            },
             cache_capable: true,
             kv_override: None,
             kv_backend_override: None,
@@ -2169,6 +2216,7 @@ mod tests {
         assert!(runtime.current_reasoning_efforts.is_empty());
         assert!(!runtime.continuous_batch_capable);
         assert_eq!(runtime.current_max_seq, 0);
+        assert_eq!(runtime.loaded, LoadedInfo::default());
         assert!(!runtime.cache_capable);
         assert!(meta
             .lock()

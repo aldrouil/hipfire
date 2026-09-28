@@ -13,7 +13,7 @@ use crate::serve::complete::{
     openai_stream_delta_for_event, openai_stream_terminal_chunks, Completion,
 };
 use crate::serve::{is_batch_eligible_request, ServeShared};
-use crate::serve::{AdmissionError, AdmissionGuard};
+use crate::serve::{AdmissionError, AdmissionGuard, LoadedInfo};
 use crate::{is_standalone_model, list_local_models, unix_timestamp};
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
@@ -465,6 +465,62 @@ pub(crate) async fn serve_listener_until(
     }
 }
 
+/// Format one `/v1/models` entry.
+///
+/// `runtime` is `Some((load facts, effective ctx))` only for the resident
+/// model — the one whose KV capacity, hidden/vocab sizes and modalities are
+/// known from the daemon's load ack. A non-resident entry is an on-disk
+/// discovery candidate with no measured runtime facts, so it gets no
+/// `meta`/`architecture`; llama.cpp fills `meta` for the loaded model only,
+/// for the same reason. `created` (OpenAI-required) is supplied by the caller
+/// from the file mtime and is omitted when unavailable.
+fn model_entry(
+    id: &str,
+    created: Option<u64>,
+    runtime: Option<(&LoadedInfo, u64)>,
+) -> serde_json::Value {
+    let mut entry = serde_json::json!({
+        "id": id,
+        "object": "model",
+        "owned_by": "hipfire",
+    });
+    if let Some(created) = created {
+        entry["created"] = serde_json::json!(created);
+    }
+    if let Some((loaded, n_ctx)) = runtime {
+        let mut meta = serde_json::Map::new();
+        if n_ctx > 0 {
+            meta.insert("n_ctx".to_owned(), serde_json::json!(n_ctx));
+        }
+        if loaded.n_embd > 0 {
+            meta.insert("n_embd".to_owned(), serde_json::json!(loaded.n_embd));
+        }
+        if loaded.n_vocab > 0 {
+            meta.insert("n_vocab".to_owned(), serde_json::json!(loaded.n_vocab));
+        }
+        if !meta.is_empty() {
+            entry["meta"] = serde_json::Value::Object(meta);
+        }
+        // `input_modalities` is what makes a harness enable image attachments;
+        // `vl` from the load ack is the post-gate truth (a tower skipped by
+        // `vision_mode=off` reports false). Gated on a known hidden size so the
+        // load window — resident id set, ack not yet in — cannot advertise
+        // text-only for a model whose facts are simply not known yet.
+        if loaded.n_embd > 0 {
+            let input_modalities = if loaded.vision {
+                vec!["text", "image"]
+            } else {
+                vec!["text"]
+            };
+            entry["architecture"] = serde_json::json!({
+                "input_modalities": input_modalities,
+                "output_modalities": ["text"],
+            });
+        }
+    }
+    entry
+}
+
 async fn handle_request(
     req: Request<Incoming>,
     shared: Arc<ServeShared>,
@@ -481,6 +537,15 @@ async fn handle_request(
 
     match (method, path.as_str()) {
         (Method::GET, "/health") => {
+            // Effective context of the resident model: the `max_seq` it was
+            // actually loaded with (KV capacity), not the registry policy and
+            // not the trained window. Read before `meta` — same runtime→meta
+            // order as `/v1/models` — and released at the end of the statement.
+            let n_ctx = shared
+                .runtime
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .current_max_seq;
             let meta = shared.meta.lock().unwrap_or_else(|e| e.into_inner());
             let body = serde_json::json!({
                 "status": "ok",
@@ -489,6 +554,9 @@ async fn handle_request(
                 "pid": std::process::id(),
                 "token": meta.instance_token,
                 "native": true,
+                // `null` while no model is resident (current_max_seq == 0), so a
+                // client cannot read 0 as "zero context".
+                "n_ctx": (n_ctx > 0).then_some(n_ctx),
             });
             json_response(body, 200)
         }
@@ -528,20 +596,22 @@ async fn handle_request(
             resp
         }
         (Method::GET, "/v1/models") => {
-            let (local, registry, resident) = {
+            let (local, registry, resident, n_ctx, loaded) = {
                 let runtime = shared.runtime.lock().unwrap_or_else(|e| e.into_inner());
                 let local = match list_local_models(&runtime.paths, &runtime.registry) {
                     Ok(m) => m,
                     Err(e) => return openai_error(&e.to_string(), 500),
                 };
                 let registry = runtime.registry.clone();
+                let n_ctx = runtime.current_max_seq;
+                let loaded = runtime.loaded.clone();
                 let resident = shared
                     .meta
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .current_model
                     .clone();
-                (local, registry, resident)
+                (local, registry, resident, n_ctx, loaded)
             };
             // Discovery contract: every id advertised here must be able to
             // serve a completion. A sidecar cannot — `qwen3.8-27b-vision.hfq`
@@ -560,23 +630,31 @@ async fn handle_request(
             // filter.
             let mut data: Vec<serde_json::Value> = Vec::new();
             if let Some(id) = resident.clone() {
-                data.push(serde_json::json!({
-                    "id": id,
-                    "object": "model",
-                    "owned_by": "hipfire",
-                }));
+                // OpenAI's `Model` requires `created`; a local artifact's only
+                // honest value is its file mtime, looked up from the on-disk
+                // listing (the resident is normally a listable file; a sidecar
+                // loaded by path still appears in the listing).
+                let created = local
+                    .iter()
+                    .find(|model| {
+                        model.registry_tag.as_deref() == Some(id.as_str())
+                            || model.name == id
+                            || model.path.to_string_lossy() == id
+                    })
+                    .map(|model| model.created)
+                    .filter(|created| *created > 0);
+                data.push(model_entry(&id, created, Some((&loaded, n_ctx))));
             }
             data.extend(
                 local
                     .into_iter()
                     .filter(|model| is_standalone_model(&model.name, &registry))
-                    .map(|model| model.registry_tag.unwrap_or(model.name))
-                    .filter(|id| Some(id) != resident.as_ref())
-                    .map(|id| serde_json::json!({
-                        "id": id,
-                        "object": "model",
-                        "owned_by": "hipfire",
-                    })),
+                    .map(|model| {
+                        let created = (model.created > 0).then_some(model.created);
+                        (model.registry_tag.unwrap_or(model.name), created)
+                    })
+                    .filter(|(id, _)| Some(id) != resident.as_ref())
+                    .map(|(id, created)| model_entry(&id, created, None)),
             );
             let body = serde_json::json!({
                 "object": "list",
@@ -1615,5 +1693,59 @@ mod tests {
         assert!(edits_form_to_body(vec![], vec![])
             .unwrap_err()
             .contains("required"));
+    }
+
+    #[test]
+    fn model_entry_publishes_runtime_facts_only_for_the_resident_model() {
+        let loaded = LoadedInfo {
+            vision: false,
+            n_embd: 2048,
+            n_vocab: 248320,
+        };
+        let resident = model_entry("qwen3.5:2b", Some(1790385975), Some((&loaded, 82944)));
+        assert_eq!(resident["created"], serde_json::json!(1790385975u64));
+        assert_eq!(resident["meta"]["n_ctx"], serde_json::json!(82944u64));
+        assert_eq!(resident["meta"]["n_embd"], serde_json::json!(2048u64));
+        assert_eq!(resident["meta"]["n_vocab"], serde_json::json!(248320u64));
+        assert_eq!(
+            resident["architecture"]["input_modalities"],
+            serde_json::json!(["text"])
+        );
+        assert_eq!(
+            resident["architecture"]["output_modalities"],
+            serde_json::json!(["text"])
+        );
+
+        // A non-resident candidate keeps only the spec-required fields plus
+        // `created`; nothing measured is advertised for it.
+        let candidate = model_entry("qwen3.6:27b", Some(1780057933), None);
+        assert_eq!(candidate["created"], serde_json::json!(1780057933u64));
+        assert!(candidate.get("meta").is_none());
+        assert!(candidate.get("architecture").is_none());
+    }
+
+    #[test]
+    fn model_entry_advertises_image_input_only_when_a_tower_loaded() {
+        let vision = LoadedInfo {
+            vision: true,
+            n_embd: 5120,
+            n_vocab: 248320,
+        };
+        let entry = model_entry("qwen3.8:27b", None, Some((&vision, 150000)));
+        assert_eq!(
+            entry["architecture"]["input_modalities"],
+            serde_json::json!(["text", "image"])
+        );
+    }
+
+    #[test]
+    fn model_entry_omits_unmeasured_facts_before_the_load_ack() {
+        // Resident id set, ack not in yet: every runtime fact is unknown, so
+        // nothing may be invented — not even a text-only modality claim.
+        let empty = LoadedInfo::default();
+        let entry = model_entry("qwen3.5:2b", None, Some((&empty, 0)));
+        assert!(entry.get("created").is_none());
+        assert!(entry.get("meta").is_none());
+        assert!(entry.get("architecture").is_none());
     }
 }
