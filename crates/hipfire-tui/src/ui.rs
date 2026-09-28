@@ -1674,6 +1674,54 @@ mod render_tests {
         );
     }
 
+    /// The row's *other* half: the exec side must draw too, with the value in the
+    /// same cell grammar as its sibling and its own explainer. Values are pinned
+    /// in-test because `render_with` builds on `App::load()`, which reads the
+    /// developer's real config.
+    #[test]
+    fn settings_easy_draws_the_offload_exec_row_and_its_explainer() {
+        let idx = App::load()
+            .expect("App::load")
+            .config
+            .easy_keys()
+            .iter()
+            .position(|k| matches!(k, Some("offload_exec")))
+            .expect("offload_exec row present in the easy list");
+
+        let render = |value: &str| {
+            let text = render_with(|app| {
+                app.tab = Tab::Settings;
+                app.settings_easy = true;
+                app.config.values.insert("offload_exec".into(), value.to_string());
+                // A real config that has the key set draws a "●" override marker
+                // between the label and the value; clear it so the adjacency
+                // assertion does not depend on the developer's own config.
+                app.config.overrides.clear();
+                app.settings_selected = idx;
+            });
+            text.split_whitespace().collect::<Vec<_>>().join(" ")
+        };
+
+        assert!(
+            render("pcie").contains("Offload exec over PCIe"),
+            "the default arm must draw as a readable state"
+        );
+        assert!(
+            render("cpu").contains("Offload exec on CPU"),
+            "the CPU arm must draw as a readable state"
+        );
+        let text = render_with(|app| {
+            app.tab = Tab::Settings;
+            app.settings_easy = true;
+            app.config.overrides.clear();
+            app.settings_selected = idx;
+        });
+        assert!(
+            text.contains("Who multiplies a spilled layer"),
+            "selecting the row must render its curated explainer"
+        );
+    }
+
     fn dash_with_system(system: SystemInfo) -> Dashboard {
         let mut d = Dashboard::offline(
             "127.0.0.1:11435".into(),

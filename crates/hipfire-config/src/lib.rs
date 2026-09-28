@@ -501,6 +501,11 @@ const THINKING_BUDGETS: &[&str] = &["off", "low", "med", "high", "xhigh", "max",
 // non-Qwen3.8 parents still validate. Values pass through as request strings;
 // model-specific mapping lives downstream of config validation.
 pub const REASONING_EFFORTS: &[&str] = &["auto", "none", "low", "medium", "high", "xhigh", "max"];
+// Which engine executes a spilled layer's weight-reading GEMVs. Exported for the
+// same reason as `REASONING_EFFORTS`: the TUI's option list must be this list, or
+// a value the schema accepts becomes unselectable (and an unselectable value
+// cycles from the wrong place).
+pub const OFFLOAD_EXECS: &[&str] = &["pcie", "cpu"];
 const SPECULATION_MODES: &[&str] = &["off", "auto", "ngram", "dflash", "mtp", "dspark"];
 
 macro_rules! field {
@@ -659,7 +664,7 @@ pub static FIELDS: &[ConfigField] = &[
         Memory,
         ModelLoad,
         DefaultValue::String("pcie"),
-        ValueRule::Enum(&["pcie", "cpu"]),
+        ValueRule::Enum(OFFLOAD_EXECS),
         true,
         false,
         Some("HIPFIRE_OFFLOAD_EXEC"),

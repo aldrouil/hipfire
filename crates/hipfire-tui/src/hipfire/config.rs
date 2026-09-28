@@ -113,6 +113,7 @@ impl ConfigState {
             Some("prefill_compression"), // Prefill (pflash)
             Some("kv_cache"),
             Some("gpu_layer_budget"), // Offload
+            Some("offload_exec"),     // Offload exec
             Some("thinking"),
             Some("reasoning_effort"),
             Some("thinking_budget"),
@@ -159,6 +160,7 @@ impl ConfigState {
             self.is_override("prefill_compression"),              // Prefill
             self.is_override("kv_cache"),                         // KV cache
             self.is_override("gpu_layer_budget"),                 // Offload
+            self.is_override("offload_exec"),                     // Offload exec
             self.is_override("thinking"),                         // Thinking
             self.is_override("reasoning_effort"),                 // Reasoning effort
             self.is_override("thinking_budget"),                  // Reasoning budget
@@ -178,6 +180,7 @@ impl ConfigState {
             "prefill_compression", // Prefill
             "kv_cache",            // KV cache
             "gpu_layer_budget",    // Offload
+            "offload_exec",        // Offload exec
             "thinking",            // Thinking
             "reasoning_effort",    // Reasoning effort
             "thinking_budget",     // Reasoning budget
@@ -257,6 +260,24 @@ impl ConfigState {
                     }
                 },
                 "How many layers stay on the GPU; the rest spill to system RAM. Frees VRAM, but much slower.",
+            ),
+            (
+                // The other half of the offload decision: placement is the row
+                // above, who multiplies is this one.
+                "Offload exec",
+                match self
+                    .values
+                    .get("offload_exec")
+                    .map(String::as_str)
+                    .unwrap_or("")
+                {
+                    "" | "pcie" => "over PCIe".into(),
+                    "cpu" => "on CPU".into(),
+                    // Only reachable if the schema's list grows: show it rather
+                    // than mislabel it.
+                    other => other.to_string(),
+                },
+                "Who multiplies a spilled layer's weights: the GPU over the link, or the CPU.",
             ),
             (
                 "Thinking",
@@ -468,6 +489,22 @@ mod tests {
         assert_eq!(row(&[("gpu_layer_budget", "")]), "all on GPU");
     }
 
+    /// The exec row's two arms, in the same cell grammar as its sibling.
+    #[test]
+    fn offload_exec_row_renders_both_arms() {
+        let row = |pairs: &[(&str, &str)]| {
+            state_with(pairs)
+                .easy_rows()
+                .into_iter()
+                .find(|(l, _, _)| *l == "Offload exec")
+                .map(|(_, value, _)| value)
+                .expect("Offload exec row present")
+        };
+
+        assert_eq!(row(&[]), "over PCIe");
+        assert_eq!(row(&[("offload_exec", "pcie")]), "over PCIe");
+        assert_eq!(row(&[("offload_exec", "cpu")]), "on CPU");
+    }
 
     #[test]
     fn easy_help_keys_have_explainers() {

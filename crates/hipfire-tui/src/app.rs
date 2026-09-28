@@ -2368,6 +2368,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn easy_offload_exec_row_cycles_and_commits_every_schema_value() {
+        // The new row is the enum half of the offload decision: it must be in the
+        // easy list, resolve to a spec, cycle through the schema's own values, and
+        // persist by Enter.
+        let (mut app, dir) = test_app();
+        app.settings_easy = true;
+        let idx = app
+            .config
+            .easy_keys()
+            .iter()
+            .position(|k| matches!(k, Some("offload_exec")))
+            .expect("offload_exec row is in the easy list");
+        app.settings_selected = idx;
+        assert!(
+            crate::hipfire::writer::field_spec("offload_exec").is_some(),
+            "the row must be inline-editable"
+        );
+
+        // Right stages a preview (no write), Enter commits it.
+        assert_eq!(app.config.easy_rows()[idx].1, "over PCIe");
+        app.handle_settings_key(key(KeyCode::Right));
+        assert_eq!(
+            app.settings_pending.as_ref().map(|p| p.value.as_str()),
+            Some("cpu"),
+            "cycling must move to the schema's next value"
+        );
+        app.handle_settings_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.config.values.get("offload_exec").map(String::as_str),
+            Some("cpu")
+        );
+        assert_eq!(app.config.easy_rows()[idx].1, "on CPU");
+        assert!(app.config.easy_override_state()[idx], "a written key is an override");
+        let on_disk = std::fs::read_to_string(&app.paths.config).unwrap();
+        assert!(
+            on_disk.contains("offload_exec") && on_disk.contains("cpu"),
+            "the value must be persisted, got: {on_disk}"
+        );
+
+        // Cycling past the end wraps to the other value and back.
+        app.handle_settings_key(key(KeyCode::Right));
+        app.handle_settings_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.config.values.get("offload_exec").map(String::as_str),
+            Some("pcie")
+        );
+        assert_eq!(app.config.easy_rows()[idx].1, "over PCIe");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn failed_save_keeps_edit_buffer() {

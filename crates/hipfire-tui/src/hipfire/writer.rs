@@ -128,6 +128,12 @@ pub const EDITABLE_FIELDS: &[FieldSpec] = &[
             max: 65536,
         },
     },
+    // The one value list comes from the schema (`hipfire_config::OFFLOAD_EXECS`),
+    // which is also what its own field validates against, so the two cannot drift.
+    FieldSpec {
+        key: "offload_exec",
+        kind: FieldKind::Enum(hipfire_config::OFFLOAD_EXECS),
+    },
     FieldSpec {
         key: "flash_mode",
         kind: FieldKind::Enum(FLASH_MODE),
@@ -383,6 +389,24 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// The option list a user can cycle through must be what the schema accepts:
+    /// a value the schema accepts but the TUI omits is unselectable, and one the
+    /// TUI offers but the schema rejects is a dead end.
+    #[test]
+    fn offload_exec_options_are_the_schema_values() {
+        let (root, path) = temp_config();
+        let spec = field_spec("offload_exec").expect("offload_exec has a spec");
+        let FieldKind::Enum(options) = spec.kind else {
+            panic!("offload_exec must be an enum row, got {:?}", spec.kind);
+        };
+        assert_eq!(options, hipfire_config::OFFLOAD_EXECS);
+        for value in options {
+            write_value(&path, "offload_exec", value)
+                .unwrap_or_else(|e| panic!("{value} must be writable: {e:?}"));
+        }
+        assert!(write_value(&path, "offload_exec", "gpu").is_err());
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn reset_removes_only_the_selected_override() {
