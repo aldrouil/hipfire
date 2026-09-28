@@ -241,15 +241,19 @@ impl ConfigState {
                     // Unset = every layer on the GPU. The bare empty string would
                     // read as "broken" in a value column, so name the state; the
                     // editor seeds its buffer from `values`, not from this label.
-                    let v = self
+                    match self
                         .values
                         .get("gpu_layer_budget")
-                        .cloned()
-                        .unwrap_or_default();
-                    if v.is_empty() {
-                        "all on GPU".into()
-                    } else {
-                        format!("{v} on GPU")
+                        .map(String::as_str)
+                        .unwrap_or("")
+                    {
+                        "" => "all on GPU".into(),
+                        // `-1` is the schema's reserved auto spelling, not a count:
+                        // rendering it as "N on GPU" would claim -1 layers are
+                        // resident. The engine currently keeps every layer on the
+                        // GPU for auto, which is what the explainer says.
+                        "-1" => "auto (engine decides)".into(),
+                        v => format!("{v} on GPU"),
                     }
                 },
                 "How many layers stay on the GPU; the rest spill to system RAM. Frees VRAM, but much slower.",
@@ -436,6 +440,34 @@ mod tests {
             );
         }
     }
+
+    /// The GPU-layers row must render every state it can hold, and render it
+    /// honestly: `-1` is the schema's *auto* spelling, not a count of layers, and
+    /// a cleared key must read as unset rather than as the string the JSON layer
+    /// happens to produce for null.
+    #[test]
+    fn offload_layer_row_renders_unset_count_and_auto() {
+        let row = |pairs: &[(&str, &str)]| {
+            state_with(pairs)
+                .easy_rows()
+                .into_iter()
+                .find(|(l, _, _)| *l == "GPU layers")
+                .map(|(_, value, _)| value)
+                .expect("GPU layers row present")
+        };
+
+        assert_eq!(row(&[]), "all on GPU");
+        assert_eq!(row(&[("gpu_layer_budget", "32")]), "32 on GPU");
+        assert_eq!(
+            row(&[("gpu_layer_budget", "-1")]),
+            "auto (engine decides)",
+            "-1 means auto, not -1 layers on the GPU"
+        );
+        // A cleared key is unset, not the literal string the JSON layer produces
+        // for null — the bug this replaced rendered "null on GPU".
+        assert_eq!(row(&[("gpu_layer_budget", "")]), "all on GPU");
+    }
+
 
     #[test]
     fn easy_help_keys_have_explainers() {

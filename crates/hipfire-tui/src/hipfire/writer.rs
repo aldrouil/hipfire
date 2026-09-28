@@ -186,10 +186,21 @@ pub fn write_value(path: &Path, key: &str, raw: &str) -> Result<Value, WriteErro
         key: key.to_owned(),
         value: raw.to_owned(),
     })?;
-    let config_value = schema.parse_cli(raw).map_err(|_| WriteError::Invalid {
+    let invalid = || WriteError::Invalid {
         key: key.to_owned(),
         value: raw.to_owned(),
-    })?;
+    };
+    let config_value = match schema.parse_cli(raw) {
+        Ok(value) => value,
+        // An empty buffer on a field that cannot hold the empty string is the
+        // *unset* spelling, not a typo: the editor opens empty exactly when the
+        // stored value is null (`App::current_setting_value` reads "" for an
+        // unset key), so Enter on a row the user never typed into must clear the
+        // key rather than be rejected. A `FreeStr` field accepts "" directly and
+        // never reaches this arm.
+        Err(_) if raw.trim().is_empty() => schema.parse_cli("null").map_err(|_| invalid())?,
+        Err(_) => return Err(invalid()),
+    };
     let json = to_json(&config_value);
     write_config_value(path, schema.key, config_value)?;
     Ok(json)
@@ -340,6 +351,38 @@ mod tests {
         assert!(!path.exists());
         let _ = fs::remove_dir_all(root);
     }
+
+    /// An empty buffer is the *unset* spelling on a field that cannot hold the
+    /// empty string — the editor opens empty exactly when the stored value is
+    /// null, so Enter on a row the user never typed into must clear it (a no-op
+    /// when it was already unset) instead of flooding an error. A free-string
+    /// field keeps meaning the empty string.
+    #[test]
+    fn empty_input_clears_a_nullable_field_but_stays_empty_for_a_string() {
+        let (root, path) = temp_config();
+        assert_eq!(
+            write_value(&path, "gpu_layer_budget", "").unwrap(),
+            Value::Null,
+            "empty on a nullable integer must clear, not be rejected"
+        );
+        assert_eq!(
+            write_value(&path, "gpu_layer_budget", "   ").unwrap(),
+            Value::Null,
+            "whitespace-only input is the same unset spelling"
+        );
+        let loaded = load_global(&ConfigPaths::under(&root)).unwrap();
+        assert!(loaded.layer.get("gpu_layer_budget").is_none(), "cleared key is off disk");
+
+        // A free string keeps the empty string as a value.
+        assert_eq!(
+            write_value(&path, "prefill_drafter", "").unwrap(),
+            Value::String(String::new())
+        );
+        // And a genuinely bad value is still rejected.
+        assert!(write_value(&path, "gpu_layer_budget", "3x").is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
 
     #[test]
     fn reset_removes_only_the_selected_override() {
