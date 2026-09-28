@@ -1023,14 +1023,7 @@ pub(crate) fn serve_foreground(
                 if runtime.current_path.is_some() {
                     let result = runtime.engine.unload();
                     if result.is_ok() {
-                        runtime.current_path = None;
-                        runtime.current_arch = None;
-                        runtime.current_reasoning_contract =
-                            saddle_core::caps::ReasoningContract::Unsupported;
-                        runtime.current_reasoning_effort_native = false;
-                        runtime.current_reasoning_efforts = Vec::new();
-                        runtime.current_max_seq = 0;
-                        runtime.cache_capable = false;
+                        runtime.clear_resident(&shared.meta);
                     }
                     result
                 } else {
@@ -1111,6 +1104,25 @@ pub(crate) fn prewarm_qwen_mq4r_decode(engine: &mut Engine) -> Result<()> {
 }
 
 impl ServeRuntime {
+    /// Drop every field that names the resident model, serve-side and
+    /// advertised. Called when the daemon is known-empty after a failed
+    /// single-shard switch (or a failed post-load prewarm): the next request
+    /// must see `must_reload == true` and `/health` must not name a model
+    /// that is no longer loaded.
+    pub(crate) fn clear_resident(&mut self, meta: &Mutex<ServeMeta>) {
+        self.current_path = None;
+        self.current_arch = None;
+        self.current_reasoning_contract = saddle_core::caps::ReasoningContract::Unsupported;
+        self.current_reasoning_effort_native = false;
+        self.current_reasoning_efforts = Vec::new();
+        self.continuous_batch_capable = false;
+        self.current_max_seq = 0;
+        self.cache_capable = false;
+        meta.lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .current_model = None;
+    }
+
     pub(crate) fn ensure_model(
         &mut self,
         model: &str,
@@ -1186,10 +1198,49 @@ impl ServeRuntime {
             if minimum_max_seq.is_some() {
                 eprintln!("[hipfire] bumping load max_seq to {loaded_max_seq} for request budget");
             }
-            let loaded = self.engine.load(&path, params)?;
+            // On a failed switch the daemon is EMPTY — but only on the
+            // single-shard path. The daemon unloads the resident
+            // (`model.take()` + `unload_model`) BEFORE attempting the new load
+            // when `load_tp <= 1` (daemon main.rs), so a load error means
+            // neither model is resident and `current_path` must be cleared:
+            // otherwise the next request for the old model sees
+            // `must_reload == false`, skips the reload, and generates against
+            // an empty daemon. Clearing also drops the advertised id, so
+            // `/health` stops naming a model that is no longer loaded and
+            // recovery is a single reload.
+            //
+            // Under EP (`tp > 1`) the daemon DELIBERATELY defers the prior
+            // unload until after the new model constructs, so a load error
+            // leaves the prior model still resident — clearing here would
+            // invent the same phantom-state class in reverse (claiming empty
+            // while the daemon still holds the old model, forcing a needless
+            // evicting reload on the next request). `self.tp` is what
+            // `ensure_model` projects into `params["tp"]`, and an absent
+            // `params["tp"]` defaults to 1 daemon-side, so
+            // `self.tp.unwrap_or(1) <= 1` mirrors the daemon's `load_tp <= 1`
+            // gate exactly.
+            let loaded = match self.engine.load(&path, params) {
+                Ok(loaded) => loaded,
+                Err(error) => {
+                    if self.tp.unwrap_or(1) <= 1 {
+                        self.clear_resident(meta);
+                    }
+                    return Err(error.into());
+                }
+            };
+            // Prewarm runs only when `should_prewarm_qwen_mq4r_decode`, which
+            // already requires `tp.unwrap_or(1) == 1`, so the daemon holds the
+            // NEW model here — not the old one. A prewarm failure still
+            // returns `Err` with `current_path` unset (the assignment below
+            // never ran), which reads as "old model resident" and is equally
+            // stale. Clearing forces a clean reload on the next request
+            // instead of generating against a misidentified resident.
             if !self.multi_slot_enabled && should_prewarm_qwen_mq4r_decode(&path, &loaded, self.tp)
             {
-                prewarm_qwen_mq4r_decode(&mut self.engine)?;
+                if let Err(error) = prewarm_qwen_mq4r_decode(&mut self.engine) {
+                    self.clear_resident(meta);
+                    return Err(error);
+                }
             }
             self.cache_capable = loaded
                 .get("cache_capable")
@@ -2040,6 +2091,91 @@ mod tests {
             &qwen,
             Some(2),
         ));
+    }
+
+    /// `clear_resident` drops every field that names the resident model, so a
+    /// failed single-shard switch can never leave `current_path` pointing at
+    /// a model the daemon already unloaded (the phantom-state class behind
+    /// "selecting qwen3.6:27b unloads the working model and nothing answers
+    /// afterwards"). This test constructs a `ServeRuntime` structurally and
+    /// only exercises the field reset — no daemon involved.
+    #[test]
+    fn clear_resident_drops_every_resident_field() {
+        use hipfire_client::Engine;
+        use hipfire_config::{resolve, ConfigLayer, ConfigPaths, ConfigSource, NamedLayer};
+        use std::collections::BTreeMap;
+        // A real Engine handle is needed only for the struct shape; spawn it
+        // against the in-repo fake daemon and never send it a load.
+        let root = test_paths("clear-resident").root;
+        std::fs::create_dir_all(&root).unwrap();
+        let daemon_src = include_str!("fake_daemon.py");
+        let daemon = root.join("fake-daemon-clear-resident");
+        std::fs::write(&daemon, daemon_src).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&daemon).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&daemon, perms).unwrap();
+        }
+        let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let process_config =
+            hipfire_config::ProcessConfig::from_resolved(&resolved).unwrap();
+        let engine =
+            Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config).unwrap();
+        let paths = test_paths("clear-resident-paths");
+        let mut runtime = ServeRuntime {
+            engine,
+            paths,
+            registry: hipfire_registry::bundled().unwrap(),
+            current_path: Some(PathBuf::from("/models/old.mq4")),
+            current_arch: Some("qwen3".to_owned()),
+            current_reasoning_contract:
+                saddle_core::caps::ReasoningContract::QwenJinja,
+            current_reasoning_effort_native: true,
+            current_reasoning_efforts: vec!["xhigh".to_owned()],
+            continuous_batch_capable: true,
+            current_max_seq: 32768,
+            cache_capable: true,
+            kv_override: None,
+            kv_backend_override: None,
+            vision_override: None,
+            tp: None,
+            continuous_batch_size: 1,
+            multi_slot_enabled: false,
+            multi_slot_slots: 4,
+            multi_slot_ctx: 8192,
+            multi_slot_prefill_chunk: 1024,
+        };
+        let meta = Mutex::new(ServeMeta {
+            current_model: Some("qwen3.8:27b".to_owned()),
+            loading_model: None,
+            instance_token: "test".to_owned(),
+            requests_served: 0,
+            retries_attempted: 0,
+            retries_succeeded: 0,
+            recent_tok_s: None,
+            started: Instant::now(),
+            last_activity: Instant::now(),
+        });
+        runtime.clear_resident(&meta);
+        assert!(runtime.current_path.is_none());
+        assert!(runtime.current_arch.is_none());
+        assert_eq!(
+            runtime.current_reasoning_contract,
+            saddle_core::caps::ReasoningContract::Unsupported
+        );
+        assert!(!runtime.current_reasoning_effort_native);
+        assert!(runtime.current_reasoning_efforts.is_empty());
+        assert!(!runtime.continuous_batch_capable);
+        assert_eq!(runtime.current_max_seq, 0);
+        assert!(!runtime.cache_capable);
+        assert!(meta
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .current_model
+            .is_none());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
