@@ -1906,7 +1906,13 @@ fn main() {
                                 gpu.replay.transport_name()
                             );
                         }
-                        let vl = m.vision_config().is_some() || m.dots_ocr().is_some();
+                        // Image capability for the load ack: the same
+                        // carrier-level probe the generate path's image gate
+                        // relies on. `has_vision_encoder` covers the qwen3.5-VL
+                        // tower, dots.ocr AND the lfm2-vl tower; the older
+                        // qwen-typed `vision_config()` accessor missed lfm2-vl,
+                        // so a VL lfm2 checkpoint advertised text-only.
+                        let vl = m.has_vision_encoder();
                         let (dim, layers, vocab) = m.ack_dims();
 
                         // Apply MTP config from load-message params.
