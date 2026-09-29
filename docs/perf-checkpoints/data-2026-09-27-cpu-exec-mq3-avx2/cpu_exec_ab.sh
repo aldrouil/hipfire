@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
-# Throwaway A/B driver for the qt49 AVX2 kernel (not committed).
+# A/B driver for the qt49 AVX2 kernel, kept beside the JSON it produced.
+# Scratch during the measurement; committed here so the numbers have a recipe.
 # Pre-change pair: /tmp/cpu_exec_pin/{hipfire,daemon}
 # Post-change pair: target/release/{hipfire,daemon}
 set -u
-cd <repo-root>
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
 
-MODEL=<models-dir>/qwen3.8-27b.mq3-xt
+# Point MODEL at the local qwen3.8-27b.mq3-xt artifact.
+MODEL="${MODEL:?set MODEL to the local qwen3.8-27b.mq3-xt path}"
 PROMPT=benchmarks/prompts/gpu_offload_probe.txt
 OUT=/tmp/cpu_exec_ab
 mkdir -p "$OUT"
@@ -38,6 +41,6 @@ run_arm() { # tag cli daemon exec
 
 run_arm old_pcie /tmp/cpu_exec_pin/hipfire   /tmp/cpu_exec_pin/daemon   pcie
 run_arm old_cpu  /tmp/cpu_exec_pin/hipfire   /tmp/cpu_exec_pin/daemon   cpu
-run_arm new_pcie ./target/release/hipfire    <repo-root>/target/release/daemon pcie
-run_arm new_cpu  ./target/release/hipfire    <repo-root>/target/release/daemon cpu
+run_arm new_pcie ./target/release/hipfire    "$REPO_ROOT/target/release/daemon" pcie
+run_arm new_cpu  ./target/release/hipfire    "$REPO_ROOT/target/release/daemon" cpu
 echo "ALL DONE $(date +%T)" | tee -a "$OUT/run.log"

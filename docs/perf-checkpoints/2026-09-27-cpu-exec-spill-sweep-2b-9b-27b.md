@@ -7,7 +7,7 @@
 stateless --prompt-file benchmarks/prompts/gpu_offload_probe.txt --json`.
 Env per point: `HIPFIRE_GPU_LAYER_BUDGET=<b> HIPFIRE_OFFLOAD_EXEC={pcie,cpu}`,
 one fresh daemon process per point, interleaved pcie/cpu × 3 rounds per budget.
-27B model path: `<models-dir>/qwen3.8-27b.mq3-xt`.
+27B model path: `/path/to/models/qwen3.8-27b.mq3-xt`.
 **Not an admission, not a BENCHMARKS.md claim, not comparable across
 host/model/quant/GPU/prompt/method.**
 **Not measured:** slots/serve path, prefill claims, decoded-text reads for these

@@ -186,6 +186,7 @@ alone is not sufficient — the host must be otherwise idle.
 /`tmp` artifacts from these runs (`/tmp/f_*.json`, `/tmp/det_*.log`,
 `/tmp/harness_*.json`, `/tmp/redline_*_spill.json`, `/tmp/timing_cpu.json`) are
 discovery pointers, not durable: the fixture identity, flags, and method above
-are what a re-measurement needs. The arm driver and the kernel microbenchmark
-were scratch and are not committed; both are ~30 lines (`hipfire bench` with the
+are what a re-measurement needs. The arm drivers (`cpu_exec_ab.sh`,
+`cpu_exec_ab2.sh`) and the kernel microbenchmark (`kernel_probe.rs`) are kept
+with this record's data directory; both are ~30 lines (`hipfire bench` with the
 flags above; `hipfire_cpu::gemv` in a loop over a `Vec<u8>`).

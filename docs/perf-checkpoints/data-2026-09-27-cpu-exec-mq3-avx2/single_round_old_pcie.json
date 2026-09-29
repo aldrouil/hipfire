@@ -1,6 +1,6 @@
 {
   "protocol": "native-generate-v1",
-  "model": "<models-dir>/qwen3.8-27b.mq3-xt",
+  "model": "/path/to/models/qwen3.8-27b.mq3-xt",
   "loaded": {
     "type": "loaded",
     "arch": "qwen3_5",

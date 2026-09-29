@@ -13,7 +13,7 @@ baseline, not an admission, not a `docs/BENCHMARKS.md` claim.
 
 ## Fixture
 
-- `qwen3.8-27b.mq3-xt` at `<models-dir>/qwen3.8-27b.mq3-xt`, 11,777,616,896 B,
+- `qwen3.8-27b.mq3-xt` at `/path/to/models/qwen3.8-27b.mq3-xt`, 11,777,616,896 B,
   64 layers, `arch_id` 5. Non-AWQ quant types in the index: **qt 49 × 497**,
   qt 3 × 49, qt 1 × 305. Layer bytes ≈ 155 MB (first-8 average 154.6 MB).
 - Card: gfx1201, 16304 MB total; host 28 GB RAM, THP `[always]`.
@@ -44,7 +44,7 @@ qt 49 has no canonical `dequantize_to_f32` arm, so its oracle is the production
 launcher on **real 27B tensors**:
 
 ```
-HIPFIRE_PARITY_EXTRA_MODEL=<models-dir>/qwen3.8-27b.mq3-xt HIPFIRE_PARITY_EXTRA_QT=49 \
+HIPFIRE_PARITY_EXTRA_MODEL=/path/to/models/qwen3.8-27b.mq3-xt HIPFIRE_PARITY_EXTRA_QT=49 \
   cargo test -p hipfire-arch-qwen35 --release --test gpu_gemv_parity -- --ignored
   qwen3.8-27b.mq3-xt qt=49 q_proj  m=12288 k=5120  rel=2.391e-7
   qwen3.8-27b.mq3-xt qt=49 q_proj  m=12288 k=5120  rel=3.530e-7

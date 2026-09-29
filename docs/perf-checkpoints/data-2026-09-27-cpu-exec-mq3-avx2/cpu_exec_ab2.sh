@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
-# Throwaway interleaved 2x2 A/B: {old,new} binaries x {pcie,cpu} exec, 3 rounds.
+# Interleaved 2x2 A/B: {old,new} binaries x {pcie,cpu} exec, 3 rounds.
 # old = /tmp/cpu_exec_pin (pre-change tree), new = target/release (HEAD + qt49 AVX2).
+# Scratch during the measurement; committed here so the numbers have a recipe.
 set -u
-cd <repo-root>
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
 
-MODEL=<models-dir>/qwen3.8-27b.mq3-xt
+# Point MODEL at the local qwen3.8-27b.mq3-xt artifact.
+MODEL="${MODEL:?set MODEL to the local qwen3.8-27b.mq3-xt path}"
 PROMPT=benchmarks/prompts/gpu_offload_probe.txt
 OUT=/tmp/cpu_exec_ab2
 mkdir -p "$OUT"
@@ -42,7 +45,7 @@ print('    $tag decode median %.1f tok/s | prefill %.1f | vram_free %s MB | samp
 " 2>> "$OUT/run.log" || echo "    $tag: no json" | tee -a "$OUT/run.log"
 }
 
-NEW=<repo-root>/target/release/daemon
+NEW="$REPO_ROOT/target/release/daemon"
 for r in 1 2 3; do
   run_arm new_cpu_$r  ./target/release/hipfire $NEW cpu
   run_arm new_pcie_$r ./target/release/hipfire $NEW pcie

@@ -30,7 +30,7 @@ importantly the 27B decoded-text parity read, which its author never completed
   `target/release/hipfire` md5 `030f080ce4c3d68ca038a614059d21b2`.
 - Model: `~/.hipfire/models/qwen3.5-9b.mq4`, md5
   `31a8d8dc7603226801b08d8319015602` (32 layers, 114.9 MB/layer).
-- Model: `<models-dir>/qwen3.8-27b.mq3-xt`, md5 `80bb9198e6a565fc006b2ae1b7c89eca`
+- Model: `/path/to/models/qwen3.8-27b.mq3-xt`, md5 `80bb9198e6a565fc006b2ae1b7c89eca`
   (11,777,616,896 B; 64 layers; **every one of its 497 projections is qt 49 /
   `MQ3G256V2`** — covered by the cpu path with no canonical host decoder).
 - Prompt: `benchmarks/prompts/humaneval_3_below_zero.txt`, md5

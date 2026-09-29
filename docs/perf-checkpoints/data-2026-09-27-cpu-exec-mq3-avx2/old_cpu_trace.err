@@ -75,7 +75,7 @@ cpu exec: 8/8 spilled layers fully covered; uncovered quants: none
   weight sweep: 3708 ms (packed-expert host-read 0 ms, H2D 0 ms)
 KV cache: fwht3 filtered (16/64 layers carry KV; K FWHT-3b 100B + V Q8 272B = 372 B/head)
 hipfire bench
-  model:  <models-dir>/qwen3.8-27b.mq3-xt
+  model:  /path/to/models/qwen3.8-27b.mq3-xt
   arch:   qwen3_5
   gpu:    gfx1201
   runs:   5
