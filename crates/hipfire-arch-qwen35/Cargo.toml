@@ -12,6 +12,8 @@ default = ["deltanet"]
 deltanet = ["hipfire-runtime/deltanet", "rdna-compute/deltanet"]
 flash-attn-ck = ["hipfire-dispatch/flash-attn-ck", "rdna-compute/flash-attn-ck"]
 moe-oracle = ["dep:sha2"]
+# GPU bring-up probes (host-mapped/offloaded weights); build with `--features lab`.
+lab = []
 
 [dependencies]
 hipfire-config = { path = "../hipfire-config" }
@@ -91,3 +93,8 @@ required-features = ["deltanet"]
 name = "qwen35_sealed_moe_oracle"
 path = "examples/qwen35_sealed_moe_oracle.rs"
 required-features = ["deltanet", "moe-oracle"]
+
+[[example]]
+name = "host_offload_smoke"
+path = "examples/host_offload_smoke.rs"
+required-features = ["lab"]
