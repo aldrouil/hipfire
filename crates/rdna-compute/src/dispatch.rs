@@ -10,8 +10,7 @@ use crate::feature_flags::FeatureFlags;
 use crate::kernels;
 use hip_bridge::{
     DeviceBuffer, HipError, HipMemAllocationProp, HipMemGenericAllocationHandle, HipResult,
-    HipRuntime, Rocblas, VmmArena,
-    HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED,
+    HipRuntime, Rocblas, VmmArena, HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED,
 };
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -2361,9 +2360,7 @@ impl Gpu {
         // Safety: registered by `alloc_host_mapped_tensor` as a live
         // `hipHostMalloc` of `tensor.buf.size() + HOST_TAIL_PAD_BYTES` bytes,
         // freed exactly once on unload.
-        Some(unsafe {
-            std::slice::from_raw_parts(host_ptr as *const u8, tensor.buf.size())
-        })
+        Some(unsafe { std::slice::from_raw_parts(host_ptr as *const u8, tensor.buf.size()) })
     }
 
     /// Helper: launch a kernel using the blob path during graph capture,
@@ -3323,7 +3320,6 @@ impl Gpu {
             dtype,
         })
     }
-
 
     /// Allocate a **host-mapped** tensor: system RAM the GPU reads directly over PCIe.
     ///
@@ -5813,7 +5809,9 @@ mod tests {
             eprintln!("skip: no GPU");
             return;
         };
-        let payload: Vec<u8> = (0..64u8).map(|i| i.wrapping_mul(3).wrapping_add(1)).collect();
+        let payload: Vec<u8> = (0..64u8)
+            .map(|i| i.wrapping_mul(3).wrapping_add(1))
+            .collect();
         let t = gpu
             .upload_raw_host(&payload, &[payload.len()])
             .expect("host-mapped raw upload");
@@ -5876,7 +5874,11 @@ mod tests {
             eprintln!("skip: no GPU");
             return;
         };
-        assert_eq!(gpu.host_mapped_count(), 0, "fresh GPU owns no host-mapped tensors");
+        assert_eq!(
+            gpu.host_mapped_count(),
+            0,
+            "fresh GPU owns no host-mapped tensors"
+        );
         gpu.ensure_vmm_cleaned().expect("idle GPU is clean");
 
         let t = gpu
@@ -5893,7 +5895,8 @@ mod tests {
 
         gpu.free_tensor(t).expect("free the host-mapped owner");
         assert_eq!(gpu.host_mapped_count(), 0);
-        gpu.ensure_vmm_cleaned().expect("clean again after the owner is freed");
+        gpu.ensure_vmm_cleaned()
+            .expect("clean again after the owner is freed");
     }
 
     #[test]
@@ -6113,8 +6116,7 @@ mod tests {
         // tell "reclaimed late" from "leaked" — which is precisely the distinction
         // this test exists to make. Poll briefly, and fail only if free never
         // recovers.
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_millis(POLL_MILLIS);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(POLL_MILLIS);
         let mut free_after = gpu.hip.get_vram_info().expect("vram after").0;
         while free_after + TOLERANCE_BYTES < free_before && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(POLL_MILLIS / 10));

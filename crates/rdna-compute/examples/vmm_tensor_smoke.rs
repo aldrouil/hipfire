@@ -99,7 +99,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         gpu.hip.memcpy_dtoh(&mut readback, &tensor.buf)?;
         assert_eq!(&readback[..chunk], first.as_slice());
         assert_eq!(&readback[chunk..], second.as_slice());
-        println!("vmm_tensor_smoke: FULLMAP_PREFIX PASS (mapped={})", chunk * 2);
+        println!(
+            "vmm_tensor_smoke: FULLMAP_PREFIX PASS (mapped={})",
+            chunk * 2
+        );
         readback
     };
 
@@ -151,9 +154,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // The requested initial size is shadowed by the full reservation, so a
         // non-granular initial still succeeds with the whole reservation mapped.
         let bad_initial = gran.saturating_sub(1).max(1);
-        let absorbed =
-            unsafe { gpu.alloc_vmm_tensor(&[chunk], DType::Raw, bad_initial, &access) }
-                .expect("windows full-map absorbs non-granular initial");
+        let absorbed = unsafe { gpu.alloc_vmm_tensor(&[chunk], DType::Raw, bad_initial, &access) }
+            .expect("windows full-map absorbs non-granular initial");
         assert_eq!(gpu.vmm_mapped_bytes(&absorbed), Some(chunk));
         assert_eq!(absorbed.buf.size(), chunk);
         gpu.free_tensor(absorbed).expect("free absorbed tensor");
@@ -173,9 +175,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(not(windows))]
     let fail_err = {
         let unaligned = gran.saturating_sub(1).max(1);
-        let absorbed =
-            unsafe { gpu.alloc_vmm_tensor(&[chunk], DType::Raw, unaligned, &access) }
-                .expect("non-granular initial map is rounded up, not rejected");
+        let absorbed = unsafe { gpu.alloc_vmm_tensor(&[chunk], DType::Raw, unaligned, &access) }
+            .expect("non-granular initial map is rounded up, not rejected");
         let expect = unaligned
             .next_multiple_of(gran)
             .min(chunk.next_multiple_of(gran));
@@ -223,14 +224,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dev_tensor =
         unsafe { gpu.alloc_vmm_tensor(&[host_elems], DType::F32, host_elems * 4, &access)? };
     assert_eq!(gpu.vmm_allocation_count(), 1);
-    assert!(!gpu.host_located(&dev_tensor), "device tensor must not be host-located");
+    assert!(
+        !gpu.host_located(&dev_tensor),
+        "device tensor must not be host-located"
+    );
     let dev_handle = gpu
         .vmm_handle(&dev_tensor)
         .expect("device tensor exposes a primary handle");
     let dev_prop = gpu.hip.mem_get_handle_properties(dev_handle)?;
     assert_eq!(
-        dev_prop.location.type_,
-        HIP_MEM_LOCATION_TYPE_DEVICE,
+        dev_prop.location.type_, HIP_MEM_LOCATION_TYPE_DEVICE,
         "device VMM handle must report DEVICE to ROCm"
     );
     gpu.free_tensor(dev_tensor)?;
@@ -246,18 +249,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `examples/host_offload_headroom.rs`.)
     let host_f32: Vec<f32> = (0..host_elems).map(|i| (i % 17) as f32 * 0.5).collect();
     let host_tensor = gpu.upload_f32_host(&host_f32, &[host_elems])?;
-    assert!(gpu.host_located(&host_tensor), "offloaded tensor must be host-located");
+    assert!(
+        gpu.host_located(&host_tensor),
+        "offloaded tensor must be host-located"
+    );
     assert_eq!(
         gpu.vmm_allocation_count(),
         0,
         "host-mapped weights must not register a VMM arena"
     );
-    assert_eq!(gpu.host_mapped_count(), 1, "host-mapped owner not registered");
+    assert_eq!(
+        gpu.host_mapped_count(),
+        1,
+        "host-mapped owner not registered"
+    );
     let rb = gpu.download_f32(&host_tensor)?;
-    assert_eq!(rb, host_f32, "host-located tensor must survive a PCIe read/write round-trip");
+    assert_eq!(
+        rb, host_f32,
+        "host-located tensor must survive a PCIe read/write round-trip"
+    );
     println!("vmm_tensor_smoke: HOST_OFFLOAD PASS");
     gpu.free_tensor(host_tensor)?;
-    assert_eq!(gpu.host_mapped_count(), 0, "host-mapped owner leaked after free");
+    assert_eq!(
+        gpu.host_mapped_count(),
+        0,
+        "host-mapped owner leaked after free"
+    );
     assert_eq!(gpu.vmm_allocation_count(), 0);
     println!("vmm_tensor_smoke: PASS");
     Ok(())

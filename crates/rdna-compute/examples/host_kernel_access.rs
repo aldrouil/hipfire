@@ -38,19 +38,25 @@ fn fwht_signs(seed: u32) -> Vec<f32> {
     (0..256)
         .map(|_| {
             st = st.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
-            if (st >> 16) & 1 == 1 { 1.0 } else { -1.0 }
+            if (st >> 16) & 1 == 1 {
+                1.0
+            } else {
+                -1.0
+            }
         })
         .collect()
 }
 
 fn max_diff(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max)
 }
 
 fn any_nonzero(v: &[f32]) -> bool {
     v.iter().any(|x| x.abs() > 1e-6)
 }
-
 
 /// In-place radix-2 Hadamard over one 256-element group, matching the kernel's
 /// expectation. `gemv_mq4g256` takes `x_rot` — x with the FWHT already applied —
@@ -95,7 +101,10 @@ fn arm_f32(gpu: &mut Gpu) {
     let mut yd = gpu.zeros(&[M], DType::F32).unwrap();
     gpu.gemv_f32(&a_dev, &xd, &yd).unwrap();
     let reference = gpu.download_f32(&yd).unwrap();
-    assert!(any_nonzero(&reference), "device reference is all zero - arm is vacuous");
+    assert!(
+        any_nonzero(&reference),
+        "device reference is all zero - arm is vacuous"
+    );
 
     // The production offload upload, not a hand-rolled host arena: this arm must
     // fail if the path the loader actually uses stops being kernel-readable.
@@ -111,8 +120,15 @@ fn arm_f32(gpu: &mut Gpu) {
             // Non-vacuity: the host result must be non-zero AND must match the
             // device twin computed from the SAME bytes.
             let d = max_diff(&reference, &got);
-            let verdict = if d == 0.0 && any_nonzero(&got) { "PASS" } else { "VACUOUS" };
-            println!("ARM1_F32 {verdict} (max diff {d}, non-zero {})", any_nonzero(&got));
+            let verdict = if d == 0.0 && any_nonzero(&got) {
+                "PASS"
+            } else {
+                "VACUOUS"
+            };
+            println!(
+                "ARM1_F32 {verdict} (max diff {d}, non-zero {})",
+                any_nonzero(&got)
+            );
         }
         Err(e) => println!("ARM1_F32 FAULT: {e:?}"),
     }
@@ -121,7 +137,11 @@ fn arm_f32(gpu: &mut Gpu) {
 fn arm_mq4(gpu: &mut Gpu) {
     const M: usize = 512;
     const K: usize = 1024;
-    assert_eq!(K % 256, 0, "K must be a multiple of 256 or groups_per_row truncates");
+    assert_eq!(
+        K % 256,
+        0,
+        "K must be a multiple of 256 or groups_per_row truncates"
+    );
     let expected = M * (K / 256) * 136;
     // Per-group layout (136 B): fp32 scale @0, fp32 zero @4, 128 nibble bytes @8.
     // The kernel reads the headers as 32-bit floats
@@ -160,8 +180,14 @@ fn arm_mq4(gpu: &mut Gpu) {
     let mut yd = gpu.zeros(&[M], DType::F32).unwrap();
     gpu.gemv_mq4g256(&a_dev, &xd, &yd, M, K).unwrap();
     let reference = gpu.download_f32(&yd).unwrap();
-    assert!(any_nonzero(&reference), "device reference is all zero - arm is vacuous");
-    println!("arm2: device-resident gemv_mq4g256 ok ({} outputs)", reference.len());
+    assert!(
+        any_nonzero(&reference),
+        "device reference is all zero - arm is vacuous"
+    );
+    println!(
+        "arm2: device-resident gemv_mq4g256 ok ({} outputs)",
+        reference.len()
+    );
 
     let a_off = gpu.upload_raw_host(&codes, &[codes.len()]).unwrap();
     assert!(gpu.host_located(&a_off), "not host-located");
@@ -181,8 +207,15 @@ fn arm_mq4(gpu: &mut Gpu) {
         Ok(()) => {
             let got = gpu.download_f32(&yh).unwrap();
             let d = max_diff(&reference, &got);
-            let verdict = if d == 0.0 && any_nonzero(&got) { "PASS" } else { "VACUOUS" };
-            println!("ARM2_MQ4 {verdict} (max diff {d}, non-zero {})", any_nonzero(&got));
+            let verdict = if d == 0.0 && any_nonzero(&got) {
+                "PASS"
+            } else {
+                "VACUOUS"
+            };
+            println!(
+                "ARM2_MQ4 {verdict} (max diff {d}, non-zero {})",
+                any_nonzero(&got)
+            );
         }
         Err(e) => println!("ARM2_MQ4 FAULT: {e:?}"),
     }

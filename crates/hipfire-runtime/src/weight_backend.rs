@@ -739,12 +739,7 @@ pub fn dequant_weight_raw(
 /// out of [`dequant_norm`] so this device path and its host-located counterpart decode
 /// byte-for-byte identically — a sign/normalization drift here is the "token soup"
 /// attractor failure mode, so there is exactly one copy.
-fn dequantize_norm(
-    quant_type: u8,
-    data: &[u8],
-    shape: &[usize],
-    bias: f32,
-) -> Vec<f32> {
+fn dequantize_norm(quant_type: u8, data: &[u8], shape: &[usize], bias: f32) -> Vec<f32> {
     let mut f32_data: Vec<f32> = match quant_type {
         1 => data
             .chunks_exact(2)
@@ -865,13 +860,13 @@ fn dequant_bq1_to_f32(data: &[u8], n: usize) -> Vec<f32> {
     out
 }
 
-    /// CPU-side dequant of HTQ weight bytes to F32 for every supported quant_type
-    /// (F16/F32/BF16, Q8_0, MQ4/6/MQ3, MFP4, codebook 19/20/30, ...). Factored out of
-    /// [`dequant_f32`] so this device path and its host-located counterpart decode
-    /// byte-for-byte identically — a sign/normalization drift here is the "token soup"
-    /// attractor failure mode, so there is exactly one copy.
-    fn dequantize_to_f32(quant_type: u8, data: &[u8], n: usize) -> Vec<f32> {
-        match quant_type {
+/// CPU-side dequant of HTQ weight bytes to F32 for every supported quant_type
+/// (F16/F32/BF16, Q8_0, MQ4/6/MQ3, MFP4, codebook 19/20/30, ...). Factored out of
+/// [`dequant_f32`] so this device path and its host-located counterpart decode
+/// byte-for-byte identically — a sign/normalization drift here is the "token soup"
+/// attractor failure mode, so there is exactly one copy.
+fn dequantize_to_f32(quant_type: u8, data: &[u8], n: usize) -> Vec<f32> {
+    match quant_type {
         1 => data
             .chunks_exact(2)
             .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
@@ -1276,19 +1271,14 @@ fn dequant_bq1_to_f32(data: &[u8], n: usize) -> Vec<f32> {
     }
 }
 
-    /// Dequantize an HTQ weight tensor to a device `F32 [n]` tensor. The CPU dequant is
-    /// factored into [`dequantize_to_f32`] so the host-located offload path stays byte for
-    /// byte identical — the only difference from the device path is the upload target
-    /// (device memory vs host-mapped system RAM readable over PCIe).
-    pub fn dequant_f32(
-        gpu: &mut Gpu,
-        quant_type: u8,
-        data: &[u8],
-        n: usize,
-    ) -> HipResult<GpuTensor> {
-        let f32_data = dequantize_to_f32(quant_type, data, n);
-        gpu.upload_f32(&f32_data[..n], &[n])
-    }
+/// Dequantize an HTQ weight tensor to a device `F32 [n]` tensor. The CPU dequant is
+/// factored into [`dequantize_to_f32`] so the host-located offload path stays byte for
+/// byte identical — the only difference from the device path is the upload target
+/// (device memory vs host-mapped system RAM readable over PCIe).
+pub fn dequant_f32(gpu: &mut Gpu, quant_type: u8, data: &[u8], n: usize) -> HipResult<GpuTensor> {
+    let f32_data = dequantize_to_f32(quant_type, data, n);
+    gpu.upload_f32(&f32_data[..n], &[n])
+}
 
 /// Public delegation to the canonical per-tensor CPU decoder [`dequantize_to_f32`].
 ///
@@ -1364,7 +1354,14 @@ pub struct HfqBackend<'a> {
     /// silent device allocation, so a half-configured offload can never masquerade
     /// as working. qwen35 dense is the only arch that sets this.
     pub read_proj_host: Option<
-        fn(&HfqFile, &mut Gpu, &str, usize, usize, fn(&str) -> Vec<String>) -> HipResult<WeightTensor>,
+        fn(
+            &HfqFile,
+            &mut Gpu,
+            &str,
+            usize,
+            usize,
+            fn(&str) -> Vec<String>,
+        ) -> HipResult<WeightTensor>,
     >,
 }
 

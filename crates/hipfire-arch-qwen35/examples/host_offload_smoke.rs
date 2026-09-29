@@ -27,13 +27,11 @@ use hipfire_runtime::hfq::HfqFile;
 use rdna_compute::Gpu;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let path = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| {
-            std::env::var("HOME")
-                .map(|h| format!("{h}/.hipfire/models/qwen3.5-9b.mq4"))
-                .unwrap_or_else(|_| "qwen3.5-9b.mq4".into())
-        });
+    let path = std::env::args().nth(1).unwrap_or_else(|| {
+        std::env::var("HOME")
+            .map(|h| format!("{h}/.hipfire/models/qwen3.5-9b.mq4"))
+            .unwrap_or_else(|_| "qwen3.5-9b.mq4".into())
+    });
     println!("model: {path}");
 
     let mut hfq = HfqFile::open(std::path::Path::new(&path))?;
@@ -81,16 +79,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
     };
     let name = name.as_str();
-    println!("picked {name} qt={qt} shape={:?}", hfq.find_tensor_info(name).map(|i| &i.shape));
+    println!(
+        "picked {name} qt={qt} shape={:?}",
+        hfq.find_tensor_info(name).map(|i| &i.shape)
+    );
 
-    let device = load_weight_tensor(
-        &hfq,
-        &gpu,
-        name,
-        m,
-        k,
-        qwen35_tensor_name_candidates,
-    )?;
+    let device = load_weight_tensor(&hfq, &gpu, name, m, k, qwen35_tensor_name_candidates)?;
     let host = load_weight_tensor_host(
         &mut hfq,
         &mut gpu,
@@ -123,7 +117,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         !gpu.host_located(&device.buf),
         "device reader unexpectedly produced a host-located tensor"
     );
-    let (_, source) = hfq.tensor_data(name).expect("selected from the index above");
+    let (_, source) = hfq
+        .tensor_data(name)
+        .expect("selected from the index above");
     assert_eq!(
         device.buf.byte_size(),
         source.len(),
@@ -134,9 +130,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         source.len(),
         "host blob size != on-disk tensor size"
     );
-    println!(
-        "locality: device=VRAM host=host-mapped (confirmed via Gpu::host_located)"
-    );
+    println!("locality: device=VRAM host=host-mapped (confirmed via Gpu::host_located)");
 
     let dev_bytes = gpu.download_raw_bytes(&device.buf)?;
     let host_bytes = gpu.download_raw_bytes(&host.buf)?;

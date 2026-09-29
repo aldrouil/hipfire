@@ -16,7 +16,10 @@ use crate::testfix;
 fn dispatch_predicate_is_forced_only_where_supported() {
     assert!(use_avx2(true, None), "detected -> on");
     assert!(!use_avx2(false, None), "undetected -> off");
-    assert!(!use_avx2(true, Some(false)), "forced off wins over detection");
+    assert!(
+        !use_avx2(true, Some(false)),
+        "forced off wins over detection"
+    );
     assert!(use_avx2(true, Some(true)), "forced on, supported");
     assert!(
         !use_avx2(false, Some(true)),
@@ -125,7 +128,11 @@ fn row_dot_enabled_matches_each_kernels_feature_gate() {
             avx2_available()
         };
         assert_eq!(row_dot_enabled(q, None), available, "{q:?}: detection");
-        assert_eq!(row_dot_enabled(q, Some(true)), available, "{q:?}: forced on");
+        assert_eq!(
+            row_dot_enabled(q, Some(true)),
+            available,
+            "{q:?}: forced on"
+        );
         assert!(!row_dot_enabled(q, Some(false)), "{q:?}: forced off");
     }
 }
@@ -180,9 +187,7 @@ fn awkward_headers(q: CpuQuant, packed: &mut [u8], m: usize, k: usize) {
                 // the fixture's books are powers of two, and qt 30's repeats an
                 // eight-entry book into sixteen lanes, which would hide an
                 // off-by-eight table error.
-                CpuQuant::Mq2G256Lloyd | CpuQuant::Mq2G256LloydU => {
-                    write_cb(packed, at, 4)
-                }
+                CpuQuant::Mq2G256Lloyd | CpuQuant::Mq2G256LloydU => write_cb(packed, at, 4),
                 CpuQuant::Mq3G256Lloyd => write_cb(packed, at, 8),
                 CpuQuant::Mq4G256Lloyd => write_cb(packed, at, 16),
                 // Element formats: the fixture's weights are small powers of

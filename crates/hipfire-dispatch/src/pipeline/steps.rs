@@ -1297,7 +1297,7 @@ fn launch_fused(
 mod tests {
     use super::*;
     use crate::context::DispatchCtx;
-use crate::cpu_exec;
+    use crate::cpu_exec;
     use crate::families::fused_qkv::FusedQkvFamily;
     use crate::types::KernelKey;
 

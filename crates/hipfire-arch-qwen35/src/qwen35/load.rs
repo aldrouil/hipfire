@@ -28,6 +28,7 @@ use super::weights::Qwen35HfqSourceIdentity;
 use super::weights::Qwen35RankSeal;
 use super::weights::Qwen35Weights;
 use super::weights::SharedExpertWeights;
+use hip_bridge::DeviceBuffer;
 use hip_bridge::HipError;
 use hip_bridge::HipResult;
 use hipfire_runtime::device_mesh::DeviceMesh;
@@ -59,7 +60,6 @@ use hipfire_runtime::weight_backend::reupload_f16_as_f32;
 use hipfire_runtime::weight_backend::HfqBackend;
 use hipfire_runtime::weight_backend::ParoBackend;
 use rdna_compute::DType;
-use hip_bridge::DeviceBuffer;
 use rdna_compute::Gpu;
 use rdna_compute::GpuTensor;
 use std::sync::Arc;
@@ -1002,13 +1002,25 @@ pub fn load_weight_tensor_host(
         for candidate in candidates(name) {
             if let Some((info, data)) = hfq.tensor_data(&candidate) {
                 qt_logged = info.quant_type;
-                wt = Some(load_weight_tensor_raw_host(gpu, info.quant_type, data, m, k)?);
+                wt = Some(load_weight_tensor_raw_host(
+                    gpu,
+                    info.quant_type,
+                    data,
+                    m,
+                    k,
+                )?);
                 matched = Some(candidate);
                 break;
             }
             if let Some((info, buf)) = hfq.tensor_data_pread(&candidate) {
                 qt_logged = info.quant_type;
-                wt = Some(load_weight_tensor_raw_host(gpu, info.quant_type, &buf, m, k)?);
+                wt = Some(load_weight_tensor_raw_host(
+                    gpu,
+                    info.quant_type,
+                    &buf,
+                    m,
+                    k,
+                )?);
                 matched = Some(candidate);
                 break;
             }

@@ -5686,13 +5686,13 @@ mod tests {
     }
 }
 
-    /// Placement policy for partial GPU offload — decides which layers stay in
-    /// device VRAM versus spill to host RAM, resolved once at load so placement is
-    /// fixed for the model's lifetime and never thrashes per request. This module is
-    /// intentionally pure and GPU-independent: it owns the configuration vocabulary
-    /// ([`GpuLayerBudget`]) and the admission arithmetic ([`largest_fitting_tail`]);
-    /// the qwen35 load path consumes them to pick `i_gpu_start`.
-    pub mod memory {
+/// Placement policy for partial GPU offload — decides which layers stay in
+/// device VRAM versus spill to host RAM, resolved once at load so placement is
+/// fixed for the model's lifetime and never thrashes per request. This module is
+/// intentionally pure and GPU-independent: it owns the configuration vocabulary
+/// ([`GpuLayerBudget`]) and the admission arithmetic ([`largest_fitting_tail`]);
+/// the qwen35 load path consumes them to pick `i_gpu_start`.
+pub mod memory {
     use super::process_value;
 
     /// Resident-layer budget for partial GPU offload (`memory.gpu_layer_budget`,
@@ -5910,20 +5910,14 @@ mod tests {
             assert_eq!(parse_gpu_layer_budget(Some("-1")), GpuLayerBudget::Auto);
             assert_eq!(parse_gpu_layer_budget(Some("AUTO")), GpuLayerBudget::Auto);
             // A non-negative integer pins that many resident layers (trimmed).
-            assert_eq!(
-                parse_gpu_layer_budget(Some("3")),
-                GpuLayerBudget::Layers(3)
-            );
+            assert_eq!(parse_gpu_layer_budget(Some("3")), GpuLayerBudget::Layers(3));
             assert_eq!(
                 parse_gpu_layer_budget(Some(" 12 ")),
                 GpuLayerBudget::Layers(12)
             );
             // Garbage, negatives other than -1, and anything unparseable fail
             // closed to full residency rather than forcing an offload.
-            assert_eq!(
-                parse_gpu_layer_budget(Some("banana")),
-                GpuLayerBudget::Full
-            );
+            assert_eq!(parse_gpu_layer_budget(Some("banana")), GpuLayerBudget::Full);
             assert_eq!(parse_gpu_layer_budget(Some("-2")), GpuLayerBudget::Full);
         }
 

@@ -137,10 +137,13 @@ pub fn gemm_with_simd(
     );
     let x = &x[..n * k];
     let use_simd = simd::row_dot_enabled(q, requested);
-    out[..n * m].par_iter_mut().enumerate().for_each(|(flat, o)| {
-        let (token, row) = (flat / m, flat % m);
-        *o = dot_row_simd(q, &packed[row * rb..], k, &x[token * k..], use_simd);
-    });
+    out[..n * m]
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(flat, o)| {
+            let (token, row) = (flat / m, flat % m);
+            *o = dot_row_simd(q, &packed[row * rb..], k, &x[token * k..], use_simd);
+        });
 }
 
 /// One output element: `Σ_j W[row][j] * x[j]`, accumulating one group at a time.
@@ -304,7 +307,9 @@ mod test {
         let q = CpuQuant::Mq6G256;
         let (m, k, n) = (4usize, 512usize, 3usize);
         let packed = weights(q, m, k);
-        let x: Vec<f32> = (0..n).flat_map(|t| x_of(k).into_iter().map(move |v| v + t as f32)).collect();
+        let x: Vec<f32> = (0..n)
+            .flat_map(|t| x_of(k).into_iter().map(move |v| v + t as f32))
+            .collect();
         let mut batch = vec![0.0f32; n * m];
         gemm(q, &packed, m, k, &x, n, &mut batch);
         for t in 0..n {
@@ -344,13 +349,27 @@ mod test {
     #[should_panic(expected = "not a multiple of 256")]
     fn unaligned_k_panics() {
         let mut y = [0.0f32; 1];
-        gemv(CpuQuant::Mq4G256, &[0u8; 200], 1, 128, &[0.0f32; 128], &mut y);
+        gemv(
+            CpuQuant::Mq4G256,
+            &[0u8; 200],
+            1,
+            128,
+            &[0.0f32; 128],
+            &mut y,
+        );
     }
 
     #[test]
     #[should_panic(expected = "packed has")]
     fn short_weight_buffer_panics() {
         let mut y = [0.0f32; 1];
-        gemv(CpuQuant::Mq4G256, &[0u8; 135], 1, 256, &[0.0f32; 256], &mut y);
+        gemv(
+            CpuQuant::Mq4G256,
+            &[0u8; 135],
+            1,
+            256,
+            &[0.0f32; 256],
+            &mut y,
+        );
     }
 }

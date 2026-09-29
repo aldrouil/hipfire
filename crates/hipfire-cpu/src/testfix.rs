@@ -19,8 +19,12 @@
 use crate::quant::CpuQuant;
 
 /// Small values that are exact in f16, bf16 and f32: `0, 1, -1, 2, -2, 3, -3, 5`.
-const SMALL_F16: [u16; 8] = [0x0000, 0x3c00, 0xbc00, 0x4000, 0xc000, 0x4200, 0xc200, 0x4500];
-const SMALL_BF16: [u16; 8] = [0x0000, 0x3f80, 0xbf80, 0x4000, 0xc000, 0x4040, 0xc040, 0x40a0];
+const SMALL_F16: [u16; 8] = [
+    0x0000, 0x3c00, 0xbc00, 0x4000, 0xc000, 0x4200, 0xc200, 0x4500,
+];
+const SMALL_BF16: [u16; 8] = [
+    0x0000, 0x3f80, 0xbf80, 0x4000, 0xc000, 0x4040, 0xc040, 0x40a0,
+];
 const SMALL_F32: [f32; 8] = [0.0, 1.0, -1.0, 2.0, -2.0, 3.0, -3.0, 5.0];
 
 /// f16 bit patterns of `0.0625, -0.25, 0.5, 0.75`.
@@ -55,9 +59,7 @@ pub fn group_bytes(q: CpuQuant, salt: usize) -> Vec<u8> {
         .map(|i| (((i + salt) * 37 + 11) & 0xFF) as u8)
         .collect();
     match q {
-        CpuQuant::Mq4G256 | CpuQuant::Hfq4G256 => {
-            bytes[..8].copy_from_slice(&f32x2(0.03125, -0.5))
-        }
+        CpuQuant::Mq4G256 | CpuQuant::Hfq4G256 => bytes[..8].copy_from_slice(&f32x2(0.03125, -0.5)),
         CpuQuant::Mq6G256 | CpuQuant::Hfq6G256 => {
             bytes[..8].copy_from_slice(&f32x2(0.0078125, -0.125))
         }

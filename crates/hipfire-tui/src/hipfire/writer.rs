@@ -380,7 +380,10 @@ mod tests {
             "whitespace-only input is the same unset spelling"
         );
         let loaded = load_global(&ConfigPaths::under(&root)).unwrap();
-        assert!(loaded.layer.get("gpu_layer_budget").is_none(), "cleared key is off disk");
+        assert!(
+            loaded.layer.get("gpu_layer_budget").is_none(),
+            "cleared key is off disk"
+        );
 
         // A free string keeps the empty string as a value.
         assert_eq!(

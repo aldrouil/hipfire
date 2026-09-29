@@ -1035,11 +1035,7 @@ fn apply_offload_policy(config: &mut Qwen35Config) {
 /// GPU or a daemon. A configured budget that silently did nothing (a resident
 /// count above the model's layer count saturating to fully resident) is exactly
 /// what made this knob confusing.
-fn residency_report(
-    n_layers: usize,
-    budget: GpuLayerBudget,
-    i_gpu_start: usize,
-) -> Option<String> {
+fn residency_report(n_layers: usize, budget: GpuLayerBudget, i_gpu_start: usize) -> Option<String> {
     if i_gpu_start != 0 {
         return Some(format!(
             "  partial offload: {} resident / {} offloaded, i_gpu_start={}",
@@ -1754,16 +1750,40 @@ mod tests {
     #[test]
     fn offload_split_maps_resident_count_to_spill_point() {
         use hipfire_config::memory::GpuLayerBudget as B;
-        assert_eq!(offload_split(64, B::Full), 0, "unset keeps every layer resident");
-        assert_eq!(offload_split(64, B::Auto), 0, "auto is a placeholder = all resident");
-        assert_eq!(offload_split(64, B::Layers(64)), 0, "asking for all of them");
+        assert_eq!(
+            offload_split(64, B::Full),
+            0,
+            "unset keeps every layer resident"
+        );
+        assert_eq!(
+            offload_split(64, B::Auto),
+            0,
+            "auto is a placeholder = all resident"
+        );
+        assert_eq!(
+            offload_split(64, B::Layers(64)),
+            0,
+            "asking for all of them"
+        );
         assert_eq!(offload_split(64, B::Layers(62)), 2, "2 spilled");
         assert_eq!(offload_split(64, B::Layers(32)), 32, "32 spilled");
         assert_eq!(offload_split(64, B::Layers(3)), 61, "3 on GPU, 61 spilled");
-        assert_eq!(offload_split(64, B::Layers(0)), 64, "0 resident spills everything");
+        assert_eq!(
+            offload_split(64, B::Layers(0)),
+            64,
+            "0 resident spills everything"
+        );
         // Overshoot saturates to fully resident instead of indexing out of range.
-        assert_eq!(offload_split(64, B::Layers(200)), 0, "more layers than the model has");
-        assert_eq!(offload_split(1, B::Layers(999)), 0, "single-layer model, large request");
+        assert_eq!(
+            offload_split(64, B::Layers(200)),
+            0,
+            "more layers than the model has"
+        );
+        assert_eq!(
+            offload_split(1, B::Layers(999)),
+            0,
+            "single-layer model, large request"
+        );
         // A model with no layers must not underflow either.
         assert_eq!(offload_split(0, B::Layers(0)), 0, "degenerate model");
     }
@@ -1774,21 +1794,34 @@ mod tests {
     #[test]
     fn residency_report_covers_every_case() {
         use hipfire_config::memory::GpuLayerBudget as B;
-        assert_eq!(residency_report(64, B::Full, 0), None, "unset must stay silent");
+        assert_eq!(
+            residency_report(64, B::Full, 0),
+            None,
+            "unset must stay silent"
+        );
 
         let spilling = residency_report(64, B::Layers(32), 32).unwrap();
-        assert!(spilling.contains("32 resident / 32 offloaded"), "{spilling}");
+        assert!(
+            spilling.contains("32 resident / 32 offloaded"),
+            "{spilling}"
+        );
         assert!(spilling.contains("i_gpu_start=32"), "{spilling}");
 
         let all_spilled = residency_report(64, B::Layers(0), 64).unwrap();
-        assert!(all_spilled.contains("0 resident / 64 offloaded"), "{all_spilled}");
+        assert!(
+            all_spilled.contains("0 resident / 64 offloaded"),
+            "{all_spilled}"
+        );
 
         let auto = residency_report(64, B::Auto, 0).unwrap();
         assert!(
             auto.contains("defers placement to the engine"),
             "auto must be reported as an engine decision, not silence: {auto}"
         );
-        assert!(!auto.contains("error"), "auto is a note, not a failure: {auto}");
+        assert!(
+            !auto.contains("error"),
+            "auto is a note, not a failure: {auto}"
+        );
 
         let overshoot = residency_report(64, B::Layers(200), 0).unwrap();
         assert!(

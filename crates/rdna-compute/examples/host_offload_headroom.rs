@@ -58,15 +58,26 @@ fn device_headroom_mb(gpu: &Gpu) -> usize {
 fn main() {
     let mut gpu = Gpu::init().unwrap();
     println!("arch={} free={} MB", gpu.arch, free_mb(&gpu));
-    assert_eq!(gpu.host_mapped_count(), 0, "no host-mapped owners before the test");
+    assert_eq!(
+        gpu.host_mapped_count(),
+        0,
+        "no host-mapped owners before the test"
+    );
 
     let control = device_headroom_mb(&gpu);
     println!("control headroom            : {control} MB");
 
     let payload = vec![0u8; SPILL_MB * 1024 * 1024];
     let host = gpu.upload_raw_host(&payload, &[payload.len()]).unwrap();
-    assert!(gpu.host_located(&host), "upload_raw_host did not host-locate");
-    assert_eq!(gpu.host_mapped_count(), 1, "host-mapped owner not registered");
+    assert!(
+        gpu.host_located(&host),
+        "upload_raw_host did not host-locate"
+    );
+    assert_eq!(
+        gpu.host_mapped_count(),
+        1,
+        "host-mapped owner not registered"
+    );
 
     let with_spill = device_headroom_mb(&gpu);
     let cost = control.saturating_sub(with_spill);
@@ -76,7 +87,11 @@ fn main() {
     );
 
     gpu.free_tensor(host).unwrap();
-    assert_eq!(gpu.host_mapped_count(), 0, "host-mapped owner leaked after free");
+    assert_eq!(
+        gpu.host_mapped_count(),
+        0,
+        "host-mapped owner leaked after free"
+    );
     let after = device_headroom_mb(&gpu);
     println!("headroom after free         : {after} MB");
 

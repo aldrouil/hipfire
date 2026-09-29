@@ -1534,7 +1534,11 @@ impl App {
                     ChatEvent::Done => {
                         // Normalize empty reasoning to None so serialization omits it.
                         if let Some(last) = self.chat.messages.last_mut() {
-                            if last.reasoning_content.as_deref().is_some_and(|s| s.is_empty()) {
+                            if last
+                                .reasoning_content
+                                .as_deref()
+                                .is_some_and(|s| s.is_empty())
+                            {
                                 last.reasoning_content = None;
                             }
                         }
@@ -1549,7 +1553,11 @@ impl App {
                     ChatEvent::Error(err) => {
                         // Normalize empty reasoning as with Done.
                         if let Some(last) = self.chat.messages.last_mut() {
-                            if last.reasoning_content.as_deref().is_some_and(|s| s.is_empty()) {
+                            if last
+                                .reasoning_content
+                                .as_deref()
+                                .is_some_and(|s| s.is_empty())
+                            {
                                 last.reasoning_content = None;
                             }
                         }
@@ -2261,7 +2269,10 @@ mod tests {
             "32 on GPU",
             "a set budget renders its count"
         );
-        assert!(app.config.easy_override_state()[idx], "a written key is an override");
+        assert!(
+            app.config.easy_override_state()[idx],
+            "a written key is an override"
+        );
 
         // Clear it the direct way: erase the seeded value and commit the empty
         // buffer, which IS the unset spelling.
@@ -2280,7 +2291,10 @@ mod tests {
             "an emptied buffer must clear and close, not error"
         );
         assert_eq!(
-            app.config.values.get("gpu_layer_budget").map(String::as_str),
+            app.config
+                .values
+                .get("gpu_layer_budget")
+                .map(String::as_str),
             Some(""),
             "a cleared value is the unset spelling, not the string \"null\""
         );
@@ -2401,7 +2415,10 @@ mod tests {
             Some("cpu")
         );
         assert_eq!(app.config.easy_rows()[idx].1, "on CPU");
-        assert!(app.config.easy_override_state()[idx], "a written key is an override");
+        assert!(
+            app.config.easy_override_state()[idx],
+            "a written key is an override"
+        );
         let on_disk = std::fs::read_to_string(&app.paths.config).unwrap();
         assert!(
             on_disk.contains("offload_exec") && on_disk.contains("cpu"),
@@ -2740,7 +2757,7 @@ mod tests {
             ChatMessage {
                 role: "assistant".into(),
                 content: String::new(),
-            reasoning_content: None, // empty slot, no deltas streamed
+                reasoning_content: None, // empty slot, no deltas streamed
             },
         ];
         let (tx, rx) = std::sync::mpsc::channel();
@@ -2884,7 +2901,10 @@ mod tests {
             Some("think step"),
             "reasoning deltas accumulated separately"
         );
-        assert_eq!(last.content, "answer", "content deltas accumulated separately");
+        assert_eq!(
+            last.content, "answer",
+            "content deltas accumulated separately"
+        );
         // Serialized request keeps them as distinct keys for prefix-cache.
         let v = serde_json::to_value(&*app.chat.messages).unwrap();
         let asst = &v[1];
@@ -2932,7 +2952,13 @@ mod tests {
         tx.send(ChatEvent::Content("hi".into())).unwrap();
         tx.send(ChatEvent::Done).unwrap();
         app.drain_chat_events();
-        assert!(app.chat.messages.last().unwrap().reasoning_content.is_none());
+        assert!(app
+            .chat
+            .messages
+            .last()
+            .unwrap()
+            .reasoning_content
+            .is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

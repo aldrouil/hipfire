@@ -184,8 +184,9 @@ fn synth_weights(q: CpuQuant, m: usize, k: usize) -> Vec<u8> {
                 CpuQuant::Tq2G128 | CpuQuant::Bq1G128 => {
                     bytes[..2].copy_from_slice(&0x3800u16.to_le_bytes())
                 }
-                CpuQuant::Mq2G256Lloyd | CpuQuant::Mq2G256LloydU => bytes[..8]
-                    .copy_from_slice(&f16s(&[0xbc00, 0xb400, 0x3400, 0x3c00])),
+                CpuQuant::Mq2G256Lloyd | CpuQuant::Mq2G256LloydU => {
+                    bytes[..8].copy_from_slice(&f16s(&[0xbc00, 0xb400, 0x3400, 0x3c00]))
+                }
                 CpuQuant::Mq3G256Lloyd => bytes[..16].copy_from_slice(&f16s(&[
                     0xbc00, 0xb800, 0xb400, 0xb000, 0x3000, 0x3400, 0x3800, 0x3c00,
                 ])),
@@ -246,9 +247,7 @@ fn compare(
             // `Step::Gemv` weight here, so there is nothing to compare against.
             // Its decode is still pinned by `hipfire-cpu`'s expectation table
             // where a canonical arm exists. Reported, never silently skipped.
-            eprintln!(
-                "{label:58} SKIP — production launcher has no kernel ({key:?}) on this arch"
-            );
+            eprintln!("{label:58} SKIP — production launcher has no kernel ({key:?}) on this arch");
             gpu.free_tensor(w).ok();
             gpu.free_tensor(x_dev).ok();
             gpu.free_tensor(y_dev).ok();
@@ -271,7 +270,9 @@ fn compare(
             let mut sc = vec![0.0f32; k];
             let sc_bytes =
                 unsafe { std::slice::from_raw_parts_mut(sc.as_mut_ptr() as *mut u8, k * 4) };
-            gpu.hip.memcpy_dtoh(sc_bytes, &scale.buf).expect("dtoh scale");
+            gpu.hip
+                .memcpy_dtoh(sc_bytes, &scale.buf)
+                .expect("dtoh scale");
             divide_by_awq_scale(&mut x_cpu, &sc);
         }
         rotate_x(&mut x_cpu);
@@ -286,9 +287,7 @@ fn compare(
         .fold(0.0f32, f32::max);
     let scale = cpu_y.iter().fold(0.0f32, |a, b| a.max(b.abs())).max(1e-6);
     let rel = max_abs / scale;
-    eprintln!(
-        "{label:58} m={m:<6} k={k:<6} max_abs={max_abs:.3e} rel={rel:.3e}",
-    );
+    eprintln!("{label:58} m={m:<6} k={k:<6} max_abs={max_abs:.3e} rel={rel:.3e}",);
     assert!(
         rel <= TOL,
         "{label} (qt {q:?}): relative error {rel:.3e} exceeds {TOL:.0e} \
@@ -376,7 +375,8 @@ fn check_prerotated(
     launched.unwrap_or_else(|e| panic!("{label}: prerotated launcher failed: {e:?}"));
     gpu.hip.device_synchronize().expect("sync");
     let mut gpu_y = vec![0.0f32; m];
-    let gpu_y_bytes = unsafe { std::slice::from_raw_parts_mut(gpu_y.as_mut_ptr() as *mut u8, m * 4) };
+    let gpu_y_bytes =
+        unsafe { std::slice::from_raw_parts_mut(gpu_y.as_mut_ptr() as *mut u8, m * 4) };
     gpu.hip.memcpy_dtoh(gpu_y_bytes, &y_dev.buf).expect("dtoh");
 
     // CPU: the same rotated activation, used exactly as handed over.
@@ -389,9 +389,7 @@ fn check_prerotated(
         .fold(0.0f32, f32::max);
     let scale = cpu_y.iter().fold(0.0f32, |a, b| a.max(b.abs())).max(1e-6);
     let rel = max_abs / scale;
-    eprintln!(
-        "{label:58} prerotated m={m:<6} k={k:<6} max_abs={max_abs:.3e} rel={rel:.3e}"
-    );
+    eprintln!("{label:58} prerotated m={m:<6} k={k:<6} max_abs={max_abs:.3e} rel={rel:.3e}");
     assert!(
         rel <= TOL,
         "{label}: Prerotated parity {rel:.3e} exceeds {TOL:.0e} — the CPU path must not \
@@ -433,13 +431,10 @@ fn gpu_cpu_gemv_parity_prerotated_input() {
             .tensors()
             .iter()
             .filter(|i| {
-                i.quant_type == *qt
-                    && i.shape.len() == 2
-                    && !i.name.contains("embed_tokens")
-                    && {
-                        let k = i.shape[1] as usize;
-                        k % 256 == 0 && (i.shape[0] as usize) * k <= MAX_ELEMS
-                    }
+                i.quant_type == *qt && i.shape.len() == 2 && !i.name.contains("embed_tokens") && {
+                    let k = i.shape[1] as usize;
+                    k % 256 == 0 && (i.shape[0] as usize) * k <= MAX_ELEMS
+                }
             })
             .max_by_key(|i| (i.shape[0] as usize) * (i.shape[1] as usize))
             .map(|i| (i.name.clone(), i.shape[0] as usize, i.shape[1] as usize))
@@ -447,7 +442,16 @@ fn gpu_cpu_gemv_parity_prerotated_input() {
             continue;
         };
         let (_, bytes) = hfq.tensor_data_vec(&name).expect("tensor bytes");
-        if check_prerotated(&mut gpu, &gemv, &format!("{file} {name}"), *q, *dtype, &bytes, m, k) {
+        if check_prerotated(
+            &mut gpu,
+            &gemv,
+            &format!("{file} {name}"),
+            *q,
+            *dtype,
+            &bytes,
+            m,
+            k,
+        ) {
             checked += 1;
         }
     }
@@ -456,8 +460,16 @@ fn gpu_cpu_gemv_parity_prerotated_input() {
     for (qt, dtype, q) in SYNTH {
         let (m, k) = (64usize, 1024usize);
         let bytes = synth_weights(*q, m, k);
-        if check_prerotated(&mut gpu, &gemv, &format!("synthetic qt={qt} {q:?}"), *q, *dtype, &bytes, m, k)
-        {
+        if check_prerotated(
+            &mut gpu,
+            &gemv,
+            &format!("synthetic qt={qt} {q:?}"),
+            *q,
+            *dtype,
+            &bytes,
+            m,
+            k,
+        ) {
             checked += 1;
         }
     }
@@ -485,7 +497,10 @@ fn gpu_cpu_gemv_parity_per_format() {
     for (file, qt, dtype, q) in REAL {
         let path = dir.join(file);
         if !path.exists() {
-            eprintln!("skip: {} not present (hipfire pull the matching tag)", path.display());
+            eprintln!(
+                "skip: {} not present (hipfire pull the matching tag)",
+                path.display()
+            );
             continue;
         }
         let hfq = HfqFile::open(&path).expect("open fixture");
@@ -495,13 +510,10 @@ fn gpu_cpu_gemv_parity_per_format() {
             .tensors()
             .iter()
             .filter(|i| {
-                i.quant_type == *qt
-                    && i.shape.len() == 2
-                    && !i.name.contains("embed_tokens")
-                    && {
-                        let (m, k) = (i.shape[0] as usize, i.shape[1] as usize);
-                        k % 256 == 0 && m * k <= MAX_ELEMS
-                    }
+                i.quant_type == *qt && i.shape.len() == 2 && !i.name.contains("embed_tokens") && {
+                    let (m, k) = (i.shape[0] as usize, i.shape[1] as usize);
+                    k % 256 == 0 && m * k <= MAX_ELEMS
+                }
             })
             .map(|i| (i.shape[0] as usize, i.shape[1] as usize, i.name.clone()))
             .collect();
@@ -515,8 +527,13 @@ fn gpu_cpu_gemv_parity_per_format() {
             let (_, bytes) = hfq
                 .tensor_data_vec(&name)
                 .unwrap_or_else(|| panic!("{file}: no bytes for {name}"));
-            let label = format!("{file} qt={qt} {}", name.rsplit('.').nth(1).unwrap_or(&name));
-            compare(&mut gpu, &gemv, &label, *q, *dtype, &bytes, m, k, None, &mut worst);
+            let label = format!(
+                "{file} qt={qt} {}",
+                name.rsplit('.').nth(1).unwrap_or(&name)
+            );
+            compare(
+                &mut gpu, &gemv, &label, *q, *dtype, &bytes, m, k, None, &mut worst,
+            );
             // AWQ arm (`RotateMqAwq`): the fixture's own sidecar, attached exactly
             // when the loader would attach it. This is the arm that catches a
             // dropped per-channel divide — the failure mode is `(W·s)·x`, which no
@@ -524,7 +541,18 @@ fn gpu_cpu_gemv_parity_per_format() {
             if dtype.supports_awq_sidecar() && done == 1 {
                 if let Some(scale) = load_awq_scale_for(&hfq, &gpu, &name, k) {
                     let label = format!("{label} +awq");
-                    compare(&mut gpu, &gemv, &label, *q, *dtype, &bytes, m, k, Some(&scale), &mut worst);
+                    compare(
+                        &mut gpu,
+                        &gemv,
+                        &label,
+                        *q,
+                        *dtype,
+                        &bytes,
+                        m,
+                        k,
+                        Some(&scale),
+                        &mut worst,
+                    );
                 }
             }
         }
@@ -537,7 +565,9 @@ fn gpu_cpu_gemv_parity_per_format() {
         let (m, k) = (64usize, 1024usize);
         let bytes = synth_weights(*q, m, k);
         let label = format!("synthetic qt={qt} {q:?}");
-        if compare(&mut gpu, &gemv, &label, *q, *dtype, &bytes, m, k, None, &mut worst) {
+        if compare(
+            &mut gpu, &gemv, &label, *q, *dtype, &bytes, m, k, None, &mut worst,
+        ) {
             synthetic_formats += 1;
         } else {
             ineligible.push(*q);
@@ -577,7 +607,9 @@ fn gpu_cpu_gemv_parity_per_format() {
                     path.to_string_lossy().rsplit('/').next().unwrap_or("extra"),
                     name.rsplit('.').nth(1).unwrap_or(&name)
                 );
-                compare(&mut gpu, &gemv, &label, *q, *dtype, &bytes, m, k, None, &mut worst);
+                compare(
+                    &mut gpu, &gemv, &label, *q, *dtype, &bytes, m, k, None, &mut worst,
+                );
             }
         }
     }

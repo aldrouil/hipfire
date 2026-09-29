@@ -169,11 +169,7 @@ pub fn cpu_offload_active(i_gpu_start: usize) -> bool {
 ///
 /// Pure truth table (the CPU-exec decision, the resolved split, and whether a
 /// replay controller is in play) so it is testable without a process snapshot.
-pub fn cpu_exec_redline_conflict(
-    cpu_exec: bool,
-    i_gpu_start: usize,
-    replay_enabled: bool,
-) -> bool {
+pub fn cpu_exec_redline_conflict(cpu_exec: bool, i_gpu_start: usize, replay_enabled: bool) -> bool {
     cpu_exec && i_gpu_start > 0 && replay_enabled
 }
 

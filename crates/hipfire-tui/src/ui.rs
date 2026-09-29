@@ -1692,7 +1692,9 @@ mod render_tests {
             let text = render_with(|app| {
                 app.tab = Tab::Settings;
                 app.settings_easy = true;
-                app.config.values.insert("offload_exec".into(), value.to_string());
+                app.config
+                    .values
+                    .insert("offload_exec".into(), value.to_string());
                 // A real config that has the key set draws a "●" override marker
                 // between the label and the value; clear it so the adjacency
                 // assertion does not depend on the developer's own config.

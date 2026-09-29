@@ -2562,9 +2562,8 @@ fn cpu_quant_rotation_agrees_with_plan() {
         DType::F32,
         DType::BF16,
     ] {
-        let q = crate::cpu_quant_for(dtype).unwrap_or_else(|| {
-            panic!("{dtype:?} has a CPU decoder and must be in cpu_quant_for")
-        });
+        let q = crate::cpu_quant_for(dtype)
+            .unwrap_or_else(|| panic!("{dtype:?} has a CPU decoder and must be in cpu_quant_for"));
         assert_eq!(
             q.is_fwht_g256(),
             dtype_rotation_plan(dtype) == RotationPlan::FwhtG256,
@@ -2580,17 +2579,17 @@ fn cpu_quant_rotation_agrees_with_plan() {
 #[test]
 fn cpu_quant_refuses_unimplemented_formats() {
     for dtype in [
-        DType::MQ8G256,     // RotationPlan::Mq8Internal: int8 activation, not FWHT-f32
-        DType::MQ4G128,     // RotationPlan::FwhtG128: a different transform
-        DType::HFP4G32,     // per-row 16 B header + per-32 block scales
+        DType::MQ8G256, // RotationPlan::Mq8Internal: int8 activation, not FWHT-f32
+        DType::MQ4G128, // RotationPlan::FwhtG128: a different transform
+        DType::HFP4G32, // per-row 16 B header + per-32 block scales
         DType::MFP4G32,
         DType::MFP4G32Lloyd,
         DType::MFP4G32P,
         DType::MFP4G32E8,
         DType::MFP4G32E8SOA,
-        DType::ParoQ4G128,  // Givens rotation on the activation
-        DType::Q4K,         // no dense HFQ artifact uses it
-        DType::Q8HFQ,       // padded rows (row_stride), not expressible in the group model
+        DType::ParoQ4G128, // Givens rotation on the activation
+        DType::Q4K,        // no dense HFQ artifact uses it
+        DType::Q8HFQ,      // padded rows (row_stride), not expressible in the group model
         DType::Raw,
     ] {
         assert!(
@@ -2605,8 +2604,17 @@ fn cpu_quant_refuses_unimplemented_formats() {
 #[test]
 fn cpu_exec_redline_conflict_is_exactly_the_conjunction() {
     use crate::cpu_exec_redline_conflict as conflict;
-    assert!(conflict(true, 12, true), "cpu + spill + replay is the conflict");
+    assert!(
+        conflict(true, 12, true),
+        "cpu + spill + replay is the conflict"
+    );
     assert!(!conflict(false, 12, true), "pcie must never be refused");
-    assert!(!conflict(true, 0, true), "nothing spilled, nothing on the CPU");
-    assert!(!conflict(true, 12, false), "no replay controller: no conflict");
+    assert!(
+        !conflict(true, 0, true),
+        "nothing spilled, nothing on the CPU"
+    );
+    assert!(
+        !conflict(true, 12, false),
+        "no replay controller: no conflict"
+    );
 }

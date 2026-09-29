@@ -147,7 +147,6 @@ impl VmmArena {
         self.reserved_bytes
     }
 
-
     /// The primary physical allocation handle backing this arena, if any mapped
     /// segment exists. Exposed so callers can query the handle's placement with
     /// `HipRuntime::mem_get_handle_properties` (fail-closed host-located check).

@@ -1308,7 +1308,10 @@ mod tests {
     #[test]
     fn tensor_layer_index_parses_real_manifest_names() {
         assert_eq!(tensor_layer_index("layers.0.mlp.gate_proj.weight"), Some(0));
-        assert_eq!(tensor_layer_index("layers.63.linear_attn.out_proj.weight"), Some(63));
+        assert_eq!(
+            tensor_layer_index("layers.63.linear_attn.out_proj.weight"),
+            Some(63)
+        );
         assert_eq!(
             tensor_layer_index("model.language_model.layers.7.self_attn.q_proj.weight"),
             Some(7)

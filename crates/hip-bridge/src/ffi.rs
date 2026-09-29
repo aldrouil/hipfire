@@ -990,10 +990,8 @@ impl HipRuntime {
 
     /// Device-visible address of a `hipHostMalloc`'d buffer.
     pub fn host_get_device_pointer(&self, host: *mut c_void, flags: u32) -> HipResult<*mut c_void> {
-        let func = self.missing_vmm_symbol(
-            "hipHostGetDevicePointer",
-            self.fn_host_get_device_pointer,
-        )?;
+        let func =
+            self.missing_vmm_symbol("hipHostGetDevicePointer", self.fn_host_get_device_pointer)?;
         let mut dev: *mut c_void = ptr::null_mut();
         let code = unsafe { func(&mut dev, host, flags) };
         self.check(code, "hipHostGetDevicePointer")?;
