@@ -3467,6 +3467,7 @@ impl Gpu {
     /// prove a spilled layer actually left VRAM rather than being merely
     /// device-pinned. Device-VMM tensors are not host-located by construction.
     pub fn host_located(&self, tensor: &GpuTensor) -> bool {
+        // bind_thread: skip — pure read of the tensor's own ownership tag; no device call.
         tensor.buf.is_host_mapped()
     }
 
@@ -3474,6 +3475,7 @@ impl Gpu {
     /// Exposed so callers can query the handle's placement with
     /// `HipRuntime::mem_get_handle_properties` (fail-closed host-located check).
     pub fn vmm_handle(&self, tensor: &GpuTensor) -> Option<HipMemGenericAllocationHandle> {
+        // bind_thread: skip — pure read of the arena registry; no device call.
         self.vmm_arenas
             .get(&(tensor.buf.as_ptr() as usize))
             .and_then(|arena| arena.primary_handle())
@@ -3650,6 +3652,7 @@ impl Gpu {
     /// read must dereference. Byte-for-byte identical contents to the device path; only
     /// the physical location differs.
     pub fn upload_f32_host(&mut self, data: &[f32], shape: &[usize]) -> HipResult<GpuTensor> {
+        self.bind_thread()?;
         let numel = shape
             .iter()
             .try_fold(1usize, |product, &dimension| product.checked_mul(dimension))
@@ -3797,6 +3800,7 @@ impl Gpu {
     /// Contents are byte-for-byte identical to the device path, so numerics are
     /// unchanged while VRAM is freed.
     pub fn upload_raw_host(&mut self, data: &[u8], shape: &[usize]) -> HipResult<GpuTensor> {
+        self.bind_thread()?;
         self.upload_raw_with_copy_host(data, shape, HipRuntime::memcpy_htod)
     }
 
