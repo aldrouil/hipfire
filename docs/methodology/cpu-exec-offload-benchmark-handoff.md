@@ -41,7 +41,7 @@ Consequences for measurement design:
 cd <repo>; git rev-parse HEAD          # 924d7fd8f6b3c674b95a60ed3b45df0e75f08d30 at handoff
 md5sum target/release/daemon target/release/hipfire
 md5sum ~/.hipfire/models/qwen3.5-2b.mq4 ~/.hipfire/models/qwen3.5-9b.mq4
-md5sum /mnt/sx8200/qwen3.8-27b.mq3-xt
+md5sum <models-dir>/qwen3.8-27b.mq3-xt
 md5sum benchmarks/prompts/gpu_offload_probe.txt benchmarks/prompts/humaneval_3_below_zero.txt
 ```
 
@@ -61,7 +61,7 @@ md5sum benchmarks/prompts/gpu_offload_probe.txt benchmarks/prompts/humaneval_3_b
 | `target/release/hipfire` | `030f080ce4c3d68ca038a614059d21b2` | — | at handoff |
 | `~/.hipfire/models/qwen3.5-2b.mq4` | `9ed6628f2df83ef4b1c062afd4a85bfb` | `bb386f7bd24397db5ef6ba28aab5985053c9db319d1645a2ba4d732a77badc6a` | 24 layers, 30.4 MB/layer |
 | `~/.hipfire/models/qwen3.5-9b.mq4` | `31a8d8dc7603226801b08d8319015602` | `829a84c708eed3db785febfe80b9a46dab2bb52172b9ac40ab17856f8f1260b3` | 32 layers, 114.9 MB/layer |
-| `/mnt/sx8200/qwen3.8-27b.mq3-xt` | `80bb9198e6a565fc006b2ae1b7c89eca` | `3e04fc8db80bda557b965ec60ac876cf2500fced7f340624f3fcbeae134af5c5` | 11,777,616,896 B; 64 layers, 154.6 MB/layer; **every projection is qt 49** |
+| `<models-dir>/qwen3.8-27b.mq3-xt` | `80bb9198e6a565fc006b2ae1b7c89eca` | `3e04fc8db80bda557b965ec60ac876cf2500fced7f340624f3fcbeae134af5c5` | 11,777,616,896 B; 64 layers, 154.6 MB/layer; **every projection is qt 49** |
 | `benchmarks/prompts/gpu_offload_probe.txt` | `5835c71e471849b4a72e1dc8e39695e7` | `b6eddc54931a1daa28c32fc8381a72d982eded30093ddf13a6a71049a695066f` | 215 B, 59 tokens — the 2026-09-26 sweep's prompt, use it for the sweep |
 | `benchmarks/prompts/humaneval_3_below_zero.txt` | `37c5aad9f9efe93b5c47f27256bdf149` | — | used for the arm-D rate comparison |
 
@@ -266,7 +266,7 @@ suspect host contention or a lingering daemon before suspecting the feature.
   ~6-10 from unrelated work. Start at 56, and only go to 48 on an idle box.
 - **All 497 projections are qt 49 (`MQ3G256V2`)** — covered, with no canonical
   host decoder, so its oracle is the production launcher on real tensors:
-  `HIPFIRE_PARITY_EXTRA_MODEL=/mnt/sx8200/qwen3.8-27b.mq3-xt
+  `HIPFIRE_PARITY_EXTRA_MODEL=<models-dir>/qwen3.8-27b.mq3-xt
   HIPFIRE_PARITY_EXTRA_QT=49 cargo test -p hipfire-arch-qwen35 --release
   --test gpu_gemv_parity -- --ignored` → 2.391e-7 / 3.530e-7 at m=12288 k=5120.
   Run that before the sweep: it is 1 s and it separates "slow" from "wrong".

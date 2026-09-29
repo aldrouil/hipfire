@@ -1,5 +1,5 @@
 GPU dev 0: gfx1201 (17.1 GB VRAM, HIP 7.2)
-  pre-compiled kernels: /home/avery/.hipfire_kernels/gfx1201
+  pre-compiled kernels: ~/.hipfire_kernels/gfx1201
   partial offload: 56 resident / 8 offloaded, i_gpu_start=8
   DeltaNet state: Q8
   loading token_embd...

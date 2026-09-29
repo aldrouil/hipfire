@@ -3,9 +3,9 @@
 # Pre-change pair: /tmp/cpu_exec_pin/{hipfire,daemon}
 # Post-change pair: target/release/{hipfire,daemon}
 set -u
-cd /home/avery/Documents/vibecoding/hipfire
+cd <repo-root>
 
-MODEL=/mnt/sx8200/qwen3.8-27b.mq3-xt
+MODEL=<models-dir>/qwen3.8-27b.mq3-xt
 PROMPT=benchmarks/prompts/gpu_offload_probe.txt
 OUT=/tmp/cpu_exec_ab
 mkdir -p "$OUT"
@@ -38,6 +38,6 @@ run_arm() { # tag cli daemon exec
 
 run_arm old_pcie /tmp/cpu_exec_pin/hipfire   /tmp/cpu_exec_pin/daemon   pcie
 run_arm old_cpu  /tmp/cpu_exec_pin/hipfire   /tmp/cpu_exec_pin/daemon   cpu
-run_arm new_pcie ./target/release/hipfire    /home/avery/Documents/vibecoding/hipfire/target/release/daemon pcie
-run_arm new_cpu  ./target/release/hipfire    /home/avery/Documents/vibecoding/hipfire/target/release/daemon cpu
+run_arm new_pcie ./target/release/hipfire    <repo-root>/target/release/daemon pcie
+run_arm new_cpu  ./target/release/hipfire    <repo-root>/target/release/daemon cpu
 echo "ALL DONE $(date +%T)" | tee -a "$OUT/run.log"

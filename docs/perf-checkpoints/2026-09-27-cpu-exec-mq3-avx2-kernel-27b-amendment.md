@@ -117,7 +117,7 @@ elements), not bytes — and 20 % of bytes is not the 9.7× this change was wort
 
 ## End-to-end A/B — budget 56 (8 of 64 layers spilled)
 
-`hipfire bench /mnt/sx8200/qwen3.8-27b.mq3-xt --spec off --runs 5 --warmups 2
+`hipfire bench <models-dir>/qwen3.8-27b.mq3-xt --spec off --runs 5 --warmups 2
 --max-tokens 64 --backend noslots --workload stateless --prompt-file
 benchmarks/prompts/gpu_offload_probe.txt --json`, `HIPFIRE_GPU_LAYER_BUDGET=56`,
 one fresh process per point, round-robin `cpu, pcie` × `old, new` × 3 rounds,
@@ -194,7 +194,7 @@ every cumulative mean in the earlier records.
 
 ```
 HIPFIRE_GPU_LAYER_BUDGET=56 HIPFIRE_OFFLOAD_EXEC={cpu,pcie} hipfire run \
-  /mnt/sx8200/qwen3.8-27b.mq3-xt "$(cat benchmarks/prompts/humaneval_3_below_zero.txt)" \
+  <models-dir>/qwen3.8-27b.mq3-xt "$(cat benchmarks/prompts/humaneval_3_below_zero.txt)" \
   -t 0 -n 3072 --no-stream
 ```
 
@@ -233,7 +233,7 @@ the paths agree forever.
   a format with no canonical `dequantize_to_f32` arm), re-run on the new binary:
 
   ```
-  HIPFIRE_PARITY_EXTRA_MODEL=/mnt/sx8200/qwen3.8-27b.mq3-xt HIPFIRE_PARITY_EXTRA_QT=49 \
+  HIPFIRE_PARITY_EXTRA_MODEL=<models-dir>/qwen3.8-27b.mq3-xt HIPFIRE_PARITY_EXTRA_QT=49 \
     cargo test -p hipfire-arch-qwen35 --release --test gpu_gemv_parity -- --ignored
     qwen3.8-27b.mq3-xt qt=49 q_proj  m=12288 k=5120  max_abs=5.364e-7 rel=1.195e-7
     qwen3.8-27b.mq3-xt qt=49 q_proj  m=12288 k=5120  max_abs=9.537e-7 rel=3.530e-7
@@ -256,7 +256,7 @@ the paths agree forever.
 | `target/release/hipfire` (new) | `57a0cf5795a8ce376d274eba78bc733a` |
 | `target/release/daemon` (pre-change) | `904368995cddb8cda8e82a7f8d31ae96` |
 | `target/release/hipfire` (pre-change) | `030f080ce4c3d68ca038a614059d21b2` |
-| `/mnt/sx8200/qwen3.8-27b.mq3-xt` | `80bb9198e6a565fc006b2ae1b7c89eca` (11,777,616,896 B) |
+| `<models-dir>/qwen3.8-27b.mq3-xt` | `80bb9198e6a565fc006b2ae1b7c89eca` (11,777,616,896 B) |
 | `benchmarks/prompts/gpu_offload_probe.txt` | `5835c71e471849b4a72e1dc8e39695e7` (59 tokens) |
 
 **Digest note.** One edit landed after the measurement: a doc comment on

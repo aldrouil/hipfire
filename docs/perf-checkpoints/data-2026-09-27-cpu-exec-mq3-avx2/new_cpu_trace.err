@@ -1,5 +1,5 @@
 GPU dev 0: gfx1201 (17.1 GB VRAM, HIP 7.2)
-  pre-compiled kernels: /home/avery/.hipfire_kernels/gfx1201
+  pre-compiled kernels: ~/.hipfire_kernels/gfx1201
   partial offload: 56 resident / 8 offloaded, i_gpu_start=8
   DeltaNet state: Q8
 cpu exec: 8/8 spilled layers fully covered; uncovered quants: none
@@ -75,7 +75,7 @@ cpu exec: 8/8 spilled layers fully covered; uncovered quants: none
   weight sweep: 1141 ms (packed-expert host-read 0 ms, H2D 0 ms)
 KV cache: fwht3 filtered (16/64 layers carry KV; K FWHT-3b 100B + V Q8 272B = 372 B/head)
 hipfire bench
-  model:  /mnt/sx8200/qwen3.8-27b.mq3-xt
+  model:  <models-dir>/qwen3.8-27b.mq3-xt
   arch:   qwen3_5
   gpu:    gfx1201
   runs:   5

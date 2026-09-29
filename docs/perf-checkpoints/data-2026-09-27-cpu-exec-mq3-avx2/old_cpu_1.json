@@ -1,6 +1,6 @@
 {
   "protocol": "native-generate-v1",
-  "model": "/mnt/sx8200/qwen3.8-27b.mq3-xt",
+  "model": "<models-dir>/qwen3.8-27b.mq3-xt",
   "loaded": {
     "type": "loaded",
     "arch": "qwen3_5",

@@ -2,9 +2,9 @@
 # Throwaway interleaved 2x2 A/B: {old,new} binaries x {pcie,cpu} exec, 3 rounds.
 # old = /tmp/cpu_exec_pin (pre-change tree), new = target/release (HEAD + qt49 AVX2).
 set -u
-cd /home/avery/Documents/vibecoding/hipfire
+cd <repo-root>
 
-MODEL=/mnt/sx8200/qwen3.8-27b.mq3-xt
+MODEL=<models-dir>/qwen3.8-27b.mq3-xt
 PROMPT=benchmarks/prompts/gpu_offload_probe.txt
 OUT=/tmp/cpu_exec_ab2
 mkdir -p "$OUT"
@@ -42,7 +42,7 @@ print('    $tag decode median %.1f tok/s | prefill %.1f | vram_free %s MB | samp
 " 2>> "$OUT/run.log" || echo "    $tag: no json" | tee -a "$OUT/run.log"
 }
 
-NEW=/home/avery/Documents/vibecoding/hipfire/target/release/daemon
+NEW=<repo-root>/target/release/daemon
 for r in 1 2 3; do
   run_arm new_cpu_$r  ./target/release/hipfire $NEW cpu
   run_arm new_pcie_$r ./target/release/hipfire $NEW pcie
