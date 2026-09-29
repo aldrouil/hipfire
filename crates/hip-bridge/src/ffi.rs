@@ -989,6 +989,9 @@ impl HipRuntime {
     }
 
     /// Device-visible address of a `hipHostMalloc`'d buffer.
+    ///
+    /// HIP treats `host` as an opaque address; Rust never dereferences it.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn host_get_device_pointer(&self, host: *mut c_void, flags: u32) -> HipResult<*mut c_void> {
         let func =
             self.missing_vmm_symbol("hipHostGetDevicePointer", self.fn_host_get_device_pointer)?;
@@ -999,6 +1002,9 @@ impl HipRuntime {
     }
 
     /// Release a `hipHostMalloc`'d buffer. # Safety: must not be in use on GPU.
+    ///
+    /// HIP treats `host` as an opaque address; Rust never dereferences it.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn host_free(&self, host: *mut c_void) -> HipResult<()> {
         let func = self.missing_vmm_symbol("hipHostFree", self.fn_host_free)?;
         let code = unsafe { func(host) };
@@ -1031,6 +1037,9 @@ impl HipRuntime {
     /// `HIP_MEM_LOCATION_TYPE_HOST` (system RAM accessed over PCIe) — exactly what
     /// partial offload requires. Fail-closed: if this ROCm build lacks the symbol,
     /// returns an error instead of pretending the pages left VRAM.
+    ///
+    /// `handle` is an opaque HIP allocation handle; Rust never dereferences it.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn mem_get_handle_properties(
         &self,
         handle: HipMemGenericAllocationHandle,
