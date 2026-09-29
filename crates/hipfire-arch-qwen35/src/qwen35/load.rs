@@ -152,7 +152,8 @@ fn load_norm_weight(
 /// uploader rather than passing a `host` flag keeps ONE copy of the match: the
 /// device path is reached through `&Gpu` (the `read_proj` fn-pointer contract,
 /// which cannot hand out `&mut Gpu`) while the host path needs `&mut Gpu` to
-/// register its VMM arena — a signature no single parameter can satisfy.
+/// register the host-mapped owner it must later free — a signature no single
+/// parameter can satisfy.
 ///
 /// `fallback` covers the quant types that dequantize to f32 instead of uploading
 /// raw codes. Only the device reader implements it; the offloaded reader refuses,
@@ -879,10 +880,11 @@ fn load_weight_tensor_raw(
 
 /// Offloaded projection weight: codes live in host memory, not VRAM.
 ///
-/// Needs `&mut Gpu` because host-locating a tensor registers a VMM arena on the
-/// Gpu — which is exactly why this is a separate entry point rather than a flag
-/// on [`load_weight_tensor_raw`]. Quant types that fall back to the f32 dequant
-/// path are refused rather than silently placed on the device.
+/// Needs `&mut Gpu` because host-locating a tensor registers its host-mapped owner
+/// on the Gpu (so the registry can `hipHostFree` it) — which is exactly why this is
+/// a separate entry point rather than a flag on [`load_weight_tensor_raw`]. Quant
+/// types that fall back to the f32 dequant path are refused rather than silently
+/// placed on the device.
 fn load_weight_tensor_raw_host(
     gpu: &mut Gpu,
     quant_type: u8,
@@ -981,7 +983,8 @@ pub fn load_weight_tensor(
 /// hot path to save nothing. Only the multi-megabyte code blob is spilled.
 ///
 /// Takes `&mut Gpu` (the `read_proj_host` contract) because the host upload
-/// registers a VMM arena; [`load_weight_tensor`] cannot, which is why these are
+/// registers its host-mapped owner for later `hipHostFree`;
+/// [`load_weight_tensor`] cannot, which is why these are
 /// two entry points over one shared match rather than one function and a flag.
 pub fn load_weight_tensor_host(
     hfq: &HfqFile,
