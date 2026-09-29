@@ -48,6 +48,42 @@ pub(crate) struct ServeMeta {
     pub(crate) recent_tok_s: Option<f64>,
     pub(crate) started: Instant,
     pub(crate) last_activity: Instant,
+    /// Effective context of the resident model — the `max_seq` it was actually
+    /// loaded with (KV capacity), not the registry policy and not the trained
+    /// window. `0` while nothing is resident.
+    ///
+    /// Mirrored here, next to `current_model` and set at the same two sites
+    /// (`ensure_model` / `clear_resident`), because `/health` must be able to
+    /// answer while a model load holds `ServeShared::runtime`: that mutex is
+    /// held for the whole load (prewarm and request-time loads alike), so
+    /// reading load facts through it would block `/health` for the duration —
+    /// the endpoint every readiness probe, the TUI and `serve_harness` poll
+    /// with a sub-second timeout (`docs/SERVE.md` § "Detached readiness").
+    pub(crate) n_ctx: u64,
+    /// Facts about the resident model from the daemon's load ack. Same reason
+    /// as `n_ctx` for living here rather than on `ServeRuntime`: it is
+    /// published state, not working state, and `/v1/models` may not need the
+    /// runtime lock to serve an entry.
+    pub(crate) loaded: LoadedInfo,
+}
+
+impl ServeMeta {
+    /// Fresh serve state: no model, no load-ack facts.
+    pub(crate) fn new(instance_token: String) -> Self {
+        Self {
+            current_model: None,
+            loading_model: None,
+            instance_token,
+            requests_served: 0,
+            retries_attempted: 0,
+            retries_succeeded: 0,
+            recent_tok_s: None,
+            started: Instant::now(),
+            last_activity: Instant::now(),
+            n_ctx: 0,
+            loaded: LoadedInfo::default(),
+        }
+    }
 }
 
 pub(crate) fn finish_prewarm(meta: &mut ServeMeta, succeeded: bool) {
@@ -106,10 +142,6 @@ pub(crate) struct ServeRuntime {
     pub(crate) current_reasoning_efforts: Vec<String>,
     pub(crate) continuous_batch_capable: bool,
     pub(crate) current_max_seq: u64,
-    /// Model facts the daemon reports in the load ack (`dim`, `vocab`, `vl`).
-    /// `/v1/models` and `/health` publish them; the daemon already sends them
-    /// and serve used to discard the whole set.
-    pub(crate) loaded: LoadedInfo,
     pub(crate) cache_capable: bool,
     pub(crate) kv_override: Option<String>,
     pub(crate) kv_backend_override: Option<String>,
@@ -934,7 +966,6 @@ pub(crate) fn serve_foreground(
             current_reasoning_efforts: Vec::new(),
             continuous_batch_capable: false,
             current_max_seq: 0,
-            loaded: LoadedInfo::default(),
             cache_capable: false,
             kv_override: args.kv_mode.clone(),
             kv_backend_override: args.kv_backend.clone(),
@@ -946,17 +977,7 @@ pub(crate) fn serve_foreground(
             multi_slot_ctx,
             multi_slot_prefill_chunk,
         }),
-        meta: Mutex::new(ServeMeta {
-            current_model: None,
-            loading_model: None,
-            instance_token: instance_token.clone(),
-            requests_served: 0,
-            retries_attempted: 0,
-            retries_succeeded: 0,
-            recent_tok_s: None,
-            started: Instant::now(),
-            last_activity: Instant::now(),
-        }),
+        meta: Mutex::new(ServeMeta::new(instance_token.clone())),
         max_request_bytes,
         admission: Arc::new(Admission::new_with_capacity(
             max_queue,
@@ -1141,11 +1162,11 @@ impl ServeRuntime {
         self.current_reasoning_efforts = Vec::new();
         self.continuous_batch_capable = false;
         self.current_max_seq = 0;
-        self.loaded = LoadedInfo::default();
         self.cache_capable = false;
-        meta.lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .current_model = None;
+        let mut meta = meta.lock().unwrap_or_else(|error| error.into_inner());
+        meta.current_model = None;
+        meta.n_ctx = 0;
+        meta.loaded = LoadedInfo::default();
     }
 
     pub(crate) fn ensure_model(
@@ -1300,7 +1321,7 @@ impl ServeRuntime {
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
             self.current_max_seq = loaded_max_seq;
-            self.loaded = LoadedInfo {
+            let published = LoadedInfo {
                 vision: loaded
                     .get("vl")
                     .and_then(serde_json::Value::as_bool)
@@ -1324,9 +1345,14 @@ impl ServeRuntime {
             } else {
                 tag.unwrap_or_else(|| model.to_owned())
             };
-            meta.lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .current_model = Some(served_name);
+            // The served facts land in `ServeMeta`, not `ServeRuntime`: this
+            // method runs with the runtime lock held for the whole load, and
+            // `/health` (100 ms readiness probes, the TUI's 450 ms poll,
+            // `serve_harness`'s 1 s poll) must keep answering while it does.
+            let mut meta = meta.lock().unwrap_or_else(|error| error.into_inner());
+            meta.current_model = Some(served_name);
+            meta.n_ctx = self.current_max_seq;
+            meta.loaded = published;
         }
         Ok(resolved)
     }
@@ -1587,13 +1613,8 @@ mod tests {
         ServeMeta {
             current_model: Some("model.hfq".to_owned()),
             loading_model: Some("model.hfq".to_owned()),
-            instance_token: "test".to_owned(),
-            requests_served: 0,
-            retries_attempted: 0,
-            retries_succeeded: 0,
-            recent_tok_s: None,
-            started: Instant::now(),
             last_activity: Instant::now() - Duration::from_secs(600),
+            ..ServeMeta::new("test".to_owned())
         }
     }
 
@@ -2141,7 +2162,7 @@ mod tests {
     #[test]
     fn clear_resident_drops_every_resident_field() {
         use hipfire_client::Engine;
-        use hipfire_config::{resolve, ConfigLayer, ConfigPaths, ConfigSource, NamedLayer};
+        use hipfire_config::{resolve, NamedLayer};
         use std::collections::BTreeMap;
         // A real Engine handle is needed only for the struct shape; spawn it
         // against the in-repo fake daemon and never send it a load.
@@ -2172,14 +2193,6 @@ mod tests {
             current_reasoning_efforts: vec!["xhigh".to_owned()],
             continuous_batch_capable: true,
             current_max_seq: 32768,
-            // Deliberately non-default: `clear_resident` must reset `loaded`
-            // too, and a default-constructed fixture would pass that assertion
-            // vacuously.
-            loaded: LoadedInfo {
-                vision: true,
-                n_embd: 5120,
-                n_vocab: 248320,
-            },
             cache_capable: true,
             kv_override: None,
             kv_backend_override: None,
@@ -2193,14 +2206,16 @@ mod tests {
         };
         let meta = Mutex::new(ServeMeta {
             current_model: Some("qwen3.8:27b".to_owned()),
-            loading_model: None,
-            instance_token: "test".to_owned(),
-            requests_served: 0,
-            retries_attempted: 0,
-            retries_succeeded: 0,
-            recent_tok_s: None,
-            started: Instant::now(),
-            last_activity: Instant::now(),
+            // Deliberately non-default: `clear_resident` must reset the
+            // published load facts too, and a default-constructed fixture
+            // would pass those assertions vacuously.
+            n_ctx: 32768,
+            loaded: LoadedInfo {
+                vision: true,
+                n_embd: 5120,
+                n_vocab: 248320,
+            },
+            ..ServeMeta::new("test".to_owned())
         });
         runtime.clear_resident(&meta);
         assert!(runtime.current_path.is_none());
@@ -2213,13 +2228,12 @@ mod tests {
         assert!(runtime.current_reasoning_efforts.is_empty());
         assert!(!runtime.continuous_batch_capable);
         assert_eq!(runtime.current_max_seq, 0);
-        assert_eq!(runtime.loaded, LoadedInfo::default());
         assert!(!runtime.cache_capable);
-        assert!(meta
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .current_model
-            .is_none());
+        let meta = meta.lock().unwrap_or_else(|error| error.into_inner());
+        assert!(meta.current_model.is_none());
+        assert_eq!(meta.n_ctx, 0);
+        assert_eq!(meta.loaded, LoadedInfo::default());
+        drop(meta);
         std::fs::remove_dir_all(&root).unwrap();
     }
 

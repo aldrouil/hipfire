@@ -537,15 +537,13 @@ async fn handle_request(
 
     match (method, path.as_str()) {
         (Method::GET, "/health") => {
-            // Effective context of the resident model: the `max_seq` it was
-            // actually loaded with (KV capacity), not the registry policy and
-            // not the trained window. Read before `meta` — same runtime→meta
-            // order as `/v1/models` — and released at the end of the statement.
-            let n_ctx = shared
-                .runtime
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .current_max_seq;
+            // Every fact here comes from `ServeMeta`, which `ensure_model`
+            // updates as the load completes. `/health` must NOT take
+            // `shared.runtime`: that mutex is held for the whole of a load
+            // (prewarm at startup and request-time loads alike), so reading
+            // through it would block this endpoint — the one every readiness
+            // probe polls — for the duration and report serve as down
+            // (`docs/SERVE.md` § "Detached readiness").
             let meta = shared.meta.lock().unwrap_or_else(|e| e.into_inner());
             let body = serde_json::json!({
                 "status": "ok",
@@ -554,9 +552,11 @@ async fn handle_request(
                 "pid": std::process::id(),
                 "token": meta.instance_token,
                 "native": true,
-                // `null` while no model is resident (current_max_seq == 0), so a
-                // client cannot read 0 as "zero context".
-                "n_ctx": (n_ctx > 0).then_some(n_ctx),
+                // Effective context of the resident model: the `max_seq` it was
+                // actually loaded with (KV capacity), not the registry policy
+                // and not the trained window. `null` while no model is resident
+                // (`n_ctx == 0`), so a client cannot read 0 as "zero context".
+                "n_ctx": (meta.n_ctx > 0).then_some(meta.n_ctx),
             });
             json_response(body, 200)
         }
@@ -596,22 +596,21 @@ async fn handle_request(
             resp
         }
         (Method::GET, "/v1/models") => {
-            let (local, registry, resident, n_ctx, loaded) = {
+            let (local, registry) = {
                 let runtime = shared.runtime.lock().unwrap_or_else(|e| e.into_inner());
                 let local = match list_local_models(&runtime.paths, &runtime.registry) {
                     Ok(m) => m,
                     Err(e) => return openai_error(&e.to_string(), 500),
                 };
-                let registry = runtime.registry.clone();
-                let n_ctx = runtime.current_max_seq;
-                let loaded = runtime.loaded.clone();
-                let resident = shared
-                    .meta
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .current_model
-                    .clone();
-                (local, registry, resident, n_ctx, loaded)
+                (local, runtime.registry.clone())
+            };
+            // The served facts come from `ServeMeta` (see `ServeMeta::n_ctx`):
+            // taking the runtime lock for them would hold this endpoint for the
+            // whole of a concurrent model load, since `ensure_model` runs with
+            // that lock held.
+            let (resident, n_ctx, loaded) = {
+                let meta = shared.meta.lock().unwrap_or_else(|e| e.into_inner());
+                (meta.current_model.clone(), meta.n_ctx, meta.loaded.clone())
             };
             // Discovery contract: every id advertised here must be able to
             // serve a completion. A sidecar cannot — `qwen3.8-27b-vision.hfq`
@@ -648,7 +647,7 @@ async fn handle_request(
             data.extend(
                 local
                     .into_iter()
-                    .filter(|model| is_standalone_model(&model.name, &registry))
+                    .filter(|model| is_standalone_model(&model.path, &model.name, &registry))
                     .map(|model| {
                         let created = (model.created > 0).then_some(model.created);
                         (model.registry_tag.unwrap_or(model.name), created)

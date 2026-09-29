@@ -23,6 +23,7 @@ use hipfire_registry::{
     load as load_registry, LoadedRegistry, ModelEntry, RegistryPaths, RegistrySource, RegistryV1,
     Sidecar,
 };
+use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::prompt_frame::ToolCall;
 use saddle_core::caps::ReasoningContract;
 use serde::{Deserialize, Serialize};
@@ -1630,9 +1631,10 @@ pub(crate) fn list_local_models(paths: &Paths, registry: &RegistryV1) -> Result<
             .to_owned();
         // Local listings (`hipfire list`, `hipfire diag`) keep sidecars: a
         // pulled draft or a vision tower is a real file the operator may want
-        // to see and `hipfire rm`. The suffix test is the only gate here.
-        // `/v1/models` narrows this with `is_standalone_model` — see
-        // `serve::http`.
+        // to see and `hipfire rm`. The gate is `is_listable_model_file` — a
+        // model suffix OR a registry entry's own `file`, which admits both
+        // kinds. `/v1/models` narrows it further with `is_standalone_model` —
+        // see `serve::http`.
         if !is_listable_model_file(&name, registry) {
             continue;
         }
@@ -6805,9 +6807,47 @@ pub(crate) fn is_listable_model_file(name: &str, registry: &RegistryV1) -> bool 
 /// Advertising either in `/v1/models` hands an OpenAI-compatible client an id
 /// that cannot answer. Both stay pullable and resolvable by tag, and both
 /// still appear in `hipfire list` — only the serve surface drops them.
-pub(crate) fn is_standalone_model(name: &str, registry: &RegistryV1) -> bool {
-    !registry_sidecar_files(registry).contains(name) && is_listable_model_file(name, registry)
+///
+/// A file the registry does not name at all (a locally quantized trunk, or a
+/// locally produced draft such as `qwen3-8b-dflash.hfq`) is classified by its
+/// own container header: `/v1/models` must not advertise it unless
+/// [`HfqFile::probe_arch_id`] reports a [`SERVE_TRUNK_ARCH_IDS`] id. The
+/// registry cannot answer for it — the catalog only knows the files it ships.
+pub(crate) fn is_standalone_model(path: &Path, name: &str, registry: &RegistryV1) -> bool {
+    if registry_sidecar_files(registry).contains(name) {
+        return false;
+    }
+    if !is_listable_model_file(name, registry) {
+        return false;
+    }
+    if registry.models.values().any(|entry| entry.file == name) {
+        return true;
+    }
+    HfqFile::probe_arch_id(path).is_ok_and(|arch_id| SERVE_TRUNK_ARCH_IDS.contains(&arch_id))
 }
+
+/// HFQ arch ids a `hipfire serve` completion can be answered from — the
+/// "Primary model ids" column of `docs/architecture-ids.md`, minus the
+/// image-generation component trunks.
+///
+/// The polarity is deliberate. This predicate exists to keep `/v1/models` to
+/// its contract ("every advertised id can answer a completion"), and it only
+/// ever judges files the registry does not vouch for (registry entries short
+/// out above). An allowlist is the fail-closed direction: an arch id that is
+/// not listed here — a sidecar the table gains later (a new drafter id, a new
+/// FLUX component) or a container that is not a model at all — is not
+/// advertised, whereas a denylist would silently re-open the reported bug the
+/// day a new draft arch ships. The cost is that a brand-new *primary* arch id
+/// is hidden from local discovery until this table is updated, which the same
+/// commit has to do anyway: assigning an arch id means editing
+/// `docs/architecture-ids.md` and the loader's carrier registry.
+///
+/// `40`/`45` (FLUX MMDiT trunks) are absent on purpose: they are image
+/// generation components, served through `hipfire img` / `/v1/images/*`, not
+/// completion trunks a `/v1/models` pick can generate text from. `8`
+/// (dots.ocr) and `11` (LFM2.5 / LFM2.5-VL) are present: both answer text
+/// completions.
+pub(crate) const SERVE_TRUNK_ARCH_IDS: &[u32] = &[0, 1, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
 
 fn source_label(source: &ConfigSource) -> String {
     match source {
@@ -6967,14 +7007,29 @@ mod tests {
         ServeMeta {
             current_model: Some("model.hfq".to_owned()),
             loading_model: Some("model.hfq".to_owned()),
-            instance_token: "test".to_owned(),
-            requests_served: 0,
-            retries_attempted: 0,
-            retries_succeeded: 0,
-            recent_tok_s: None,
-            started: Instant::now(),
             last_activity: Instant::now() - Duration::from_secs(600),
+            ..ServeMeta::new("test".to_owned())
         }
+    }
+
+    /// A minimal real HFQ container carrying `arch_id`, so the discovery
+    /// predicate's header probe runs against the format it will meet on disk
+    /// rather than a stub.
+    fn write_hfq_fixture(path: &Path, arch_id: u32) {
+        use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqMemTensor};
+        write_hfqm_package_mem(
+            path,
+            arch_id,
+            "{}",
+            &[HfqMemTensor {
+                name: "model.embed_tokens.weight".to_owned(),
+                quant_type: 1,
+                shape: vec![4, 4],
+                group_size: 0,
+                data: vec![0u8; 32],
+            }],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -7001,17 +7056,26 @@ mod tests {
     #[test]
     fn standalone_model_classification_separates_sidecars_from_tiers() {
         let registry = hipfire_registry::bundled().unwrap();
+        // Registry-vouched files are judged by the catalog, never by the file:
+        // these paths deliberately do not exist.
+        let classified = |name: &str| {
+            is_standalone_model(
+                &PathBuf::from("/nonexistent/models").join(name),
+                name,
+                &registry,
+            )
+        };
 
         // The tier whose suffix is missing from MODEL_SUFFIXES: listable AND
         // servable. This is the model the operator actually wants.
         assert!(!is_model_file("qwen3.8-27b.mq3-xt"));
         assert!(is_listable_model_file("qwen3.8-27b.mq3-xt", &registry));
-        assert!(is_standalone_model("qwen3.8-27b.mq3-xt", &registry));
+        assert!(classified("qwen3.8-27b.mq3-xt"));
 
         // A sidecar-only file: listable (it is really on disk) but NOT
         // servable. It embeds `"tokenizer": "{}"`.
         assert!(is_listable_model_file("qwen3.8-27b-vision.hfq", &registry));
-        assert!(!is_standalone_model("qwen3.8-27b-vision.hfq", &registry));
+        assert!(!classified("qwen3.8-27b-vision.hfq"));
 
         // The overlap case: the DFlash draft is BOTH its own registry entry's
         // `file` (the documented `hipfire pull qwen3.8:27b-draft-mq3` target)
@@ -7025,10 +7089,51 @@ mod tests {
             "qwen38-27b-dflash-mq3.hfq",
             &registry
         ));
-        assert!(!is_standalone_model("qwen38-27b-dflash-mq3.hfq", &registry));
+        assert!(!classified("qwen38-27b-dflash-mq3.hfq"));
 
         assert!(!is_listable_model_file("README.md", &registry));
-        assert!(!is_standalone_model("README.md", &registry));
+        assert!(!classified("README.md"));
+    }
+
+    /// A file the registry does not name at all — what `hipfire quantize`
+    /// leaves in the models dir — is classified by its own container header.
+    ///
+    /// This is the class the registry-sidecar filter cannot see: on a real
+    /// box, `/v1/models` advertised `qwen3-8b-dflash.hfq`, and selecting it
+    /// failed with `no carrier for HFQ arch_id=20`.
+    #[test]
+    fn unregistered_files_are_classified_by_their_container_arch_id() {
+        let registry = hipfire_registry::bundled().unwrap();
+        let paths = test_paths("unregistered-arch");
+        fs::create_dir_all(&paths.models).unwrap();
+        let classify = |file: &str| {
+            let path = paths.models.join(file);
+            is_standalone_model(&path, file, &registry)
+        };
+
+        // A locally quantized trunk of a primary arch: advertised.
+        write_hfq_fixture(&paths.models.join("local-trunk.mq4"), 5);
+        assert!(classify("local-trunk.mq4"));
+
+        // Locally produced sidecars: never advertised, whatever the registry
+        // knows. 20 = DFlash draft, 23 = Muse Glimmer drafter.
+        write_hfq_fixture(&paths.models.join("qwen3-8b-dflash.hfq"), 20);
+        write_hfq_fixture(&paths.models.join("glimmer-assistant.hfq"), 23);
+        assert!(!classify("qwen3-8b-dflash.hfq"));
+        assert!(!classify("glimmer-assistant.hfq"));
+
+        // Not a container at all (or truncated): fail closed rather than
+        // advertise an id that cannot be classified.
+        fs::write(paths.models.join("garbage.hfq"), b"not an HFQ container").unwrap();
+        fs::write(paths.models.join("short.hfq"), b"HFQM\x01\x00\x00\x00").unwrap();
+        assert!(!classify("garbage.hfq"));
+        assert!(!classify("short.hfq"));
+
+        // A FLUX component trunk is a container with a carrier, but it cannot
+        // answer a completion: `/v1/models` is the completion surface.
+        write_hfq_fixture(&paths.models.join("flux-transformer.hfq"), 40);
+        assert!(!classify("flux-transformer.hfq"));
+        fs::remove_dir_all(&paths.root).unwrap();
     }
 
     /// The two surfaces deliberately disagree, and that is the point:
@@ -7045,19 +7150,22 @@ mod tests {
         ] {
             fs::write(paths.models.join(file), b"fixture").unwrap();
         }
+        // Unregistered artifacts, so the header probe decides: a local trunk
+        // stays advertised, a local draft does not.
+        write_hfq_fixture(&paths.models.join("local-trunk.mq4"), 5);
+        write_hfq_fixture(&paths.models.join("qwen3-8b-dflash.hfq"), 20);
         let registry = hipfire_registry::bundled().unwrap();
 
-        let listed: Vec<String> = list_local_models(&paths, &registry)
-            .unwrap()
-            .into_iter()
-            .map(|model| model.name)
-            .collect();
+        let models = list_local_models(&paths, &registry).unwrap();
+        let listed: Vec<String> = models.iter().map(|model| model.name.clone()).collect();
         // Local listing: everything on disk is visible and rm-able.
         for file in [
             "qwen3.8-27b.mq3-xt",
             "qwen3.8-27b-vision.hfq",
             "qwen38-27b-dflash-mq3.hfq",
             "qwen3.6-27b.mq4",
+            "local-trunk.mq4",
+            "qwen3-8b-dflash.hfq",
         ] {
             assert!(
                 listed.contains(&file.to_owned()),
@@ -7066,10 +7174,10 @@ mod tests {
         }
 
         // Serve discovery: the XT tier survives, sidecars do not.
-        let served: Vec<String> = listed
+        let served: Vec<String> = models
             .iter()
-            .filter(|name| is_standalone_model(name, &registry))
-            .cloned()
+            .filter(|model| is_standalone_model(&model.path, &model.name, &registry))
+            .map(|model| model.name.clone())
             .collect();
         assert!(
             served.contains(&"qwen3.8-27b.mq3-xt".to_owned()),
@@ -7077,12 +7185,20 @@ mod tests {
         );
         assert!(served.contains(&"qwen3.6-27b.mq4".to_owned()), "{served:?}");
         assert!(
+            served.contains(&"local-trunk.mq4".to_owned()),
+            "a local trunk must stay advertised: {served:?}"
+        );
+        assert!(
             !served.contains(&"qwen3.8-27b-vision.hfq".to_owned()),
             "tower sidecar must not be offered as a model: {served:?}"
         );
         assert!(
             !served.contains(&"qwen38-27b-dflash-mq3.hfq".to_owned()),
             "DFlash draft must not be offered as a model: {served:?}"
+        );
+        assert!(
+            !served.contains(&"qwen3-8b-dflash.hfq".to_owned()),
+            "an unregistered DFlash draft must not be offered as a model: {served:?}"
         );
         fs::remove_dir_all(&paths.root).unwrap();
     }
@@ -10298,7 +10414,6 @@ mod tests {
                     current_reasoning_efforts: Vec::new(),
                     continuous_batch_capable: false,
                     current_max_seq: 0,
-                    loaded: crate::serve::LoadedInfo::default(),
                     cache_capable: false,
                     kv_override: None,
                     kv_backend_override: None,
@@ -10310,17 +10425,7 @@ mod tests {
                     multi_slot_ctx: 8192,
                     multi_slot_prefill_chunk: 1024,
                 }),
-                meta: Mutex::new(ServeMeta {
-                    current_model: None,
-                    loading_model: None,
-                    instance_token: serve_instance_token(),
-                    requests_served: 0,
-                    retries_attempted: 0,
-                    retries_succeeded: 0,
-                    recent_tok_s: None,
-                    started: Instant::now(),
-                    last_activity: Instant::now(),
-                }),
+                meta: Mutex::new(ServeMeta::new(serve_instance_token())),
                 max_request_bytes: 8 * 1024 * 1024,
                 admission: Arc::new(Admission::new(4, Duration::from_secs(5))),
                 idle_timeout: Duration::from_secs(0),
