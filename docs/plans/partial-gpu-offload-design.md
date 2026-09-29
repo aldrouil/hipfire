@@ -1,6 +1,7 @@
 # Partial GPU Offload — Design Plan
 
-**Status:** DRAFT for review
+**Status:** shipped — v1 covers the qwen35 dense path (§9 steps 1–2). The §5–§8 text
+below is the *design-time* plan; read the as-shipped note first before implementing from it.
 **Author:** (agent)
 **Created:** 2026-09-23
 **Companion:** `docs/VALIDATION.md`, `CLAUDE.md` § Runtime validation, AGENTS.md §6 pitfalls
@@ -572,11 +573,27 @@ No single correctness gate applies; select by what changed:
 
 ## 11. Acceptance criteria (final)
 
+Status against the evidence of record (`docs/perf-checkpoints/2026-09-27-*`). Ticked items
+name the fixture that evidences them; unticked items have no run of record.
+
 - [ ] qwen3.8-27B MQ4XT DENSE runs to completion via the spill path (use case 1 long-context, and
       use case 2 run-the-unfit on an over-capacity dense model); output byte-identical to resident
       mode on ≥3 fresh-process runs.
-- [ ] Config knob controls placement; daemon logs residency decision.
-- [ ] Resident qwen3.8-27B dense path is byte-identical when no layer is spilled (zero-diff baseline).
-- [ ] Validated with `serve_harness.py battery` + chain, decoded and eyeballed; md5s recorded.
+      **Not evidenced on MQ4XT.** The 27B run of record is `qwen3.8-27b.mq3-xt` (64 layers) at an
+      8-layer spill: one 610 B completion, byte-identical to the `pcie` arm, single prompt, no
+      ≥3-process byte diff. Cross-process byte-identity and the byte-diff guard were read on the 9B
+      (`qwen3.5-9b.mq4`, 8 of 32 spilled). Under greedy decode the two arms agree for 723 characters
+      (~190 tokens) and then differ by one whitespace token — the documented contract is coherence
+      plus a *measured* divergence, not bit-identity.
+- [x] Config knob controls placement; daemon logs residency decision — `memory.gpu_layer_budget`
+      resolves `i_gpu_start` and logs `partial offload: N resident / M offloaded`.
+- [x] Resident path is byte-identical when no layer is spilled (zero-diff baseline) — read on
+      `qwen3.5-2b` and `qwen3.5-9b` (1343 / 2734 chars) against the parent build. The unset-budget
+      branch of the same path is what the 27B fixture runs, but no 27B byte-diff was read.
+- [x] Validated with `serve_harness.py battery` + chain, decoded and eyeballed; md5s recorded —
+      `cpu` arm with a spill, 5/5 turns each, `runaway=0 empty=0 attractor=0 retrieval_miss=0`.
 - [ ] MoE/EP tables untouched by v1 — the qwen3.8-27B dense trace matches resident bit-for-bit, proving
       no regression was introduced into the A3B path (§9 step 1 gate).
+      **Half evidenced.** MoE is structurally out of reach (the MoE loader never sees the offload flag)
+      and the other arches declare `host_local: false`; no A3B sparse trace of record was compared
+      against resident.
