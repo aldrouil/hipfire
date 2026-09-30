@@ -1064,7 +1064,7 @@ pub(crate) fn alloc_ep_dummies(
             row_stride: spec.gate_stride,
             paro: None,
             awq_scale: None,
-        exec: rdna_compute::ExecTarget::Gpu,
+            exec: rdna_compute::ExecTarget::Gpu,
         };
         let down = WeightTensor {
             buf: down_owner.shallow_clone(),
@@ -1074,7 +1074,7 @@ pub(crate) fn alloc_ep_dummies(
             row_stride: spec.down_stride,
             paro: None,
             awq_scale: None,
-        exec: rdna_compute::ExecTarget::Gpu,
+            exec: rdna_compute::ExecTarget::Gpu,
         };
         owners.push(gate_owner);
         owners.push(down_owner);
@@ -2492,41 +2492,53 @@ impl LayerWeights {
     /// `experts` is empty here and nothing dangles.
     pub fn owned_bytes(&self) -> (u64, u64) {
         use hipfire_runtime::model_load::{add_bytes, split_tensor_bytes};
-        let dense = |norms: [&GpuTensor; 4], weights: &[&WeightTensor]| {
-            let mut stats = split_tensor_bytes(norms);
+        // Iterators, not fixed-size arrays: a fixed arity silently drops a tensor
+        // when one is added to the struct, which is exactly the under-count this
+        // function exists to avoid.
+        let sum = |norms: &[&GpuTensor], weights: &[&WeightTensor]| {
+            let mut stats = split_tensor_bytes(norms.iter().copied());
             for w in weights {
                 stats = add_bytes(stats, w.owned_bytes());
             }
             stats
         };
         match self {
-            LayerWeights::DeltaNet(l) => dense(
-                [&l.attn_norm, &l.ffn_norm, &l.a_log, &l.dt_bias],
+            // The DeltaNet arms own `conv_weight` and `norm_weight` as well as the
+            // two small scalars — `free_gpu` releases all four, so all four count.
+            LayerWeights::DeltaNet(l) => sum(
+                &[
+                    &l.attn_norm,
+                    &l.ffn_norm,
+                    &l.a_log,
+                    &l.dt_bias,
+                    &l.conv_weight,
+                    &l.norm_weight,
+                ],
                 &[
                     &l.wqkv, &l.wz, &l.w_alpha, &l.w_beta, &l.wo, &l.w_gate, &l.w_up, &l.w_down,
                 ],
             ),
-            LayerWeights::FullAttn(l) => dense(
-                [&l.attn_norm, &l.ffn_norm, &l.q_norm, &l.k_norm],
+            LayerWeights::FullAttn(l) => sum(
+                &[&l.attn_norm, &l.ffn_norm, &l.q_norm, &l.k_norm],
                 &[&l.wq, &l.wk, &l.wv, &l.wo, &l.w_gate, &l.w_up, &l.w_down],
             ),
             LayerWeights::DeltaNetMoe(l) => {
-                // DeltaNet also owns `conv_weight` / `norm_weight`, which the dense
-                // arm above carries separately from the four-element norm list.
-                let stats = add_bytes(
-                    dense(
-                        [&l.attn_norm, &l.ffn_norm, &l.conv_weight, &l.norm_weight],
-                        &[
-                            &l.wqkv, &l.wz, &l.w_alpha, &l.w_beta, &l.wo,
-                        ],
-                    ),
-                    split_tensor_bytes([&l.a_log, &l.dt_bias]),
+                let stats = sum(
+                    &[
+                        &l.attn_norm,
+                        &l.ffn_norm,
+                        &l.conv_weight,
+                        &l.norm_weight,
+                        &l.a_log,
+                        &l.dt_bias,
+                    ],
+                    &[&l.wqkv, &l.wz, &l.w_alpha, &l.w_beta, &l.wo],
                 );
                 add_bytes(stats, moe_ffn_owned_bytes(&l.ffn))
             }
             LayerWeights::FullAttnMoe(l) => {
-                let stats = dense(
-                    [&l.attn_norm, &l.ffn_norm, &l.q_norm, &l.k_norm],
+                let stats = sum(
+                    &[&l.attn_norm, &l.ffn_norm, &l.q_norm, &l.k_norm],
                     &[&l.wq, &l.wk, &l.wv, &l.wo],
                 );
                 add_bytes(stats, moe_ffn_owned_bytes(&l.ffn))
