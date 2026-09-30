@@ -250,7 +250,12 @@ impl ConfigState {
                         .map(String::as_str)
                         .unwrap_or("")
                     {
-                        "" => "all on GPU".into(),
+                        // `null` is the schema's accepted spelling for this
+                        // nullable field (it is what `hipfire config set` writes
+                        // to clear the key), and the key is off disk once it is
+                        // written, so the state it describes is the unset one.
+                        // Rendering the literal would read as "null on GPU".
+                        "" | "null" => "all on GPU".into(),
                         // `-1` is the schema's reserved spelling and it means the
                         // same thing as unset — fully resident, no engine
                         // decision involved. Rendering it as a count would claim
@@ -485,9 +490,11 @@ mod tests {
             "all on GPU",
             "-1 means fully resident, not -1 layers on the GPU"
         );
-        // A cleared key is unset, not the literal string the JSON layer produces
-        // for null — the bug this replaced rendered "null on GPU".
+        // A cleared key is unset, and so is the `null` spelling the schema (and
+        // `hipfire config set`) uses to clear it — neither may render as
+        // "null on GPU".
         assert_eq!(row(&[("gpu_layer_budget", "")]), "all on GPU");
+        assert_eq!(row(&[("gpu_layer_budget", "null")]), "all on GPU");
     }
 
     /// The exec row's two arms, in the same cell grammar as its sibling.
