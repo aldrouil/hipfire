@@ -1624,6 +1624,15 @@ pub fn weight_gemv_swiglu_residual(
         // GEMV into a kernel the seam cannot see, so it splits here rather than
         // widening the seam.
         _ if hipfire_dispatch::host_mapped_cpu_capable(&wr) => {
+            // The SiLU is not a weight-reading op, so it stays on the GPU; the
+            // down-projection and its residual accumulate run on the CPU over the
+            // host-mapped weight bytes.
+            //
+            // This op family fuses silu + rotate + gemv into one kernel, so the
+            // split has to be expressed by the one caller that knows about it —
+            // but it is expressed as *steps*, so the CPU decision, the rotation
+            // disposition and the launch all come from the seam and the recorded
+            // `WeightRef.exec`, not from a second private convention here.
             gpu.silu_mul_f32(gate, up, ffn_hidden_scratch)?;
             // `wr` above carries `awq_scale: None` because the fused GPU arm gets
             // the sidecar through `w_down` (`fused_silu_mul_rotate_mq_for`).
@@ -1634,7 +1643,17 @@ pub fn weight_gemv_swiglu_residual(
                 awq_scale: w_down.awq_scale.as_ref(),
                 ..wr
             };
-            hipfire_dispatch::run_host_mapped_gemv_residual(gpu, &wr_cpu, ffn_hidden_scratch, x)
+            let steps = [hipfire_dispatch::pipeline::Step::GemvResidual {
+                w: &wr_cpu,
+                input: hipfire_dispatch::pipeline::GemvInput::Raw(ffn_hidden_scratch),
+                residual: x,
+                // A residual step accumulates into `residual` and never writes its
+                // `out` scratch (see `cpu_exec::run_step`), so this is a placeholder
+                // that the plan cannot touch: the step is CPU-executed by
+                // construction (the arm's guard proved the seam will take it).
+                out: x,
+            }];
+            hipfire_dispatch::pipeline::execute_steps(gpu, &ctx, &steps)
                 .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
         }
         DType::MQ4G256
