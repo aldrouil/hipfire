@@ -979,18 +979,6 @@ fn offload_split(n_layers: usize, budget: GpuLayerBudget) -> usize {
     match budget {
         GpuLayerBudget::Full => 0,
         GpuLayerBudget::Layers(resident) => n_layers.saturating_sub(resident),
-        // `auto` means "the engine decides", exactly as it does for every other
-        // config key. The engine currently decides to offload nothing: a placement
-        // decision needs measured device capacity and per-layer weight bytes, and
-        // at config construction there is no `Gpu` (the arch trait hands us
-        // `&Config`). Once that measurement is in hand it feeds
-        // `hipfire_config::memory::largest_fitting_tail` and the engine decides a
-        // real split — `auto`'s meaning does not change, only what it decides.
-        //
-        // It deliberately does not fail the load: a config value that breaks a
-        // model reads to a user as "the model is broken", and the whole point of
-        // `auto` is that it is always a safe choice.
-        GpuLayerBudget::Auto => 0,
     }
 }
 
@@ -1002,7 +990,7 @@ fn offload_split(n_layers: usize, budget: GpuLayerBudget) -> usize {
 /// i_gpu_start)` to host-mapped system RAM; `load_layer_into` turns that into a
 /// per-layer `host_local` flag.
 ///
-/// `Full` (the default, and the zero-diff regression guard) and `Auto` leave
+/// `Full` (the default, and the zero-diff regression guard) leaves
 /// `i_gpu_start = 0`, so every layer stays device-resident and the load is
 /// byte-identical to stock. `Layers(n)` is pure arithmetic on `n_layers` and
 /// needs no device measurement, which is why it can be resolved here.
@@ -1046,11 +1034,6 @@ fn residency_report(n_layers: usize, budget: GpuLayerBudget, i_gpu_start: usize)
     }
     match budget {
         GpuLayerBudget::Full => None,
-        GpuLayerBudget::Auto => Some(
-            "  partial offload: 'auto' defers placement to the engine, which currently keeps \
-             every layer on the GPU — set a layer count to offload"
-                .to_string(),
-        ),
         GpuLayerBudget::Layers(resident) if resident > n_layers => Some(format!(
             "  partial offload: gpu_layer_budget={resident} is more than this model's {n_layers} \
              layers; keeping every layer on the GPU"
@@ -1756,11 +1739,6 @@ mod tests {
             "unset keeps every layer resident"
         );
         assert_eq!(
-            offload_split(64, B::Auto),
-            0,
-            "auto is a placeholder = all resident"
-        );
-        assert_eq!(
             offload_split(64, B::Layers(64)),
             0,
             "asking for all of them"
@@ -1811,16 +1789,6 @@ mod tests {
         assert!(
             all_spilled.contains("0 resident / 64 offloaded"),
             "{all_spilled}"
-        );
-
-        let auto = residency_report(64, B::Auto, 0).unwrap();
-        assert!(
-            auto.contains("defers placement to the engine"),
-            "auto must be reported as an engine decision, not silence: {auto}"
-        );
-        assert!(
-            !auto.contains("error"),
-            "auto is a note, not a failure: {auto}"
         );
 
         let overshoot = residency_report(64, B::Layers(200), 0).unwrap();
