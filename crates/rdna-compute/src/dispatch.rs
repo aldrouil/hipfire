@@ -5476,13 +5476,32 @@ mod tests {
         );
     }
 
-    fn try_gpu() -> Option<super::Gpu> {
-        super::Gpu::init().ok()
+    /// One device is shared by every GPU test in this module, and several assert on
+    /// allocator/VRAM bookkeeping. `upload_raw_copy_failure_hip_frees_owner` demands
+    /// byte-exact `hipMemGetInfo` free across its window, which a sibling test
+    /// allocating or freeing VRAM in that window breaks — observed as a failure on
+    /// roughly one `cargo test -p rdna-compute --lib` run in three with no source
+    /// change. Holding this lock for each GPU test's duration makes the suite
+    /// deterministic without weakening any assertion. Poisoning is ignored: a panic
+    /// in one test must not fail the rest.
+    static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Serialized GPU handle for a test. The guard must be *bound* for the test's
+    /// duration — `let Some((mut gpu, _guard)) = try_gpu() else { … }` — because
+    /// dropping it immediately would release the lock.
+    fn try_gpu() -> Option<(super::Gpu, std::sync::MutexGuard<'static, ()>)> {
+        let guard = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match super::Gpu::init() {
+            Ok(gpu) => Some((gpu, guard)),
+            Err(_) => None,
+        }
     }
 
     #[test]
     fn ensure_vmm_cleaned_never_releases_a_live_owner() {
-        let Some(mut gpu) = try_gpu() else {
+        let Some((mut gpu, _guard)) = try_gpu() else {
             eprintln!("skip: no GPU");
             return;
         };
@@ -5526,7 +5545,7 @@ mod tests {
 
     #[test]
     fn vmm_fullmap_covers_unaligned_reservation() {
-        let Some(mut gpu) = try_gpu() else {
+        let Some((mut gpu, _guard)) = try_gpu() else {
             eprintln!("skip: no GPU");
             return;
         };
@@ -5601,7 +5620,7 @@ mod tests {
     /// measured window; a leaked owner still forces a fresh malloc on retry.
     #[test]
     fn alloc_then_init_failure_returns_pool_owner() {
-        let Some(mut gpu) = try_gpu() else {
+        let Some((mut gpu, _guard)) = try_gpu() else {
             eprintln!("skip: no GPU");
             return;
         };
@@ -5646,7 +5665,7 @@ mod tests {
     /// `free_tensor`/pool). Soft-skip without GPU like the other leaf tests.
     #[test]
     fn upload_raw_copy_failure_hip_frees_owner() {
-        let Some(mut gpu) = try_gpu() else {
+        let Some((mut gpu, _guard)) = try_gpu() else {
             eprintln!("skip: no GPU");
             return;
         };
@@ -5659,10 +5678,25 @@ mod tests {
         assert!(warm.buf.is_hip_allocation());
         gpu.free_tensor(warm).expect("free warm into pool");
 
+        // Global free VRAM cannot verify a release byte-exactly on this driver.
+        // Measured (`free_retention` probe, gfx1201): the owner's own bytes always
+        // return exactly, but the driver intermittently charges extra overhead at
+        // allocation that `hipFree` never returns — 0 or 28 MiB for a 64 MiB
+        // request, up to 56 MiB at 2 GiB. Byte-exact equality therefore failed a
+        // correct implementation in roughly 2 of 5 runs. Use a payload far above
+        // that measured overhead (a leak of this owner drops free by 512 MiB) and
+        // tolerate an absolute 64 MiB, which no observed overhead reaches.
+        const PROBE_BYTES: usize = 512 * 1024 * 1024;
+        const TOLERANCE_BYTES: usize = 64 * 1024 * 1024;
+        /// How long to let a late reclaim land. Never-returned driver overhead is
+        /// covered by `TOLERANCE_BYTES` instead; this only absorbs lag.
+        const POLL_MILLIS: u64 = 500;
+        let payload = vec![7u8; PROBE_BYTES];
+
         let (free_before, total) = gpu.hip.get_vram_info().expect("vram before");
         let pool_before = gpu.pool_stats();
 
-        let err = match gpu.upload_raw_with_copy(&[7u8; 64], &[64], |_hip, _buf, _data| {
+        let err = match gpu.upload_raw_with_copy(&payload, &[PROBE_BYTES], |_hip, _buf, _data| {
             Err(hip_bridge::HipError::new(2, "injected raw H2D failure"))
         }) {
             Err(error) => error,
@@ -5676,10 +5710,23 @@ mod tests {
             "unexpected error: {err}"
         );
 
-        let (free_after, _) = gpu.hip.get_vram_info().expect("vram after");
-        assert_eq!(
-            free_after, free_before,
-            "copy-fail must hip.free the malloc owner (free VRAM {free_before} → {free_after}, total={total})"
+        // Reclaim on this driver is occasionally LATE rather than lost (measured:
+        // the owner's bytes return exactly in 11 of 12 samples, with the "missing"
+        // 28 MiB appearing on a later pass), so a single instantaneous sample can't
+        // tell "reclaimed late" from "leaked" — which is precisely the distinction
+        // this test exists to make. Poll briefly, and fail only if free never
+        // recovers.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(POLL_MILLIS);
+        let mut free_after = gpu.hip.get_vram_info().expect("vram after").0;
+        while free_after + TOLERANCE_BYTES < free_before && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(POLL_MILLIS / 10));
+            free_after = gpu.hip.get_vram_info().expect("vram after").0;
+        }
+        assert!(
+            free_after + TOLERANCE_BYTES >= free_before,
+            "copy-fail must hip.free the malloc owner: {PROBE_BYTES} bytes never came back \
+             (free VRAM {free_before} → {free_after} after {POLL_MILLIS}ms of polling, \
+             total={total}, tolerance={TOLERANCE_BYTES})"
         );
         // hip.free path must not touch pool counters (would if free_tensor'd).
         assert_eq!(
@@ -5696,7 +5743,7 @@ mod tests {
 
     #[test]
     fn free_tensor_unmap_failure_retains_owner_for_retry() {
-        let Some(mut gpu) = try_gpu() else {
+        let Some((mut gpu, _guard)) = try_gpu() else {
             eprintln!("skip: no GPU");
             return;
         };
@@ -5745,7 +5792,7 @@ mod tests {
 
     #[test]
     fn free_tensor_release_failure_retains_owner_for_retry() {
-        let Some(mut gpu) = try_gpu() else {
+        let Some((mut gpu, _guard)) = try_gpu() else {
             eprintln!("skip: no GPU");
             return;
         };
@@ -5777,7 +5824,7 @@ mod tests {
 
     #[test]
     fn access_reset_failure_does_not_publish_live_owner() {
-        let Some(mut gpu) = try_gpu() else {
+        let Some((mut gpu, _guard)) = try_gpu() else {
             eprintln!("skip: no GPU");
             return;
         };
@@ -5815,7 +5862,7 @@ mod tests {
 
     #[test]
     fn ensure_vmm_cleaned_refuses_while_pending() {
-        let Some(mut gpu) = try_gpu() else {
+        let Some((mut gpu, _guard)) = try_gpu() else {
             eprintln!("skip: no GPU");
             return;
         };
