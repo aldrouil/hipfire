@@ -222,7 +222,7 @@ pub fn reupload_f16_as_f32(
         row_stride: 0,
         paro: None,
         awq_scale: None,
-    exec: rdna_compute::ExecTarget::Gpu,
+        exec: rdna_compute::ExecTarget::Gpu,
     })
 }
 
@@ -246,7 +246,7 @@ pub fn tied_lm_head_alias(
         row_stride: 0,
         paro: None,
         awq_scale: None,
-    exec: rdna_compute::ExecTarget::Gpu,
+        exec: rdna_compute::ExecTarget::Gpu,
     }
 }
 
@@ -608,7 +608,7 @@ pub(crate) fn decode_raw_codec(
         row_stride: codec.dtype.row_stride(k),
         paro: None,
         awq_scale: None,
-    exec: exec_for(residency),
+        exec: exec_for(residency),
     })
 }
 
@@ -730,7 +730,7 @@ pub fn dequant_weight_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
-            exec: exec_for(residency),
+                exec: exec_for(residency),
             })
         }
         2 => {
@@ -744,7 +744,7 @@ pub fn dequant_weight_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
-            exec: exec_for(residency),
+                exec: exec_for(residency),
             })
         }
         16 => {
@@ -762,7 +762,7 @@ pub fn dequant_weight_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
-            exec: exec_for(residency),
+                exec: exec_for(residency),
             })
         }
         other => match raw_codec(other) {
@@ -906,6 +906,24 @@ fn dequant_bq1_to_f32(data: &[u8], n: usize) -> Vec<f32> {
 /// byte-for-byte identically — a sign/normalization drift here is the "token soup"
 /// attractor failure mode, so there is exactly one copy.
 fn dequantize_to_f32(quant_type: u8, data: &[u8], n: usize) -> Vec<f32> {
+    // `hipfire_cpu` is the canonical CPU decoder: it is the one the CPU-exec offload
+    // path actually runs, and it covers formats this match did not (qt 49's
+    // MQ3G256V2, for instance, used to reach the panic at the end of this function).
+    // Delegating leaves one implementation to keep correct instead of two
+    // transcriptions that must agree — which is why the cross-check that used to
+    // hold them together is gone.
+    if let Some(q) = hipfire_cpu::quant::CpuQuant::from_quant_type(quant_type) {
+        let group_elems = q.group_elems();
+        if group_elems != 0 && n % group_elems == 0 && q.group_bytes() != 0 {
+            let mut out = vec![0.0f32; n];
+            for (g, group) in out.chunks_mut(group_elems).enumerate() {
+                let start = g * q.group_bytes();
+                let packed = data.get(start..).unwrap_or_default();
+                hipfire_cpu::quant::dequant_group(q, packed, group);
+            }
+            return out;
+        }
+    }
     match quant_type {
         1 => data
             .chunks_exact(2)
@@ -1318,24 +1336,6 @@ fn dequantize_to_f32(quant_type: u8, data: &[u8], n: usize) -> Vec<f32> {
 pub fn dequant_f32(gpu: &mut Gpu, quant_type: u8, data: &[u8], n: usize) -> HipResult<GpuTensor> {
     let f32_data = dequantize_to_f32(quant_type, data, n);
     gpu.upload_f32(&f32_data[..n], &[n])
-}
-
-/// Public delegation to the canonical per-tensor CPU decoder [`dequantize_to_f32`].
-///
-/// The decoder itself is deliberately private (it is an implementation detail
-/// of the weight-loading path); this wrapper exists for the two places that
-/// need to hold a *second* decoder to the same bytes:
-///
-/// * `crates/hipfire-runtime/tests/cpu_quant_cross_check.rs`, which asserts
-///   `hipfire_cpu::quant::dequant_group` reproduces this arithmetic bit-for-bit
-///   over the real tensors of the on-disk fixtures, and
-/// * whatever generated the literal expectation tables in that crate.
-///
-/// Integrating a second decoder is the real risk in the CPU-offload path, so
-/// the check is a test rather than a comment. See [`dequantize_to_f32`] for the
-/// per-quant byte layouts.
-pub fn dequantize_weight_to_f32(quant_type: u8, data: &[u8], n: usize) -> Vec<f32> {
-    dequantize_to_f32(quant_type, data, n)
 }
 
 // ── WeightBackend trait ─────────────────────────────────────────────────────
@@ -1827,12 +1827,12 @@ mod tests {
             // These were `assert!(k % 256 == 0)` in that match; the guard is now
             // `DType::requires_k_mod_256`, so a wrong dtype here also silently
             // drops the K constraint rather than mis-tagging alone.
-            (31, DType::MQ5G256),       // q35:331 MQ5-G256, 168 B/group 5.25 bpw
-            (32, DType::MFP4G32Lloyd),  // q35:366 mfp4 + 32 B fp16 codebook prefix
-            (33, DType::MFP4G32P),      // q35:388 mfp4 + E4M3 per-block scale, no prefix
-            (34, DType::MFP4G32E8),     // q35:406 E8-lattice codewords, same row_bytes
-            (36, DType::MFP3G32E8),     // q35:433 3-bit lattice, 13 B/blk 3.25 bpw
-            (37, DType::MFP2G32E8),     // q35:453 2-bit lattice,  9 B/blk 2.25 bpw
+            (31, DType::MQ5G256),      // q35:331 MQ5-G256, 168 B/group 5.25 bpw
+            (32, DType::MFP4G32Lloyd), // q35:366 mfp4 + 32 B fp16 codebook prefix
+            (33, DType::MFP4G32P),     // q35:388 mfp4 + E4M3 per-block scale, no prefix
+            (34, DType::MFP4G32E8),    // q35:406 E8-lattice codewords, same row_bytes
+            (36, DType::MFP3G32E8),    // q35:433 3-bit lattice, 13 B/blk 3.25 bpw
+            (37, DType::MFP2G32E8),    // q35:453 2-bit lattice,  9 B/blk 2.25 bpw
             // GL ("global Lloyd") codebook formats — MoE-routed-expert only.
             // RHS pinned against hipfire-quantize `QuantType::MQ2G256GL = 38` /
             // `MQ3G256GL = 39`; a swap here mis-decodes 64 B/group indices as
@@ -1866,6 +1866,33 @@ mod tests {
             assert!(
                 raw_codec(qt).is_none(),
                 "qt={qt} is host-decode, must not be a raw codec"
+            );
+        }
+    }
+
+    /// The CPU decoder table and the dispatch dtype map must agree.
+    ///
+    /// `hipfire_cpu::quant::CpuQuant` is the canonical per-format decoder (indexed
+    /// by quant_type) and `hipfire_dispatch::cpu_exec::cpu_quant_for` is the
+    /// per-DType view of it that the dispatch seam actually calls. Two tables for
+    /// one fact is exactly the kind of pair that drifts: a new format added to one
+    /// and not the other means a weight either never moves to the CPU or moves
+    /// there with no decoder. Whichever side gains a row, this fails until the
+    /// other does too.
+    #[test]
+    fn cpu_decoder_tables_agree_per_format() {
+        use hipfire_cpu::quant::CpuQuant;
+        for codec in RAW_CODECS {
+            let Some(from_qt) = CpuQuant::from_quant_type(codec.quant_type) else {
+                continue;
+            };
+            assert_eq!(
+                hipfire_dispatch::cpu_exec::cpu_quant_for(codec.dtype),
+                Some(from_qt),
+                "qt {} ({:?}): the CPU decoder table says {from_qt:?} but the \
+                 dispatch dtype map disagrees",
+                codec.quant_type,
+                codec.dtype
             );
         }
     }

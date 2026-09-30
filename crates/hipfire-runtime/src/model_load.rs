@@ -26,11 +26,21 @@ pub enum Residency {
 
 /// What one load actually allocated, split by where it landed.
 ///
-/// Measured, not estimated: every field is summed from the tensors the source
-/// produced, so the loader's own accounting is what admission charges. This is the
-/// honest replacement for deriving a footprint from the file size or from
-/// tensor-name parsing — an offloaded layer's bytes are host-pinned, and charging
-/// them to VRAM would deny the context the spill exists to afford.
+/// Measured from the tensors the source produced, so the loader's own accounting
+/// is what admission charges. This is the honest replacement for deriving a
+/// footprint from the file size or from tensor-name parsing — an offloaded layer's
+/// bytes are host-pinned, and charging them to VRAM would deny the context the
+/// spill exists to afford.
+///
+/// Scope, stated because the numbers are used for admission: these are *tensor*
+/// bytes. They exclude the allocator's own granularity and padding, which on the
+/// 9B fixture measured ~300 MB (~6%) above `device_bytes`, and they exclude the
+/// 1 MiB host-tail pad each host-mapped tensor carries. A caller that needs the
+/// real VRAM commitment asks the device (`hipMemGetInfo`), which is what the serve
+/// preflight does.
+///
+/// The paged-experts route is the one deliberate exclusion: its expert buffers
+/// belong to the `WeightPager`, which accounts for them itself.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LoadStats {
     /// Weight bytes owned in device memory (VRAM) for the model's lifetime.
@@ -209,7 +219,10 @@ impl Layout {
     /// Infallible by construction — the budget is pure arithmetic on the layer
     /// count — and silent only when nothing was configured, so a stock-vs-branch
     /// log diff stays readable.
-    pub fn resolve_residency(&mut self, requested_resident: Option<usize>) -> (usize, Option<String>) {
+    pub fn resolve_residency(
+        &mut self,
+        requested_resident: Option<usize>,
+    ) -> (usize, Option<String>) {
         let n_layers = self.layer_residency.len();
         let spilled = Self::spill_count(n_layers, requested_resident);
         for residency in self.layer_residency.iter_mut().take(spilled) {
@@ -539,7 +552,11 @@ impl<S: WeightSource> StagedLoadOps for GpuStagedLoadOps<'_, S> {
 
 /// Whether a CPU-executed spill conflicts with a retained-replay backend. Pure, so
 /// the conjunction is testable without a GPU or a process snapshot.
-pub fn cpu_exec_offends_replay(spill_requested: bool, cpu_exec: bool, replay_enabled: bool) -> bool {
+pub fn cpu_exec_offends_replay(
+    spill_requested: bool,
+    cpu_exec: bool,
+    replay_enabled: bool,
+) -> bool {
     spill_requested && cpu_exec && replay_enabled
 }
 
@@ -678,13 +695,18 @@ fn load_weights_inner<S: WeightSource>(
     };
     let staged = match fault {
         None => run_staged_load(&mut ops, n_devices, n_devices == 1)?,
-        Some(fault) => run_staged_load_with_fault(&mut ops, n_devices, n_devices == 1, Some(fault))?,
+        Some(fault) => {
+            run_staged_load_with_fault(&mut ops, n_devices, n_devices == 1, Some(fault))?
+        }
     };
     // Measured, not estimated: the bytes the source actually produced, split by
     // where each tensor landed. A tied output head accounts only its metadata,
     // because its buffer is the embedding's (the same split `free_output` uses).
     let mut stats = LoadStats::default();
-    stats.add(split_tensor_bytes([&staged.token_embd, &staged.output_norm]));
+    stats.add(split_tensor_bytes([
+        &staged.token_embd,
+        &staged.output_norm,
+    ]));
     stats.add(if staged.lm_head_aliases_embd {
         staged.output.owned_metadata_bytes()
     } else {
@@ -692,6 +714,14 @@ fn load_weights_inner<S: WeightSource>(
     });
     for layer in &staged.layers {
         stats.add(source.layer_bytes(layer));
+    }
+    if hipfire_config::developer_var("HIPFIRE_OFFLOAD_DEBUG").is_ok() {
+        eprintln!(
+            "[offload-debug] load stats: device={} B, host_pinned={} B ({} layers, {_spilled} spilled)",
+            stats.device_bytes,
+            stats.host_pinned_bytes,
+            layout.layer_residency.len(),
+        );
     }
     Ok(LoadedWeights {
         token_embd: staged.token_embd,
@@ -824,15 +854,27 @@ mod tests {
         // No spill: nothing can be refused, whatever else is set.
         assert!(offload_load_refusal(false, None, None, true, true).is_ok());
         assert!(
-            offload_load_refusal(false, Some("a source that cannot spill".into()), None, true, true)
-                .is_ok(),
+            offload_load_refusal(
+                false,
+                Some("a source that cannot spill".into()),
+                None,
+                true,
+                true
+            )
+            .is_ok(),
             "a refusal reason with no spill requested is not a refusal"
         );
 
         // A spill with a source that cannot honour it.
-        let err = offload_load_refusal(true, Some("this source is PaRoQuant".into()), None, false, false)
-            .unwrap_err()
-            .to_string();
+        let err = offload_load_refusal(
+            true,
+            Some("this source is PaRoQuant".into()),
+            None,
+            false,
+            false,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("this source is PaRoQuant"), "{err}");
 
         // A spill on unified memory.
@@ -843,7 +885,10 @@ mod tests {
 
         // A spill executed on the CPU with a retained-replay backend.
         assert!(cpu_exec_offends_replay(true, true, true));
-        assert!(!cpu_exec_offends_replay(false, true, true), "nothing spilled");
+        assert!(
+            !cpu_exec_offends_replay(false, true, true),
+            "nothing spilled"
+        );
         assert!(!cpu_exec_offends_replay(true, false, true), "pcie is fine");
         assert!(!cpu_exec_offends_replay(true, true, false), "no replay");
         let err = offload_load_refusal(true, None, None, true, true)
@@ -1105,8 +1150,8 @@ mod tests {
                 "seam fault {fault:?} must fire"
             );
             source.assert_clean();
-            let loaded = run_staged_load(&mut source, 2, false)
-                .expect("production retry after seam fault");
+            let loaded =
+                run_staged_load(&mut source, 2, false).expect("production retry after seam fault");
             // Non-aliased output owns primary + metadata: 1 embed + 1 norm +
             // 2 output + 4 layers live after a clean production load.
             assert_eq!(source.allocator.live.len(), 8);

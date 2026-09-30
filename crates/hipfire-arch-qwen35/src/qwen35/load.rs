@@ -41,10 +41,10 @@ use hipfire_runtime::llama::ParoRotation;
 use hipfire_runtime::llama::WeightTensor;
 use hipfire_runtime::model_load::load_weights as rt_load_weights;
 use hipfire_runtime::model_load::load_weights_with_fault as rt_load_weights_with_fault;
-use hipfire_runtime::model_load::LoadedWeights;
-use hipfire_runtime::model_load::LoadStats;
-use hipfire_runtime::model_load::Residency;
 use hipfire_runtime::model_load::split_tensor_bytes;
+use hipfire_runtime::model_load::LoadStats;
+use hipfire_runtime::model_load::LoadedWeights;
+use hipfire_runtime::model_load::Residency;
 pub use hipfire_runtime::model_load::StagedLoadFault;
 use hipfire_runtime::model_load::WeightSource;
 use hipfire_runtime::model_source::ModelSource;
@@ -156,7 +156,6 @@ fn load_norm_weight(
 pub use hipfire_runtime::hfq::load_weight_tensor;
 pub(crate) use hipfire_runtime::hfq::{decode_lm_head_bytes, decode_weight_bytes};
 
-
 /// REAP keep variant of [`load_weight_tensor`]: gather the tensor's first-axis
 /// rows (one row per original expert) down to `keep` BEFORE quant decode, then
 /// build the `WeightTensor` from the gathered bytes with `m = keep.len()`.
@@ -264,7 +263,15 @@ fn load_weight_tensor_keep(
             ),
         ));
     }
-    let mut wt = decode_weight_bytes(gpu, info.quant_type, &sub, m, k, &info.name, Residency::Device)?;
+    let mut wt = decode_weight_bytes(
+        gpu,
+        info.quant_type,
+        &sub,
+        m,
+        k,
+        &info.name,
+        Residency::Device,
+    )?;
     if wt.gpu_dtype.supports_awq_sidecar() {
         // The AWQ sidecar is indexed by K and remains unchanged by row
         // gathering. Resolve under the original source name.
@@ -447,7 +454,7 @@ pub(crate) fn load_paroquant_weight(
             is_alias: false,
         }),
         awq_scale: None,
-    exec: rdna_compute::ExecTarget::Gpu,
+        exec: rdna_compute::ExecTarget::Gpu,
     })
 }
 
@@ -487,7 +494,7 @@ fn load_fp16_weight_from_source(
         row_stride: 0,
         paro: None,
         awq_scale: None,
-    exec: rdna_compute::ExecTarget::Gpu,
+        exec: rdna_compute::ExecTarget::Gpu,
     })
 }
 
@@ -1671,10 +1678,15 @@ pub fn report_cpu_exec_coverage(hfq: &HfqFile, spilled_layers: usize) {
             // family, PARO), and a tensor skipped here would be reported as
             // covered while nothing decodes it. F16/F32/BF16 do resolve, and are
             // covered because the loader host-decodes them to f32 at load time.
+            //
+            // `cpu_quant_for` is the per-DType view of `hipfire_cpu`'s canonical
+            // per-format decoder, and `weight_backend`'s
+            // `cpu_decoder_tables_agree_per_format` fails if the two ever disagree,
+            // so this line cannot report coverage the seam would not deliver.
             let Ok(dtype) = dtype_from_quant_type(t.quant_type) else {
                 continue;
             };
-            if hipfire_dispatch::cpu_quant_for(dtype).is_none() {
+            if hipfire_dispatch::cpu_exec::cpu_quant_for(dtype).is_none() {
                 layer_covered = false;
                 uncovered.insert(format!("{dtype:?}"));
             }
@@ -1936,16 +1948,7 @@ impl WeightSource for HfqSource<'_> {
     /// VL branch in this source to leave half-applied. If a VL source ever gains
     /// one, it owes its own `Some` here rather than a silent partial spill.
     fn spill_refusal(&self) -> Option<String> {
-        if self.c.num_experts > 0 {
-            Some(
-                "this model is MoE: routed experts are placed in VRAM by `load_moe_ffn`, which \
-                 never sees the placement, so a spill would be half-applied (the layer's dense \
-                 half on the host, its experts in VRAM)"
-                    .to_string(),
-            )
-        } else {
-            None
-        }
+        self.c.spill_refusal()
     }
     /// Every tensor the layer owns, mirroring `LayerWeights::free_gpu`'s lists —
     /// the enumeration the teardown already trusts, so accounting that drifted
@@ -3910,7 +3913,7 @@ fn try_load_packed_mq4_experts(
             row_stride: 0,
             paro: None,
             awq_scale: None,
-        exec: rdna_compute::ExecTarget::Gpu,
+            exec: rdna_compute::ExecTarget::Gpu,
         };
         gate_up.awq_scale = load_awq_scale_for(hfq, gpu, &spec.gate_up_name, dim);
         let mut down = WeightTensor {
@@ -3921,7 +3924,7 @@ fn try_load_packed_mq4_experts(
             row_stride: 0,
             paro: None,
             awq_scale: None,
-        exec: rdna_compute::ExecTarget::Gpu,
+            exec: rdna_compute::ExecTarget::Gpu,
         };
         down.awq_scale = load_awq_scale_for(hfq, gpu, &spec.down_name, mi);
         experts.push(ExpertWeights { gate_up, down });
@@ -5541,8 +5544,8 @@ fn load_weights_ep_rank_inner(
 #[cfg(test)]
 mod sealed_ep_tests {
     use super::{
-        load_weights, load_weights_ep_rank, load_weights_ep_rank_with_fault,
-        tensor_layer_index, EpFault, EpLoadStage, HfqSource, Layout,
+        load_weights, load_weights_ep_rank, load_weights_ep_rank_with_fault, tensor_layer_index,
+        EpFault, EpLoadStage, HfqSource, Layout,
     };
     use crate::qwen35::{
         config_from_hfq, shard_all_moe_layers, shard_all_moe_layers_with_fault, LayerWeights,
@@ -5731,7 +5734,7 @@ mod sealed_ep_tests {
                     row_stride: 0,
                     paro: None,
                     awq_scale: None,
-                exec: rdna_compute::ExecTarget::Gpu,
+                    exec: rdna_compute::ExecTarget::Gpu,
                 },
                 down: WeightTensor {
                     buf: down_buf.shallow_clone(),
@@ -5741,7 +5744,7 @@ mod sealed_ep_tests {
                     row_stride: 0,
                     paro: None,
                     awq_scale: None,
-                exec: rdna_compute::ExecTarget::Gpu,
+                    exec: rdna_compute::ExecTarget::Gpu,
                 },
             });
             owned_buffers.push(gate_buf);

@@ -16,6 +16,32 @@ use std::ops::Range;
 
 // ─── Config ─────────────────────────────────────────────────────────────
 
+impl Qwen35Config {
+    /// Why this model cannot honour a spill, or `None` if it can.
+    ///
+    /// MoE routes its experts around the placement: `load_moe_ffn` (and the EP
+    /// loader) allocate them device-side and never see the backend, so a budget
+    /// would host-locate this layer's dense half while its experts stayed in VRAM —
+    /// half-applied, and still counted as spilled. Vision tensors are not a second
+    /// refusal: the text tower is the only source on this path, and a VL source
+    /// that gains one owes its own answer.
+    ///
+    /// Lives on the config rather than in the source so the predicate is testable
+    /// without an HFQ file or a GPU.
+    pub fn spill_refusal(&self) -> Option<String> {
+        if self.num_experts > 0 {
+            Some(
+                "this model is MoE: routed experts are placed in VRAM by `load_moe_ffn`, which \
+                 never sees the placement, so a spill would be half-applied (the layer's dense \
+                 half on the host, its experts in VRAM)"
+                    .to_string(),
+            )
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LayerType {
     LinearAttention, // DeltaNet
@@ -1598,6 +1624,58 @@ mod tests {
         });
         let cfg4 = from_config_value(&inner4).unwrap();
         assert!(dense_tp_rank_layouts(&cfg4, &shard).is_err());
+    }
+
+    /// MoE refuses a spill, and a dense model does not. The predicate lives on the
+    /// config so this is testable without an HFQ fixture — there is no MoE model on
+    /// this box, which is why the fail-closed check's end-to-end MoE arm is not
+    /// runnable here and this pin stands in for it.
+    #[test]
+    fn moe_refuses_a_spill_dense_does_not() {
+        let dense = from_config_value(&serde_json::json!({
+            "hidden_size": 1024,
+            "intermediate_size": 1024,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 2,
+            "head_dim": 128,
+            "vocab_size": 1000,
+            "linear_num_key_heads": 4,
+            "linear_num_value_heads": 8,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128
+        }))
+        .unwrap();
+        assert_eq!(dense.num_experts, 0, "the dense fixture really is dense");
+        assert!(
+            dense.spill_refusal().is_none(),
+            "a dense model can honour a spill"
+        );
+
+        let moe = from_config_value(&serde_json::json!({
+            "hidden_size": 1024,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 2,
+            "head_dim": 128,
+            "vocab_size": 1000,
+            "linear_num_key_heads": 4,
+            "linear_num_value_heads": 8,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128,
+            "num_experts": 8,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 512
+        }))
+        .unwrap();
+        assert!(moe.num_experts > 0, "the MoE fixture really has experts");
+        let reason = moe
+            .spill_refusal()
+            .expect("a MoE config must refuse a spill");
+        assert!(
+            reason.contains("load_moe_ffn"),
+            "the refusal must name the loader that would half-apply it: {reason}"
+        );
     }
 
     /// The resident-tail split arithmetic moved to the shared loader

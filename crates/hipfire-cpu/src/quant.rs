@@ -759,13 +759,19 @@ mod test {
 
     // ── expectation tables, generated from the canonical decoder ────────────
     // Recipe (a throwaway example in `hipfire-runtime`, deleted after use): for
-    // each format, run
-    // `weight_backend::dequantize_weight_to_f32(qt, &testfix::group_bytes(q, 0), q.group_elems())`
-    // and print `v.to_bits()` as `0x%08x`. Bit patterns rather than decimal
-    // literals, so the comparison is exact and immune to float-literal
-    // round-tripping. Only formats with a canonical `dequantize_to_f32` arm have a
-    // table: qt 45 / 47 / 48 / 49 / 50 and qt 9 / 10 / 31 have no arm there, so
-    // their oracle is the GPU launcher (`gpu_gemv_parity`), not this table.
+    // each format, run the canonical CPU decoder
+    // (`weight_backend::dequantize_weight_to_f32` at the time; that wrapper is
+    // gone and `dequantize_to_f32` now delegates here, so the oracle and the
+    // implementation are one) over `&testfix::group_bytes(q, 0)` for
+    // `q.group_elems()` elements and print `v.to_bits()` as `0x%08x`. Bit patterns
+    // rather than decimal literals, so the comparison is exact and immune to
+    // float-literal round-tripping. These tables are now a frozen pin on the byte
+    // layouts: a layout change must show up as a table diff, not as a silently
+    // re-frozen expectation.
+    //
+    // Formats without a table (qt 45 / 47 / 48 / 49 / 50 and qt 9 / 10 / 31) are
+    // the ones whose oracle is the GPU parity test (`gpu_gemv_parity`), not this
+    // file.
     /// qt 13, 136 B / 256 elems.
     const EXPECTED_MQ4G256: [u32; 256] = [
         0x3df00000, 0x3e200000, 0xbd800000, 0xbe280000, 0xbe840000, 0xbed00000, 0xbd400000,

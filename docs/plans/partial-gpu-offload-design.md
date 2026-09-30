@@ -23,6 +23,42 @@ below is the *design-time* plan; read the as-shipped note first before implement
 > focus on (§10) whether the memory-class approach is the right linchpin and whether the graph-
 > capture gate in §4B is sufficient.
 
+> **Post-review revision (2026-09-30).** The review's concern was structural: offload lived in
+> `hipfire-arch-qwen35`, so only that arch could spill and its placement had no relationship to
+> what the load actually did. The rework moved every one of those decisions into the shared
+> runtime seams, and the following are now **retired** wherever they appear below:
+>
+> - **Placement.** `Qwen35Config::i_gpu_start`, `apply_offload_policy`, `offload_split` and
+>   `residency_report` are gone. `model_load::Layout::spill_count` resolves the budget once, in
+>   `load_weights_inner`, from `memory.gpu_layer_budget()` (now `Option<usize>` — the requested
+>   resident count; unset/`auto`/`-1`/empty all mean "no budget"). `WeightSource::read_layer`
+>   receives the resolved `Residency`, so llama, qwen2 and qwen35 spill identically. The
+>   `partial offload: N resident / M offloaded, i_gpu_start=8` line is still emitted, by the
+>   loader, with that wording.
+> - **The reader seam (§6.1).** `HfqBackend::read_proj_host` / `host_local` and the
+>   `load_weight_tensor_raw*` family are gone: one reader (`hfq::load_weight_tensor` +
+>   `decode_weight_bytes`) takes a `Residency`, the codec registry (`RAW_CODECS`) covers the
+>   formats qwen35 used to decode privately (qt 31-34 and 36-37; qt 35 is lm_head-only and
+>   deliberately absent), and the host-decode fallback uploads to
+>   host memory instead of refusing. `kernel.lm_head_f16` is now consulted only where an LM head
+>   is bound.
+> - **Execution target.** `WeightTensor::exec` / `WeightRef::exec` record who reads a weight;
+>   `cpu_exec_enabled()` and `cpu_offload_active(i_gpu_start)` are gone, and the dispatch seam
+>   tests the recorded target, so `pcie` over host-mapped bytes stays a GPU path.
+> - **The capture gate.** `GraphState::cpu_exec_weights` is set once per load and all capture
+>   entries (including `Gpu::begin_stream_capture` and `ReplayController::begin_capture`) refuse
+>   while it is set, instead of each caller remembering. The Redline refusal moved to the loader,
+>   where the resolved spill and the replay backend are both known.
+> - **Admission.** `LoadStats` (measured from the tensors the source produced) replaces the
+>   file-size estimate and `serve_engine`'s tensor-name parsing; spilled bytes are charged to the
+>   admission host tier, and the serve preflight runs on the loader's own numbers after the load.
+> - **Fail-closed.** A source that cannot honour a spill (PaRoQuant, MoE routed experts) and a
+>   unified-memory device refuse the load before allocating; the manifest executor refuses a
+>   host-mapped placement rather than allocating it in VRAM.
+>
+> §5–§8 remain the design-time record of how the feature was brought up; where they name the
+> retired symbols above, this note is what the code does.
+
 ---
 
 ## 1. Problem & goal
@@ -208,10 +244,15 @@ are more surface area than staging and buy nothing until speed matters.
 
 #### Implementation decisions settled during bring-up (do not re-litigate)
 
-- **`proj` needs a second reader seam; per-layer selection is impossible.** Quantized weights
-  upload raw codes through the arch-supplied `read_proj` fn pointer, whose `&Gpu` cannot
-  host-allocate: `Gpu::alloc_host_mapped_tensor` is `&mut self` because it records the host
-  pointer in `self.host_mapped` (the registry `free_tensor` needs to `hipHostFree`). Selecting a
+- **`proj` needs a second reader seam; per-layer selection is impossible.** *(Retired by the
+  post-review revision above: the twin is gone. The problem it solved was real — quantized
+  weights upload raw codes through an arch-supplied `read_proj` fn pointer whose `&Gpu` cannot
+  host-allocate, because `Gpu::alloc_host_mapped_tensor` is `&mut self` (it records the host
+  pointer in `self.host_mapped`, which `hipHostFree` needs). The resolution was to change the
+  fn-pointer *signature* rather than duplicate the reader: `read_proj` takes `&mut Gpu` and a
+  `Residency`, so one reader serves both placements and there is no `None` case to hard-error
+  on. Kept here as the record of the design-time constraint.)* The original argument follows:
+  selecting a
   different `read_proj` per layer does not help either — the
   backend is built per layer, but the parameter type is fixed across arches and cannot carry
   `&mut Gpu`. Ship a twin instead: `read_proj_host: Option<fn(&HfqFile, &mut Gpu, …)>`, which
@@ -226,7 +267,11 @@ are more surface area than staging and buy nothing until speed matters.
   change a signature shared with qwen2/llama/runtime for no gain on the dense target. The AWQ
   sidecar stays device-resident deliberately: it is a 1-D f16 vector of length K, so spilling
   it would cost PCIe bandwidth per GEMV to save kilobytes.
-- **MoE is structurally out of reach, but the log line is the only guard.** `load_moe_ffn(hfq,
+- **MoE is structurally out of reach, but the log line is the only guard.** *(Now structural
+  rather than advisory: `Qwen35Config::spill_refusal` refuses a budgeted load for any
+  `num_experts > 0` model, so the half-applied case below cannot be reached at all — the log
+  line is no longer the only guard. The paragraph is kept as the record of why MoE was out of
+  v1.)* `load_moe_ffn(hfq,
   gpu, …)` takes the raw `&HfqFile`/`&mut Gpu` and never sees an `HfqBackend`, so it cannot read
   `host_local` — that is what keeps A3B-MoE out of v1. It also allocates device-side
   unconditionally, so a *future* policy that offloaded a MoE layer would spill that layer's dense
@@ -276,7 +321,8 @@ PCIe link (27.1 GB/s measured, §7) instead of device DRAM: this is llama.cpp's
 - **Config.** `memory.offload_exec` = `pcie` (default: byte-for-byte the
   behaviour above, and the zero-diff guard) | `cpu` (env
   `HIPFIRE_OFFLOAD_EXEC`). Unset, empty and unknown all fail closed to `pcie`.
-  With `i_gpu_start == 0` it prints one informational line and changes nothing:
+  With `i_gpu_start == 0` *(now: with no budget configured — the key parses to `Option<usize>`
+  and unset/`auto`/`-1`/empty are all `None`)* it prints one informational line and changes nothing:
   no weight is host-mapped, so no step can move.
 - **Seam.** One arch-agnostic place: `hipfire-dispatch`'s `execute_steps`. With
   CPU execution on, a fused entry that spans a CPU step is not matched (a fusion
@@ -296,7 +342,8 @@ PCIe link (27.1 GB/s measured, §7) instead of device DRAM: this is llama.cpp's
   carries no tag).
 - **Graph capture.** A CPU step is a host sync point, so hipGraph capture is
   disabled for the model's lifetime whenever CPU steps are possible
-  (`cpu_offload_active(i_gpu_start)`), logged once
+  (`cpu_offload_active(i_gpu_start)` *(now: `GraphState::cpu_exec_weights`, set once by the
+  loader and enforced by every capture entry)*), logged once
   (`cpu exec: hipGraph capture disabled (CPU-executed steps present)`). The slot
   decode graph takes the same decision.
 - **Footprint recipe for a large spilled prefix.** `hipHostMalloc` memory is
@@ -402,7 +449,8 @@ PCIe link (27.1 GB/s measured, §7) instead of device DRAM: this is llama.cpp's
   the largest KV cache that remains.
 
 **Placement heuristic.** Match llama.cpp (`llama-model.cpp:1467`): keep a contiguous suffix
-`[i_gpu_start .. n_layer]` on GPU, spill the prefix to host RAM. Every layer reads its weights each
+`[i_gpu_start .. n_layer]` *(now: `Layout::spill_count` resolves the suffix; the layers before it
+carry `Residency::HostMapped`)* on GPU, spill the prefix to host RAM. Every layer reads its weights each
 decode step (the residual stream passes through all of them), so no layer is bandwidth-free — but
 a contiguous split keeps the hot path simple and matches the reference exactly. The input/embed and
 output/lm_head layers stay resident regardless (tiny, used every step).
@@ -586,7 +634,8 @@ name the fixture that evidences them; unticked items have no run of record.
       (~190 tokens) and then differ by one whitespace token — the documented contract is coherence
       plus a *measured* divergence, not bit-identity.
 - [x] Config knob controls placement; daemon logs residency decision — `memory.gpu_layer_budget`
-      resolves `i_gpu_start` and logs `partial offload: N resident / M offloaded`.
+      resolves `i_gpu_start` *(now: the shared loader resolves placement, and emits the same
+      string)* and logs `partial offload: N resident / M offloaded`.
 - [x] Resident path is byte-identical when no layer is spilled (zero-diff baseline) — read on
       `qwen3.5-2b` and `qwen3.5-9b` (1343 / 2734 chars) against the parent build. The unset-budget
       branch of the same path is what the 27B fixture runs, but no 27B byte-diff was read.
@@ -595,5 +644,7 @@ name the fixture that evidences them; unticked items have no run of record.
 - [ ] MoE/EP tables untouched by v1 — the qwen3.8-27B dense trace matches resident bit-for-bit, proving
       no regression was introduced into the A3B path (§9 step 1 gate).
       **Half evidenced.** MoE is structurally out of reach (the MoE loader never sees the offload flag)
-      and the other arches declare `host_local: false`; no A3B sparse trace of record was compared
+      *(now stricter: `spill_refusal` refuses a budgeted load outright for a MoE config)*
+      and the other arches declare `host_local: false` *(now: llama and qwen2 inherit placement
+      through `Layout`, and the field is gone)*; no A3B sparse trace of record was compared
       against resident.
