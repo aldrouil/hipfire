@@ -2723,6 +2723,7 @@ pub(crate) fn run_plain_gemm_key(
         row_stride: k,
         rotation: None,
         awq_scale: None,
+    exec: rdna_compute::ExecTarget::Gpu,
     };
     let params = GemmParams {
         w: &w,
@@ -2773,6 +2774,7 @@ pub(crate) fn run_residual_gemm_key(
         row_stride: k,
         rotation: None,
         awq_scale: None,
+    exec: rdna_compute::ExecTarget::Gpu,
     };
     // The residual stream `y` is BOTH the residual and the output (`y += W·x`).
     let params = GemmParams {
@@ -3279,6 +3281,7 @@ pub(crate) fn prefill_moe_ffn_body_batched_with_route(
             row_stride: ffn.router.k,
             rotation: None,
             awq_scale: None,
+        exec: ffn.router.exec,
         };
         let params = GemmParams {
             w: &w,

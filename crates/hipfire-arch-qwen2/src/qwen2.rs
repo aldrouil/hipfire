@@ -284,6 +284,9 @@ pub struct Qwen2Weights {
     /// True when the model uses tied embeddings and `output` aliases the
     /// embedding table (no separate `lm_head.weight` on disk).
     pub tied_lm_head: bool,
+    /// What this load actually allocated, by destination. See
+    /// [`hipfire_runtime::model_load::LoadStats`].
+    pub stats: hipfire_runtime::model_load::LoadStats,
 }
 
 impl Qwen2Weights {
@@ -362,6 +365,7 @@ pub fn load_weights(
         output,
         layers,
         lm_head_aliases_embd,
+        stats,
     } = model_load::load_weights(&mut source, std::slice::from_mut(gpu), &mut layout)?;
 
     Ok(Qwen2Weights {
@@ -371,6 +375,7 @@ pub fn load_weights(
         output,
         layers,
         tied_lm_head: lm_head_aliases_embd,
+        stats,
     })
 }
 
@@ -447,6 +452,59 @@ impl WeightSource for Qwen2WeightSource<'_> {
     fn free_layer(&mut self, gpu: &mut Gpu, layer: Self::Layer) {
         layer.free_gpu(gpu);
     }
+    fn layer_bytes(&self, layer: &Qwen2LayerWeights) -> (u64, u64) {
+        qwen2_layer_bytes(layer)
+    }
+}
+
+/// One qwen2 layer's owned bytes, mirroring `Qwen2LayerWeights::free_gpu`: the
+/// norms/biases are plain tensors, the seven projections own their blobs and
+/// sidecars.
+fn qwen2_layer_bytes(layer: &Qwen2LayerWeights) -> (u64, u64) {
+    use hipfire_runtime::model_load::{add_bytes, split_tensor_bytes};
+    let mut stats = split_tensor_bytes([
+        &layer.attn_norm,
+        &layer.wq_bias,
+        &layer.wk_bias,
+        &layer.wv_bias,
+        &layer.ffn_norm,
+    ]);
+    for weight in [
+        &layer.wq,
+        &layer.wk,
+        &layer.wv,
+        &layer.wo,
+        &layer.w_gate,
+        &layer.w_up,
+        &layer.w_down,
+    ] {
+        stats = add_bytes(stats, weight.owned_bytes());
+    }
+    stats
+}
+
+/// [`LoadStats`](hipfire_runtime::model_load::LoadStats) for a qwen2 load built
+/// outside the shared loader (the safetensors-source route). The HFQ route reports
+/// through `model_load` itself; `qwen2_layer_bytes` is what both use per layer.
+fn qwen2_load_stats(
+    token_embd: &GpuTensor,
+    output_norm: &GpuTensor,
+    output: &WeightTensor,
+    layers: &[Qwen2LayerWeights],
+    tied_lm_head: bool,
+) -> hipfire_runtime::model_load::LoadStats {
+    use hipfire_runtime::model_load::{split_tensor_bytes, LoadStats};
+    let mut stats = LoadStats::default();
+    stats.add(split_tensor_bytes([token_embd, output_norm]));
+    stats.add(if tied_lm_head {
+        output.owned_metadata_bytes()
+    } else {
+        output.owned_bytes()
+    });
+    for layer in layers {
+        stats.add(qwen2_layer_bytes(layer));
+    }
+    stats
 }
 
 // ─── Per-tensor loaders ─────────────────────────────────────────────────
@@ -714,6 +772,7 @@ fn load_weight_tensor_from_source(
         row_stride: 0,
         paro: None,
         awq_scale: None,
+    exec: rdna_compute::ExecTarget::Gpu,
     })
 }
 
@@ -761,6 +820,7 @@ fn load_lm_head_from_source(
             row_stride: 0,
             paro: None,
             awq_scale: None,
+        exec: rdna_compute::ExecTarget::Gpu,
         };
         Ok((wt, true))
     } else {
@@ -900,6 +960,7 @@ pub fn load_weights_from_source(
         layers.push(load_layer_from_source(source, gpu, cfg, i)?);
     }
 
+    let stats = qwen2_load_stats(&embd_token, &output_norm, &output, &layers, tied_lm_head);
     Ok(Qwen2Weights {
         token_embd: embd_token,
         embd_format,
@@ -907,6 +968,7 @@ pub fn load_weights_from_source(
         output,
         layers,
         tied_lm_head,
+        stats,
     })
 }
 

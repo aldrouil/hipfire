@@ -42,7 +42,9 @@ use hipfire_runtime::llama::WeightTensor;
 use hipfire_runtime::model_load::load_weights as rt_load_weights;
 use hipfire_runtime::model_load::load_weights_with_fault as rt_load_weights_with_fault;
 use hipfire_runtime::model_load::LoadedWeights;
+use hipfire_runtime::model_load::LoadStats;
 use hipfire_runtime::model_load::Residency;
+use hipfire_runtime::model_load::split_tensor_bytes;
 pub use hipfire_runtime::model_load::StagedLoadFault;
 use hipfire_runtime::model_load::WeightSource;
 use hipfire_runtime::model_source::ModelSource;
@@ -445,6 +447,7 @@ pub(crate) fn load_paroquant_weight(
             is_alias: false,
         }),
         awq_scale: None,
+    exec: rdna_compute::ExecTarget::Gpu,
     })
 }
 
@@ -484,6 +487,7 @@ fn load_fp16_weight_from_source(
         row_stride: 0,
         paro: None,
         awq_scale: None,
+    exec: rdna_compute::ExecTarget::Gpu,
     })
 }
 
@@ -1604,6 +1608,27 @@ pub use hipfire_runtime::model_load::Layout;
 
 // ── CPU-exec offload coverage report ──────────────────────────────────────
 
+/// Layer ordinal in an HFQ tensor name (`layers.<n>.…`, optionally behind a
+/// text-tower prefix such as `model.language_model.`). `None` for non-layer
+/// tensors.
+///
+/// The `layers.` segment must sit at a path boundary (start of name, or after a
+/// `.`), so an unrelated name that merely contains the substring — `my_layers.4.w`
+/// — is not mistaken for a layer tensor and attributed to the wrong layer.
+///
+/// This used to live in `serve_engine` to charge a split across the device/host
+/// sides of the admission estimate. Admission now takes the loader's measured
+/// `LoadStats`, so its one remaining caller is the CPU-coverage report below.
+fn tensor_layer_index(name: &str) -> Option<usize> {
+    let at = name.find("layers.")?;
+    if at != 0 && name.as_bytes()[at - 1] != b'.' {
+        return None;
+    }
+    let rest = &name[at + "layers.".len()..];
+    let end = rest.find('.')?;
+    rest[..end].parse().ok()
+}
+
 /// The load-time CPU-exec coverage line for `memory.offload_exec=cpu`.
 ///
 /// Reads the *file's* tensor index rather than the loaded weights: the question
@@ -1613,10 +1638,9 @@ pub use hipfire_runtime::model_load::Layout;
 /// resolves to a DType has a CPU decoder; the uncovered set names the formats
 /// that therefore keep reading their weights over PCIe.
 ///
-/// Follows the same silence contract as the residency report in
-/// [`super::config::apply_offload_policy`]: nothing is printed unless
-/// `memory.offload_exec` was actually configured to `cpu`, so a stock-vs-branch
-/// log diff stays readable.
+/// Follows the same silence contract as the loader's residency report: nothing is
+/// printed unless `memory.offload_exec` was actually configured to `cpu`, so a
+/// stock-vs-branch log diff stays readable.
 pub fn report_cpu_exec_coverage(hfq: &HfqFile, spilled_layers: usize) {
     use hipfire_config::memory::{offload_exec, OffloadExec};
     use std::collections::BTreeSet;
@@ -1638,7 +1662,7 @@ pub fn report_cpu_exec_coverage(hfq: &HfqFile, spilled_layers: usize) {
     for layer in 0..spilled {
         let mut layer_covered = true;
         for t in hfq.tensors() {
-            if crate::serve_engine::tensor_layer_index(&t.name) != Some(layer) {
+            if tensor_layer_index(&t.name) != Some(layer) {
                 continue;
             }
             // Resolve through the *loader's own* map, not the passthrough table:
@@ -1719,6 +1743,7 @@ fn load_weights_inner(
         output,
         layers,
         lm_head_aliases_embd,
+        stats,
     } = match fault {
         None => rt_load_weights(source, devices, layout)?,
         Some(fault) => rt_load_weights_with_fault(source, devices, layout, fault)?,
@@ -1739,7 +1764,31 @@ fn load_weights_inner(
         pager: None,
         lm_head_aliases_embd,
         ep_shard: None,
+        stats,
     })
+}
+
+/// [`LoadStats`] for a qwen35 load built outside the shared loader (dense TP).
+/// The ordinary route reports through `model_load` itself;
+/// [`LayerWeights::owned_bytes`] is what both use per layer.
+pub fn qwen35_load_stats(
+    token_embd: &GpuTensor,
+    output_norm: &GpuTensor,
+    output: &WeightTensor,
+    layers: &[LayerWeights],
+    lm_head_aliases_embd: bool,
+) -> LoadStats {
+    let mut stats = LoadStats::default();
+    stats.add(split_tensor_bytes([token_embd, output_norm]));
+    stats.add(if lm_head_aliases_embd {
+        output.owned_metadata_bytes()
+    } else {
+        output.owned_bytes()
+    });
+    for layer in layers {
+        stats.add(layer.owned_bytes());
+    }
+    stats
 }
 
 // ── HfqSource ─────────────────────────────────────────────────────────────
@@ -1898,6 +1947,12 @@ impl WeightSource for HfqSource<'_> {
             None
         }
     }
+    /// Every tensor the layer owns, mirroring `LayerWeights::free_gpu`'s lists —
+    /// the enumeration the teardown already trusts, so accounting that drifted
+    /// from it would be visible right next to it.
+    fn layer_bytes(&self, layer: &LayerWeights) -> (u64, u64) {
+        layer.owned_bytes()
+    }
     fn free_layer(&mut self, gpu: &mut Gpu, layer: Self::Layer) {
         layer.free_gpu(gpu);
     }
@@ -2032,6 +2087,9 @@ impl WeightSource for ParoSource<'_> {
              unset it or use an .hfq source"
                 .to_string(),
         )
+    }
+    fn layer_bytes(&self, layer: &LayerWeights) -> (u64, u64) {
+        layer.owned_bytes()
     }
     fn free_layer(&mut self, gpu: &mut Gpu, layer: Self::Layer) {
         layer.free_gpu(gpu);
@@ -3523,6 +3581,14 @@ pub fn load_weights_dense_tp_rank(
         let output = pending.output.take().unwrap();
         let lm_head_aliases_embd = pending.lm_head_aliases_embd;
         let layers = std::mem::take(&mut pending.layers);
+        // Measured from the tensors this route produced, before `layers` is moved.
+        let stats = qwen35_load_stats(
+            &token_embd,
+            &output_norm,
+            &output,
+            &layers,
+            lm_head_aliases_embd,
+        );
         Ok(Qwen35Weights {
             token_embd,
             embd_format,
@@ -3533,6 +3599,7 @@ pub fn load_weights_dense_tp_rank(
             pager: None,
             lm_head_aliases_embd,
             ep_shard: None,
+            stats,
         })
     })();
     match res {
@@ -3843,6 +3910,7 @@ fn try_load_packed_mq4_experts(
             row_stride: 0,
             paro: None,
             awq_scale: None,
+        exec: rdna_compute::ExecTarget::Gpu,
         };
         gate_up.awq_scale = load_awq_scale_for(hfq, gpu, &spec.gate_up_name, dim);
         let mut down = WeightTensor {
@@ -3853,6 +3921,7 @@ fn try_load_packed_mq4_experts(
             row_stride: 0,
             paro: None,
             awq_scale: None,
+        exec: rdna_compute::ExecTarget::Gpu,
         };
         down.awq_scale = load_awq_scale_for(hfq, gpu, &spec.down_name, mi);
         experts.push(ExpertWeights { gate_up, down });
@@ -5418,16 +5487,28 @@ fn load_weights_ep_rank_inner(
         lm_head_aliases_embd,
         layers,
     } = staging;
+    let token_embd = token_embd.expect("staged EP embedding");
+    let embd_format = embd_format.expect("staged EP embedding format");
+    let output_norm = output_norm.expect("staged EP norm");
+    let output = output.expect("staged EP output");
+    let stats = qwen35_load_stats(
+        &token_embd,
+        &output_norm,
+        &output,
+        &layers,
+        lm_head_aliases_embd,
+    );
     let mut weights = Qwen35Weights {
-        token_embd: token_embd.expect("staged EP embedding"),
-        embd_format: embd_format.expect("staged EP embedding format"),
-        output_norm: output_norm.expect("staged EP norm"),
-        output: output.expect("staged EP output"),
+        token_embd,
+        embd_format,
+        output_norm,
+        output,
         moe_has_mq6,
         layers,
         pager: None,
         lm_head_aliases_embd,
         ep_shard: None,
+        stats,
     };
     let fingerprint = match &weights.layers[0] {
         LayerWeights::DeltaNetMoe(layer) => layer.ffn.expert_execution_plan.execution_fingerprint(),
@@ -5460,8 +5541,8 @@ fn load_weights_ep_rank_inner(
 #[cfg(test)]
 mod sealed_ep_tests {
     use super::{
-        load_weights, load_weights_ep_rank, load_weights_ep_rank_with_fault, EpFault, EpLoadStage,
-        HfqSource, Layout,
+        load_weights, load_weights_ep_rank, load_weights_ep_rank_with_fault,
+        tensor_layer_index, EpFault, EpLoadStage, HfqSource, Layout,
     };
     use crate::qwen35::{
         config_from_hfq, shard_all_moe_layers, shard_all_moe_layers_with_fault, LayerWeights,
@@ -5476,6 +5557,40 @@ mod sealed_ep_tests {
     use std::sync::Mutex;
 
     static EP_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// The CPU-coverage report attributes tensors to layers by parsing the layer
+    /// ordinal out of an HFQ tensor name, so a name it fails to attribute would
+    /// count a layer's coverage wrong — and report a format as covered while
+    /// nothing decodes it. Pin the shapes the real manifests use plus the
+    /// near-misses.
+    #[test]
+    fn tensor_layer_index_parses_real_manifest_names() {
+        assert_eq!(tensor_layer_index("layers.0.mlp.gate_proj.weight"), Some(0));
+        assert_eq!(
+            tensor_layer_index("layers.63.linear_attn.out_proj.weight"),
+            Some(63)
+        );
+        assert_eq!(
+            tensor_layer_index("model.language_model.layers.7.self_attn.q_proj.weight"),
+            Some(7)
+        );
+        assert_eq!(
+            tensor_layer_index("model.layers.12.input_layernorm.weight"),
+            Some(12)
+        );
+        // Always-resident tensors must not be attributed to a layer.
+        assert_eq!(tensor_layer_index("token_embd.weight"), None);
+        assert_eq!(tensor_layer_index("output_norm.weight"), None);
+        assert_eq!(tensor_layer_index("lm_head.weight"), None);
+        assert_eq!(
+            tensor_layer_index("model.language_model.lm_head.weight"),
+            None
+        );
+        // Near-misses: "layers." not followed by an ordinal is not a layer tensor.
+        assert_eq!(tensor_layer_index("layers.weight"), None);
+        assert_eq!(tensor_layer_index("layers..weight"), None);
+        assert_eq!(tensor_layer_index("my_layers.4.w"), None);
+    }
 
     const EP_VRAM_SLACK_BYTES: usize = 64 << 20;
     const ORNITH_FIXTURE_ENV: &str = "HIPFIRE_ORNITH_FIXTURE";
@@ -5616,6 +5731,7 @@ mod sealed_ep_tests {
                     row_stride: 0,
                     paro: None,
                     awq_scale: None,
+                exec: rdna_compute::ExecTarget::Gpu,
                 },
                 down: WeightTensor {
                     buf: down_buf.shallow_clone(),
@@ -5625,6 +5741,7 @@ mod sealed_ep_tests {
                     row_stride: 0,
                     paro: None,
                     awq_scale: None,
+                exec: rdna_compute::ExecTarget::Gpu,
                 },
             });
             owned_buffers.push(gate_buf);
@@ -6434,6 +6551,10 @@ mod direct_load_fault_tests {
             }
             fn spill_refusal(&self) -> Option<String> {
                 None
+            }
+            fn layer_bytes(&self, _layer: &Self::Layer) -> (u64, u64) {
+                // Never reached: this source exists to fail before any device exists.
+                (0, 0)
             }
             fn free_layer(&mut self, _gpu: &mut Gpu, _layer: Self::Layer) {
                 unreachable!("source must not run without devices")

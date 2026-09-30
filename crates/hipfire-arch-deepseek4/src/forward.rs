@@ -314,6 +314,7 @@ pub(crate) fn gemv_auto(
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+    exec: rdna_compute::ExecTarget::Gpu,
     };
     // DeepSeek prepares and reuses the FWHT input in architecture-owned
     // scratch. `run_auto` treats its input as plain and rotates every typed MQ

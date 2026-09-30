@@ -220,45 +220,6 @@ fn dn_buffers(dn: &DeltaNetState) -> Vec<&GpuTensor> {
     v
 }
 
-/// Device-resident weight bytes for the placement described by `i_gpu_start`.
-///
-/// Sums the on-disk size of every tensor the loader will place on the device: all
-/// tensors of layers `[i_gpu_start .. n_layers)`, plus every non-layer tensor.
-/// `token_embd` / `output_norm` / `lm_head` are always resident because the host
-/// path is reachable only from the per-layer `HfqBackend`. Layers
-/// `[0 .. i_gpu_start)` are excluded: they live in host RAM, and charging them to
-/// the device is what stopped offload from affording the context it frees.
-///
-/// Conservative in one direction only. The AWQ sidecar of an *offloaded* layer
-/// stays device-resident and is not counted here, but it is a 1-D f16 vector of
-/// length K per tensor — tens of KB against the MiB of weight blob it accompanies
-/// — which the caller's fixed headroom absorbs.
-fn resident_weight_bytes(hfq: &hipfire_runtime::hfq::HfqFile, i_gpu_start: usize) -> u64 {
-    hfq.tensors()
-        .iter()
-        .filter(|t| tensor_layer_index(&t.name).map_or(true, |i| i >= i_gpu_start))
-        .map(|t| t.data_size as u64)
-        .sum()
-}
-
-/// Layer ordinal in an HFQ tensor name (`layers.<n>.…`, optionally behind a
-/// text-tower prefix such as `model.language_model.`). `None` for non-layer
-/// tensors.
-///
-/// The `layers.` segment must sit at a path boundary (start of name, or after a
-/// `.`), so an unrelated name that merely contains the substring — `my_layers.4.w`
-/// — is not mistaken for a layer tensor and charged to the wrong side of the
-/// offload split.
-pub(crate) fn tensor_layer_index(name: &str) -> Option<usize> {
-    let at = name.find("layers.")?;
-    if at != 0 && name.as_bytes()[at - 1] != b'.' {
-        return None;
-    }
-    let rest = &name[at + "layers.".len()..];
-    let end = rest.find('.')?;
-    rest[..end].parse().ok()
-}
-
 impl Rig {
     /// Build the GPU rig.
     ///
@@ -294,50 +255,41 @@ impl Rig {
         let weight_bytes = std::fs::metadata(&cfg.model_path)
             .map_err(|e| format!("stat model: {e}"))?
             .len();
-        // Charge only what actually lands on the device. With partial offload the
-        // prefix `[0 .. i_gpu_start)` lives in host RAM (`hipHostMalloc`, which
-        // costs the device heap nothing), so charging the whole file here would
-        // make offload unable to buy the KV capacity it exists to buy: the gate
-        // would refuse the very context the freed VRAM affords. Summed from the
-        // tensor index rather than estimated per layer, because the split is
-        // contiguous but the layers are not uniform (linear-attention vs
-        // full-attention, different MLP widths). Non-layer tensors (token_embd,
-        // output_norm, lm_head) are always resident and always charged.
-        // Transitional: the split is the shared loader's arithmetic applied to the
-        // same key the loader resolves. Phase 3.3 replaces this whole estimate with
-        // the bytes the loader actually allocated (`LoadedWeights::stats`), which
-        // removes the tensor-name parsing below.
-        let spilled_layers =
-            qwen35::Layout::spill_count(config.n_layers, hipfire_config::memory::gpu_layer_budget());
-        let resident_weight_bytes = if spilled_layers == 0 {
-            weight_bytes
-        } else {
-            resident_weight_bytes(&hfq, spilled_layers)
-        };
         let cap_rounded = cfg.cap_tokens.div_ceil(128) * 128;
         let kv_bytes = (n_fa_layers as u64)
             * 2
             * (cfg.n_slots as u64)
             * (cap_rounded as u64)
             * (per_pos_bytes as u64);
-        let planned = resident_weight_bytes + kv_bytes + 768 * 1024 * 1024;
 
-        // GPU context only before preflight — no device allocations yet. Free/
-        // total come from the live device so gfx1100 is not over-admitted
-        // against a hardcoded R9700 budget.
+        // GPU context, then weights, then the preflight.
+        //
+        // The preflight's input is what the loader *actually* allocated
+        // (`weights.stats`), so it has to follow the load. Its job is unchanged —
+        // refuse before the K/V arenas and scratch are committed, which is where an
+        // overshoot would happen — and the weights are committed either way, so the
+        // check still stops the KV overshoot it was written for.
         let mut gpu = Gpu::init().map_err(|e| format!("gpu init: {e}"))?;
-        let (vram_free, vram_total) = gpu
-            .hip
-            .get_vram_info()
-            .map_err(|e| format!("vram info: {e}"))?;
-        preflight_alloc(planned, vram_free as u64, "SlotEngine")
-            .map_err(|e| format!("preflight refused: {e}"))?;
         let weights: Qwen35Weights = {
             let mut src = qwen35::HfqSource::new(&mut hfq, &config);
             let mut layout = qwen35::Layout::single(config.n_layers);
             qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &mut layout)
         }
         .map_err(|e| format!("load weights: {e}"))?;
+        // Captured before `Guard` takes ownership of the weights; admission is
+        // built from what the loader measured, not from the file size.
+        let weight_stats = weights.stats;
+        // `weight_stats.device_bytes` has already left `vram_free`, so the
+        // commitment still to be admitted is KV plus scratch headroom. Free/total
+        // come from the live device, so gfx1100 is not over-admitted against a
+        // hardcoded R9700 budget.
+        let planned = kv_bytes + 768 * 1024 * 1024;
+        let (vram_free, vram_total) = gpu
+            .hip
+            .get_vram_info()
+            .map_err(|e| format!("vram info: {e}"))?;
+        preflight_alloc(planned, vram_free as u64, "SlotEngine")
+            .map_err(|e| format!("preflight refused: {e}"))?;
 
         // ── Transactional post-weight guard ────────────────────────────────
         // Every allocation after weights is owned here. On any error, Drop
@@ -400,6 +352,8 @@ impl Rig {
         }
         let mut g = Guard {
             gpu: Some(gpu),
+            // Captured before the move: admission is built from what the loader
+            // measured, and the `Guard` takes ownership of the weights themselves.
             weights: Some(weights),
             k_arenas: Vec::with_capacity(n_fa_layers),
             v_arenas: Vec::with_capacity(n_fa_layers),
@@ -486,8 +440,12 @@ impl Rig {
 
         let mut adm = AdmissionController::new(
             ModelFootprint {
-                weights_bytes: resident_weight_bytes,
+                // Measured by the loader, not estimated from the file: the device
+                // half is what actually landed in VRAM, and the host half is the
+                // unreclaimable pinned spill the host tier must carry.
+                weights_bytes: weight_stats.device_bytes,
                 kv_bytes_per_token: (n_fa_layers * 2 * per_pos_bytes) as u64,
+                host_bytes: weight_stats.host_pinned_bytes,
             },
             vram_total as u64,
         );
@@ -1306,39 +1264,6 @@ fn restore(rig: &mut Rig, id: SessionId, slot: SlotId) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The offload admission gate decides which tensors are charged to the device
-    /// by parsing the layer ordinal out of an HFQ tensor name, so a name it fails
-    /// to attribute would silently be charged (or not charged) to the wrong side
-    /// of the split. Pin the shapes the real manifests use plus the near-misses.
-    #[test]
-    fn tensor_layer_index_parses_real_manifest_names() {
-        assert_eq!(tensor_layer_index("layers.0.mlp.gate_proj.weight"), Some(0));
-        assert_eq!(
-            tensor_layer_index("layers.63.linear_attn.out_proj.weight"),
-            Some(63)
-        );
-        assert_eq!(
-            tensor_layer_index("model.language_model.layers.7.self_attn.q_proj.weight"),
-            Some(7)
-        );
-        assert_eq!(
-            tensor_layer_index("model.layers.12.input_layernorm.weight"),
-            Some(12)
-        );
-        // Always-resident tensors must not be attributed to a layer.
-        assert_eq!(tensor_layer_index("token_embd.weight"), None);
-        assert_eq!(tensor_layer_index("output_norm.weight"), None);
-        assert_eq!(tensor_layer_index("lm_head.weight"), None);
-        assert_eq!(
-            tensor_layer_index("model.language_model.lm_head.weight"),
-            None
-        );
-        // Near-misses: "layers." not followed by an ordinal is not a layer tensor.
-        assert_eq!(tensor_layer_index("layers.weight"), None);
-        assert_eq!(tensor_layer_index("layers..weight"), None);
-        assert_eq!(tensor_layer_index("my_layers.4.w"), None);
-    }
 
     /// Pure stand-in for the MaxTokens bookkeeping in `run_loop`: only
     /// MaxTokens keeps the terminal emitted tok in the session transcript.

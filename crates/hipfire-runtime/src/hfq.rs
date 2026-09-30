@@ -5,14 +5,17 @@
 //! HFQ (.hfq) file loader for hipfire-native Q4_F16 quantized models.
 
 use crate::llama::{
-    f16_to_f32, EmbeddingFormat, LayerWeights, LlamaConfig, LlamaWeights, ModelArch, WeightTensor,
+    f16_to_f32, layer_owned_bytes, llama_load_stats, EmbeddingFormat, LayerWeights, LlamaConfig,
+    LlamaWeights, ModelArch, WeightTensor,
 };
 use crate::model_load::{
-    load_weights as rt_load_weights, LoadedWeights, Residency, WeightSource,
+    add_bytes, load_weights as rt_load_weights, split_tensor_bytes, LoadedWeights, Residency,
+    WeightSource,
 };
 use crate::weight_backend::{
-    decode_raw_codec, dequant_weight_raw, flat_name_candidates, load_awq_scale_for, load_embedding,
-    raw_codec, resolve_lm_head, reupload_f16_as_f32, upload_bytes, HfqBackend, WeightBackend,
+    decode_raw_codec, dequant_weight_raw, exec_for, flat_name_candidates, load_awq_scale_for,
+    load_embedding, raw_codec, resolve_lm_head, reupload_f16_as_f32, upload_bytes, HfqBackend,
+    WeightBackend,
 };
 use hip_bridge::{HipError, HipResult};
 use memmap2::Mmap;
@@ -1689,6 +1692,7 @@ pub fn decode_weight_bytes(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+            exec: exec_for(residency),
             })
         }
         // Everything else: the passthrough registry, or the host-decode fallback
@@ -1913,6 +1917,9 @@ impl WeightSource for LlamaHfqSource<'_> {
     fn spill_refusal(&self) -> Option<String> {
         None
     }
+    fn layer_bytes(&self, layer: &LayerWeights) -> (u64, u64) {
+        layer_owned_bytes(layer)
+    }
     fn free_layer(&mut self, gpu: &mut Gpu, layer: Self::Layer) {
         layer.free_gpu(gpu);
     }
@@ -1995,6 +2002,7 @@ pub fn load_weights_hfq(
         output,
         layers,
         lm_head_aliases_embd,
+        stats,
     } = rt_load_weights(&mut source, std::slice::from_mut(gpu), &mut layout)?;
     Ok(LlamaWeights {
         token_embd,
@@ -2003,6 +2011,7 @@ pub fn load_weights_hfq(
         output,
         layers,
         lm_head_aliases_embd,
+        stats,
     })
 }
 
@@ -2218,6 +2227,7 @@ fn load_fp16_weight_tensor_from_source(
         row_stride: 0,
         paro: None,
         awq_scale: None,
+    exec: rdna_compute::ExecTarget::Gpu,
     })
 }
 
@@ -2328,6 +2338,7 @@ pub fn load_weights_paroquant_llama(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+            exec: rdna_compute::ExecTarget::Gpu,
             })
         },
     )?;
@@ -2353,6 +2364,8 @@ pub fn load_weights_paroquant_llama(
         }
     }
 
+    // Measured from the tensors this route produced, before `layers` is moved.
+    let stats = llama_load_stats(&token_embd, &output_norm, &output, &layers, lm_head_aliases_embd);
     Ok(LlamaWeights {
         token_embd,
         embd_format: embd_fmt,
@@ -2360,6 +2373,7 @@ pub fn load_weights_paroquant_llama(
         output,
         layers,
         lm_head_aliases_embd,
+        stats,
     })
 }
 // ─── HFQM streaming writer (calibration collector) ──────────────────────────

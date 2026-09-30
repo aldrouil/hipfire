@@ -587,6 +587,23 @@ impl DType {
     }
 }
 
+/// Which engine executes the ops that read one weight tensor.
+///
+/// This is a *recorded decision*, not a derived property: a weight's memory
+/// location says where the bytes are, and `memory.offload_exec` says who reads
+/// them. `HostMapped` + `Cpu` is the pair a CPU-executed step needs, and every
+/// searn that must agree about it (the dispatch CPU seam, the hipGraph capture
+/// gate) reads this field instead of re-deriving it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ExecTarget {
+    /// The GPU kernels read this weight (device memory, or host memory over PCIe).
+    #[default]
+    Gpu,
+    /// The CPU reads this weight's bytes: only produced for a host-mapped weight
+    /// when `memory.offload_exec=cpu`.
+    Cpu,
+}
+
 /// Activation-capture hook for the Tier 1 hipfire-native calibration path.
 ///
 /// Foundation scaffold (2026-05-19) — the field on `Gpu` is set by
@@ -1013,6 +1030,18 @@ impl Gpu {
         Ok(())
     }
 
+    /// Record that this model's step mix includes CPU-executed weights.
+    ///
+    /// Set once per load, from the placement the loader resolved, and it is the
+    /// single source of truth for the three decisions that must agree: whether a
+    /// hipGraph may be captured at all, whether the retained-replay tape may
+    /// record, and whether the dispatch seam plans CPU steps (`DispatchCtx::new`
+    /// reads it back off this `Gpu`).
+    pub fn set_cpu_exec_weights(&mut self, on: bool) {
+        self.graphs.cpu_exec_weights = on;
+        self.replay.set_cpu_exec_weights(on);
+    }
+
     /// Begin capturing this `Gpu`'s stream into a graph.
     ///
     /// Mode 1 is `hipStreamCaptureModeThreadLocal`: only this thread is
@@ -1020,6 +1049,10 @@ impl Gpu {
     /// this crate launches during capture must already be warm -- a kernel
     /// compile mid-capture is exactly the kind of call the mode forbids.
     pub fn begin_stream_capture(&mut self) -> HipResult<()> {
+        // Same gate as the `GraphState` capture entries (see
+        // `GraphState::cpu_exec_weights`): this is the third capture path, so the
+        // refusal has to live on it too rather than only at its call site.
+        self.graphs.reject_cpu_exec_capture()?;
         self.bind_thread()?;
         let stream = self.active_stream.as_ref().ok_or_else(|| {
             hip_bridge::HipError::new(0, "begin_stream_capture: no active stream")
@@ -1426,6 +1459,8 @@ impl Gpu {
                     capturing: None,
                     lmhead_argmax: std::collections::HashSet::new(),
                 },
+                // False until a load resolves placement; see `Gpu::set_cpu_exec_weights`.
+                cpu_exec_weights: false,
             },
             rocblas: None,
             fp16_shadow_cache: HashMap::new(),

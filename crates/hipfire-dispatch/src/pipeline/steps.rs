@@ -678,7 +678,7 @@ pub fn execute_steps(
         // there to save — nothing else. (Fusion has no numerical contract to
         // preserve here; see the module docs on the tolerance contract.)
         let fused = match_prefix(FUSED_TABLE, &steps[i..], ctx).filter(|(_, len)| {
-            !cpu_exec::cpu_exec_enabled()
+            !ctx.cpu_exec()
                 || !steps[i..i + *len]
                     .iter()
                     .any(|s| cpu_exec::plan_step(gpu, s).is_some())
@@ -703,7 +703,7 @@ pub fn execute_steps(
             cpu_exec::run_step(gpu, &plan)?;
             i += 1;
         } else {
-            if cpu_exec::cpu_exec_enabled() && cpu_exec::reads_host_mapped_weight(gpu, &steps[i]) {
+            if ctx.cpu_exec() && cpu_exec::reads_host_mapped_weight(gpu, &steps[i]) {
                 // Host-mapped weight that the CPU could not take: an unsupported
                 // quant format, or a step shape that never reached the seam. Counted
                 // so the failure is visible instead of silent (see the coverage
@@ -1383,15 +1383,9 @@ mod tests {
         use std::sync::Arc;
         let mut flags = FeatureFlags::for_test("gfx1100");
         flags.force_unfused = true;
-        let ctx = DispatchCtx {
-            arch: rdna_compute::arch_caps::ArchCaps::new(
-                "gfx1100",
-                Arc::new(FeatureFlags::for_test("gfx1100")),
-            ),
-            flags: Arc::new(flags),
-            resources: crate::resource::ResourceManager::for_test(),
-            workload: crate::context::DispatchWorkload::Standard,
-        };
+        let mut ctx = DispatchCtx::for_test("gfx1100");
+        ctx.arch = rdna_compute::arch_caps::ArchCaps::new("gfx1100", Arc::new(flags.clone()));
+        ctx.flags = Arc::new(flags);
         // short-circuit: every guard opens with `force_unfused → false`, so even
         // an empty slice returns false. This proves the branch exists.
         let empty: &[Step] = &[];
@@ -1541,15 +1535,9 @@ mod tests {
         use std::sync::Arc;
         let mut flags = FeatureFlags::for_test("gfx1100");
         flags.force_unfused = true;
-        let ctx = DispatchCtx {
-            arch: rdna_compute::arch_caps::ArchCaps::new(
-                "gfx1100",
-                Arc::new(FeatureFlags::for_test("gfx1100")),
-            ),
-            flags: Arc::new(flags),
-            resources: crate::resource::ResourceManager::for_test(),
-            workload: crate::context::DispatchWorkload::Standard,
-        };
+        let mut ctx = DispatchCtx::for_test("gfx1100");
+        ctx.arch = rdna_compute::arch_caps::ArchCaps::new("gfx1100", Arc::new(flags.clone()));
+        ctx.flags = Arc::new(flags);
         let empty: &[Step] = &[];
         assert!(
             !guard_qkv_q4k(empty, &ctx),

@@ -238,6 +238,7 @@ fn compare(
         row_stride: 0,
         rotation: None,
         awq_scale: awq,
+    exec: rdna_compute::ExecTarget::Gpu,
     };
     match gemv.run_auto(&ctx, gpu, &wr, &x_dev, &y_dev) {
         Ok(()) => {}
@@ -351,6 +352,7 @@ fn check_prerotated(
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+    exec: rdna_compute::ExecTarget::Gpu,
     };
     let launched = gemv.run(
         &ctx,

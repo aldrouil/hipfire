@@ -52,7 +52,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
 
-use rdna_compute::{DType, Gpu, GpuTensor};
+use rdna_compute::{DType, ExecTarget, Gpu, GpuTensor};
 
 use hipfire_cpu::epilogue::residual_add;
 use hipfire_cpu::gemv::gemv;
@@ -61,15 +61,6 @@ use hipfire_cpu::quant::{divide_by_awq_scale, rotate_x, CpuQuant};
 use crate::families::gemv::WeightRef;
 use crate::pipeline::steps::{GemvInput, Step};
 use crate::types::{dtype_rotation_plan, DispatchError, RotationPlan};
-
-/// Cached `memory.offload_exec == Cpu`, mirroring the `forward_lowered_enabled`
-/// precedent: resolved once from the process snapshot, never re-read per step.
-pub fn cpu_exec_enabled() -> bool {
-    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
-        hipfire_config::memory::offload_exec() == hipfire_config::memory::OffloadExec::Cpu
-    });
-    *ENABLED
-}
 
 /// (steps executed on the CPU, host-mapped steps that stayed on the GPU).
 ///
@@ -152,59 +143,6 @@ pub fn cpu_quant_for(dtype: DType) -> Option<CpuQuant> {
     }
 }
 
-/// Whether a model with this resolved offload split has CPU-executed steps at
-/// all: CPU execution selected *and* a non-empty spilled prefix
-/// (`Qwen35Config::i_gpu_start`). With no spill every weight stays
-/// device-resident, [`Gpu::host_located`] is false everywhere, and not a single
-/// step can move to the CPU — `memory.offload_exec=cpu` must not change a number
-/// there.
-///
-/// Conservative by construction: a spill whose every weight is an unsupported
-/// format also reports `true`, which costs a hipGraph but never correctness.
-pub fn cpu_offload_active(i_gpu_start: usize) -> bool {
-    cpu_exec_enabled() && i_gpu_start > 0
-}
-
-/// Whether `memory.offload_exec=cpu` conflicts with a retained-replay backend.
-///
-/// Pure truth table (the CPU-exec decision, the resolved split, and whether a
-/// replay controller is in play) so it is testable without a process snapshot.
-pub fn cpu_exec_redline_conflict(cpu_exec: bool, i_gpu_start: usize, replay_enabled: bool) -> bool {
-    cpu_exec && i_gpu_start > 0 && replay_enabled
-}
-
-/// Refuse `memory.offload_exec=cpu` together with a retained-replay (Redline)
-/// backend, naming both keys.
-///
-/// Redline does not go through `execute_steps`' launch funnel: its tape records
-/// GPU launches and replays them, so a CPU-executed step would run while the
-/// tape is built and then be *absent* from every replay — the replayed route
-/// would keep computing from the activations that step should have refreshed.
-/// Nothing in the tape can express that, so the load fails instead of running a
-/// route whose output is silently stale.
-///
-/// `replay_enabled` is the controller's own predicate
-/// (`ReplayController::is_enabled`), not a config string: whether Redline is in
-/// play depends on the runtime route decision and certification state, so the
-/// caller with the `Gpu` supplies the fact. Shadow controllers are refused too
-/// (conservatively — shadow does not change the launch route, so the refusal is
-/// stricter than strictly necessary there).
-pub fn reject_cpu_exec_under_redline(
-    i_gpu_start: usize,
-    replay_enabled: bool,
-) -> Result<(), String> {
-    if cpu_exec_redline_conflict(cpu_exec_enabled(), i_gpu_start, replay_enabled) {
-        return Err(
-            "memory.offload_exec=cpu conflicts with the retained-replay (Redline) backend: the \
-             replay tape records GPU launches and does not execute the CPU-executed steps, so a \
-             replayed route would compute from stale activations. Set memory.offload_exec=pcie \
-             (HIPFIRE_OFFLOAD_EXEC=pcie) or replay.backend=hip"
-                .to_string(),
-        );
-    }
-    Ok(())
-}
-
 /// Log the capture-disable decision once per process. A CPU-executed step is a
 /// host sync point (a D2H and an H2D around the multiplication), so a graph that
 /// contained one could neither be recorded nor replayed correctly.
@@ -228,7 +166,7 @@ pub fn run_host_mapped_gemv(
     rotate_input: bool,
     out: &GpuTensor,
 ) -> Result<(), DispatchError> {
-    let q = host_mapped_quant(gpu, w)?;
+    let q = host_mapped_quant(w)?;
     let (m, k) = (w.m, w.k);
     let bytes = gpu
         .host_bytes(w.buf)
@@ -298,7 +236,7 @@ pub fn run_host_mapped_gemv_residual(
     x: &GpuTensor,
     acc: &GpuTensor,
 ) -> Result<(), DispatchError> {
-    let q = host_mapped_quant(gpu, w)?;
+    let q = host_mapped_quant(w)?;
     let (m, k) = (w.m, w.k);
     let rotate_input = dtype_rotation_plan(w.dtype) == RotationPlan::FwhtG256;
     let bytes = gpu
@@ -330,17 +268,22 @@ pub fn run_host_mapped_gemv_residual(
 }
 
 /// Whether [`run_host_mapped_gemv`] / [`run_host_mapped_gemv_residual`] can drive
-/// this weight: host-mapped *and* a decodable format.
-pub fn host_mapped_cpu_capable(gpu: &Gpu, w: &WeightRef) -> bool {
-    cpu_exec_enabled() && gpu.host_located(w.buf) && cpu_quant_for(w.dtype).is_some()
+/// this weight: this model's step mix executes on the CPU *and* the format has a
+/// CPU decoder.
+///
+/// The execution target is the loader's recorded decision (`WeightTensor::exec`),
+/// not a re-derivation from where the bytes happen to live: a host-mapped weight
+/// under `memory.offload_exec=pcie` is read by the GPU over the link, and that is
+/// a deliberate mode, not a case for the CPU.
+pub fn host_mapped_cpu_capable(w: &WeightRef) -> bool {
+    w.exec == ExecTarget::Cpu && cpu_quant_for(w.dtype).is_some()
 }
 
-fn host_mapped_quant(gpu: &Gpu, w: &WeightRef) -> Result<CpuQuant, DispatchError> {
-    if !cpu_exec_enabled() {
-        return Err(cpu_err("cpu exec is not enabled (memory.offload_exec)"));
-    }
-    if !gpu.host_located(w.buf) {
-        return Err(cpu_err("weight tensor is not host-mapped"));
+fn host_mapped_quant(w: &WeightRef) -> Result<CpuQuant, DispatchError> {
+    if w.exec != ExecTarget::Cpu {
+        return Err(cpu_err(
+            "this weight's execution target is not the CPU (memory.offload_exec)",
+        ));
     }
     cpu_quant_for(w.dtype).ok_or_else(|| {
         cpu_err(&format!(
@@ -377,13 +320,9 @@ pub(crate) struct CpuStep<'a> {
     residual: Option<&'a GpuTensor>,
 }
 
-/// Plan a CPU execution for `step`, or `None` when it must stay on the GPU:
-/// CPU execution disabled, weight not host-mapped, or a format
-/// [`cpu_quant_for`] does not cover.
-pub(crate) fn plan_step<'a>(gpu: &Gpu, step: &'a Step<'a>) -> Option<CpuStep<'a>> {
-    if !cpu_exec_enabled() {
-        return None;
-    }
+/// Plan a CPU execution for `step`, or `None` when it must stay on the GPU: not
+/// planned for the CPU, or a format [`cpu_quant_for`] does not cover.
+pub(crate) fn plan_step<'a>(_gpu: &Gpu, step: &'a Step<'a>) -> Option<CpuStep<'a>> {
     let (w, input, out, residual) = match step {
         Step::Gemv { w, input, out } => (*w, input, *out, None),
         Step::GemvResidual {
@@ -394,7 +333,7 @@ pub(crate) fn plan_step<'a>(gpu: &Gpu, step: &'a Step<'a>) -> Option<CpuStep<'a>
         } => (*w, input, *out, Some(*residual)),
         _ => return None,
     };
-    if !gpu.host_located(w.buf) || cpu_quant_for(w.dtype).is_none() {
+    if w.exec != ExecTarget::Cpu || cpu_quant_for(w.dtype).is_none() {
         return None;
     }
     Some(CpuStep {

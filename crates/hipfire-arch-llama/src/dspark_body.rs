@@ -59,8 +59,8 @@ use hipfire_runtime::dspark_core::{
 };
 use hipfire_runtime::hfq::{load_layer, load_weight_tensor_pread, HfqFile};
 use hipfire_runtime::llama::{
-    weight_gemv, ForwardScratch, KvCache, LayerWeights, LlamaConfig, LlamaWeights, ModelArch,
-    PrefillBatchScratch, WeightTensor,
+    llama_load_stats, weight_gemv, ForwardScratch, KvCache, LayerWeights, LlamaConfig,
+    LlamaWeights, ModelArch, PrefillBatchScratch, WeightTensor,
 };
 use hipfire_runtime::model_load::Residency;
 use hipfire_runtime::weight_backend::{
@@ -170,6 +170,8 @@ pub fn load_qwen3_dspark(
     };
     let lm_head = load_global_proj(source, gpu, "lm_head.weight", draft_vocab, cfg.dim)?;
 
+    // Measured from the tensors this sidecar route produced.
+    let stats = llama_load_stats(&token_embd, &output_norm, &lm_head, &layers, false);
     let weights = LlamaWeights {
         token_embd,
         embd_format,
@@ -177,6 +179,7 @@ pub fn load_qwen3_dspark(
         output: lm_head,
         layers,
         lm_head_aliases_embd: false,
+        stats,
     };
 
     // 7. DSpark globals

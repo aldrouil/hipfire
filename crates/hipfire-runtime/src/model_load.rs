@@ -24,6 +24,56 @@ pub enum Residency {
     HostMapped,
 }
 
+/// What one load actually allocated, split by where it landed.
+///
+/// Measured, not estimated: every field is summed from the tensors the source
+/// produced, so the loader's own accounting is what admission charges. This is the
+/// honest replacement for deriving a footprint from the file size or from
+/// tensor-name parsing — an offloaded layer's bytes are host-pinned, and charging
+/// them to VRAM would deny the context the spill exists to afford.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LoadStats {
+    /// Weight bytes owned in device memory (VRAM) for the model's lifetime.
+    pub device_bytes: u64,
+    /// Weight bytes owned as pinned host memory (`hipHostMalloc`) for the model's
+    /// lifetime. Unreclaimable while the model is loaded, which is why the host
+    /// admission tier charges it.
+    pub host_pinned_bytes: u64,
+}
+
+impl LoadStats {
+    /// Accumulate another `(device, host)` pair.
+    pub fn add(&mut self, (device, host): (u64, u64)) {
+        self.device_bytes += device;
+        self.host_pinned_bytes += host;
+    }
+}
+
+/// Sum `tensors` into `(device, pinned-host)` bytes, splitting on each tensor's own
+/// allocation tag. Used by `WeightSource::layer_bytes` impls, which are then a list
+/// of the layer's tensors rather than per-tensor arithmetic.
+pub fn split_tensor_bytes<'a, I>(tensors: I) -> (u64, u64)
+where
+    I: IntoIterator<Item = &'a GpuTensor>,
+{
+    let mut device = 0u64;
+    let mut host = 0u64;
+    for tensor in tensors {
+        let bytes = tensor.byte_size() as u64;
+        if tensor.buf.is_host_mapped() {
+            host += bytes;
+        } else {
+            device += bytes;
+        }
+    }
+    (device, host)
+}
+
+/// Accumulate one `(device, host)` pair into another.
+pub fn add_bytes((device, host): (u64, u64), other: (u64, u64)) -> (u64, u64) {
+    (device + other.0, host + other.1)
+}
+
 /// Where each piece of the model lands across a device slice. `single` = the
 /// n==1 degenerate case (everything on device 0). Moved verbatim from
 /// `hipfire-arch-qwen35::qwen35::Layout` — arch-agnostic (depends only on `Gpus`).
@@ -198,6 +248,8 @@ pub struct LoadedWeights<L> {
     /// True iff the tied lm_head aliases the embedding buffer on this
     /// single-device route; false means a separate output allocation exists.
     pub lm_head_aliases_embd: bool,
+    /// What this load actually allocated, by destination. See [`LoadStats`].
+    pub stats: LoadStats,
 }
 
 /// Whole-model weight source — the one place HFQ vs PaRo differs. Config is held
@@ -232,6 +284,11 @@ pub trait WeightSource {
     /// half-applying it (host-locating the layers it can see while a
     /// source-internal allocation stays in VRAM).
     fn spill_refusal(&self) -> Option<String>;
+    /// `(device bytes, pinned-host bytes)` owned by one loaded layer, for the
+    /// loader's own accounting ([`LoadStats`]). Split on the tensor's own
+    /// allocation tag, so a spilled layer reports its bytes as host-pinned and a
+    /// resident one as device.
+    fn layer_bytes(&self, layer: &Self::Layer) -> (u64, u64);
     /// Release one successfully loaded layer during whole-model rollback.
     ///
     /// Layer ownership is architecture-specific (Qwen3.5 carries MoE
@@ -480,6 +537,66 @@ impl<S: WeightSource> StagedLoadOps for GpuStagedLoadOps<'_, S> {
     }
 }
 
+/// Whether a CPU-executed spill conflicts with a retained-replay backend. Pure, so
+/// the conjunction is testable without a GPU or a process snapshot.
+pub fn cpu_exec_offends_replay(spill_requested: bool, cpu_exec: bool, replay_enabled: bool) -> bool {
+    spill_requested && cpu_exec && replay_enabled
+}
+
+/// Whether a load must be refused, and why, before a byte is allocated.
+///
+/// Two fail-closed rules, both about a spill that cannot be honoured:
+///
+/// * a source that cannot spill at all (`WeightSource::spill_refusal`), and
+/// * a unified-memory device, where host-mapped and device memory come from one
+///   pool so spilling frees no VRAM.
+///
+/// Plus the one combination that is not a placement problem but a route problem:
+/// `memory.offload_exec=cpu` with a retained-replay backend. Redline's tape
+/// records GPU launches and replays them, so a CPU-executed step would run while
+/// the tape is built and then be *absent* from every replay — the replayed route
+/// would compute from activations that step should have refreshed, and nothing in
+/// the tape can express that. Refusing the load beats running a stale route.
+///
+/// Returns `Ok(())` when the load may proceed.
+pub fn offload_load_refusal(
+    spills_anything: bool,
+    source_refusal: Option<String>,
+    uma_device: Option<usize>,
+    cpu_exec: bool,
+    replay_enabled: bool,
+) -> HipResult<()> {
+    if !spills_anything {
+        return Ok(());
+    }
+    if let Some(reason) = source_refusal {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!("memory.gpu_layer_budget is set but {reason}"),
+        ));
+    }
+    if let Some(device) = uma_device {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "memory.gpu_layer_budget is set on a unified-memory device (device {device}): \
+                 host-mapped and device memory come from the same pool, so spilling frees no \
+                 VRAM. Unset the key"
+            ),
+        ));
+    }
+    if cpu_exec_offends_replay(true, cpu_exec, replay_enabled) {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "memory.offload_exec=cpu conflicts with the retained-replay (Redline) backend: the \
+             replay tape records GPU launches and does not execute the CPU-executed steps, so a \
+             replayed route would compute from stale activations. Set memory.offload_exec=pcie \
+             (HIPFIRE_OFFLOAD_EXEC=pcie) or replay.backend=hip",
+        ));
+    }
+    Ok(())
+}
+
 /// Drive a `WeightSource` across a device slice. Single shared copy of the
 /// embed → norm → output → per-device layer loop.
 ///
@@ -538,25 +655,21 @@ fn load_weights_inner<S: WeightSource>(
     // honour is a refused load, never a half-applied placement — and the check
     // runs before `prepare`/`read_embed` so the user sees the budget message
     // rather than whatever the source would have objected to first.
-    if layout.spills_anything() {
-        if let Some(reason) = source.spill_refusal() {
-            return Err(hip_bridge::HipError::new(
-                0,
-                &format!("memory.gpu_layer_budget is set but {reason}"),
-            ));
-        }
-        // Unified memory has one pool: host-mapped and device allocations come
-        // from the same physical RAM, so spilling frees no VRAM at all.
-        if let Some(device) = devices.iter().position(|device| device.is_uma()) {
-            return Err(hip_bridge::HipError::new(
-                0,
-                &format!(
-                    "memory.gpu_layer_budget is set on a unified-memory device (device {device}): \
-                     host-mapped and device memory come from the same pool, so spilling frees no \
-                     VRAM. Unset the key"
-                ),
-            ));
-        }
+    offload_load_refusal(
+        layout.spills_anything(),
+        source.spill_refusal(),
+        devices.iter().position(|device| device.is_uma()),
+        hipfire_config::memory::offload_exec() == hipfire_config::memory::OffloadExec::Cpu,
+        devices.iter().any(|device| device.replay.is_enabled()),
+    )?;
+    // Record the execution target for the whole device: the capture gate and the
+    // dispatch CPU seam both read this instead of re-deriving it per step, so a
+    // model whose steps include a CPU-executed weight cannot be captured or
+    // replayed by accident. `false` on every load that spills nothing.
+    let cpu_exec_weights = layout.spills_anything()
+        && hipfire_config::memory::offload_exec() == hipfire_config::memory::OffloadExec::Cpu;
+    for device in devices.iter_mut() {
+        device.set_cpu_exec_weights(cpu_exec_weights);
     }
     let mut ops = GpuStagedLoadOps {
         source,
@@ -567,6 +680,19 @@ fn load_weights_inner<S: WeightSource>(
         None => run_staged_load(&mut ops, n_devices, n_devices == 1)?,
         Some(fault) => run_staged_load_with_fault(&mut ops, n_devices, n_devices == 1, Some(fault))?,
     };
+    // Measured, not estimated: the bytes the source actually produced, split by
+    // where each tensor landed. A tied output head accounts only its metadata,
+    // because its buffer is the embedding's (the same split `free_output` uses).
+    let mut stats = LoadStats::default();
+    stats.add(split_tensor_bytes([&staged.token_embd, &staged.output_norm]));
+    stats.add(if staged.lm_head_aliases_embd {
+        staged.output.owned_metadata_bytes()
+    } else {
+        staged.output.owned_bytes()
+    });
+    for layer in &staged.layers {
+        stats.add(source.layer_bytes(layer));
+    }
     Ok(LoadedWeights {
         token_embd: staged.token_embd,
         embd_format: staged.embd_format,
@@ -574,6 +700,7 @@ fn load_weights_inner<S: WeightSource>(
         output: staged.output,
         layers: staged.layers,
         lm_head_aliases_embd: staged.lm_head_aliases_embd,
+        stats,
     })
 }
 
@@ -687,6 +814,46 @@ mod tests {
         layout.layer_residency.clear();
         let err = layout.validate(1, 2).unwrap_err();
         assert!(err.contains("placements"), "{err}");
+    }
+
+    /// The refusal conjunction is exact: each term alone must not refuse a load,
+    /// or a plain `memory.offload_exec=pcie` run (whose `spills_anything` is true)
+    /// would stop loading.
+    #[test]
+    fn offload_refusal_is_exactly_the_conjunction() {
+        // No spill: nothing can be refused, whatever else is set.
+        assert!(offload_load_refusal(false, None, None, true, true).is_ok());
+        assert!(
+            offload_load_refusal(false, Some("a source that cannot spill".into()), None, true, true)
+                .is_ok(),
+            "a refusal reason with no spill requested is not a refusal"
+        );
+
+        // A spill with a source that cannot honour it.
+        let err = offload_load_refusal(true, Some("this source is PaRoQuant".into()), None, false, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("this source is PaRoQuant"), "{err}");
+
+        // A spill on unified memory.
+        let err = offload_load_refusal(true, None, Some(0), false, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unified-memory device"), "{err}");
+
+        // A spill executed on the CPU with a retained-replay backend.
+        assert!(cpu_exec_offends_replay(true, true, true));
+        assert!(!cpu_exec_offends_replay(false, true, true), "nothing spilled");
+        assert!(!cpu_exec_offends_replay(true, false, true), "pcie is fine");
+        assert!(!cpu_exec_offends_replay(true, true, false), "no replay");
+        let err = offload_load_refusal(true, None, None, true, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("retained-replay"), "{err}");
+
+        // The clean cases: a spill on a dense source, CPU-executed, with no replay.
+        assert!(offload_load_refusal(true, None, None, true, false).is_ok());
+        assert!(offload_load_refusal(true, None, None, false, true).is_ok());
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -2514,11 +2514,9 @@ pub fn forward_batch_slots_graphed(
     }
     // The captured step includes the per-slot lm_head `Step::Gemv`, so a spilled
     // model routes it to the CPU (a host sync point) and the graph must not be
-    // used — same rule as the dense AR graph in `qwen35/forward.rs`.
-    if hipfire_dispatch::cpu_offload_active(hipfire_runtime::model_load::Layout::spill_count(
-        config.n_layers,
-        hipfire_config::memory::gpu_layer_budget(),
-    )) {
+    // used — same rule as the dense AR graph in `qwen35/forward.rs`, and the same
+    // loader-recorded flag; `GraphState` refuses the capture independently.
+    if gpu.graphs.cpu_exec_weights {
         hipfire_dispatch::log_capture_disabled_once();
         return forward_batch_slots(
             gpu,

@@ -221,6 +221,9 @@ fn main() {
     let footprint = ModelFootprint {
         weights_bytes: weight_bytes,
         kv_bytes_per_token,
+        // This demo loads fully resident (no `memory.gpu_layer_budget`), so there
+        // are no pinned host weight bytes to charge.
+        host_bytes: 0,
     };
     println!(
         "\nAdmissionController footprint (measured, this model): weights={:.2} GiB, \

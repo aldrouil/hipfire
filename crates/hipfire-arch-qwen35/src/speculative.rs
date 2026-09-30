@@ -95,6 +95,7 @@ fn run_spec_gemm_key(
         row_stride: k,
         rotation: None,
         awq_scale: None,
+    exec: rdna_compute::ExecTarget::Gpu,
     };
     let params = GemmParams {
         w: &w,

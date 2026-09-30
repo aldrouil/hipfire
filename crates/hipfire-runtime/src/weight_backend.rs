@@ -12,7 +12,7 @@ use crate::llama::{f16_to_f32, EmbeddingFormat, KvCache, WeightTensor};
 use crate::model_load::Residency;
 use hip_bridge::HipResult;
 use rdna_compute::{
-    DType, Gpu, GpuTensor, HipError, MQ2G256V2_GROUP_BYTES, MQ3G256V2_GROUP_BYTES,
+    DType, ExecTarget, Gpu, GpuTensor, HipError, MQ2G256V2_GROUP_BYTES, MQ3G256V2_GROUP_BYTES,
     MQ4C_GROUP_BYTES, MQ5G256V2_GROUP_BYTES, MQ6G256V2_GROUP_BYTES,
 };
 
@@ -222,6 +222,7 @@ pub fn reupload_f16_as_f32(
         row_stride: 0,
         paro: None,
         awq_scale: None,
+    exec: rdna_compute::ExecTarget::Gpu,
     })
 }
 
@@ -245,6 +246,7 @@ pub fn tied_lm_head_alias(
         row_stride: 0,
         paro: None,
         awq_scale: None,
+    exec: rdna_compute::ExecTarget::Gpu,
     }
 }
 
@@ -533,6 +535,22 @@ pub(crate) fn expected_payload_bytes(dtype: DType, m: usize, k: usize) -> Option
     Some(m * (k / 256) * group_bytes)
 }
 
+/// Which engine reads a weight at `residency`.
+///
+/// The one place that decision is made. A device weight is always read by the
+/// GPU; a host-mapped weight is read by the CPU only when `memory.offload_exec=cpu`
+/// asks for it, so the `pcie` default keeps the GPU kernels dereferencing it over
+/// the link — byte-identical, slower.
+pub(crate) fn exec_for(residency: Residency) -> ExecTarget {
+    if residency == Residency::HostMapped
+        && hipfire_config::memory::offload_exec() == hipfire_config::memory::OffloadExec::Cpu
+    {
+        ExecTarget::Cpu
+    } else {
+        ExecTarget::Gpu
+    }
+}
+
 /// Decode a passthrough quant format: enforce the K%256 guard (via DType),
 /// upload bytes verbatim to `residency`, build the `WeightTensor` with the dtype
 /// + its DType-derived row_stride. `name` is the caller context for the guard
@@ -590,6 +608,7 @@ pub(crate) fn decode_raw_codec(
         row_stride: codec.dtype.row_stride(k),
         paro: None,
         awq_scale: None,
+    exec: exec_for(residency),
     })
 }
 
@@ -711,6 +730,7 @@ pub fn dequant_weight_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+            exec: exec_for(residency),
             })
         }
         2 => {
@@ -724,6 +744,7 @@ pub fn dequant_weight_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+            exec: exec_for(residency),
             })
         }
         16 => {
@@ -741,6 +762,7 @@ pub fn dequant_weight_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+            exec: exec_for(residency),
             })
         }
         other => match raw_codec(other) {

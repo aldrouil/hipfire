@@ -86,11 +86,9 @@ impl Architecture for Qwen35 {
         let spilled =
             Layout::spill_count(cfg.n_layers, hipfire_config::memory::gpu_layer_budget());
         crate::qwen35::load::report_cpu_exec_coverage(hfq, spilled);
-        // A retained-replay backend and CPU-executed steps are mutually
-        // exclusive: the tape cannot express a step the CPU owns. Refuse the
-        // load rather than replay a route with stale activations.
-        hipfire_dispatch::reject_cpu_exec_under_redline(spilled, gpu.replay.is_enabled())
-            .map_err(|e| format!("qwen35: {e}"))?;
+        // The retained-replay refusal and the CPU-exec capture flag live in the
+        // shared loader (`model_load::load_weights`), which owns the placement and
+        // the `Gpu` for every arch — so there is one check, not one per arch.
         let mut source = HfqSource::new(hfq, cfg);
         let mut layout = Layout::single(cfg.n_layers);
         qwen35_load_weights(&mut source, std::slice::from_mut(gpu), &mut layout)

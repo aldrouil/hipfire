@@ -379,6 +379,7 @@ fn wt_from_raw(
         row_stride: 0,
         paro: None,
         awq_scale: None,
+    exec: rdna_compute::ExecTarget::Gpu,
     })
 }
 
@@ -1187,6 +1188,7 @@ fn load_wt_from_source(
         row_stride: 0,
         paro: None,
         awq_scale: None,
+    exec: rdna_compute::ExecTarget::Gpu,
     })
 }
 
@@ -1342,6 +1344,7 @@ pub fn load_weights_from_safetensors(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+            exec: rdna_compute::ExecTarget::Gpu,
             }
         };
         let mut down = {
@@ -1356,6 +1359,7 @@ pub fn load_weights_from_safetensors(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+            exec: rdna_compute::ExecTarget::Gpu,
             }
         };
         drop(gu_combined);
