@@ -641,6 +641,16 @@ name the fixture that evidences them; unticked items have no run of record.
       branch of the same path is what the 27B fixture runs, but no 27B byte-diff was read.
 - [x] Validated with `serve_harness.py battery` + chain, decoded and eyeballed; md5s recorded —
       `cpu` arm with a spill, 5/5 turns each, `runaway=0 empty=0 attractor=0 retrieval_miss=0`.
+      **Re-run post-rework (2026-09-30)** against the same claim, since the capture gate, the
+      recorded exec target and the loader-side refusals all changed after the original run:
+      `battery` avg_decode 24.4 tok/s and `chain` 26.7 tok/s, both 5/5 turns with the same zero
+      counters, decoded text eyeballed; `redline_daemon_harness.py` on the pcie-spill arm
+      (`HIPFIRE_GPU_LAYER_BUDGET=24 HIPFIRE_OFFLOAD_EXEC=pcie`) `pass=True` with capture stable at
+      128/512/decode, 19 AQL contracts and shadow parity `exact=True`. Fixture identity for those
+      numbers: model `qwen3.5-9b.mq4` md5 `296092bf1e6a45d78c1acf815eb93366` (this host's artifact —
+      **not** the pinned `31a8d8dc…`, so the figures are not comparable to the records above),
+      branch `hipfire` md5 `2b3af98c16bf79d1e4b1bc1e6aa37e31`, daemon md5
+      `3cd0af9390cfaebeb2de099abd60bcb2`.
 - [ ] MoE/EP tables untouched by v1 — the qwen3.8-27B dense trace matches resident bit-for-bit, proving
       no regression was introduced into the A3B path (§9 step 1 gate).
       **Half evidenced.** MoE is structurally out of reach (the MoE loader never sees the offload flag)
