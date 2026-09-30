@@ -3,13 +3,13 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 //! Quant decode for the CPU-executed offload path.
 //!
-//! Every arm is a transcription of
-//! `hipfire_runtime::weight_backend::dequantize_to_f32` (the single canonical
-//! CPU decoder — see its doc comment: "there is exactly one copy") and, for
-//! qt 3, of `hipfire_runtime::llama::dequantize_q8_0`. The transcription exists
-//! rather than a call because this crate must not link the GPU stack (see the
-//! crate docs). `crates/hipfire-runtime/tests/cpu_quant_cross_check.rs` is what
-//! keeps the two copies honest.
+//! Each arm is a decode of one on-disk format, and this crate is the single
+//! canonical CPU decoder: `hipfire_runtime::weight_backend::dequantize_to_f32`
+//! calls [`dequant_group`] for every format this file covers, so there is no
+//! second transcription to keep honest. The decoders live here rather than in
+//! `hipfire-runtime` because this crate must not link the GPU stack (see the
+//! crate docs); the qt 3 arm additionally mirrors
+//! `hipfire_runtime::llama::dequantize_q8_0`.
 //!
 //! Two decodes are exposed, and the difference between them is *the* thing to
 //! get right in this file:
@@ -751,8 +751,7 @@ mod test {
     }
 
     /// The f16 bit patterns every implementation in this workspace must agree on,
-    /// computed by hand as shortest-round-trip literals in
-    /// `crates/hipfire-runtime/tests/cpu_quant_cross_check.rs`'s generator.
+    /// chosen as values that are exact in f16, bf16 and f32.
     const EXPECTED_F16_BITS: [u16; 10] = [
         0x0000, 0x3c00, 0xbc00, 0x4000, 0xc000, 0x4200, 0xc200, 0x4500, 0x2c00, 0x3a00,
     ];

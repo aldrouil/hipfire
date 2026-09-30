@@ -21,11 +21,10 @@
 //!
 //! This crate is deliberately a leaf: it depends on `rayon` and nothing else,
 //! so its tests run in the GPU-free CI gate (`scripts/no-gpu-ci.sh`) with no GPU
-//! stack linked. That is also why [`quant`] *transcribes* the canonical decoder
-//! in `hipfire-runtime` instead of calling it —
-//! `crates/hipfire-runtime/tests/cpu_quant_cross_check.rs` holds the two copies
-//! together by asserting bit-for-bit equality over the real tensors of the
-//! on-disk fixtures.
+//! stack linked. That is also why [`quant`] owns the per-format decoders rather
+//! than calling a runtime copy — and since this rework the direction is the other
+//! way round: `weight_backend::dequantize_to_f32` delegates here, so there is one
+//! implementation rather than two transcriptions held together by a test.
 
 pub mod epilogue;
 pub mod gemv;
