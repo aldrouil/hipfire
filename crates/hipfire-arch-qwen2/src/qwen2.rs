@@ -32,13 +32,13 @@ use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
 use hipfire_dispatch::types::dtype_rotation_plan;
 use hipfire_runtime::arch_spec::{dense_forward, DenseArch, DenseKnobs, DenseLayer, DenseScratch};
-use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::hfq::{load_weight_tensor, HfqFile};
 use hipfire_runtime::llama::{f16_to_f32, f32_to_f16};
 use hipfire_runtime::llama::{gemv_family, weight_gemm, EmbeddingFormat, WeightTensor};
+use hipfire_runtime::model_load::Residency;
 use hipfire_runtime::model_source::ModelSource;
 use hipfire_runtime::weight_backend::{
-    dequant_norm, dequant_weight_raw, flat_name_candidates, load_embedding, resolve_lm_head,
-    HfqBackend, WeightBackend,
+    dequant_norm, flat_name_candidates, load_embedding, resolve_lm_head, HfqBackend, WeightBackend,
 };
 use hipfire_runtime::{screen_weight_tensor, MmqScreenable};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -413,6 +413,7 @@ fn load_lm_head(
                 cfg.vocab_size,
                 cfg.hidden_size,
                 flat_name_candidates,
+                Residency::Device,
             )
         },
         // qwen2 is single-GPU; the reupload arm is never taken.
@@ -436,9 +437,9 @@ fn load_layer(
         candidates: flat_name_candidates,
         read_proj: load_weight_tensor,
         layer: i,
-        // qwen2 is always fully resident — no offload support.
-        host_local: false,
-        read_proj_host: None,
+        // qwen2 does not implement the shared placement plumbing, so it is always
+        // fully resident — a spill would half-apply and the honest answer is none.
+        residency: Residency::Device,
     };
 
     Ok(Qwen2LayerWeights {
@@ -483,27 +484,12 @@ fn load_norm_weight_raw(
     Ok(t)
 }
 
-/// TODO(transformer-extraction): duplicates `load_weight_tensor` +
-/// `load_weight_tensor_raw` in `hipfire-arch-qwen35::qwen35`. The qwen35
-/// version handles ~14 quant_types; this rev-1 starter only covers the
-/// two we've actually shipped HFQ files for (HFQ4G256, F16). Extend as
-/// needed, or wait for the consolidation PR to pick up the qwen35
-/// implementation.
-fn load_weight_tensor(
-    hfq: &HfqFile,
-    gpu: &Gpu,
-    name: &str,
-    m: usize,
-    k: usize,
-    candidates: fn(&str) -> Vec<String>,
-) -> HipResult<WeightTensor> {
-    for cand in candidates(name) {
-        if let Some((info, data)) = hfq.tensor_data_vec(&cand) {
-            return dequant_weight_raw(gpu, info.quant_type, &data, m, k);
-        }
-    }
-    panic!("qwen2: tensor not found: {name}");
-}
+// qwen2's own copy of the projection reader used to live here. It was a strict
+// subset of `hipfire_runtime::hfq::load_weight_tensor` (pread-only,
+// `dequant_weight_raw`-only, panicking on a missing tensor), so it was deleted in
+// favour of the shared reader — which also gives qwen2 the mmap-first path and
+// real errors on a missing tensor. qwen2 keeps its bespoke weight *loop*
+// (`Qwen2Weights::load`); only the per-tensor read was consolidated.
 
 // ─── Source-based loaders (from &dyn ModelSource) ──────────────────────
 

@@ -23,23 +23,6 @@ pub enum LayerType {
     FullAttention,   // Standard MHA with gated output
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum F16LmHeadMode {
-    Native,
-    F32,
-}
-
-fn parse_f16_lm_head_mode(value: Option<&str>) -> F16LmHeadMode {
-    match value.map(|v| v.trim().to_ascii_lowercase()) {
-        Some(v) if matches!(v.as_str(), "0" | "f32" | "fp32" | "legacy") => F16LmHeadMode::F32,
-        _ => F16LmHeadMode::Native,
-    }
-}
-
-pub(crate) fn f16_lm_head_mode_from_config() -> F16LmHeadMode {
-    parse_f16_lm_head_mode(Some(hipfire_runtime::config::get().lm_head_f16.as_str()))
-}
-
 /// Optional tree-attention context for `forward_prefill_batch` — activates
 /// DDTree batched verify when `Some`.
 ///
@@ -988,7 +971,7 @@ fn offload_split(n_layers: usize, budget: GpuLayerBudget) -> usize {
 /// config construction — rather than per request. The split keeps a contiguous
 /// resident TAIL `[i_gpu_start .. n_layers)` and spills the prefix `[0 ..
 /// i_gpu_start)` to host-mapped system RAM; `load_layer_into` turns that into a
-/// per-layer `host_local` flag.
+/// per-layer `Residency`.
 ///
 /// `Full` (the default, and the zero-diff regression guard) leaves
 /// `i_gpu_start = 0`, so every layer stays device-resident and the load is
@@ -1365,34 +1348,6 @@ mod tests {
         // descended into text_config for the shape.
         assert_eq!(cfg.dim, 2048);
         assert_eq!(cfg.vocab_size, 151936);
-    }
-
-    #[test]
-    fn f16_lm_head_mode_defaults_to_native() {
-        assert_eq!(parse_f16_lm_head_mode(None), F16LmHeadMode::Native);
-        assert_eq!(parse_f16_lm_head_mode(Some("auto")), F16LmHeadMode::Native);
-        assert_eq!(parse_f16_lm_head_mode(Some("1")), F16LmHeadMode::Native);
-        assert_eq!(
-            parse_f16_lm_head_mode(Some("native")),
-            F16LmHeadMode::Native
-        );
-        assert_eq!(parse_f16_lm_head_mode(Some("f16")), F16LmHeadMode::Native);
-    }
-
-    #[test]
-    fn f16_lm_head_mode_allows_legacy_f32() {
-        assert_eq!(parse_f16_lm_head_mode(Some("0")), F16LmHeadMode::F32);
-        assert_eq!(parse_f16_lm_head_mode(Some("f32")), F16LmHeadMode::F32);
-        assert_eq!(parse_f16_lm_head_mode(Some("fp32")), F16LmHeadMode::F32);
-        assert_eq!(parse_f16_lm_head_mode(Some("legacy")), F16LmHeadMode::F32);
-    }
-
-    #[test]
-    fn f16_lm_head_mode_unknown_falls_back_to_native() {
-        assert_eq!(
-            parse_f16_lm_head_mode(Some("surprise")),
-            F16LmHeadMode::Native
-        );
     }
 
     #[test]

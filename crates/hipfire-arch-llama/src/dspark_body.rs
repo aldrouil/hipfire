@@ -62,6 +62,7 @@ use hipfire_runtime::llama::{
     weight_gemv, ForwardScratch, KvCache, LayerWeights, LlamaConfig, LlamaWeights, ModelArch,
     PrefillBatchScratch, WeightTensor,
 };
+use hipfire_runtime::model_load::Residency;
 use hipfire_runtime::weight_backend::{
     dequant_f32, dequant_norm, dequant_weight_raw, load_awq_scale_for, load_embedding, read_first,
     HfqBackend,
@@ -311,9 +312,9 @@ fn load_drafter_layer(
         candidates: bare_name_candidates,
         read_proj: load_weight_tensor_pread,
         layer: i,
-        // DSpark drafter sidecar is always fully resident — no offload support.
-        host_local: false,
-        read_proj_host: None,
+        // The DSpark drafter sidecar is always fully resident: residency is the
+        // caller's placement decision and this loader has none of its own.
+        residency: Residency::Device,
     };
     load_layer(&mut b, cfg, q_out_dim, kv_dim, i)
         .map_err(|e| format!("qwen3_dspark layer {i}: {e:?}"))
@@ -350,7 +351,7 @@ fn load_global_proj(
 ) -> Result<WeightTensor, String> {
     let (info, data) = read_first(source, name, bare_name_candidates)
         .ok_or_else(|| format!("qwen3_dspark: {name} missing"))?;
-    let mut wt = dequant_weight_raw(gpu, info.quant_type, &data, m, k)
+    let mut wt = dequant_weight_raw(gpu, info.quant_type, &data, m, k, Residency::Device)
         .map_err(|e| format!("qwen3_dspark: {name}: {e:?}"))?;
     if wt.gpu_dtype.supports_awq_sidecar() {
         wt.awq_scale = load_awq_scale_for(source, gpu, name, k);

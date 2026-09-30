@@ -5686,6 +5686,74 @@ mod tests {
     }
 }
 
+/// Kernel-scope typed keys the weight loader must read (`kernel.*`).
+pub mod kernel {
+    use super::process_value;
+
+    /// Pure truth table behind [`lm_head_f16_native`], split out so unit tests can
+    /// pin the contract without touching the process-global snapshot.
+    pub fn parse_lm_head_f16_native(raw: Option<&str>) -> bool {
+        match raw.map(|value| value.trim().to_ascii_lowercase()).as_deref() {
+            Some("0") | Some("f32") | Some("fp32") | Some("legacy") => false,
+            _ => true,
+        }
+    }
+
+    /// Whether a native F16 (qt 1) LM head stays F16 instead of being expanded to
+    /// F32 (`kernel.lm_head_f16`, compat env `HIPFIRE_LM_HEAD_F16`).
+    ///
+    /// Mirrors that key's allow-list exactly: `0`/`f32`/`fp32`/`legacy` expand to
+    /// F32; `auto`/`native`/`f16`/`1` — and absent or unrecognised, which fall back
+    /// to `auto` — keep the native F16 storage. The values are identical either
+    /// way (F16 → F32 widening is exact); only which GEMV runs differs, so this is
+    /// a storage/bandwidth policy and never a numerics change.
+    ///
+    /// Lives here rather than in an arch crate because the single shared weight
+    /// reader needs it: the expansion is a per-tensor decision taken while the
+    /// bytes are read, not an arch-level one.
+    pub fn lm_head_f16_native() -> bool {
+        parse_lm_head_f16_native(process_value("HIPFIRE_LM_HEAD_F16").as_deref())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn native_is_the_default_and_the_failure_mode() {
+            // Absent, empty and unrecognised all keep the native F16 storage: a
+            // typo must not silently double the LM head's footprint.
+            for raw in [
+                None,
+                Some(""),
+                Some("auto"),
+                Some("native"),
+                Some("f16"),
+                Some("1"),
+                Some("surprise"),
+            ] {
+                assert!(
+                    parse_lm_head_f16_native(raw),
+                    "{raw:?} must keep the native F16 storage"
+                );
+            }
+        }
+
+        #[test]
+        fn the_four_legacy_spellings_expand_to_f32() {
+            for raw in ["0", "f32", "fp32", "legacy"] {
+                assert!(
+                    !parse_lm_head_f16_native(Some(raw)),
+                    "{raw} must select the legacy F32 expansion"
+                );
+            }
+            // Trimmed and case-insensitive, like every other key in this module.
+            assert!(!parse_lm_head_f16_native(Some(" F32 ")));
+            assert!(!parse_lm_head_f16_native(Some("LEGACY")));
+        }
+    }
+}
+
 /// Placement policy for partial GPU offload — decides which layers stay in
 /// device VRAM versus spill to host RAM, resolved once at load so placement is
 /// fixed for the model's lifetime and never thrashes per request. This module is

@@ -11,6 +11,19 @@ use crate::multi_gpu::Gpus;
 use hip_bridge::HipResult;
 use rdna_compute::{Gpu, GpuTensor};
 
+/// Where one layer's weights physically live. Resolved once per load and fixed
+/// for the model's lifetime.
+///
+/// `Device` is VRAM. `HostMapped` is `hipHostMalloc(hipHostMallocMapped)` system
+/// RAM that the kernels dereference through a device-visible alias — the same
+/// bytes, read over PCIe. Every upload seam takes this so a spilled layer can
+/// never silently land in the VRAM the spill exists to free.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Residency {
+    Device,
+    HostMapped,
+}
+
 /// Where each piece of the model lands across a device slice. `single` = the
 /// n==1 degenerate case (everything on device 0). Moved verbatim from
 /// `hipfire-arch-qwen35::qwen35::Layout` — arch-agnostic (depends only on `Gpus`).

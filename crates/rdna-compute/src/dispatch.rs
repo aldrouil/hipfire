@@ -562,12 +562,19 @@ impl DType {
         }
     }
 
-    /// Whether this format's GEMV kernel requires K%256==0 (HFP4 family: the
+    /// Whether this format's GEMV kernel requires K%256==0 (HFP4/MFP4 family: the
+    /// per-row header plus 17-byte g32 blocks; V2 Magnum and the GL codebook
+    /// formats: `gpr = K/256` indexes the scale/column region).
     pub fn requires_k_mod_256(self) -> bool {
         matches!(
             self,
             DType::HFP4G32
                 | DType::MFP4G32
+                | DType::MFP4G32Lloyd
+                | DType::MFP4G32P
+                | DType::MFP4G32E8
+                | DType::MFP3G32E8
+                | DType::MFP2G32E8
                 | DType::MQ2G256GL
                 | DType::MQ3G256GL
                 | DType::MQ4G256V2

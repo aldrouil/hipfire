@@ -11,19 +11,19 @@
 //! rather than by inspection: it loads the same tensor through both readers and
 //! compares the code blobs bit-for-bit.
 //!
-//! It exists because the two readers share one quant-type match behind an
-//! injected uploader, and a partial swap would be invisible until it OOMs or
-//! silently spills to VRAM. One comparison covers every arm.
+//! It exists because device and host placement now go through one reader whose
+//! only difference is the `Residency` argument, and a partial swap of that
+//! argument would be invisible until it OOMs or silently spills to VRAM. One
+//! comparison covers every arm.
 //!
 //! Usage:
-//!     cargo run --release -p hipfire-arch-qwen35 --example host_offload_smoke -- MODEL.hfq
+//!     cargo run --release -p hipfire-arch-qwen35 --features lab --example host_offload_smoke -- MODEL.hfq
 //!
 //! With no argument it defaults to `~/.hipfire/models/qwen3.5-9b.mq4`.
 
-use hipfire_arch_qwen35::qwen35::load::{
-    load_weight_tensor, load_weight_tensor_host, qwen35_tensor_name_candidates,
-};
+use hipfire_arch_qwen35::qwen35::load::{load_weight_tensor, qwen35_tensor_name_candidates};
 use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::model_load::Residency;
 use rdna_compute::Gpu;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -84,14 +84,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         hfq.find_tensor_info(name).map(|i| &i.shape)
     );
 
-    let device = load_weight_tensor(&hfq, &gpu, name, m, k, qwen35_tensor_name_candidates)?;
-    let host = load_weight_tensor_host(
-        &mut hfq,
+    let device = load_weight_tensor(
+        &hfq,
         &mut gpu,
         name,
         m,
         k,
         qwen35_tensor_name_candidates,
+        Residency::Device,
+    )?;
+    let host = load_weight_tensor(
+        &hfq,
+        &mut gpu,
+        name,
+        m,
+        k,
+        qwen35_tensor_name_candidates,
+        Residency::HostMapped,
     )?;
 
     assert_eq!(device.gpu_dtype, host.gpu_dtype, "dtype diverged");
