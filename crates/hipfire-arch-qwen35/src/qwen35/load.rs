@@ -1617,14 +1617,14 @@ pub use hipfire_runtime::model_load::Layout;
 /// [`super::config::apply_offload_policy`]: nothing is printed unless
 /// `memory.offload_exec` was actually configured to `cpu`, so a stock-vs-branch
 /// log diff stays readable.
-pub fn report_cpu_exec_coverage(hfq: &HfqFile, config: &Qwen35Config) {
+pub fn report_cpu_exec_coverage(hfq: &HfqFile, spilled_layers: usize) {
     use hipfire_config::memory::{offload_exec, OffloadExec};
     use std::collections::BTreeSet;
 
     if offload_exec() != OffloadExec::Cpu {
         return;
     }
-    let spilled = config.i_gpu_start;
+    let spilled = spilled_layers;
     if spilled == 0 {
         eprintln!(
             "cpu exec: memory.offload_exec=cpu but nothing is spilled \
@@ -1680,7 +1680,7 @@ pub fn report_cpu_exec_coverage(hfq: &HfqFile, config: &Qwen35Config) {
 pub fn load_weights(
     source: &mut (impl WeightSource<Layer = LayerWeights>),
     devices: &mut [Gpu],
-    layout: &Layout,
+    layout: &mut Layout,
 ) -> HipResult<Qwen35Weights> {
     load_weights_inner(source, devices, layout, None)
 }
@@ -1697,7 +1697,7 @@ pub fn load_weights(
 pub fn load_weights_with_fault(
     source: &mut (impl WeightSource<Layer = LayerWeights>),
     devices: &mut [Gpu],
-    layout: &Layout,
+    layout: &mut Layout,
     fault: StagedLoadFault,
 ) -> HipResult<Qwen35Weights> {
     load_weights_inner(source, devices, layout, Some(fault))
@@ -1706,7 +1706,7 @@ pub fn load_weights_with_fault(
 fn load_weights_inner(
     source: &mut (impl WeightSource<Layer = LayerWeights>),
     devices: &mut [Gpu],
-    layout: &Layout,
+    layout: &mut Layout,
     fault: Option<StagedLoadFault>,
 ) -> HipResult<Qwen35Weights> {
     use std::sync::atomic::Ordering;
@@ -1854,7 +1854,12 @@ impl WeightSource for HfqSource<'_> {
         Ok((output, aliases))
     }
 
-    fn read_layer(&mut self, gpu: &mut Gpu, layer_idx: usize) -> HipResult<LayerWeights> {
+    fn read_layer(
+        &mut self,
+        gpu: &mut Gpu,
+        layer_idx: usize,
+        residency: Residency,
+    ) -> HipResult<LayerWeights> {
         let c = self.c;
         let is_moe = c.num_experts > 0;
         eprintln!(
@@ -1865,11 +1870,33 @@ impl WeightSource for HfqSource<'_> {
         );
         let p = format!("layers.{layer_idx}");
         let page = self.hfq.layer_data_range(&p);
-        let lw = load_layer_into(self.hfq, c, layer_idx, &p, gpu)?;
+        let lw = load_layer_into(self.hfq, c, layer_idx, &p, gpu, residency)?;
         if let Some((start, end)) = page {
             self.hfq.drop_pages_range(start, end - start);
         }
         Ok(lw)
+    }
+    /// MoE is refused: `load_moe_ffn` places routed experts in VRAM
+    /// unconditionally and never sees the placement, so a budget would
+    /// host-locate this layer's dense half while the experts stayed resident —
+    /// half-applied, and still counted as spilled.
+    ///
+    /// Vision tensors are not a second refusal: this source is the text tower
+    /// (`qwen3.5-vl` routes its own text weights through here with the vision
+    /// sidecar loaded separately, off the HFQ layer path), so there is no
+    /// VL branch in this source to leave half-applied. If a VL source ever gains
+    /// one, it owes its own `Some` here rather than a silent partial spill.
+    fn spill_refusal(&self) -> Option<String> {
+        if self.c.num_experts > 0 {
+            Some(
+                "this model is MoE: routed experts are placed in VRAM by `load_moe_ffn`, which \
+                 never sees the placement, so a spill would be half-applied (the layer's dense \
+                 half on the host, its experts in VRAM)"
+                    .to_string(),
+            )
+        } else {
+            None
+        }
     }
     fn free_layer(&mut self, gpu: &mut Gpu, layer: Self::Layer) {
         layer.free_gpu(gpu);
@@ -1969,7 +1996,17 @@ impl WeightSource for ParoSource<'_> {
         )
     }
 
-    fn read_layer(&mut self, gpu: &mut Gpu, layer_idx: usize) -> HipResult<LayerWeights> {
+    fn read_layer(
+        &mut self,
+        gpu: &mut Gpu,
+        layer_idx: usize,
+        _residency: Residency,
+    ) -> HipResult<LayerWeights> {
+        // `_residency` is always `Device` here: `spill_refusal` refuses a budgeted
+        // load, so this source never sees a spilled layer. Threading the argument
+        // rather than inventing a second placement mechanism is the point — if
+        // PaRoQuant ever gains a host-mapped upload path, only `ParoBackend` and
+        // this signature's use change.
         let c = self.c;
         eprintln!(
             "  loading layer {layer_idx}/{} ({:?}, ParoQuant)...",
@@ -1986,6 +2023,15 @@ impl WeightSource for ParoSource<'_> {
             )
         };
         crate::layer_driver::load_layer(&mut b, c, layer_idx, moe)
+    }
+    /// PaRoQuant augmentor sidecars have no host-mapped upload path: their
+    /// tensors come from `ParoBackend`, which allocates on the device.
+    fn spill_refusal(&self) -> Option<String> {
+        Some(
+            "this source is PaRoQuant (augmentor sidecars have no host-mapped upload path); \
+             unset it or use an .hfq source"
+                .to_string(),
+        )
     }
     fn free_layer(&mut self, gpu: &mut Gpu, layer: Self::Layer) {
         layer.free_gpu(gpu);
@@ -2042,16 +2088,9 @@ fn load_layer_into(
     layer_idx: usize,
     p: &str,
     gpu: &mut Gpu,
+    residency: Residency,
 ) -> HipResult<LayerWeights> {
     debug_assert_eq!(p, &format!("layers.{layer_idx}"));
-    // Partial GPU offload: layers before the resident-tail split point load their
-    // weights into host-mapped system RAM. `i_gpu_start` defaults to 0, so an unset
-    // budget keeps every layer device-resident (the zero-diff regression guard).
-    let residency = if layer_idx < config.i_gpu_start {
-        Residency::HostMapped
-    } else {
-        Residency::Device
-    };
     let mut b = qwen35_hfq_backend(hfq, gpu, layer_idx, residency);
     let moe = |bk: &mut HfqBackend, cfg: &Qwen35Config, li: usize| {
         load_moe_ffn(bk.hfq, bk.gpu, &format!("layers.{li}"), cfg, li as u16)
@@ -5842,11 +5881,11 @@ mod sealed_ep_tests {
         let mut hfq = HfqFile::open(std::path::Path::new(&path)).expect("open fixture");
         let mut weights = {
             let mut src = HfqSource::new(&mut hfq, &config);
-            let layout = Layout::single(config.n_layers);
+            let mut layout = Layout::single(config.n_layers);
             load_weights(
                 &mut src,
                 std::slice::from_mut(&mut gpus.devices[0]),
-                &layout,
+                &mut layout,
             )
             .expect("ornith single load")
         };
@@ -6078,7 +6117,9 @@ mod sealed_ep_tests {
 /// route unchanged.
 #[cfg(test)]
 mod direct_load_fault_tests {
-    use super::{load_weights, load_weights_with_fault, HfqSource, Layout, StagedLoadFault};
+    use super::{
+        load_weights, load_weights_with_fault, HfqSource, Layout, Residency, StagedLoadFault,
+    };
     use crate::qwen35::{
         config_from_hfq, forward, DeltaNetState, LayerWeights, Qwen35Config,
         Qwen35HfqSourceIdentity,
@@ -6202,7 +6243,7 @@ mod direct_load_fault_tests {
         assert_eq!(Qwen35::name(), "qwen35");
         assert_eq!(Qwen35::arch_id(), 5);
         let free_before = qwen35_free_vram_bytes(&gpu);
-        let layout = Layout::single(cfg.n_layers);
+        let mut layout = Layout::single(cfg.n_layers);
 
         // Fail AFTER the named publication through the production `HfqSource`
         // route — the same construction `Qwen35::load_weights` uses.
@@ -6211,7 +6252,7 @@ mod direct_load_fault_tests {
             match load_weights_with_fault(
                 &mut source,
                 std::slice::from_mut(&mut gpu),
-                &layout,
+                &mut layout,
                 fault,
             ) {
                 Ok(_) => panic!("fault-injected Qwen35 load must fail for {fault:?}"),
@@ -6233,7 +6274,7 @@ mod direct_load_fault_tests {
         // retained carrier/store route still serves after the fault.
         let weights = {
             let mut source = HfqSource::new(&mut hfq, &cfg);
-            load_weights(&mut source, std::slice::from_mut(&mut gpu), &layout)
+            load_weights(&mut source, std::slice::from_mut(&mut gpu), &mut layout)
                 .expect("Qwen35 retry load")
         };
         assert_eq!(weights.layers.len(), cfg.n_layers, "retry dropped layers");
@@ -6383,15 +6424,23 @@ mod direct_load_fault_tests {
             ) -> HipResult<(WeightTensor, bool)> {
                 unreachable!("source must not run without devices")
             }
-            fn read_layer(&mut self, _gpu: &mut Gpu, _layer_idx: usize) -> HipResult<Self::Layer> {
+            fn read_layer(
+                &mut self,
+                _gpu: &mut Gpu,
+                _layer_idx: usize,
+                _residency: Residency,
+            ) -> HipResult<Self::Layer> {
                 unreachable!("source must not run without devices")
+            }
+            fn spill_refusal(&self) -> Option<String> {
+                None
             }
             fn free_layer(&mut self, _gpu: &mut Gpu, _layer: Self::Layer) {
                 unreachable!("source must not run without devices")
             }
         }
 
-        let layout = Layout::single(2);
+        let mut layout = Layout::single(2);
         let mut devices: Vec<Gpu> = Vec::new();
         let mut source = NoGpuSource { n_layers: 2 };
         for fault in [
@@ -6399,7 +6448,7 @@ mod direct_load_fault_tests {
             StagedLoadFault::AfterOutput,
             StagedLoadFault::AfterLayer(0),
         ] {
-            let err = match load_weights_with_fault(&mut source, &mut devices, &layout, fault) {
+            let err = match load_weights_with_fault(&mut source, &mut devices, &mut layout, fault) {
                 Ok(_) => panic!("empty devices must reject before the fault hook"),
                 Err(err) => err,
             };
@@ -6412,7 +6461,7 @@ mod direct_load_fault_tests {
                 "fault hook reachable without devices: {err:?}"
             );
         }
-        let err = match load_weights(&mut source, &mut devices, &layout) {
+        let err = match load_weights(&mut source, &mut devices, &mut layout) {
             Ok(_) => panic!("empty devices must reject on the production route"),
             Err(err) => err,
         };

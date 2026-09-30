@@ -465,8 +465,8 @@ fn main() {
     let mut gpu = rdna_compute::Gpu::init_with_device(target_device).expect("target GPU init");
     let weights = {
         let mut src = qwen35::HfqSource::new(&mut hfq, &config);
-        let layout = qwen35::Layout::single(config.n_layers);
-        qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &layout)
+        let mut layout = qwen35::Layout::single(config.n_layers);
+        qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &mut layout)
     }
     .expect("load weights");
     eprintln!(

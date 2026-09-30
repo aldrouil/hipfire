@@ -119,11 +119,12 @@ pub const EDITABLE_FIELDS: &[FieldSpec] = &[
     // Present in `config::easy_keys()`, so the Settings editor offers it as an
     // inline-editable row; without a spec here Enter falls through to "not
     // editable from the TUI" and no value can be typed. `min: -1` matches the
-    // schema (negative is the reserved auto spelling). Clearing: the editor seeds
-    // its buffer from the *current* value, so an emptied buffer is the unset
-    // spelling — `write_value` maps empty input on a nullable field to clear — and
-    // a typed `null` is the config/CLI spelling rather than something the buffer
-    // can reach once a value exists (typing appends to the seed).
+    // schema, where a negative value is the reserved "fully resident" spelling
+    // rather than a count. Clearing: the editor seeds its buffer from the
+    // *current* value, so an emptied buffer is the unset spelling — `write_value`
+    // maps empty input on a nullable field to clear — and a typed `null` is the
+    // config/CLI spelling rather than something the buffer can reach once a value
+    // exists (typing appends to the seed).
     FieldSpec {
         key: "gpu_layer_budget",
         kind: FieldKind::Int {

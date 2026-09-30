@@ -877,8 +877,8 @@ impl ModelSlot {
             )
         })?;
         let mut src = qwen35::HfqSource::new(&mut hfq, &config);
-        let layout = qwen35::Layout::single(config.n_layers);
-        let weights = qwen35::load_weights(&mut src, std::slice::from_mut(gpu), &layout)?;
+        let mut layout = qwen35::Layout::single(config.n_layers);
+        let weights = qwen35::load_weights(&mut src, std::slice::from_mut(gpu), &mut layout)?;
 
         // For hybrid arches (Qwen 3.5 = 48 DeltaNet LinearAttention + 16
         // FullAttention out of 64 total), only the FullAttention layers need
@@ -3496,7 +3496,7 @@ fn build_dflash_verify_binding(
         layout.push(k.buf.as_ptr() as u64);
         layout.push(v.buf.as_ptr() as u64);
     }
-    let layout_generation = fingerprint_u64(&layout);
+    let layout_generation = fingerprint_u64(&mut layout);
     DflashVerifyBinding::new(
         b,
         arch,

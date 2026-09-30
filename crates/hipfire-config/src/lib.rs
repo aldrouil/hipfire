@@ -656,7 +656,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         Some("HIPFIRE_GPU_LAYER_BUDGET"),
-        "Resident-layer budget for partial GPU offload: N keeps the last N layers on the GPU and spills the rest to system RAM; unset keeps every layer on the GPU. The number counts layers ON the GPU, not layers offloaded — 3 on a 64-layer model spills 61. 'auto' (-1) and empty mean fully resident: the engine keeps every layer on the GPU until it measures the device."
+        "Resident-layer budget for partial GPU offload: N keeps the last N layers on the GPU and spills the rest to system RAM; unset keeps every layer on the GPU. The number counts layers ON the GPU, not layers offloaded — 3 on a 64-layer model spills 61. 'auto' (-1) and empty mean fully resident too: nothing is spilled unless a layer count is set."
     ),
     field!(
         "memory.offload_exec",
@@ -5762,55 +5762,30 @@ pub mod kernel {
 pub mod memory {
     use super::process_value;
 
-    /// Resident-layer budget for partial GPU offload (`memory.gpu_layer_budget`,
-    /// compat env `HIPFIRE_GPU_LAYER_BUDGET`). Resolved once at load.
+    /// The requested resident-layer count for partial GPU offload
+    /// (`memory.gpu_layer_budget`, compat env `HIPFIRE_GPU_LAYER_BUDGET`), or
+    /// `None` when nothing is configured.
     ///
-    /// * [`GpuLayerBudget::Full`] is the unset default: keep every layer
-    ///   resident, never offload — byte-identical to a pure-VRAM run and the
-    ///   regression guard for the whole feature. `auto` and `-1` spell the same
-    ///   thing.
-    /// * [`GpuLayerBudget::Layers`] pins exactly this many resident layers; the
-    ///   layers before them spill to host RAM.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum GpuLayerBudget {
-        /// Fully resident — never offload (the zero-diff default).
-        Full,
-        /// Pin exactly this many resident layers; spill everything before them.
-        Layers(usize),
-    }
-
-    impl std::fmt::Display for GpuLayerBudget {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
-                GpuLayerBudget::Full => write!(f, "full"),
-                GpuLayerBudget::Layers(n) => write!(f, "{n}"),
-            }
-        }
-    }
-
-    /// Pure truth table behind [`gpu_layer_budget`], split out so unit tests can
-    /// pin the contract without touching the process-global snapshot. Unset,
-    /// empty, `"auto"`, `"-1"` and unparseable inputs all fail closed to fully
-    /// resident (so a bad or absent setting never forces offload); any other
-    /// non-negative integer pins that many resident layers. A negative value
-    /// other than `-1` is treated as unset rather than an error.
-    pub fn parse_gpu_layer_budget(raw: Option<&str>) -> GpuLayerBudget {
-        match raw.map(|v| v.trim().to_ascii_lowercase()) {
-            None => GpuLayerBudget::Full,
-            Some(v) if v.is_empty() => GpuLayerBudget::Full,
-            Some(v) if v == "auto" || v == "-1" => GpuLayerBudget::Full,
-            Some(v) => match v.parse::<i64>() {
-                Ok(n) if n >= 0 => GpuLayerBudget::Layers(n as usize),
-                _ => GpuLayerBudget::Full,
+    /// The count is layers LEFT ON the GPU; the layers before them spill to host
+    /// RAM. `None` — unset, empty, `auto`, `-1`, or anything unparseable — keeps
+    /// every layer resident: that is the zero-diff default and the regression guard
+    /// for the whole feature, and it is why a bad value can never force an offload.
+    ///
+    /// Pure, so the contract is unit-testable without the process-global snapshot.
+    /// Placement itself is the shared loader's (`model_load::Layout::spill_count`);
+    /// this is only the number the user asked for.
+    pub fn parse_gpu_layer_budget(raw: Option<&str>) -> Option<usize> {
+        match raw.map(|value| value.trim().to_ascii_lowercase()) {
+            Some(value) => match value.parse::<i64>() {
+                Ok(n) if n >= 0 => Some(n as usize),
+                _ => None,
             },
+            None => None,
         }
     }
 
-    /// The configured [`GpuLayerBudget`] from the process snapshot. Reads exactly
-    /// one resolved value: unset, `"auto"` or `"-1"` keeps every layer resident; a
-    /// non-negative integer pins that many resident layers; anything else fails
-    /// closed to full residency (the zero-diff baseline).
-    pub fn gpu_layer_budget() -> GpuLayerBudget {
+    /// The configured resident-layer budget from the process snapshot.
+    pub fn gpu_layer_budget() -> Option<usize> {
         parse_gpu_layer_budget(process_value("HIPFIRE_GPU_LAYER_BUDGET").as_deref())
     }
 
@@ -5883,32 +5858,28 @@ pub mod memory {
 
         #[test]
         fn gpu_layer_budget_roundtrip() {
-            // Unset resolves to full residency — the zero-diff baseline.
-            assert_eq!(parse_gpu_layer_budget(None), GpuLayerBudget::Full);
+            // Unset resolves to "no budget" — every layer resident, the zero-diff
+            // baseline.
+            assert_eq!(parse_gpu_layer_budget(None), None);
             // Empty string is unset, not an error.
-            assert_eq!(parse_gpu_layer_budget(Some("")), GpuLayerBudget::Full);
-            // "auto" and "-1" both mean fully resident (case-insensitive): the
-            // engine keeps every layer on the GPU until it measures the device, so
-            // neither spelling can force an offload.
-            assert_eq!(parse_gpu_layer_budget(Some("auto")), GpuLayerBudget::Full);
-            assert_eq!(parse_gpu_layer_budget(Some("-1")), GpuLayerBudget::Full);
-            assert_eq!(parse_gpu_layer_budget(Some("AUTO")), GpuLayerBudget::Full);
-            // A non-negative integer pins that many resident layers (trimmed).
-            assert_eq!(parse_gpu_layer_budget(Some("3")), GpuLayerBudget::Layers(3));
-            assert_eq!(
-                parse_gpu_layer_budget(Some(" 12 ")),
-                GpuLayerBudget::Layers(12)
-            );
-            // Garbage, negatives other than -1, and anything unparseable fail
-            // closed to full residency rather than forcing an offload.
-            assert_eq!(parse_gpu_layer_budget(Some("banana")), GpuLayerBudget::Full);
-            assert_eq!(parse_gpu_layer_budget(Some("-2")), GpuLayerBudget::Full);
-        }
-
-        #[test]
-        fn gpu_layer_budget_display() {
-            assert_eq!(GpuLayerBudget::Full.to_string(), "full");
-            assert_eq!(GpuLayerBudget::Layers(5).to_string(), "5");
+            assert_eq!(parse_gpu_layer_budget(Some("")), None);
+            // "auto" and "-1" mean the same as unset (case-insensitive): the engine
+            // keeps every layer on the GPU until it measures the device, so neither
+            // spelling can force an offload.
+            assert_eq!(parse_gpu_layer_budget(Some("auto")), None);
+            assert_eq!(parse_gpu_layer_budget(Some("-1")), None);
+            assert_eq!(parse_gpu_layer_budget(Some("AUTO")), None);
+            // A non-negative integer is the resident-layer count (trimmed).
+            assert_eq!(parse_gpu_layer_budget(Some("3")), Some(3));
+            assert_eq!(parse_gpu_layer_budget(Some(" 12 ")), Some(12));
+            // The counts at both ends of the range, which the loader's split
+            // arithmetic depends on: 0 spills everything, n keeps everything.
+            assert_eq!(parse_gpu_layer_budget(Some("0")), Some(0));
+            assert_eq!(parse_gpu_layer_budget(Some("65536")), Some(65536));
+            // Garbage and negative values resolve to "no budget" rather than
+            // forcing an offload.
+            assert_eq!(parse_gpu_layer_budget(Some("banana")), None);
+            assert_eq!(parse_gpu_layer_budget(Some("-2")), None);
         }
     }
 }

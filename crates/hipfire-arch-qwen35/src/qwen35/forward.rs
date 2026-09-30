@@ -1691,7 +1691,15 @@ pub fn forward_scratch(
     // host sync point — a D2H and an H2D around the multiplication — so it can
     // neither be recorded into a hipGraph nor replayed out of one. Take the
     // non-captured path for the model's whole lifetime instead.
-    let cpu_blocks_capture = hipfire_dispatch::cpu_offload_active(config.i_gpu_start);
+    //
+    // The split is the loader's own arithmetic applied to the same key the loader
+    // resolves, so this decision cannot drift from the placement that follows.
+    let cpu_blocks_capture = hipfire_dispatch::cpu_offload_active(
+        hipfire_runtime::model_load::Layout::spill_count(
+            config.n_layers,
+            hipfire_config::memory::gpu_layer_budget(),
+        ),
+    );
     if graph_would_be_used && cpu_blocks_capture {
         hipfire_dispatch::log_capture_disabled_once();
     }

@@ -251,11 +251,11 @@ impl ConfigState {
                         .unwrap_or("")
                     {
                         "" => "all on GPU".into(),
-                        // `-1` is the schema's reserved auto spelling, not a count:
-                        // rendering it as "N on GPU" would claim -1 layers are
-                        // resident. The engine currently keeps every layer on the
-                        // GPU for auto, which is what the explainer says.
-                        "-1" => "auto (engine decides)".into(),
+                        // `-1` is the schema's reserved spelling and it means the
+                        // same thing as unset — fully resident, no engine
+                        // decision involved. Rendering it as a count would claim
+                        // -1 layers are resident.
+                        "-1" => "all on GPU".into(),
                         v => format!("{v} on GPU"),
                     }
                 },
@@ -463,8 +463,9 @@ mod tests {
     }
 
     /// The GPU-layers row must render every state it can hold, and render it
-    /// honestly: `-1` is the schema's *auto* spelling, not a count of layers, and
-    /// a cleared key must read as unset rather than as the string the JSON layer
+    /// honestly: `-1` is the schema's reserved spelling and means the same as
+    /// unset — fully resident — so it must not read as a count of layers, and a
+    /// cleared key must read as unset rather than as the string the JSON layer
     /// happens to produce for null.
     #[test]
     fn offload_layer_row_renders_unset_count_and_auto() {
@@ -481,8 +482,8 @@ mod tests {
         assert_eq!(row(&[("gpu_layer_budget", "32")]), "32 on GPU");
         assert_eq!(
             row(&[("gpu_layer_budget", "-1")]),
-            "auto (engine decides)",
-            "-1 means auto, not -1 layers on the GPU"
+            "all on GPU",
+            "-1 means fully resident, not -1 layers on the GPU"
         );
         // A cleared key is unset, not the literal string the JSON layer produces
         // for null — the bug this replaced rendered "null on GPU".

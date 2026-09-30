@@ -30,18 +30,23 @@ pub enum Residency {
 pub struct Layout {
     output_device: usize,
     layer_to_device: Vec<usize>,
+    /// Resolved placement per layer index. Always the same length as
+    /// `layer_to_device`; `validate` enforces it. Fixed for the load.
+    layer_residency: Vec<Residency>,
 }
 impl Layout {
     pub fn single(n_layers: usize) -> Self {
         Self {
             output_device: 0,
             layer_to_device: vec![0; n_layers],
+            layer_residency: vec![Residency::Device; n_layers],
         }
     }
     pub fn from_gpus(g: &Gpus, n_layers: usize) -> Self {
         Self {
             output_device: g.output_device,
             layer_to_device: (0..n_layers).map(|i| g.device_for_layer(i)).collect(),
+            layer_residency: vec![Residency::Device; n_layers],
         }
     }
 
@@ -76,6 +81,7 @@ impl Layout {
                 .device_of(&output_coord)
                 .expect("output stage coordinate is in bounds on an admitted mesh"),
             layer_to_device,
+            layer_residency: vec![Residency::Device; n_layers],
         }
     }
 
@@ -91,6 +97,12 @@ impl Layout {
             return Err(format!(
                 "layout has {} layer assignments, expected {n_layers}",
                 self.layer_to_device.len()
+            ));
+        }
+        if self.layer_residency.len() != n_layers {
+            return Err(format!(
+                "layout has {} layer placements, expected {n_layers}",
+                self.layer_residency.len()
             ));
         }
         if let Some((layer, &device)) = self
@@ -110,6 +122,68 @@ impl Layout {
     }
     pub fn output_device(&self) -> usize {
         self.output_device
+    }
+
+    /// Pure split arithmetic for the resident-tail budget: layers `[0 .. spilled)`
+    /// spill, `[spilled .. n_layers)` stay on the GPU. `requested_resident` counts
+    /// layers left ON the GPU, so an unset budget (`None`) spills nothing and an
+    /// over-large request saturates to nothing spilled.
+    ///
+    /// This is the whole placement policy: the engine never measures the device
+    /// or probes a layer's size. Whatever the caller resolves here is what every
+    /// arch loads, which is why the same `memory.gpu_layer_budget` means the same
+    /// thing for llama, qwen2 and qwen35.
+    pub fn spill_count(n_layers: usize, requested_resident: Option<usize>) -> usize {
+        requested_resident.map_or(0, |resident| n_layers.saturating_sub(resident))
+    }
+
+    /// Resolved placement for one layer. Fixed for the load: nothing re-decides
+    /// placement per request.
+    pub fn residency_for_layer(&self, i: usize) -> Residency {
+        self.layer_residency[i]
+    }
+
+    /// Whether this load spills anything at all — the gate for the fail-closed
+    /// capability checks (a source or device that cannot honour a spill must
+    /// refuse the load before it allocates, not half-apply it).
+    pub fn spills_anything(&self) -> bool {
+        self.layer_residency
+            .iter()
+            .any(|r| *r == Residency::HostMapped)
+    }
+
+    /// Resolve this layout's placement from the configured budget, mutating it in
+    /// place, and return the number of spilled layers plus the report line to
+    /// print (`None` for "print nothing": the unset default).
+    ///
+    /// Infallible by construction — the budget is pure arithmetic on the layer
+    /// count — and silent only when nothing was configured, so a stock-vs-branch
+    /// log diff stays readable.
+    pub fn resolve_residency(&mut self, requested_resident: Option<usize>) -> (usize, Option<String>) {
+        let n_layers = self.layer_residency.len();
+        let spilled = Self::spill_count(n_layers, requested_resident);
+        for residency in self.layer_residency.iter_mut().take(spilled) {
+            *residency = Residency::HostMapped;
+        }
+        let resident = n_layers - spilled;
+        let report = match requested_resident {
+            None => None,
+            // Nothing spilled while something *was* configured: either the request
+            // exceeds the layer count (a configured no-op worth saying) or it asked
+            // for exactly every layer (worth saying only because it was explicit).
+            Some(requested) if spilled == 0 => Some(if requested > n_layers {
+                format!(
+                    "  partial offload: gpu_layer_budget={requested} is more than this model's \
+                     {n_layers} layers; keeping every layer on the GPU"
+                )
+            } else {
+                format!("  partial offload: 0 offloaded ({n_layers} resident), i_gpu_start=0")
+            }),
+            Some(_) => Some(format!(
+                "  partial offload: {resident} resident / {spilled} offloaded, i_gpu_start={spilled}"
+            )),
+        };
+        (spilled, report)
     }
 }
 
@@ -145,7 +219,19 @@ pub trait WeightSource {
         embd_fmt: EmbeddingFormat,
         can_alias: bool,
     ) -> HipResult<(WeightTensor, bool)>;
-    fn read_layer(&mut self, gpu: &mut Gpu, layer_idx: usize) -> HipResult<Self::Layer>;
+    fn read_layer(
+        &mut self,
+        gpu: &mut Gpu,
+        layer_idx: usize,
+        residency: Residency,
+    ) -> HipResult<Self::Layer>;
+    /// Why this source cannot spill, or `None` if it can.
+    ///
+    /// The loader fails the load when a budget is set and this returns `Some`, so
+    /// a source that cannot honour a spill refuses it up front instead of
+    /// half-applying it (host-locating the layers it can see while a
+    /// source-internal allocation stays in VRAM).
+    fn spill_refusal(&self) -> Option<String>;
     /// Release one successfully loaded layer during whole-model rollback.
     ///
     /// Layer ownership is architecture-specific (Qwen3.5 carries MoE
@@ -358,7 +444,9 @@ impl<S: WeightSource> StagedLoadOps for GpuStagedLoadOps<'_, S> {
 
     fn read_layer(&mut self, layer_idx: usize) -> Result<Self::Layer, Self::Error> {
         let device = self.layout.device_for_layer(layer_idx);
-        self.source.read_layer(&mut self.devices[device], layer_idx)
+        let residency = self.layout.residency_for_layer(layer_idx);
+        self.source
+            .read_layer(&mut self.devices[device], layer_idx, residency)
     }
 
     fn free_layer(&mut self, layer_idx: usize, layer: Self::Layer) {
@@ -394,10 +482,14 @@ impl<S: WeightSource> StagedLoadOps for GpuStagedLoadOps<'_, S> {
 
 /// Drive a `WeightSource` across a device slice. Single shared copy of the
 /// embed → norm → output → per-device layer loop.
+///
+/// `layout` is taken mutably because this is where placement is resolved: the
+/// configured `memory.gpu_layer_budget` becomes a per-layer `Residency` here and
+/// is then carried to every arch's source unchanged.
 pub fn load_weights<S: WeightSource>(
     source: &mut S,
     devices: &mut [Gpu],
-    layout: &Layout,
+    layout: &mut Layout,
 ) -> HipResult<LoadedWeights<S::Layer>> {
     load_weights_inner(source, devices, layout, None)
 }
@@ -413,7 +505,7 @@ pub fn load_weights<S: WeightSource>(
 pub fn load_weights_with_fault<S: WeightSource>(
     source: &mut S,
     devices: &mut [Gpu],
-    layout: &Layout,
+    layout: &mut Layout,
     fault: StagedLoadFault,
 ) -> HipResult<LoadedWeights<S::Layer>> {
     load_weights_inner(source, devices, layout, Some(fault))
@@ -422,7 +514,7 @@ pub fn load_weights_with_fault<S: WeightSource>(
 fn load_weights_inner<S: WeightSource>(
     source: &mut S,
     devices: &mut [Gpu],
-    layout: &Layout,
+    layout: &mut Layout,
     fault: Option<StagedLoadFault>,
 ) -> HipResult<LoadedWeights<S::Layer>> {
     let n_devices = devices.len();
@@ -435,6 +527,37 @@ fn load_weights_inner<S: WeightSource>(
     layout
         .validate(n_devices, source.n_layers())
         .map_err(|reason| hip_bridge::HipError::new(0, &reason))?;
+    // The one placement decision in the engine. Every arch reads it back through
+    // `residency_for_layer`, so `memory.gpu_layer_budget` means the same thing
+    // everywhere instead of being re-derived per loader.
+    let (_spilled, report) = layout.resolve_residency(hipfire_config::memory::gpu_layer_budget());
+    if let Some(line) = report {
+        eprintln!("{line}");
+    }
+    // Fail closed before a single byte is allocated. A spill this source cannot
+    // honour is a refused load, never a half-applied placement — and the check
+    // runs before `prepare`/`read_embed` so the user sees the budget message
+    // rather than whatever the source would have objected to first.
+    if layout.spills_anything() {
+        if let Some(reason) = source.spill_refusal() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("memory.gpu_layer_budget is set but {reason}"),
+            ));
+        }
+        // Unified memory has one pool: host-mapped and device allocations come
+        // from the same physical RAM, so spilling frees no VRAM at all.
+        if let Some(device) = devices.iter().position(|device| device.is_uma()) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "memory.gpu_layer_budget is set on a unified-memory device (device {device}): \
+                     host-mapped and device memory come from the same pool, so spilling frees no \
+                     VRAM. Unset the key"
+                ),
+            ));
+        }
+    }
     let mut ops = GpuStagedLoadOps {
         source,
         devices,
@@ -488,6 +611,82 @@ mod tests {
         let layout = Layout::single(2);
         assert!(layout.validate(0, 2).is_err());
         assert!(layout.validate(1, 3).is_err());
+    }
+
+    /// The whole placement policy, in one test: the split arithmetic, the
+    /// resolved per-layer `Residency`, and the report line each case produces.
+    /// `resident` counts layers LEFT ON the GPU, so `Some(3)` of 64 spills 61 —
+    /// the contract the `memory.gpu_layer_budget` help text states.
+    #[test]
+    fn spill_count_is_the_whole_policy() {
+        // Unset: nothing spilled, and silent — the only case allowed to print
+        // nothing, because its absence is what keeps stock-vs-branch log diffs
+        // readable.
+        assert_eq!(Layout::spill_count(64, None), 0);
+        let mut layout = Layout::single(64);
+        let (spilled, report) = layout.resolve_residency(None);
+        assert_eq!((spilled, report), (0, None));
+        assert!(!layout.spills_anything());
+
+        // Pinned resident count: exactly one boundary, everything before it spills.
+        assert_eq!(Layout::spill_count(64, Some(3)), 61);
+        let mut layout = Layout::single(64);
+        let (spilled, report) = layout.resolve_residency(Some(3));
+        assert_eq!(spilled, 61);
+        assert_eq!(
+            report.as_deref(),
+            Some("  partial offload: 3 resident / 61 offloaded, i_gpu_start=61")
+        );
+        assert!(layout.spills_anything());
+        for layer in 0..64 {
+            let expected = if layer < 61 {
+                Residency::HostMapped
+            } else {
+                Residency::Device
+            };
+            assert_eq!(layout.residency_for_layer(layer), expected, "layer {layer}");
+        }
+
+        // 0 resident spills everything; n resident spills nothing.
+        assert_eq!(Layout::spill_count(64, Some(0)), 64);
+        assert_eq!(Layout::spill_count(64, Some(64)), 0);
+
+        // A request above the layer count saturates to fully resident and says so
+        // rather than letting a configured budget do nothing in silence.
+        let mut layout = Layout::single(64);
+        let (spilled, report) = layout.resolve_residency(Some(200));
+        assert_eq!(spilled, 0);
+        assert_eq!(
+            report.as_deref(),
+            Some(
+                "  partial offload: gpu_layer_budget=200 is more than this model's 64 layers; \
+                 keeping every layer on the GPU"
+            )
+        );
+
+        // Exactly every layer is also a no-op, but it was asked for explicitly, so
+        // it is reported.
+        let mut layout = Layout::single(64);
+        let (_, report) = layout.resolve_residency(Some(64));
+        assert_eq!(
+            report.as_deref(),
+            Some("  partial offload: 0 offloaded (64 resident), i_gpu_start=0")
+        );
+
+        // Degenerate models must not underflow.
+        assert_eq!(Layout::spill_count(0, Some(0)), 0);
+        assert_eq!(Layout::spill_count(1, Some(999)), 0);
+    }
+
+    /// `validate` must reject a placement vector that does not match the layer
+    /// count: `residency_for_layer` indexes it directly, so a short vector would
+    /// panic mid-load instead of failing the load.
+    #[test]
+    fn layout_rejects_a_mismatched_placement_vector() {
+        let mut layout = Layout::single(2);
+        layout.layer_residency.clear();
+        let err = layout.validate(1, 2).unwrap_err();
+        assert!(err.contains("placements"), "{err}");
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]

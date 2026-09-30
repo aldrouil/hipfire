@@ -303,10 +303,16 @@ impl Rig {
         // contiguous but the layers are not uniform (linear-attention vs
         // full-attention, different MLP widths). Non-layer tensors (token_embd,
         // output_norm, lm_head) are always resident and always charged.
-        let resident_weight_bytes = if config.i_gpu_start == 0 {
+        // Transitional: the split is the shared loader's arithmetic applied to the
+        // same key the loader resolves. Phase 3.3 replaces this whole estimate with
+        // the bytes the loader actually allocated (`LoadedWeights::stats`), which
+        // removes the tensor-name parsing below.
+        let spilled_layers =
+            qwen35::Layout::spill_count(config.n_layers, hipfire_config::memory::gpu_layer_budget());
+        let resident_weight_bytes = if spilled_layers == 0 {
             weight_bytes
         } else {
-            resident_weight_bytes(&hfq, config.i_gpu_start)
+            resident_weight_bytes(&hfq, spilled_layers)
         };
         let cap_rounded = cfg.cap_tokens.div_ceil(128) * 128;
         let kv_bytes = (n_fa_layers as u64)
@@ -328,8 +334,8 @@ impl Rig {
             .map_err(|e| format!("preflight refused: {e}"))?;
         let weights: Qwen35Weights = {
             let mut src = qwen35::HfqSource::new(&mut hfq, &config);
-            let layout = qwen35::Layout::single(config.n_layers);
-            qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &layout)
+            let mut layout = qwen35::Layout::single(config.n_layers);
+            qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &mut layout)
         }
         .map_err(|e| format!("load weights: {e}"))?;
 

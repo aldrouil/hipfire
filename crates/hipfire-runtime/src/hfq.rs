@@ -1887,7 +1887,12 @@ impl WeightSource for LlamaHfqSource<'_> {
         )
     }
 
-    fn read_layer(&mut self, gpu: &mut Gpu, i: usize) -> HipResult<LayerWeights> {
+    fn read_layer(
+        &mut self,
+        gpu: &mut Gpu,
+        i: usize,
+        residency: Residency,
+    ) -> HipResult<LayerWeights> {
         let cfg = self.cfg;
         let q_out_dim = cfg.n_heads * cfg.head_dim;
         let kv_dim = cfg.n_kv_heads * cfg.head_dim;
@@ -1899,11 +1904,14 @@ impl WeightSource for LlamaHfqSource<'_> {
             candidates: flat_name_candidates,
             read_proj: load_weight_tensor,
             layer: i,
-            // Residency comes from the caller's layer placement (the shared
-            // loader's `Layout`), never from this arch.
-            residency: Residency::Device,
+            residency,
         };
         load_layer(&mut b, cfg, q_out_dim, kv_dim, i)
+    }
+    /// The generic llama-family reader is dense-only on this path: every tensor of
+    /// a layer goes through `HfqBackend`, so a spill lands completely.
+    fn spill_refusal(&self) -> Option<String> {
+        None
     }
     fn free_layer(&mut self, gpu: &mut Gpu, layer: Self::Layer) {
         layer.free_gpu(gpu);
@@ -1979,7 +1987,7 @@ pub fn load_weights_hfq(
     validate_llama_hfq_admission(hfq)?;
 
     let mut source = LlamaHfqSource { hfq, cfg: config };
-    let layout = crate::model_load::Layout::single(config.n_layers);
+    let mut layout = crate::model_load::Layout::single(config.n_layers);
     let LoadedWeights {
         token_embd,
         embd_format,
@@ -1987,7 +1995,7 @@ pub fn load_weights_hfq(
         output,
         layers,
         lm_head_aliases_embd,
-    } = rt_load_weights(&mut source, std::slice::from_mut(gpu), &layout)?;
+    } = rt_load_weights(&mut source, std::slice::from_mut(gpu), &mut layout)?;
     Ok(LlamaWeights {
         token_embd,
         embd_format,
