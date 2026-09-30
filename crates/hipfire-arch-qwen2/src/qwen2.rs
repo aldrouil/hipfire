@@ -35,7 +35,7 @@ use hipfire_runtime::arch_spec::{dense_forward, DenseArch, DenseKnobs, DenseLaye
 use hipfire_runtime::hfq::{load_weight_tensor, HfqFile};
 use hipfire_runtime::llama::{f16_to_f32, f32_to_f16};
 use hipfire_runtime::llama::{gemv_family, weight_gemm, EmbeddingFormat, WeightTensor};
-use hipfire_runtime::model_load::Residency;
+use hipfire_runtime::model_load::{self, Layout, LoadedWeights, Residency, WeightSource};
 use hipfire_runtime::model_source::ModelSource;
 use hipfire_runtime::weight_backend::{
     dequant_norm, flat_name_candidates, load_embedding, resolve_lm_head, HfqBackend, WeightBackend,
@@ -252,6 +252,28 @@ pub struct Qwen2LayerWeights {
     pub w_down: WeightTensor, // mlp.down_proj.weight
 }
 
+impl Qwen2LayerWeights {
+    /// Return every buffer of this layer to the pool.
+    ///
+    /// The shared load transaction calls this for each layer already published
+    /// when a later one fails, so a rollback reclaims exactly what the load
+    /// committed. Mirrors the per-layer arm of [`Qwen2Weights::free_gpu`].
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let _ = gpu.free_tensor(self.attn_norm);
+        self.wq.free_all(gpu);
+        let _ = gpu.free_tensor(self.wq_bias);
+        self.wk.free_all(gpu);
+        let _ = gpu.free_tensor(self.wk_bias);
+        self.wv.free_all(gpu);
+        let _ = gpu.free_tensor(self.wv_bias);
+        self.wo.free_all(gpu);
+        let _ = gpu.free_tensor(self.ffn_norm);
+        self.w_gate.free_all(gpu);
+        self.w_up.free_all(gpu);
+        self.w_down.free_all(gpu);
+    }
+}
+
 /// GPU-resident Qwen2 model weights.
 pub struct Qwen2Weights {
     pub token_embd: GpuTensor,
@@ -331,36 +353,100 @@ pub fn load_weights(
     cfg: &Qwen2Config,
     gpu: &mut Gpu,
 ) -> HipResult<Qwen2Weights> {
-    #[cfg(unix)]
-    hfq.drop_mmap();
-
-    eprintln!("qwen2: loading token_embd...");
-    let (embd_token, embd_format) = load_embed_tokens(hfq, gpu, cfg)?;
-
-    eprintln!("qwen2: loading model.norm...");
-    let output_norm = load_norm_weight_raw(hfq, gpu, "model.norm.weight", cfg.hidden_size)?;
-
-    eprintln!("qwen2: loading lm_head...");
-    let (output, tied_lm_head) = load_lm_head(hfq, gpu, cfg, &embd_token, embd_format)?;
-
-    let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
-    for i in 0..cfg.num_hidden_layers {
-        eprintln!(
-            "qwen2: loading layer {}/{}...",
-            i + 1,
-            cfg.num_hidden_layers
-        );
-        layers.push(load_layer(hfq, gpu, cfg, i)?);
-    }
-
-    Ok(Qwen2Weights {
-        token_embd: embd_token,
+    let mut source = Qwen2WeightSource { hfq, cfg };
+    let mut layout = Layout::single(cfg.num_hidden_layers);
+    let LoadedWeights {
+        token_embd,
         embd_format,
         output_norm,
         output,
         layers,
-        tied_lm_head,
+        lm_head_aliases_embd,
+    } = model_load::load_weights(&mut source, std::slice::from_mut(gpu), &mut layout)?;
+
+    Ok(Qwen2Weights {
+        token_embd,
+        embd_format,
+        output_norm,
+        output,
+        layers,
+        tied_lm_head: lm_head_aliases_embd,
     })
+}
+
+/// qwen2's `WeightSource`: the same embed → norm → lm_head → layer sequence it
+/// used to drive inline, wired into `hipfire_runtime::model_load` so qwen2
+/// inherits the shared placement resolution (`memory.gpu_layer_budget`), the
+/// shared whole-model rollback, and the shared fail-closed admission checks
+/// instead of having none of them.
+struct Qwen2WeightSource<'a> {
+    hfq: &'a mut HfqFile,
+    cfg: &'a Qwen2Config,
+}
+
+impl WeightSource for Qwen2WeightSource<'_> {
+    type Layer = Qwen2LayerWeights;
+
+    fn n_layers(&self) -> usize {
+        self.cfg.num_hidden_layers
+    }
+
+    /// Drop the mmap before loading: on unified memory a live mapping and the GPU
+    /// copy would otherwise share the same physical pages and double the
+    /// footprint. Every read below therefore resolves through the pread path.
+    fn prepare(&mut self, _n_devices: usize) -> HipResult<()> {
+        #[cfg(unix)]
+        self.hfq.drop_mmap();
+        Ok(())
+    }
+
+    fn read_embed(&mut self, gpu: &mut Gpu) -> HipResult<(GpuTensor, EmbeddingFormat)> {
+        eprintln!("qwen2: loading token_embd...");
+        load_embed_tokens(self.hfq, gpu, self.cfg)
+    }
+
+    fn read_final_norm(&mut self, gpu: &mut Gpu) -> HipResult<GpuTensor> {
+        eprintln!("qwen2: loading model.norm...");
+        load_norm_weight_raw(self.hfq, gpu, "model.norm.weight", self.cfg.hidden_size)
+    }
+
+    fn read_output(
+        &mut self,
+        gpu: &mut Gpu,
+        embd: &GpuTensor,
+        embd_fmt: EmbeddingFormat,
+        _can_alias: bool,
+    ) -> HipResult<(WeightTensor, bool)> {
+        // `load_lm_head` already handles both arms; `_can_alias` is ignored
+        // because qwen2 is single-GPU by construction and the reupload arm is
+        // unreachable (see its closure).
+        eprintln!("qwen2: loading lm_head...");
+        load_lm_head(self.hfq, gpu, self.cfg, embd, embd_fmt)
+    }
+
+    fn read_layer(
+        &mut self,
+        gpu: &mut Gpu,
+        i: usize,
+        residency: Residency,
+    ) -> HipResult<Self::Layer> {
+        eprintln!(
+            "qwen2: loading layer {}/{}...",
+            i + 1,
+            self.cfg.num_hidden_layers
+        );
+        load_layer(self.hfq, gpu, self.cfg, i, residency)
+    }
+
+    /// Dense GQA: every tensor of a layer goes through `HfqBackend`, so a spill
+    /// lands completely rather than half-applying.
+    fn spill_refusal(&self) -> Option<String> {
+        None
+    }
+
+    fn free_layer(&mut self, gpu: &mut Gpu, layer: Self::Layer) {
+        layer.free_gpu(gpu);
+    }
 }
 
 // ─── Per-tensor loaders ─────────────────────────────────────────────────
@@ -426,6 +512,7 @@ fn load_layer(
     gpu: &mut Gpu,
     cfg: &Qwen2Config,
     i: usize,
+    residency: Residency,
 ) -> HipResult<Qwen2LayerWeights> {
     let q_dim = cfg.num_attention_heads * cfg.head_dim;
     let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
@@ -437,9 +524,9 @@ fn load_layer(
         candidates: flat_name_candidates,
         read_proj: load_weight_tensor,
         layer: i,
-        // qwen2 does not implement the shared placement plumbing, so it is always
-        // fully resident — a spill would half-apply and the honest answer is none.
-        residency: Residency::Device,
+        // Residency is the caller's resolved placement (the shared loader's
+        // `Layout`), so qwen2 spills exactly the layers llama and qwen35 do.
+        residency,
     };
 
     Ok(Qwen2LayerWeights {
