@@ -623,7 +623,7 @@ impl WeightTensor {
                 krot: p.krot as usize,
             }),
             awq_scale: self.awq_scale.as_ref(),
-        exec: self.exec,
+            exec: self.exec,
         }
     }
 }
@@ -884,7 +884,7 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
         row_stride: 0,
         rotation: None,
         awq_scale: None,
-    exec: w.exec,
+        exec: w.exec,
     };
 
     if !dtype_needs_rotation(w.gpu_dtype) {
@@ -1411,7 +1411,7 @@ pub fn weight_gemv_prerotated(
             row_stride: 0,
             rotation: None,
             awq_scale: None,
-        exec: w.exec,
+            exec: w.exec,
         };
         return gemv
             .run_auto(&ctx, gpu, &wr, x, y)
@@ -1451,7 +1451,7 @@ pub fn weight_gemv_prerotated(
                 row_stride: 0,
                 rotation: None,
                 awq_scale: None,
-            exec: w.exec,
+                exec: w.exec,
             };
             return gemv
                 .run(
@@ -1480,7 +1480,7 @@ pub fn weight_gemv_prerotated(
         row_stride: 0,
         rotation: None,
         awq_scale: None,
-    exec: w.exec,
+        exec: w.exec,
     };
     gemv.run_auto(&ctx, gpu, &wr, x, y)
         .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
@@ -1518,7 +1518,7 @@ pub fn weight_gemv_residual(
         row_stride: 0,
         rotation: None,
         awq_scale: None,
-    exec: w.exec,
+        exec: w.exec,
     };
 
     match w.gpu_dtype {
@@ -1614,7 +1614,7 @@ pub fn weight_gemv_swiglu_residual(
         row_stride: 0,
         rotation: None,
         awq_scale: None,
-    exec: w_down.exec,
+        exec: w_down.exec,
     };
     match w_down.gpu_dtype {
         // ── CPU-executed offload (`memory.offload_exec=cpu`) ─────────────────
@@ -3689,7 +3689,7 @@ pub fn load_weights(
                     row_stride: 0,
                     paro: None,
                     awq_scale: None,
-                exec: rdna_compute::ExecTarget::Gpu,
+                    exec: rdna_compute::ExecTarget::Gpu,
                 })
             }
             GgmlType::Q6K => {
@@ -3702,7 +3702,7 @@ pub fn load_weights(
                     row_stride: 0,
                     paro: None,
                     awq_scale: None,
-                exec: rdna_compute::ExecTarget::Gpu,
+                    exec: rdna_compute::ExecTarget::Gpu,
                 })
             }
             GgmlType::Q8_0 => {
@@ -3715,7 +3715,7 @@ pub fn load_weights(
                     row_stride: 0,
                     paro: None,
                     awq_scale: None,
-                exec: rdna_compute::ExecTarget::Gpu,
+                    exec: rdna_compute::ExecTarget::Gpu,
                 })
             }
             GgmlType::F32 => {
@@ -3728,7 +3728,7 @@ pub fn load_weights(
                     row_stride: 0,
                     paro: None,
                     awq_scale: None,
-                exec: rdna_compute::ExecTarget::Gpu,
+                    exec: rdna_compute::ExecTarget::Gpu,
                 })
             }
             _ => {
@@ -3746,7 +3746,7 @@ pub fn load_weights(
                     row_stride: 0,
                     paro: None,
                     awq_scale: None,
-                exec: rdna_compute::ExecTarget::Gpu,
+                    exec: rdna_compute::ExecTarget::Gpu,
                 })
             }
         }
@@ -3789,7 +3789,7 @@ pub fn load_weights(
             row_stride: 0,
             paro: None,
             awq_scale: None,
-        exec: rdna_compute::ExecTarget::Gpu,
+            exec: rdna_compute::ExecTarget::Gpu,
         }
     };
 

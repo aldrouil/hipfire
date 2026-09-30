@@ -1692,7 +1692,7 @@ pub fn decode_weight_bytes(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
-            exec: exec_for(residency),
+                exec: exec_for(residency),
             })
         }
         // Everything else: the passthrough registry, or the host-decode fallback
@@ -1752,13 +1752,17 @@ pub fn load_weight_tensor(
     for candidate in candidates(name) {
         if let Some((info, data)) = hfq.tensor_data(&candidate) {
             let qt = info.quant_type;
-            wt = Some(decode_weight_bytes(gpu, qt, data, m, k, &candidate, residency)?);
+            wt = Some(decode_weight_bytes(
+                gpu, qt, data, m, k, &candidate, residency,
+            )?);
             matched = Some(candidate);
             break;
         }
         if let Some((info, buf)) = hfq.tensor_data_pread(&candidate) {
             let qt = info.quant_type;
-            wt = Some(decode_weight_bytes(gpu, qt, &buf, m, k, &candidate, residency)?);
+            wt = Some(decode_weight_bytes(
+                gpu, qt, &buf, m, k, &candidate, residency,
+            )?);
             matched = Some(candidate);
             break;
         }
@@ -2227,7 +2231,7 @@ fn load_fp16_weight_tensor_from_source(
         row_stride: 0,
         paro: None,
         awq_scale: None,
-    exec: rdna_compute::ExecTarget::Gpu,
+        exec: rdna_compute::ExecTarget::Gpu,
     })
 }
 
@@ -2338,7 +2342,7 @@ pub fn load_weights_paroquant_llama(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
-            exec: rdna_compute::ExecTarget::Gpu,
+                exec: rdna_compute::ExecTarget::Gpu,
             })
         },
     )?;
@@ -2365,7 +2369,13 @@ pub fn load_weights_paroquant_llama(
     }
 
     // Measured from the tensors this route produced, before `layers` is moved.
-    let stats = llama_load_stats(&token_embd, &output_norm, &output, &layers, lm_head_aliases_embd);
+    let stats = llama_load_stats(
+        &token_embd,
+        &output_norm,
+        &output,
+        &layers,
+        lm_head_aliases_embd,
+    );
     Ok(LlamaWeights {
         token_embd,
         embd_format: embd_fmt,

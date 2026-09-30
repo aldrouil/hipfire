@@ -504,7 +504,7 @@ pub(crate) fn paro_load_moe_ffn(
                     shared.group_size,
                 )),
                 awq_scale: None,
-            exec: rdna_compute::ExecTarget::Gpu,
+                exec: rdna_compute::ExecTarget::Gpu,
             }
         };
         let down = {
@@ -523,7 +523,7 @@ pub(crate) fn paro_load_moe_ffn(
                     shared.group_size,
                 )),
                 awq_scale: None,
-            exec: rdna_compute::ExecTarget::Gpu,
+                exec: rdna_compute::ExecTarget::Gpu,
             }
         };
         pending.experts.push(ExpertWeights { gate_up, down });

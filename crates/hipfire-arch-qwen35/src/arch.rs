@@ -83,8 +83,7 @@ impl Architecture for Qwen35 {
         // The split is the loader's own arithmetic (`Layout::spill_count`), so this
         // reports exactly what the load below will do; qwen35 no longer has a
         // placement policy of its own.
-        let spilled =
-            Layout::spill_count(cfg.n_layers, hipfire_config::memory::gpu_layer_budget());
+        let spilled = Layout::spill_count(cfg.n_layers, hipfire_config::memory::gpu_layer_budget());
         crate::qwen35::load::report_cpu_exec_coverage(hfq, spilled);
         // The retained-replay refusal and the CPU-exec capture flag live in the
         // shared loader (`model_load::load_weights`), which owns the placement and

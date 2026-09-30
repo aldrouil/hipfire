@@ -4074,7 +4074,7 @@ mod tests {
             row_stride: 0,
             rotation: None,
             awq_scale: None,
-        exec: rdna_compute::ExecTarget::Gpu,
+            exec: rdna_compute::ExecTarget::Gpu,
         }
     }
 
@@ -4637,7 +4637,7 @@ mod tests {
             row_stride: 0,
             rotation: None,
             awq_scale: None,
-        exec: rdna_compute::ExecTarget::Gpu,
+            exec: rdna_compute::ExecTarget::Gpu,
         }
     }
 

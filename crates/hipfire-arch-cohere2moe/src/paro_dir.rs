@@ -459,7 +459,7 @@ pub fn load_from_source(
                     row_stride: gate_up_row_stride,
                     paro: Some(gate_up_paro),
                     awq_scale: None,
-                exec: rdna_compute::ExecTarget::Gpu,
+                    exec: rdna_compute::ExecTarget::Gpu,
                 };
                 let down = WeightTensor {
                     buf: tx.take_tensor(down_slot)?,
@@ -469,7 +469,7 @@ pub fn load_from_source(
                     row_stride: down_row_stride,
                     paro: Some(down_paro),
                     awq_scale: None,
-                exec: rdna_compute::ExecTarget::Gpu,
+                    exec: rdna_compute::ExecTarget::Gpu,
                 };
                 let expert = ExpertWeights { gate_up, down };
                 expert_slots.push(tx.hold_expert(expert));

@@ -1070,7 +1070,8 @@ fn begin_mtp_proposal_graph_capture(gpu: &mut Gpu) -> HipResult<()> {
         .active_stream
         .as_ref()
         .expect("proposal graph capture requires an explicit stream");
-    gpu.graphs.begin_graph_capture(&gpu.hip, gpu.device_id, stream)
+    gpu.graphs
+        .begin_graph_capture(&gpu.hip, gpu.device_id, stream)
 }
 
 fn end_mtp_proposal_graph_capture(gpu: &mut Gpu) -> HipResult<(Graph, GraphExec, Vec<Vec<u8>>)> {

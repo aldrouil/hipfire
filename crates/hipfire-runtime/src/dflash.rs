@@ -456,7 +456,7 @@ fn hfq_weight(
                     row_stride: 0,
                     paro: None,
                     awq_scale: None,
-                exec: rdna_compute::ExecTarget::Gpu,
+                    exec: rdna_compute::ExecTarget::Gpu,
                 })
             } else {
                 let f32_data: Vec<f32> = data
@@ -473,7 +473,7 @@ fn hfq_weight(
                     row_stride: 0,
                     paro: None,
                     awq_scale: None,
-                exec: rdna_compute::ExecTarget::Gpu,
+                    exec: rdna_compute::ExecTarget::Gpu,
                 })
             }
         }
@@ -492,7 +492,7 @@ fn hfq_weight(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
-            exec: rdna_compute::ExecTarget::Gpu,
+                exec: rdna_compute::ExecTarget::Gpu,
             })
         }
         13 => {
@@ -507,7 +507,7 @@ fn hfq_weight(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
-            exec: rdna_compute::ExecTarget::Gpu,
+                exec: rdna_compute::ExecTarget::Gpu,
             })
         }
         15 => {
@@ -522,7 +522,7 @@ fn hfq_weight(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
-            exec: rdna_compute::ExecTarget::Gpu,
+                exec: rdna_compute::ExecTarget::Gpu,
             })
         }
         17 => {
@@ -538,7 +538,7 @@ fn hfq_weight(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
-            exec: rdna_compute::ExecTarget::Gpu,
+                exec: rdna_compute::ExecTarget::Gpu,
             })
         }
         44 => {
@@ -565,7 +565,7 @@ fn hfq_weight(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
-            exec: rdna_compute::ExecTarget::Gpu,
+                exec: rdna_compute::ExecTarget::Gpu,
             })
         }
         47 => {
@@ -590,7 +590,7 @@ fn hfq_weight(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
-            exec: rdna_compute::ExecTarget::Gpu,
+                exec: rdna_compute::ExecTarget::Gpu,
             })
         }
         48 => {
@@ -615,7 +615,7 @@ fn hfq_weight(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
-            exec: rdna_compute::ExecTarget::Gpu,
+                exec: rdna_compute::ExecTarget::Gpu,
             })
         }
         49 => {
@@ -640,7 +640,7 @@ fn hfq_weight(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
-            exec: rdna_compute::ExecTarget::Gpu,
+                exec: rdna_compute::ExecTarget::Gpu,
             })
         }
         50 => {
@@ -665,7 +665,7 @@ fn hfq_weight(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
-            exec: rdna_compute::ExecTarget::Gpu,
+                exec: rdna_compute::ExecTarget::Gpu,
             })
         }
         q => panic!("dflash: unsupported matrix quant_type {q} for {name}"),
@@ -2521,7 +2521,8 @@ fn begin_draft_ffn_graph_capture(gpu: &mut Gpu) -> HipResult<()> {
         .active_stream
         .as_ref()
         .expect("draft FFN graph capture requires an explicit stream");
-    gpu.graphs.begin_graph_capture(&gpu.hip, gpu.device_id, stream)
+    gpu.graphs
+        .begin_graph_capture(&gpu.hip, gpu.device_id, stream)
 }
 
 fn end_draft_ffn_graph_capture(gpu: &mut Gpu) -> HipResult<(Graph, GraphExec, Vec<Vec<u8>>)> {
@@ -4155,7 +4156,7 @@ mod construction_tests {
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
-            exec: rdna_compute::ExecTarget::Gpu,
+                exec: rdna_compute::ExecTarget::Gpu,
             }
         }
 

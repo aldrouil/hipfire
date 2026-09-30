@@ -445,7 +445,7 @@ fn load_wt(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
-            exec: rdna_compute::ExecTarget::Gpu,
+                exec: rdna_compute::ExecTarget::Gpu,
             }
         }
         // MQ4G256 (13) and its Lloyd-codebook sibling (19). The drafter's
@@ -470,7 +470,7 @@ fn load_wt(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
-            exec: rdna_compute::ExecTarget::Gpu,
+                exec: rdna_compute::ExecTarget::Gpu,
             }
         }
         1 => {
@@ -489,7 +489,7 @@ fn load_wt(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
-            exec: rdna_compute::ExecTarget::Gpu,
+                exec: rdna_compute::ExecTarget::Gpu,
             }
         }
         2 => {
@@ -508,7 +508,7 @@ fn load_wt(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
-            exec: rdna_compute::ExecTarget::Gpu,
+                exec: rdna_compute::ExecTarget::Gpu,
             }
         }
         16 => {
@@ -527,7 +527,7 @@ fn load_wt(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
-            exec: rdna_compute::ExecTarget::Gpu,
+                exec: rdna_compute::ExecTarget::Gpu,
             }
         }
         qt => {

@@ -134,7 +134,7 @@ fn run_prefill_gemm_inner(
                 row_stride: w.k,
                 rotation: None,
                 awq_scale: None,
-            exec: w.exec,
+                exec: w.exec,
             };
             let ctx = DispatchCtx::new(gpu);
             let params = GemmParams {
@@ -170,7 +170,7 @@ fn run_prefill_gemm_inner(
                 row_stride: w.k,
                 rotation: None,
                 awq_scale: None,
-            exec: w.exec,
+                exec: w.exec,
             };
             let ctx = DispatchCtx::new(gpu);
             let params = GemmParams {
@@ -201,7 +201,7 @@ fn run_prefill_gemm_inner(
             row_stride: w.k,
             rotation: None,
             awq_scale: None,
-        exec: w.exec,
+            exec: w.exec,
         };
         let ctx = DispatchCtx::new(gpu);
         let params = GemmParams {
@@ -231,7 +231,7 @@ fn run_prefill_gemm_inner(
         row_stride: w.k,
         rotation: None,
         awq_scale: None,
-    exec: w.exec,
+        exec: w.exec,
     };
     let params = GemmParams {
         w: &w_ref,
@@ -1053,7 +1053,7 @@ fn load_gemma4_weight_impl(
                 row_stride: 0,
                 awq_scale: None,
                 paro: None,
-            exec: rdna_compute::ExecTarget::Gpu,
+                exec: rdna_compute::ExecTarget::Gpu,
             });
         }
         16 => {
@@ -1069,7 +1069,7 @@ fn load_gemma4_weight_impl(
                     row_stride: 0,
                     awq_scale: None,
                     paro: None,
-                exec: rdna_compute::ExecTarget::Gpu,
+                    exec: rdna_compute::ExecTarget::Gpu,
                 });
             }
             // Default: BF16 → widen to F32 (shift, not f16 decode)
@@ -1089,7 +1089,7 @@ fn load_gemma4_weight_impl(
                 row_stride: 0,
                 awq_scale: None,
                 paro: None,
-            exec: rdna_compute::ExecTarget::Gpu,
+                exec: rdna_compute::ExecTarget::Gpu,
             });
         }
         2 => {
@@ -1103,7 +1103,7 @@ fn load_gemma4_weight_impl(
                 row_stride: 0,
                 awq_scale: None,
                 paro: None,
-            exec: rdna_compute::ExecTarget::Gpu,
+                exec: rdna_compute::ExecTarget::Gpu,
             });
         }
         // Q8F16/Q8_0 projections are emitted when a matrix is not eligible
@@ -1164,7 +1164,7 @@ fn load_gemma4_weight_impl(
         row_stride: 0,
         awq_scale,
         paro: None,
-    exec: rdna_compute::ExecTarget::Gpu,
+        exec: rdna_compute::ExecTarget::Gpu,
     })
 }
 
@@ -1413,7 +1413,7 @@ fn load_moe_layer_extras(
                 row_stride: 0,
                 awq_scale: None,
                 paro: None,
-            exec: rdna_compute::ExecTarget::Gpu,
+                exec: rdna_compute::ExecTarget::Gpu,
             },
             down_proj: WeightTensor {
                 buf: dn_view,
@@ -1423,7 +1423,7 @@ fn load_moe_layer_extras(
                 row_stride: 0,
                 awq_scale: None,
                 paro: None,
-            exec: rdna_compute::ExecTarget::Gpu,
+                exec: rdna_compute::ExecTarget::Gpu,
             },
         });
     }
@@ -1684,7 +1684,7 @@ fn load_weights_impl(
             row_stride: 0,
             awq_scale: None,
             paro: None,
-        exec: rdna_compute::ExecTarget::Gpu,
+            exec: rdna_compute::ExecTarget::Gpu,
         }
     };
     lm_head_opt = Some(lm_head);

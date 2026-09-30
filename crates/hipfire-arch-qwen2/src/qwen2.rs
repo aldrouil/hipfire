@@ -772,7 +772,7 @@ fn load_weight_tensor_from_source(
         row_stride: 0,
         paro: None,
         awq_scale: None,
-    exec: rdna_compute::ExecTarget::Gpu,
+        exec: rdna_compute::ExecTarget::Gpu,
     })
 }
 
@@ -820,7 +820,7 @@ fn load_lm_head_from_source(
             row_stride: 0,
             paro: None,
             awq_scale: None,
-        exec: rdna_compute::ExecTarget::Gpu,
+            exec: rdna_compute::ExecTarget::Gpu,
         };
         Ok((wt, true))
     } else {

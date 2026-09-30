@@ -310,7 +310,10 @@ pub struct WeightPlacement {
 pub fn placement_residency(layer: Option<usize>, n_layers: usize) -> Residency {
     residency_for_spilled_prefix(
         layer,
-        crate::model_load::Layout::spill_count(n_layers, hipfire_config::memory::gpu_layer_budget()),
+        crate::model_load::Layout::spill_count(
+            n_layers,
+            hipfire_config::memory::gpu_layer_budget(),
+        ),
     )
 }
 

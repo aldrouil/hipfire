@@ -54,7 +54,7 @@ fn proj_gemm_batched(
                 row_stride: w.k,
                 rotation: None,
                 awq_scale: None,
-            exec: w.exec,
+                exec: w.exec,
             };
             let params = GemmParams {
                 w: &w_ref,
@@ -93,7 +93,7 @@ fn proj_gemm_batched(
                 row_stride: w.k,
                 rotation: None,
                 awq_scale: None,
-            exec: w.exec,
+                exec: w.exec,
             };
             let params = GemmParams {
                 w: &w_ref,
@@ -146,7 +146,7 @@ fn dispatch_bf16_batched(
         row_stride: w.k,
         rotation: None,
         awq_scale: None,
-    exec: w.exec,
+        exec: w.exec,
     };
     let params = GemmParams {
         w: &w_ref,
@@ -760,7 +760,7 @@ pub(crate) fn forward_decode_batch_prepared_glimmer(
                 row_stride: dim,
                 rotation: None,
                 awq_scale: None,
-            exec: weights.lm_head.exec,
+                exec: weights.lm_head.exec,
             };
             let params = GemmParams {
                 w: &w_ref,
@@ -797,7 +797,7 @@ pub(crate) fn forward_decode_batch_prepared_glimmer(
                 row_stride: dim,
                 rotation: None,
                 awq_scale: None,
-            exec: weights.lm_head.exec,
+                exec: weights.lm_head.exec,
             };
             let params = GemmParams {
                 w: &w_ref,

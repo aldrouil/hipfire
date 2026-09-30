@@ -5693,7 +5693,10 @@ pub mod kernel {
     /// Pure truth table behind [`lm_head_f16_native`], split out so unit tests can
     /// pin the contract without touching the process-global snapshot.
     pub fn parse_lm_head_f16_native(raw: Option<&str>) -> bool {
-        match raw.map(|value| value.trim().to_ascii_lowercase()).as_deref() {
+        match raw
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref()
+        {
             Some("0") | Some("f32") | Some("fp32") | Some("legacy") => false,
             _ => true,
         }

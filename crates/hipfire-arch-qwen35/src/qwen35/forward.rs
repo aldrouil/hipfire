@@ -2832,7 +2832,7 @@ fn qkvza_via_execute_steps(
             row_stride: 0,
             rotation: wqkv.paro.as_ref().map(paro_to_givens),
             awq_scale: None,
-        exec: wqkv.exec,
+            exec: wqkv.exec,
         };
         let wr_z = WeightRef {
             buf: &wz.buf,
@@ -2842,7 +2842,7 @@ fn qkvza_via_execute_steps(
             row_stride: 0,
             rotation: wz.paro.as_ref().map(paro_to_givens),
             awq_scale: None,
-        exec: wz.exec,
+            exec: wz.exec,
         };
         let wr_beta = WeightRef {
             buf: &w_beta.buf,
@@ -2852,7 +2852,7 @@ fn qkvza_via_execute_steps(
             row_stride: 0,
             rotation: w_beta.paro.as_ref().map(paro_to_givens),
             awq_scale: None,
-        exec: w_beta.exec,
+            exec: w_beta.exec,
         };
         let wr_alpha = WeightRef {
             buf: &w_alpha.buf,
@@ -2862,7 +2862,7 @@ fn qkvza_via_execute_steps(
             row_stride: 0,
             rotation: w_alpha.paro.as_ref().map(paro_to_givens),
             awq_scale: None,
-        exec: w_alpha.exec,
+            exec: w_alpha.exec,
         };
         let steps = [
             Step::RmsnormAutomatic {
@@ -2909,7 +2909,7 @@ fn qkvza_via_execute_steps(
             row_stride: 0,
             rotation: None,
             awq_scale: None,
-        exec: wqkv.exec,
+            exec: wqkv.exec,
         };
         let wr_z = WeightRef {
             buf: &wz.buf,
@@ -2919,7 +2919,7 @@ fn qkvza_via_execute_steps(
             row_stride: 0,
             rotation: None,
             awq_scale: None,
-        exec: wz.exec,
+            exec: wz.exec,
         };
         let wr_beta = WeightRef {
             buf: &w_beta.buf,
@@ -2929,7 +2929,7 @@ fn qkvza_via_execute_steps(
             row_stride: 0,
             rotation: None,
             awq_scale: None,
-        exec: w_beta.exec,
+            exec: w_beta.exec,
         };
         let wr_alpha = WeightRef {
             buf: &w_alpha.buf,
@@ -2939,7 +2939,7 @@ fn qkvza_via_execute_steps(
             row_stride: 0,
             rotation: None,
             awq_scale: None,
-        exec: w_alpha.exec,
+            exec: w_alpha.exec,
         };
         let steps = [
             Step::RmsnormAutomatic {
@@ -3007,7 +3007,7 @@ fn qkv_via_execute_steps(
             row_stride: 0,
             rotation: wq.paro.as_ref().map(paro_to_givens),
             awq_scale: None,
-        exec: wq.exec,
+            exec: wq.exec,
         };
         let wrk = WeightRef {
             buf: &wk.buf,
@@ -3017,7 +3017,7 @@ fn qkv_via_execute_steps(
             row_stride: 0,
             rotation: wk.paro.as_ref().map(paro_to_givens),
             awq_scale: None,
-        exec: wk.exec,
+            exec: wk.exec,
         };
         let wrv = WeightRef {
             buf: &wv.buf,
@@ -3027,7 +3027,7 @@ fn qkv_via_execute_steps(
             row_stride: 0,
             rotation: wv.paro.as_ref().map(paro_to_givens),
             awq_scale: None,
-        exec: wv.exec,
+            exec: wv.exec,
         };
         let steps = [
             Step::RmsnormAutomatic {
@@ -3066,7 +3066,7 @@ fn qkv_via_execute_steps(
             row_stride: 0,
             rotation: None,
             awq_scale: None,
-        exec: wq.exec,
+            exec: wq.exec,
         };
         let wrk = WeightRef {
             buf: &wk.buf,
@@ -3076,7 +3076,7 @@ fn qkv_via_execute_steps(
             row_stride: 0,
             rotation: None,
             awq_scale: None,
-        exec: wk.exec,
+            exec: wk.exec,
         };
         let wrv = WeightRef {
             buf: &wv.buf,
@@ -3086,7 +3086,7 @@ fn qkv_via_execute_steps(
             row_stride: 0,
             rotation: None,
             awq_scale: None,
-        exec: wv.exec,
+            exec: wv.exec,
         };
         let steps = [
             Step::RmsnormAutomatic {
@@ -3145,7 +3145,7 @@ fn gate_up_via_execute_steps(
             row_stride: 0,
             rotation: w_gate.paro.as_ref().map(paro_to_givens),
             awq_scale: None,
-        exec: w_gate.exec,
+            exec: w_gate.exec,
         };
         let wru = WeightRef {
             buf: &w_up.buf,
@@ -3155,7 +3155,7 @@ fn gate_up_via_execute_steps(
             row_stride: 0,
             rotation: w_up.paro.as_ref().map(paro_to_givens),
             awq_scale: None,
-        exec: w_up.exec,
+            exec: w_up.exec,
         };
         let steps = [
             Step::RmsnormAutomatic {
@@ -3189,7 +3189,7 @@ fn gate_up_via_execute_steps(
             row_stride: 0,
             rotation: None,
             awq_scale: None,
-        exec: w_gate.exec,
+            exec: w_gate.exec,
         };
         let wru = WeightRef {
             buf: &w_up.buf,
@@ -3199,7 +3199,7 @@ fn gate_up_via_execute_steps(
             row_stride: 0,
             rotation: None,
             awq_scale: None,
-        exec: w_up.exec,
+            exec: w_up.exec,
         };
         let steps = [
             Step::RmsnormAutomatic {

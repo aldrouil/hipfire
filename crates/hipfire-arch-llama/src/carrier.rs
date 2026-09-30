@@ -395,7 +395,7 @@ fn resident_weight(
         row_stride: dtype.row_stride(k),
         paro: None,
         awq_scale: None,
-    exec: rdna_compute::ExecTarget::Gpu,
+        exec: rdna_compute::ExecTarget::Gpu,
     }
 }
 
@@ -573,7 +573,13 @@ fn assemble_llama_weights(
     }
     debug_assert!(cells.is_empty(), "validated LLaMA assembly left cells");
     // Measured from the tensors this route produced, before `layers` is moved.
-    let stats = llama_load_stats(&token_embd, &output_norm, &output, &layers, lm_head_aliases_embd);
+    let stats = llama_load_stats(
+        &token_embd,
+        &output_norm,
+        &output,
+        &layers,
+        lm_head_aliases_embd,
+    );
     Ok(LlamaWeights {
         token_embd,
         embd_format,
