@@ -120,11 +120,10 @@ pub const EDITABLE_FIELDS: &[FieldSpec] = &[
     // inline-editable row; without a spec here Enter falls through to "not
     // editable from the TUI" and no value can be typed. `min: -1` matches the
     // schema, where a negative value is the reserved "fully resident" spelling
-    // rather than a count. Clearing: the editor seeds its buffer from the
-    // *current* value, so an emptied buffer is the unset spelling — `write_value`
-    // maps empty input on a nullable field to clear — and a typed `null` is the
-    // config/CLI spelling rather than something the buffer can reach once a value
-    // exists (typing appends to the seed).
+    // rather than a count. Clearing a value this row has set is the row's
+    // Delete/Backspace — the mainline clear path (`App::reset_selected_setting`)
+    // — because an emptied buffer is not the unset spelling for a numeric field,
+    // exactly as it is not for any other numeric row.
     FieldSpec {
         key: "gpu_layer_budget",
         kind: FieldKind::Int {
@@ -196,21 +195,10 @@ pub fn write_value(path: &Path, key: &str, raw: &str) -> Result<Value, WriteErro
         key: key.to_owned(),
         value: raw.to_owned(),
     })?;
-    let invalid = || WriteError::Invalid {
+    let config_value = schema.parse_cli(raw).map_err(|_| WriteError::Invalid {
         key: key.to_owned(),
         value: raw.to_owned(),
-    };
-    let config_value = match schema.parse_cli(raw) {
-        Ok(value) => value,
-        // An empty buffer on a field that cannot hold the empty string is the
-        // *unset* spelling, not a typo: the editor opens empty exactly when the
-        // stored value is null (`App::current_setting_value` reads "" for an
-        // unset key), so Enter on a row the user never typed into must clear the
-        // key rather than be rejected. A `FreeStr` field accepts "" directly and
-        // never reaches this arm.
-        Err(_) if raw.trim().is_empty() => schema.parse_cli("null").map_err(|_| invalid())?,
-        Err(_) => return Err(invalid()),
-    };
+    })?;
     let json = to_json(&config_value);
     write_config_value(path, schema.key, config_value)?;
     Ok(json)
@@ -362,42 +350,64 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    /// An empty buffer is the *unset* spelling on a field that cannot hold the
-    /// empty string — the editor opens empty exactly when the stored value is
-    /// null, so Enter on a row the user never typed into must clear it (a no-op
-    /// when it was already unset) instead of flooding an error. A free-string
-    /// field keeps meaning the empty string.
+    /// An empty buffer is *not* a clear spelling — not for the offload row and
+    /// not for any row that predates it. Clearing a setting is the row's
+    /// Delete/Backspace (`App::reset_selected_setting` -> `delete_key`), so
+    /// `write_value` keeps the rule master has: empty input on a numeric field is
+    /// the invalid input it always was. The config/CLI spelling for "unset" is
+    /// the literal `null`, which the schema's nullable fields accept.
     #[test]
-    fn empty_input_clears_a_nullable_field_but_stays_empty_for_a_string() {
+    fn empty_input_is_invalid_and_the_null_spelling_clears_a_nullable_field() {
         let (root, path) = temp_config();
-        assert_eq!(
-            write_value(&path, "gpu_layer_budget", "").unwrap(),
-            Value::Null,
-            "empty on a nullable integer must clear, not be rejected"
+        assert!(
+            write_value(&path, "gpu_layer_budget", "").is_err(),
+            "empty is not a clear spelling for the offload row"
         );
+        assert!(
+            write_value(&path, "gpu_layer_budget", "   ").is_err(),
+            "nor is whitespace-only input"
+        );
+        assert!(
+            write_value(&path, "max_tokens", "").is_err(),
+            "unchanged from master for a pre-existing Int row"
+        );
+        assert!(
+            write_value(&path, "temperature", "").is_err(),
+            "unchanged from master for a pre-existing Float row"
+        );
+        assert!(
+            write_value(&path, "mmq_screen", "").is_err(),
+            "unchanged from master for a pre-existing Enum row"
+        );
+        assert!(
+            write_value(&path, "deepseek4_experts_per_token", "").is_err(),
+            "unchanged from master even for a pre-existing *nullable* integer"
+        );
+        assert!(!path.exists(), "a rejected write must not touch the file");
+
+        // `null` is the schema's unset spelling for a nullable field: it drops
+        // the key. A real value still writes, and a bad one is still rejected.
         assert_eq!(
-            write_value(&path, "gpu_layer_budget", "   ").unwrap(),
-            Value::Null,
-            "whitespace-only input is the same unset spelling"
+            write_value(&path, "gpu_layer_budget", "null").unwrap(),
+            Value::Null
         );
         let loaded = load_global(&ConfigPaths::under(&root)).unwrap();
         assert!(
             loaded.layer.get("gpu_layer_budget").is_none(),
-            "cleared key is off disk"
+            "the null spelling takes the key off disk"
         );
+        write_value(&path, "gpu_layer_budget", "24").unwrap();
+        let loaded = load_global(&ConfigPaths::under(&root)).unwrap();
+        assert_eq!(
+            loaded.layer.get("gpu_layer_budget"),
+            Some(&ConfigValue::Integer(24))
+        );
+        assert!(write_value(&path, "gpu_layer_budget", "3x").is_err());
 
         // A free string keeps the empty string as a value.
         assert_eq!(
             write_value(&path, "prefill_drafter", "").unwrap(),
             Value::String(String::new())
-        );
-        // And a genuinely bad value is still rejected.
-        assert!(write_value(&path, "gpu_layer_budget", "3x").is_err());
-        // The empty-means-clear retry must not hand a non-nullable enum a clear
-        // spelling it does not have in the schema (`pcie|cpu`).
-        assert!(
-            write_value(&path, "offload_exec", "").is_err(),
-            "empty input must not make a non-nullable enum clearable"
         );
         let _ = fs::remove_dir_all(root);
     }
