@@ -340,6 +340,12 @@ PCIe link (27.1 GB/s measured, §7) instead of device DRAM: this is llama.cpp's
   fused launch the guard missed or a call site that bypasses `execute_steps`
   shows up there instead of as a mystery. The `calls=` field on the line is what
   makes the number quotable: a shape's first line is its cold first step.
+  The same flag prints `cpu exec: idle N% — window ending at step S …` on the
+  *global* step count's doubling schedule: the share of a decode window's wall
+  spent inside CPU-executed steps. Because a CPU step is a host sync point and
+  prefill never enters the seam, that share is a **lower bound on the GPU's idle
+  fraction** — the only reason a scheme that hands part of a spilled step back
+  to the GPU could pay. It is a headroom reading, not a correctness signal.
 - **Not covered, deliberately.** The slots/serve body (`forward_batch_slots` →
   `dense_ffn_body_slots`) and prefill run batched GEMM kernels that never enter
   `execute_steps`, so their spilled weights are still read over PCIe; the seam

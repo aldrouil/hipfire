@@ -48,7 +48,7 @@
 //! into the step representation.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
 
@@ -81,11 +81,80 @@ pub fn cpu_exec_enabled() -> bool {
 static CPU_STEPS: AtomicUsize = AtomicUsize::new(0);
 static HOST_MAPPED_GPU_STEPS: AtomicUsize = AtomicUsize::new(0);
 
+/// Cumulative wall time spent *inside* CPU-executed steps, entry to return: the
+/// D2H drain, the multiplication, the H2D. Paired with [`CPU_STEPS`] for the
+/// GPU-idle accounting in [`report_idle`].
+static CPU_STEP_WALL_NS: AtomicU64 = AtomicU64::new(0);
+
 pub fn cpu_exec_counters() -> (usize, usize) {
     (
         CPU_STEPS.load(Ordering::Relaxed),
         HOST_MAPPED_GPU_STEPS.load(Ordering::Relaxed),
     )
+}
+
+/// Wall-clock partition of a decode run into CPU-step time and everything else.
+///
+/// A CPU-executed step is a host sync point: its D2H drains the stream, the
+/// multiplication and the H2D run on the host, so the compute units execute
+/// nothing for its whole duration — *provided* nothing else is using the device.
+/// Over a decode-only span (prefill is GPU-side and never enters the seam) the
+/// fraction of the wall spent inside those steps is therefore a **lower bound**
+/// on the GPU's idle fraction, and the headroom a "hand some of the spilled
+/// work back to an idle GPU" scheme would be spending. `HIPFIRE_CPU_EXEC_TRACE=1`
+/// prints it per window; it is not a correctness signal and nothing depends on
+/// it.
+#[derive(Clone, Copy)]
+struct IdleWindow {
+    anchor: Instant,
+    cpu_ns: u64,
+    steps: usize,
+}
+
+/// `None` until the first report; a window is the span between two consecutive
+/// reports. Windows rather than a cumulative ratio because `hipfire bench
+/// --runs N` decodes several times inside one process and the gaps between runs
+/// are neither GPU-idle nor CPU-step time — a cumulative ratio would dilute
+/// every window that spanned one.
+static IDLE_WINDOW: Mutex<Option<IdleWindow>> = Mutex::new(None);
+
+/// Print the CPU-step share of the wall since the last report. Called from
+/// [`trace_step`] at the same doubling schedule as the per-shape lines, so the
+/// last windows of a run cover the bulk of it and the cold first steps sit in
+/// the first, discarded, window.
+fn report_idle(steps: usize) {
+    let total_cpu_ns = CPU_STEP_WALL_NS.load(Ordering::Relaxed);
+    let Ok(mut window) = IDLE_WINDOW.lock() else {
+        return;
+    };
+    let now = Instant::now();
+    let Some(previous) = window.as_mut() else {
+        *window = Some(IdleWindow {
+            anchor: now,
+            cpu_ns: total_cpu_ns,
+            steps,
+        });
+        return;
+    };
+    let span = now.duration_since(previous.anchor);
+    let cpu_ns = total_cpu_ns.saturating_sub(previous.cpu_ns);
+    let window_steps = steps - previous.steps;
+    previous.anchor = now;
+    previous.cpu_ns = total_cpu_ns;
+    previous.steps = steps;
+    let span_ns = span.as_nanos() as u64;
+    if span_ns == 0 {
+        return;
+    }
+    let per_step_us = cpu_ns as f64 / window_steps.max(1) as f64 / 1e3;
+    eprintln!(
+        "cpu exec: idle {:.1}% — window ending at step {steps} covers {window_steps} steps: \
+         {:.0}ms wall, {:.0}ms on CPU ({per_step_us:.0}us CPU/step) \
+         — GPU-idle lower bound, see report_idle",
+        100.0 * cpu_ns as f64 / span_ns as f64,
+        span_ns as f64 / 1e6,
+        cpu_ns as f64 / 1e6,
+    );
 }
 
 /// Per-step wall-time split, in nanoseconds: device→host, the GEMV itself,
@@ -229,6 +298,7 @@ pub fn run_host_mapped_gemv(
     out: &GpuTensor,
 ) -> Result<(), DispatchError> {
     let q = host_mapped_quant(gpu, w)?;
+    let step_start = Instant::now();
     let (m, k) = (w.m, w.k);
     let bytes = gpu
         .host_bytes(w.buf)
@@ -241,12 +311,12 @@ pub fn run_host_mapped_gemv(
     let t2 = Instant::now();
     upload_f32(gpu, out, &y)?;
     let h2d_ns = t2.elapsed().as_nanos() as u64;
-    CPU_STEPS.fetch_add(1, Ordering::Relaxed);
-    trace_step(
+    finish_step(
         q,
         w,
         rotate_input,
         false,
+        step_start,
         StepTiming {
             d2h_ns,
             gemv_ns,
@@ -299,6 +369,7 @@ pub fn run_host_mapped_gemv_residual(
     acc: &GpuTensor,
 ) -> Result<(), DispatchError> {
     let q = host_mapped_quant(gpu, w)?;
+    let step_start = Instant::now();
     let (m, k) = (w.m, w.k);
     let rotate_input = dtype_rotation_plan(w.dtype) == RotationPlan::FwhtG256;
     let bytes = gpu
@@ -314,12 +385,12 @@ pub fn run_host_mapped_gemv_residual(
     residual_add(&mut acc_host, &y);
     upload_f32(gpu, acc, &acc_host)?;
     let h2d_ns = t2.elapsed().as_nanos() as u64;
-    CPU_STEPS.fetch_add(1, Ordering::Relaxed);
-    trace_step(
+    finish_step(
         q,
         w,
         rotate_input,
         true,
+        step_start,
         StepTiming {
             d2h_ns,
             gemv_ns,
@@ -327,6 +398,23 @@ pub fn run_host_mapped_gemv_residual(
         },
     );
     Ok(())
+}
+
+/// Close out a CPU-executed step: count it, charge its whole wall time (the
+/// blocking D2H, the multiplication, the H2D) to the GPU-idle account, and feed
+/// the per-shape trace. One call site per executed step, so the counters and
+/// the trace can never disagree about how many steps ran.
+fn finish_step(
+    q: CpuQuant,
+    w: &WeightRef,
+    rotated: bool,
+    residual: bool,
+    step_start: Instant,
+    timing: StepTiming,
+) {
+    CPU_STEPS.fetch_add(1, Ordering::Relaxed);
+    CPU_STEP_WALL_NS.fetch_add(step_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    trace_step(q, w, rotated, residual, timing);
 }
 
 /// Whether [`run_host_mapped_gemv`] / [`run_host_mapped_gemv_residual`] can drive
@@ -509,11 +597,16 @@ fn trace_step(q: CpuQuant, w: &WeightRef, rotated: bool, residual: bool, timing:
     stats.gemv_ns += timing.gemv_ns;
     stats.h2d_ns += timing.h2d_ns;
     let stats = *stats;
+    // The GPU-idle window report rides the *global* step count's doubling
+    // schedule, so it exists even for a spill whose every shape is new.
+    let (on_cpu, on_gpu) = cpu_exec_counters();
+    if on_cpu.is_power_of_two() {
+        report_idle(on_cpu);
+    }
     if !stats.calls.is_power_of_two() {
         return;
     }
     let (m, k) = (w.m, w.k);
-    let (on_cpu, on_gpu) = cpu_exec_counters();
     // ns -> ms, averaged over *this shape's* calls so far.
     let per_ms = |ns: u64| ns as f64 / 1e6 / stats.calls as f64;
     eprintln!(
