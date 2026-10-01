@@ -211,9 +211,9 @@ struct ShapeState {
     r_cpu: Option<Ewma>,
     r_gpu: Option<Ewma>,
     samples: u64,
-    /// Steps whose join outlasted the CPU multiply — the only ones `r_gpu` is
-    /// sampled from. Printed with the shape so an operator can see whether the
-    /// GPU rate the share rests on was ever actually observed.
+    /// Steps whose join exceeded the shape's no-wait floor plus the margin — the
+    /// only ones `r_gpu` is sampled from. Printed with the shape so an operator can
+    /// see whether the GPU rate the share rests on was ever actually observed.
     gpu_samples: u64,
     /// The smallest blocking-H2D time seen for this shape: the step's own
     /// no-wait floor, i.e. what the copy costs when the GPU arm finished first.
@@ -283,9 +283,13 @@ pub struct ShapeSnapshot {
     pub cpu_bytes_per_s: Option<f64>,
     pub gpu_bytes_per_s: Option<f64>,
     pub samples: u64,
-    /// Steps whose join outlasted the CPU multiply — the only ones the GPU rate
-    /// above can come from.
+    /// Steps whose join exceeded the shape's no-wait floor plus the margin — the
+    /// only ones the GPU rate above can come from.
     pub gpu_samples: u64,
+    /// The smallest blocking-H2D time seen for this shape: the no-wait floor the
+    /// controller measures every join against, and the reason a "wait" needs no
+    /// host constant.
+    pub min_join_ns: Option<u64>,
     pub last_waited: bool,
     pub last_target: Option<f64>,
     pub applied: u32,
@@ -331,6 +335,7 @@ fn shape_of(((dtype, k), state): (&(DType, usize), &ShapeState)) -> ShapeSnapsho
         gpu_bytes_per_s: state.r_gpu.map(|e| e.value),
         samples: state.samples,
         gpu_samples: state.gpu_samples,
+        min_join_ns: state.min_join_ns,
         last_waited: state.last_waited,
         last_target: state.last_target,
         applied: state.applied,
