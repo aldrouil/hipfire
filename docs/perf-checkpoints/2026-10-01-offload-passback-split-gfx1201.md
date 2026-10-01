@@ -359,21 +359,31 @@ lands on a tie once the spill is only 8 of 64 layers and the resident work domin
 | `--write` | wrote `offload_passback_share = "0.377"` to `~/.hipfire/config.toml`; `hipfire config get memory.offload_passback_share` printed `0.377` |
 | restore | `hipfire config reset memory.offload_passback_share` left the config byte-identical to its pre-test copy (`diff` clean) |
 
-## 10. Long-range correctness arc — 32,768 tokens per backend
+## 10. Not measured: a long-horizon text arc (attempted, then abandoned)
 
-`[amended]` Added after the original; **its own run**, launched after the sweep.
+`[amended]` A 32k-token completion per backend was started and then dropped at the
+record owner's request: the prompt was a self-verifying integer sequence rather than
+the long *prose* they wanted, and re-scoping it is not this record's business. Its
+outputs and prompt were deleted with it, so no numbers from the attempt are quoted
+here. Two pitfalls it did establish, both worth knowing before anyone retries:
 
-A 32k-token greedy completion per backend (cpu / passback / pcie) at budget 24
-(8 of 32 spilled), `-t 0 --spec off -n 32768`, on one committed prompt
-(`benchmarks/prompts/long_range_count.txt`, md5 `abab011aadb5cb1d3ef86a0e646cc1a3`) —
-a self-verifying task ("write the integers from 1 upward, one per line"), so a
-reviewer can check monotonicity and completeness directly instead of reading prose.
+* **`hipfire run` has no reasoning flag, and a long budget is consumed by hidden
+  reasoning.** With `reasoning.mode = on` (the config default, and the 9B is a
+  reasoning model), two arms each spent ~20 minutes of real decode and wrote **1
+  byte** — a bare `println!()` around an empty visible answer, because every token
+  went into the invisible think block. `reasoning.mode = off` streamed text
+  immediately, at 27 tok/s (matching the sweep's `cpu` point). AGENTS.md § 7 warns
+  about the `bench` side of this ("a reasoning model cannot close `<think>` inside the
+  token budget, and the daemon fails that turn closed"); `run` has only the config
+  key.
+* **`-n` does not set the arc's length — the model's own stop does.** Instructed to
+  "keep going as long as you are allowed to", the 9B stopped by EOS at 1000 (997
+  integers, 3887 bytes ≈ 3.9k tokens, 143 s). For a long arc, the length has to come
+  from the prompt (a bounded range) rather than from the token budget.
 
-Outputs are **not quoted here** (32k tokens each): they are local, gitignored files
-under `.codeinsight+research/arc-2026-10-01/`, which also carries a `README.md`
-briefing with the fixture identity and the checks worth running. Sizes, digests,
-per-arm wall times and the completeness check land in § 10.1 when the three arms
-finish (the run outlives this commit).
+What *is* measured about long-horizon behaviour in this record is § 6: the 256- and
+512-token text comparisons across all three modes, and the element-level divergence
+in § 5.
 
 ## Appendix: whole `hipfire bench --json` per arm (9 arms)
 
