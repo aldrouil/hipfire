@@ -24,6 +24,7 @@ use hipfire_registry::{
     Sidecar,
 };
 use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::offload_calibrate::{CalibrateOptions, CalibrationReport};
 use hipfire_runtime::prompt_frame::ToolCall;
 use saddle_core::caps::ReasoningContract;
 use saddle_core::kv::KvBackend;
@@ -652,7 +653,7 @@ struct OffloadBenchArgs {
     /// Timed reps per engine; the median is reported.
     #[arg(long, value_name = "N")]
     reps: Option<usize>,
-    /// Persist the recommended share for the largest format measured.
+    /// Persist the recommended share (the median over the largest measurements).
     #[arg(long)]
     write: bool,
 }
@@ -2620,6 +2621,31 @@ fn live_daemon_pids(paths: &Paths) -> Vec<i32> {
     live
 }
 
+/// The share `offload-bench` recommends from a measurement matrix.
+///
+/// The recommendation comes from the largest measurements: a real spilled
+/// projection is MBs of weight bytes, and the matrix's smallest entry is where the
+/// copies and the launch overhead distort the balance most. Every format is
+/// measured over the same `buffer_mb` by construction, so "the largest" is usually
+/// the whole matrix — a *set* — and the **median** share over it is the honest
+/// single number (a singleton when `--format` pinned one format). Split out from
+/// the command so the tie behavior is pinned by a test rather than by
+/// `max_by_key`'s iteration order, which silently picked whichever format came
+/// last.
+fn recommended_share(reports: &[CalibrationReport]) -> Option<(String, f64)> {
+    let largest = reports.iter().map(|r| r.bytes).max()?;
+    let biggest: Vec<&CalibrationReport> =
+        reports.iter().filter(|r| r.bytes == largest).collect();
+    let mut shares: Vec<f64> = biggest.iter().map(|r| r.share).collect();
+    shares.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let label = if biggest.len() == 1 {
+        biggest[0].format.clone()
+    } else {
+        format!("the {} largest measured formats", biggest.len())
+    };
+    Some((label, shares[shares.len() / 2]))
+}
+
 /// `hipfire offload-bench`: measure this host's GPU share for a split offload step
 /// (`memory.offload_exec=passback`, `memory.offload_passback_share`).
 ///
@@ -2640,7 +2666,7 @@ fn offload_bench_command(paths: &Paths, args: OffloadBenchArgs) -> Result<()> {
     }
     let mut gpu = rdna_compute::Gpu::init()
         .map_err(|e| anyhow!("offload-bench needs a GPU: {} [code {}]", e.message, e.code))?;
-    let opts = hipfire_runtime::offload_calibrate::CalibrateOptions {
+    let opts = CalibrateOptions {
         format: args.format.clone(),
         k: args.k,
         buffer_mb: args
@@ -2651,30 +2677,7 @@ fn offload_bench_command(paths: &Paths, args: OffloadBenchArgs) -> Result<()> {
             .unwrap_or(hipfire_runtime::offload_calibrate::DEFAULT_REPS),
     };
     let reports = hipfire_runtime::offload_calibrate::calibrate(&mut gpu, &opts)?;
-    // The recommendation comes from the largest measurements. Every format is
-    // measured over the same `buffer_mb` by construction, so "the largest" is
-    // usually the whole matrix — a *set* — and a median over it is the honest
-    // single number (a singleton when `--format` pinned one format).
-    let recommended = {
-        let largest = reports.iter().map(|r| r.bytes).max();
-        let mut shares: Vec<f64> = reports
-            .iter()
-            .filter(|r| Some(r.bytes) == largest)
-            .map(|r| r.share)
-            .collect();
-        shares.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        (!shares.is_empty()).then(|| {
-            let label = match shares.len() {
-                1 => reports
-                    .iter()
-                    .find(|r| Some(r.bytes) == largest)
-                    .map(|r| r.format.clone())
-                    .unwrap_or_else(|| "?".into()),
-                n => format!("the {n} largest measured formats"),
-            };
-            (label, shares[shares.len() / 2])
-        })
-    };
+    let recommended = recommended_share(&reports);
     if args.json {
         let rows: Vec<serde_json::Value> = reports
             .iter()
@@ -7797,6 +7800,79 @@ mod tests {
             last_activity: Instant::now() - Duration::from_secs(600),
             ..ServeMeta::new("test".to_owned())
         }
+    }
+
+    /// `offload-bench` is a raw device benchmark: it must name a live daemon and
+    /// measure nothing. The predicate behind that refusal is pure filesystem +
+    /// `kill(pid, 0)`, so it is testable without a GPU or a real daemon — and it is
+    /// the only thing standing between a user and two engines sharing the device.
+    #[test]
+    fn live_daemon_pids_sees_live_pid_files_only() {
+        let paths = test_paths("offload-bench-pids");
+        std::fs::create_dir_all(&paths.root).unwrap();
+        // Our own pid is alive; a pid above the kernel's `pid_max` cannot be.
+        std::fs::write(paths.root.join("daemon.pid"), format!("{}\n", std::process::id())).unwrap();
+        std::fs::write(paths.root.join("daemon-GPU-0abc_pci-0000:14:00.0.pid"), "999999999\n")
+            .unwrap();
+        // Not pid files, and not a pid: ignored, never an error.
+        std::fs::write(paths.root.join("daemon.pid.bak"), "1\n").unwrap();
+        std::fs::write(paths.root.join("daemon-garbage.pid"), "not-a-pid\n").unwrap();
+        std::fs::write(paths.root.join("serve.pid"), format!("{}\n", std::process::id())).unwrap();
+
+        assert_eq!(live_daemon_pids(&paths), vec![std::process::id() as i32]);
+
+        // The same file naming a dead process is no longer a live daemon.
+        std::fs::write(paths.root.join("daemon.pid"), "999999999\n").unwrap();
+        assert!(live_daemon_pids(&paths).is_empty());
+
+        // A missing root is empty, not a panic.
+        let _ = std::fs::remove_dir_all(&paths.root);
+        assert!(live_daemon_pids(&paths).is_empty());
+    }
+
+    /// The recommendation a user pins: a singleton when one format was measured,
+    /// otherwise the **median** of the largest measurements. The tie is the point —
+    /// every format is measured over the same `buffer_mb`, so picking by
+    /// `max_by_key(bytes)` silently returned whichever format came last in the
+    /// matrix (q8_0), whose rate profile is not the model's.
+    #[test]
+    fn recommended_share_takes_the_median_of_the_largest() {
+        let report = |format: &str, bytes: usize, share: f64| CalibrationReport {
+            arch: "gfx1201".into(),
+            format: format.into(),
+            m: bytes / 2720,
+            k: 5120,
+            bytes,
+            cpu_bytes_per_s: 4.0e10,
+            gpu_bytes_per_s: 2.5e10,
+            share,
+            predicted_speedup: 1.5,
+        };
+
+        assert!(recommended_share(&[]).is_none());
+
+        // One pinned format: itself, named.
+        let one = vec![report("mq4g256", 201_328_960, 0.375)];
+        assert_eq!(recommended_share(&one), Some(("mq4g256".to_string(), 0.375)));
+
+        // A tie on size takes the median share of the tied set, and says so.
+        let tied = vec![
+            report("a", 100, 0.10),
+            report("b", 100, 0.20),
+            report("c", 100, 0.50),
+            report("small", 50, 0.99),
+        ];
+        assert_eq!(
+            recommended_share(&tied),
+            Some(("the 3 largest measured formats".to_string(), 0.20))
+        );
+
+        // A strictly larger entry wins outright, wherever it sits in the matrix.
+        let mixed = vec![report("small", 50, 0.99), report("big", 200, 0.30)];
+        assert_eq!(
+            recommended_share(&mixed),
+            Some(("big".to_string(), 0.30))
+        );
     }
 
     /// A minimal real HFQ container carrying `arch_id`, so the discovery
