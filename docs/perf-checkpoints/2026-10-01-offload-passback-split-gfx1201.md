@@ -2,6 +2,14 @@
 
 **Lifecycle:** `historical`
 
+**Amended in place 2026-10-01, later the same day**, on the record owner's
+instruction. `docs/perf-checkpoints/README.md` routes corrections to a new dated
+amendment file; that rule is deliberately overridden here, and every changed
+passage is marked `[amended]` so a reader can still see what moved. Sections added:
+§ 8 (offload-amount sweep + a 27B comparison point), § 9 (CLI paths), § 10 (the
+32k-token long-range arc). § 4 and the identity table were corrected — see the
+`[amended]` notes.
+
 **Disposition:** measured evidence for `memory.offload_exec=passback` (the row-split
 pass-back mode; design in
 [`../plans/partial-gpu-offload-design.md`](../plans/partial-gpu-offload-design.md) § 6.2.2).
@@ -33,8 +41,12 @@ new record.
    `cpu` 27.40 tok/s, `passback` 30.60 (+11.7 %),
    `pcie` 23.20 (-15.3 %). Per-arm spread was
    tiny (`cpu` [27.4, 27.5, 27.2], `passback` [30.8, 30.6, 30.2], `pcie` [23.2, 23.2, 23.2]); `vram_free_mb`
-   is identical across the three arms at the same budget (11308–11308 MB),
-   which is expected: a pass-back moves no bytes out of VRAM.
+   `[amended]` spread 11308–11336 MB across **all nine** arms (per-arm values in
+   § 1) — identical within the diagnostic's own granularity, as expected: a
+   pass-back changes who multiplies, never what is resident. The pass-back's own
+   values (11336/11336/11308) sit *inside* the cpu and pcie ranges, so nothing here
+   is attributable to the split. The earlier wording of this bullet said
+   "11308–11308 MB", which was wrong; the data were always the per-arm lists in § 1.
 5. **The scheduler converges on its own to the share the standalone bench predicts.**
    With `share auto` the four covered shapes settled at **0.279–0.360** on the field
    shapes (2–27 MB) and froze there; `hipfire offload-bench` measures the same host's
@@ -60,8 +72,14 @@ new record.
 
 - Host: 1 × Radeon RX 9070 XT `gfx1201`, 16304 MB, **PCIe 16.0 GT/s × 16** (4.0 x16),
   ROCm/HIP 7.2; Ryzen 7 7800X3D (8c/16t), 28 GB RAM. 1-min load average 4.6–5.9 during
-  the arms (unrelated work, so the host was **not** idle — the interleaved 3-round design
-  is what makes the deltas readable).
+  the arms. `[amended]` The load was **not** unrelated work and the host was never
+  near the plan's `uptime ≈ 0.5`: the top consumer is `orcaslicer_main` at ~55 % of a
+  core, plus konsole/kwin/easyeffects, so `nproc`-normalised load stays around 3–8
+  through every arm. The interleaved round design is what makes the deltas readable;
+  the **absolute rates are depressed relative to an idle host** and the balance point
+  itself shifts with contention (a slower CPU arm favours a higher GPU share), so
+  nothing here should be quoted as this machine's standalone engine rates. § 2's
+  `offload-bench` table was taken in the same regime.
 - Source HEAD `f9079882c1d66740e22cea5da1b9418b6f24531a`;
   `target/release/daemon` md5 `ec8f192755cc349b8e46b2dd578429eb`;
   `target/release/hipfire` md5 `c291d26c39f82013d492d94512b3f0c8`.
@@ -222,7 +240,7 @@ test passback_row_offset_equivalence ... ok
 | `HIPFIRE_OFFLOAD_EXEC=cpu` vs `passback` with `HIPFIRE_OFFLOAD_PASSBACK_SHARE=0`, 256 tokens | **identical** (`cmp`), `0` `split:` lines |
 | `pcie` vs `pcie` + stray `HIPFIRE_OFFLOAD_PASSBACK_SHARE=0.4`, 256 tokens | **identical**; stray-share notice printed |
 | `cpu` vs `passback` (share auto), 256 tokens | **identical** |
-| `cpu` vs `passback` (share auto), 512 tokens (full completion, EOS at 642 chars) | **identical** |
+| `cpu` vs `passback` (share auto), 512 tokens (EOS at 642 chars, so both runs end early) | **identical** |
 | `cpu` vs `pcie`, 256 tokens | **identical** |
 
 That last row is the honest headline for this fixture: on the registry 9B artifact,
@@ -259,6 +277,92 @@ Coherent, correct for the prompt, and terminated by EOS; identical to the `cpu` 
   around the D2H would help is not measured; the same-stream ordering was sufficient
   (the copies are ~0.03–0.08 ms against 0.1–0.6 ms CPU arms).
 - **`Ky` / host-DRAM contention** — the headroom record's subject, not repeated here.
+
+
+## 8. Offload-amount sweep (9B) and one 27B comparison point
+
+`[amended]` Added after the original. Same method as § 1 (`hipfire bench … --json`,
+one fresh daemon per arm, arms interleaved, `--spec off --backend noslots
+--workload stateless`, 128 tokens, greedy, the same committed prompt), sweeping the
+resident-layer budget so the spilled prefix changes. Two rounds per point.
+
+Bars: [`data-2026-10-01-offload-passback-split/mode-sweep-vs-spilled-layers.png`](data-2026-10-01-offload-passback-split/mode-sweep-vs-spilled-layers.png)
+(+ `.svg`).
+
+### 8.1 Qwen3.5-9B mq4 (32 layers)
+
+| layers spilled | `cpu` tok/s | `passback` tok/s | `pcie` tok/s | passback vs `cpu` | passback vs `pcie` |
+|---:|---:|---:|---:|---:|---:|
+| 4 | 43.80 | 47.50 | 39.45 | **+8.4 %** | +20.4 % |
+| 8 | 28.10 | 30.50 | 23.55 | **+8.5 %** | +29.5 % |
+| 12 | 20.50 | 23.20 | 16.65 | **+13.2 %** | +39.3 % |
+| 16 | 16.20 | 18.45 | 12.85 | **+13.9 %** | +43.6 % |
+
+Per-round raw (the drift check; medians above are of these two):
+
+```
+  4   cpu       [43.6, 44.0]   passback [47.1, 47.9]   pcie [39.2, 39.7]
+  8   cpu       [28.0, 28.2]   passback [31.0, 30.0]   pcie [23.7, 23.4]
+ 12   cpu       [20.5, 20.5]   passback [23.7, 22.7]   pcie [16.6, 16.7]
+ 16   cpu       [16.2, 16.2]   passback [18.4, 18.5]   pcie [12.9, 12.8]
+```
+
+Reading: **the pass-back's advantage grows with the spill** — +8.4 % at 4 of 32
+spilled, +13.9 % at 16 of 32 — and its advantage over `pcie` grows faster still
+(+20 % → +44 %), because `pcie` is the arm that pays the whole link read per step
+while `cpu` and `passback` share the host's own bandwidth. The budget-8 point here
+(cpu 28.10 / passback 30.50) is the same shape as § 1's three-round point (27.40 /
+30.60) measured a few hours earlier on a differently loaded host — the pass-back
+figure reproduced to 0.3 %, the `cpu` figure moved 0.7 tok/s, which is the honest
+size of the pass-back gain's uncertainty at this budget (**+8.5 %…+11.7 %**, not a
+single number).
+
+### 8.2 Qwen3.8-27B mq3-xt (64 layers), 8 of 64 spilled
+
+`~/.hipfire/models/qwen3.8-27b.mq3-xt` — 11,777,616,896 B, md5
+`80bb9198e6a565fc006b2ae1b7c89eca` (the headroom record's pinned 27B; the registry
+`qwen3.8:27b-mq4-xts` fixture is **not** on this disk, so this is the comparable
+artifact, not the canonical one). One round; a second round was abandoned when the
+`pcie` arm wedged under memory pressure (`free` at 0 GB / 12 GB available) — the
+same stall the headroom record documents at 27B load.
+
+| mode | decode tok/s | ttft ms | vram_free_mb |
+|---|---:|---:|---:|
+| `cpu` | 14.40 | 586 | 4730 |
+| **`passback` (auto)** | **17.10** | 588 | 4730 |
+| `pcie` | 14.40 | 591 | 4758 |
+
+**+18.8 % over `cpu`**, against +8.5 % for the 9B at 8 of 32 spilled: a bigger model
+at the same *number* of spilled layers gains more, because each spilled projection
+is a larger vector and the CPU arm's serialized host time per step is longer. Note
+`pcie` ties `cpu` exactly here (14.40 both) rather than winning or losing — the
+"GPU route is ~20 % slower per byte than the CPU route" from the headroom record
+lands on a tie once the spill is only 8 of 64 layers and the resident work dominates.
+
+## 9. `hipfire offload-bench` CLI paths
+
+`[amended]` Added after the original — these are user-facing and were unrecorded.
+
+| check | result |
+|---|---|
+| while a daemon is live | exit **1**, stdout empty (0 bytes), one line naming the live pid: `a hipfire daemon is live (pid N); stop it first (`hipfire stop`) — offload-bench measures the device directly, and a concurrent daemon makes both engine rates meaningless` |
+| `--json` | exit 0, one object: `arch`, `recommended {format, share}`, `formats[] {format, m, k, bytes, cpu_bytes_per_s, gpu_bytes_per_s, share, predicted_speedup}` |
+| `--write` | wrote `offload_passback_share = "0.377"` to `~/.hipfire/config.toml`; `hipfire config get memory.offload_passback_share` printed `0.377` |
+| restore | `hipfire config reset memory.offload_passback_share` left the config byte-identical to its pre-test copy (`diff` clean) |
+
+## 10. Long-range correctness arc — 32,768 tokens per backend
+
+`[amended]` Added after the original; **its own run**, launched after the sweep.
+
+A 32k-token greedy completion per backend (cpu / passback / pcie) at budget 24
+(8 of 32 spilled), `-t 0 --spec off -n 32768`, on one committed prompt
+(`benchmarks/prompts/long_range_count.txt`, md5 `abab011aadb5cb1d3ef86a0e646cc1a3`) —
+a self-verifying task ("write the integers from 1 upward, one per line"), so a
+reviewer can check monotonicity and completeness directly instead of reading prose.
+
+Outputs are **not quoted here** (32k tokens each): they are local files, not
+checkpoint content, and are listed with sizes, digests and per-arm wall times in
+§ 10.1 so a reviewer can work from the bytes rather than from a transcription.
 
 ## Appendix: whole `hipfire bench --json` per arm (9 arms)
 
