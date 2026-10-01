@@ -853,8 +853,11 @@ fn trace_step(
             Some(s) => (
                 format!("{:.3}", s.share),
                 format!(
-                    " (gpu samples {}, last waited={}, target={}, {} applied{})",
+                    " (gpu samples {}, floor={}, last waited={}, target={}, {} applied{})",
                     s.gpu_samples,
+                    s.min_join_ns
+                        .map(|ns| format!("{:.2}ms", ns as f64 / 1e6))
+                        .unwrap_or_else(|| "—".into()),
                     s.last_waited,
                     s.last_target
                         .map(|t| format!("{t:.3}"))
