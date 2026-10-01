@@ -39,7 +39,7 @@ The rate columns are context for the idle columns, not results in their own righ
 
 ## Fixture identity (measured)
 
-- Host: 1× Radeon RX 9070 XT `gfx1201`, 16304 MB, PCIe **5.0 x16** (`32.0 GT/s`
+- Host: 1× Radeon RX 9070 XT `gfx1201`, 16304 MB, PCIe **4.0 x16** (`~32 GB/s`
   × 16 current and max), ROCm/HIP 7.2; Ryzen 7 7800X3D (8c/16t), 28 GB RAM.
   Full desktop session; 1-min load 2.1–4.8 during the arms (own work decaying),
   which the repeat runs below show the idle *ratio* does not track.
