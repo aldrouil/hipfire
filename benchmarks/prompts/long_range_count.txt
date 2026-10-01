@@ -1,5 +1,0 @@
-Write the integers from 1 upward, one per line, in order, with no other text before, between, or after them. Keep going as long as you are allowed to; do not summarise, do not count a second time, and do not stop early.
-
-1
-2
-3
