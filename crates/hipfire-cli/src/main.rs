@@ -2694,13 +2694,30 @@ fn offload_bench_command(paths: &Paths, args: OffloadBenchArgs) -> Result<()> {
             .unwrap_or(hipfire_runtime::offload_calibrate::DEFAULT_REPS),
     };
     let reports = hipfire_runtime::offload_calibrate::calibrate(&mut gpu, &opts)?;
-    // The recommendation is the largest format's: a real spilled projection is MBs
-    // of weight bytes, and the matrix's smallest entry is the one where the copies
-    // and the launch overhead distort the balance the most.
-    let recommended = reports
-        .iter()
-        .max_by_key(|report| report.bytes)
-        .map(|report| (report.format.clone(), report.share));
+    // The recommendation comes from the largest measurements. Every format is
+    // measured over the same `buffer_mb` by construction, so "the largest" is
+    // usually the whole matrix — a *set* — and a median over it is the honest
+    // single number (a singleton when `--format` pinned one format).
+    let recommended = {
+        let largest = reports.iter().map(|r| r.bytes).max();
+        let mut shares: Vec<f64> = reports
+            .iter()
+            .filter(|r| Some(r.bytes) == largest)
+            .map(|r| r.share)
+            .collect();
+        shares.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        (!shares.is_empty()).then(|| {
+            let label = match shares.len() {
+                1 => reports
+                    .iter()
+                    .find(|r| Some(r.bytes) == largest)
+                    .map(|r| r.format.clone())
+                    .unwrap_or_else(|| "?".into()),
+                n => format!("the {n} largest measured formats"),
+            };
+            (label, shares[shares.len() / 2])
+        })
+    };
     if args.json {
         let rows: Vec<serde_json::Value> = reports
             .iter()

@@ -790,13 +790,13 @@ pub(crate) struct StepTiming {
 /// shows up as a number rather than as a mystery.
 ///
 /// A pass-back shape prints its own line instead (`split: …`): for it `join` is
-/// the blocking H2D, which is `copy + max(0, gpu_ns - cpu_ns)`. The signal the
-/// scheduler's online controller reads is therefore **`join > gemv`**: only then
-/// did the H2D demonstrably wait for the concurrently-launched GPU arm, so the
-/// GPU arm is the straggler and the share should come down. In the common regime
-/// (`join ≪ gemv`, the CPU arm the straggler) the share should go up — and
-/// `gpu≥` on this line is then a *lower bound* that says nothing about the GPU's
-/// real rate, which is why it is printed as a bound.
+/// the blocking H2D, `copy + max(0, gpu_ns - cpu_ns)`. What the scheduler's
+/// controller reads is the join's excess over the shape's own **no-wait floor**
+/// (the smallest join seen), so `gpu samples` on that line says how often the
+/// GPU rate its share rests on was actually observed: zero means the share is
+/// still being pushed up because every join so far sat at the floor, and
+/// `gpu≥GB/s` is then a lower bound that says nothing about the real rate (which
+/// is why it is printed as a bound).
 fn trace_step(
     q: CpuQuant,
     w: &WeightRef,
@@ -849,12 +849,24 @@ fn trace_step(
         let whole_ns = (stats.d2h_ns + stats.gemv_ns + stats.h2d_ns).max(1) as f64;
         let cpu_gbs = stats.split_cpu_rows as f64 * row_bytes / cpu_arm_ns;
         let gpu_gbs = stats.split_gpu_rows as f64 * row_bytes / whole_ns;
-        let share = match crate::offload_split::shape_share(w.dtype, w.k) {
-            Some(s) => format!("{s:.3}"),
-            None => "n/a".to_string(),
+        let (share, control) = match crate::offload_split::shape_state(w.dtype, w.k) {
+            Some(s) => (
+                format!("{:.3}", s.share),
+                format!(
+                    " (gpu samples {}, last waited={}, target={}, {} applied{})",
+                    s.gpu_samples,
+                    s.last_waited,
+                    s.last_target
+                        .map(|t| format!("{t:.3}"))
+                        .unwrap_or_else(|| "—".into()),
+                    s.applied,
+                    if s.frozen { ", frozen" } else { "" },
+                ),
+            ),
+            None => ("n/a".to_string(), String::new()),
         };
         eprintln!(
-            "split: step gemv m={m} k={k} quant={q:?} gpu_rows={:.0}/{m} share={share} \
+            "split: step gemv m={m} k={k} quant={q:?} gpu_rows={:.0}/{m} share={share}{control} \
              rotated={rotated} residual={residual} awq={} | {} calls | {total} steps ({splits} \
              split), {on_gpu} host-mapped steps still on GPU | mean per split step: \
              d2h={:.2}ms gemv={:.2}ms join={:.2}ms | cpu={cpu_gbs:.1}GB/s gpu\u{2265}{gpu_gbs:.1}GB/s",
