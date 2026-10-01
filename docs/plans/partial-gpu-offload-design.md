@@ -446,25 +446,30 @@ product claim.)*
   `(dtype, k)` seeds itself by timing both engines on that step's *own* weight buffer
   (median of 3 reps; the GPU arm through a scratch-output probe, so a residual probe
   cannot be double-counted by the following real arm) and every split step then
-  refines the share from its own arm timings: `r_cpu` from the contended CPU arm
-  every step, `r_gpu` only when the join outlasts the CPU's own multiply — the one
-  regime in which the blocking H2D waited for the GPU arm, making its duration
-  recoverable as `cpu_ns + join`. Below that (the common case: a CPU multiply of
-  hundreds of microseconds against a tens-of-microseconds copy) the join carries
-  the *opposite* signal — the CPU is the straggler — and the share rises. Reading
-  the join as a GPU duration there yields a rate an order of magnitude too low and
-  pins the split to its floor with both engines idle in turn. Shares are
-  clamped to `[0.05, 0.50]`, adjusted every 4 steps (step 0.3 of the way toward
-  `r_gpu/(r_gpu+r_cpu)`), and frozen once a shape has applied 64 adjustments with the
-  last four all under 0.005.
+  refines the share from its own arm timings. The join is `copy + max(0, gpu_ns −
+  cpu_ns)`, and the controller reads it **relative to the shape's own no-wait floor**
+  — the smallest join it has seen, i.e. what the copy costs when the GPU arm finished
+  first — with a hysteresis margin (10 µs, or a quarter of the floor). Only the excess
+  over `floor + margin` can be a wait: when there is one, `r_gpu` is sampled as
+  `rows_gpu·row_bytes / (cpu_ns + excess)` and the share moves toward the balance
+  point; when there is not, the CPU is the straggler and the share rises. Both an
+  absolute microsecond threshold (the measured copy alone is 30–50 µs for the ~30 KB
+  this mode copies back, so any threshold below that samples on *every* step) and the
+  raw join (`cpu_ns + join` is the *CPU's* duration whenever the CPU is the straggler,
+  which reports a GPU rate an order of magnitude too low and pins the split to its
+  floor with both engines idle in turn) are wrong here; the floor is measured, not
+  assumed. Shares are clamped to `[0.05, 0.50]`, adjusted every 4 steps (step 0.3 of
+  the way toward `r_gpu/(r_gpu+r_cpu)`), and frozen once a shape has applied 64
+  adjustments with the last four all under 0.005.
 - **Accounting and diagnostics.** A split step is *not* charged to the CPU-idle
   numerator (its wall contains GPU work, so it would inflate the lower bound §6.2.1
   documents) and gets its own `split: …` trace line under
   `HIPFIRE_CPU_EXEC_TRACE=1`, whose `join` is the blocking H2D
-  (`copy + max(0, gpu_ns − cpu_ns)`): `join > gemv` means the H2D waited for the
-  GPU arm, so the GPU is the straggler (lower the share); `join ≪ gemv` means the
-  CPU is (raise it) — the same signal the controller uses, and the reason `gpu≥` on
-  that line is printed as a lower bound rather than a rate. `hipfire offload-bench` measures the host
+  (`copy + max(0, gpu_ns − cpu_ns)`): the line also prints the controller's own state
+  (`gpu samples`, the last `waited`, the last `target`, `applied`, `frozen`), so a share
+  nobody can explain is diagnosable from one run. `gpu≥GB/s` is a lower bound by
+  construction (it divides the GPU's bytes by the *whole* step wall) and is printed as
+  a bound for that reason. `hipfire offload-bench` measures the host
   independently (its own `--format`/`--buffer-mb`/`--reps`, `--json`, and `--write` to
   persist the recommended share), and refuses while a daemon pid file names a live
   process.

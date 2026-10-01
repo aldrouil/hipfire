@@ -710,7 +710,7 @@ fn split_case(
     bytes: &[u8],
     m: usize,
     k: usize,
-) {
+) -> bool {
     use hipfire_dispatch::pipeline::{GemvInput, Step};
 
     // The gate's correctness-critical invariant: the byte length is exactly
@@ -792,6 +792,19 @@ fn split_case(
 
     let split = read_f32(gpu, &out_split, m);
     let full = read_f32(gpu, &out_full, m);
+    // How far apart the two *engines* are on identical bytes — the numerical
+    // divergence the end-to-end text may or may not expose. Printed per case, and
+    // the test requires at least one covered case to differ: a split whose arms
+    // agreed bitwise would be a mixture in name only (and this is the reference
+    // against which the requirement "coherent output, plus a measured divergence"
+    // is met at the element level rather than at the token level).
+    let arm_scale = cpu_full.iter().fold(0.0f32, |a, b| a.max(b.abs())).max(1e-30);
+    let arm_delta = full
+        .iter()
+        .zip(&cpu_full)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let arms_differ = arm_delta > 0.0;
     for row in 0..g {
         assert_eq!(
             split[row].to_bits(),
@@ -839,15 +852,18 @@ fn split_case(
         );
         eprintln!(
             "{label:44} m={m:<6} k={k:<6} row_bytes={row_bytes:<6} g={g:<6} \
-             (m-g={}) exact; residual arm refused (no GPU residual kernel)",
-            m - g
+             (m-g={}) exact; residual arm refused (no GPU residual kernel); \
+             arm delta {:.3e} (rel {:.2e})",
+            m - g,
+            arm_delta,
+            arm_delta / arm_scale,
         );
         gpu.free_tensor(out_split).ok();
         gpu.free_tensor(out_full).ok();
         gpu.free_tensor(acc).ok();
         gpu.free_tensor(x_dev).ok();
         gpu.free_tensor(w).ok();
-        return;
+        return arms_differ;
     }
     let resid_split = gpu.upload_f32(&seed, &[m + 8]).expect("upload acc");
     let resid_full = gpu.upload_f32(&seed, &[m + 8]).expect("upload acc ref");
@@ -916,8 +932,10 @@ fn split_case(
 
     eprintln!(
         "{label:44} m={m:<6} k={k:<6} row_bytes={row_bytes:<6} g={g:<6} \
-         (m-g={}) exact",
-        m - g
+         (m-g={}) exact; arm delta {:.3e} (rel {:.2e})",
+        m - g,
+        arm_delta,
+        arm_delta / arm_scale,
     );
     gpu.free_tensor(out_split).ok();
     gpu.free_tensor(out_full).ok();
@@ -925,6 +943,7 @@ fn split_case(
     gpu.free_tensor(resid_full).ok();
     gpu.free_tensor(x_dev).ok();
     gpu.free_tensor(w).ok();
+    arms_differ
 }
 
 /// The pass-back split's load-bearing test: a split step's two arms are
@@ -1039,13 +1058,26 @@ fn passback_row_offset_equivalence() {
         !cases.is_empty(),
         "no fixture or synthetic case was available — pull qwen3.5:2b"
     );
-    for (label, q, dtype, bytes, m, k) in &cases {
-        split_case(
-            &mut gpu, &gemv, &ctx, &opts, label, *q, *dtype, bytes, *m, *k,
-        );
-    }
+    let differing_arms = cases
+        .iter()
+        .filter(|(label, q, dtype, bytes, m, k)| {
+            split_case(
+                &mut gpu, &gemv, &ctx, &opts, label, *q, *dtype, bytes, *m, *k,
+            )
+        })
+        .count();
+    // The two engines are independent implementations with different
+    // accumulation orders, so their *numbers* must differ somewhere in the matrix
+    // even when the greedy token stream matches: a split whose arms agreed bitwise
+    // would be a mixture in name only.
+    assert!(
+        differing_arms > 0,
+        "no covered case showed the two engines' numbers differing — the split \
+         would be a no-op mixture"
+    );
     eprintln!(
-        "\npass-back row-offset equivalence: {} case(s) bit-exact on {}",
+        "\npass-back row-offset equivalence: {} case(s) bit-exact on {}; \
+         {differing_arms} of them mix numerically different engines",
         cases.len(),
         gpu.arch
     );

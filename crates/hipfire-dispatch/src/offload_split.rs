@@ -41,14 +41,15 @@
 //! from its own arm timings. No host constant is load-bearing: the probe
 //! accelerates convergence and the online controller corrects it.
 //!
-//! The controller reads exactly one thing out of a step: whether the blocking H2D
-//! (`join`) outlasted the CPU's own multiply (`gemv`). If it did, the H2D waited
-//! for the GPU arm, the GPU arm is the straggler, and `cpu_ns + join` recovers its
-//! duration — the only regime in which a GPU *rate* is observable at all. If it
-//! did not (the common one: the CPU multiply is hundreds of microseconds against
-//! tens for the copy), the CPU is the straggler and the share rises. Reading the
-//! join as a GPU duration in that second regime is how a split ends up pinned to
-//! its own floor with both engines idle in turn.
+//! The controller reads the blocking H2D (`join`) relative to the shape's own
+//! no-wait floor — the smallest join it has seen, i.e. what the copy costs when
+//! the GPU arm finished first. Only the excess over that floor can be a wait for
+//! the GPU arm; when there is one, `cpu_ns + excess` recovers the arm's duration
+//! and the share moves toward the balance point. When there is not (the common
+//! regime: a CPU multiply of hundreds of microseconds against a
+//! tens-of-microseconds copy) the CPU is the straggler and the share rises.
+//! Reading the raw join as a GPU duration in that regime is how a split ends up
+//! pinned to its own floor with both engines idle in turn.
 //!
 //! Scope is the dense qwen3.5 seam only (the step lists that carry
 //! `qkv_via_execute_steps`, `qkvza_via_execute_steps`,
@@ -210,6 +211,19 @@ struct ShapeState {
     r_cpu: Option<Ewma>,
     r_gpu: Option<Ewma>,
     samples: u64,
+    /// Steps whose join outlasted the CPU multiply — the only ones `r_gpu` is
+    /// sampled from. Printed with the shape so an operator can see whether the
+    /// GPU rate the share rests on was ever actually observed.
+    gpu_samples: u64,
+    /// The smallest blocking-H2D time seen for this shape: the step's own
+    /// no-wait floor, i.e. what the copy costs when the GPU arm finished first.
+    /// Every larger join is measured *against* it, so the controller needs no
+    /// host constant for the copy (the measured one is 30–50 µs for the ~30 KB
+    /// this mode copies back — above any threshold guessed from the link rate).
+    min_join_ns: Option<u64>,
+    /// The last adjustment's proposal and whether that step's join had waited.
+    last_target: Option<f64>,
+    last_waited: bool,
     applied: u32,
     /// The last four adjustment magnitudes, seeded above the freeze threshold so
     /// a shape cannot freeze on its first few no-op adjustments.
@@ -224,6 +238,10 @@ impl ShapeState {
             r_cpu: None,
             r_gpu: None,
             samples: 0,
+            gpu_samples: 0,
+            min_join_ns: None,
+            last_target: None,
+            last_waited: false,
             applied: 0,
             deltas: [f64::MAX; 4],
             frozen: false,
@@ -265,6 +283,11 @@ pub struct ShapeSnapshot {
     pub cpu_bytes_per_s: Option<f64>,
     pub gpu_bytes_per_s: Option<f64>,
     pub samples: u64,
+    /// Steps whose join outlasted the CPU multiply — the only ones the GPU rate
+    /// above can come from.
+    pub gpu_samples: u64,
+    pub last_waited: bool,
+    pub last_target: Option<f64>,
     pub applied: u32,
     pub frozen: bool,
 }
@@ -275,20 +298,7 @@ pub fn scheduler_snapshot() -> Vec<ShapeSnapshot> {
     let Ok(scheduler) = SCHEDULER.lock() else {
         return Vec::new();
     };
-    scheduler
-        .shapes
-        .iter()
-        .map(|((dtype, k), state)| ShapeSnapshot {
-            dtype: *dtype,
-            k: *k,
-            share: state.share,
-            cpu_bytes_per_s: state.r_cpu.map(|e| e.value),
-            gpu_bytes_per_s: state.r_gpu.map(|e| e.value),
-            samples: state.samples,
-            applied: state.applied,
-            frozen: state.frozen,
-        })
-        .collect()
+    scheduler.shapes.iter().map(shape_of).collect()
 }
 
 /// Install a calibration measured elsewhere (by [`probe_synthetic`], the
@@ -306,13 +316,26 @@ pub fn seed(calibration: &SplitCalibration) {
 ///
 /// The split trace reads this so the printed share is the one actually used,
 /// pinned or scheduled.
-pub(crate) fn shape_share(dtype: DType, k: usize) -> Option<f64> {
-    SCHEDULER
-        .lock()
-        .ok()?
-        .shapes
-        .get(&(dtype, k))
-        .map(|state| state.share)
+pub(crate) fn shape_state(dtype: DType, k: usize) -> Option<ShapeSnapshot> {
+    let scheduler = SCHEDULER.lock().ok()?;
+    let state = scheduler.shapes.get(&(dtype, k))?;
+    Some(shape_of((&(dtype, k), state)))
+}
+
+fn shape_of(((dtype, k), state): (&(DType, usize), &ShapeState)) -> ShapeSnapshot {
+    ShapeSnapshot {
+        dtype: *dtype,
+        k: *k,
+        share: state.share,
+        cpu_bytes_per_s: state.r_cpu.map(|e| e.value),
+        gpu_bytes_per_s: state.r_gpu.map(|e| e.value),
+        samples: state.samples,
+        gpu_samples: state.gpu_samples,
+        last_waited: state.last_waited,
+        last_target: state.last_target,
+        applied: state.applied,
+        frozen: state.frozen,
+    }
 }
 
 /// The scheduler's fallback share, when one was installed.
@@ -367,11 +390,32 @@ fn scheduled_share(key: (DType, usize)) -> f64 {
         .unwrap_or(DEFAULT_GPU_SHARE)
 }
 
+/// Hysteresis on the join, in nanoseconds: an excess over the shape's no-wait
+/// floor smaller than this is host-timer noise around the copy, not a wait.
+///
+/// Needed because the floor is the *minimum* join ever seen, so most joins exceed
+/// it by a few microseconds; without the margin nearly every step would read as a
+/// wait and the samples would be noise. Ten microseconds is well above that jitter
+/// and far below the waits this mode acts on (hundreds of microseconds to
+/// milliseconds). It is a timer-resolution constant, not a host performance one.
+const JOIN_MARGIN_NS: u64 = 10_000;
+
+/// The excess of `join_ns` over the shape's no-wait floor that can be a wait: the
+/// hysteresis margin, or a quarter of the floor for a host whose copy is itself
+/// slow (the copy's own jitter scales with it).
+fn waited_extra_ns(join_ns: u64, floor_ns: Option<u64>) -> u64 {
+    let Some(floor) = floor_ns else {
+        return 0;
+    };
+    let margin = JOIN_MARGIN_NS.max(floor / 4);
+    join_ns.saturating_sub(floor.saturating_add(margin))
+}
+
 /// The controller's proposal after one step's measurements.
 ///
 /// With both rates present, move toward the balance point
-/// `r_gpu / (r_gpu + r_cpu)`. With no GPU rate and a join that did *not* outlast
-/// the CPU's own multiply — the common regime, where the H2D of the CPU's rows
+/// `r_gpu / (r_gpu + r_cpu)`. With no GPU rate yet and a join that sat at the
+/// shape's no-wait floor — the common regime, where the H2D of the CPU's rows
 /// costs tens of microseconds against a CPU multiply of hundreds — the CPU is the
 /// straggler, so raise the share. Otherwise the step carries no usable signal and
 /// the share is unchanged.
@@ -388,24 +432,22 @@ fn next_share(cur: f64, r_cpu: Option<f64>, r_gpu: Option<f64>, gpu_waited: bool
 /// One split step's measurements. Rates are bytes per **second**, matching
 /// [`SplitCalibration`]; the controller only uses them as a ratio.
 ///
-/// `cpu_ns` is the CPU arm's own duration (the blocking D2H plus the multiply),
-/// `gemv_ns` its multiply alone, and `join_ns` the blocking H2D — which is
-/// `copy + max(0, gpu_ns - cpu_ns)`.
+/// `cpu_ns` is the CPU arm's own duration (the blocking D2H plus the multiply) and
+/// `join_ns` the blocking H2D, which is `copy + max(0, gpu_ns - cpu_ns)`.
 ///
-/// **`join_ns > gemv_ns` is the only case in which the join carries GPU-rate
-/// information.** Then the H2D demonstrably waited for the GPU arm, so
-/// `cpu_ns + join_ns` recovers the GPU arm's duration (ignoring the small copy).
-/// Below that, `cpu_ns + join_ns` is the *CPU's* duration and would yield a GPU
-/// rate an order of magnitude too low — which is exactly what drags a share to
-/// the floor forever. Such a step carries the opposite signal, and
-/// [`next_share`]'s raise branch uses it.
+/// The join is read relative to the shape's own no-wait floor ([`min_join_ns`]),
+/// never against an absolute threshold: only the excess over that floor can be a
+/// wait for the GPU arm, and in that case `cpu_ns + excess` recovers the arm's
+/// duration. Treating the raw join as a GPU duration in the other regime — the
+/// common one, where the CPU multiply is hundreds of microseconds against a
+/// tens-of-microseconds copy — reports a GPU rate an order of magnitude too low
+/// and drags the share to its floor with both engines idle in turn.
 fn observe(
     key: (DType, usize),
     rows_cpu: usize,
     rows_gpu: usize,
     row_bytes: usize,
     cpu_ns: u64,
-    gemv_ns: u64,
     join_ns: u64,
 ) {
     let Ok(mut scheduler) = SCHEDULER.lock() else {
@@ -424,9 +466,22 @@ fn observe(
             None => Ewma::new(sample),
         });
     }
-    let gpu_waited = join_ns > gemv_ns;
-    if gpu_waited && cpu_ns + join_ns > 0 {
-        let sample = bytes_per_s(rows_gpu as f64 * row_bytes as f64, cpu_ns + join_ns);
+    // The join is `copy + max(0, gpu_ns - cpu_ns)`, and only its excess over this
+    // shape's own smallest join can be a wait for the GPU arm. Measuring against
+    // that floor (rather than a fixed microsecond threshold, or the CPU's own
+    // multiply) is what makes the sample honest on a host where the copy alone
+    // costs more than the link rate suggests: at the floor the CPU is the
+    // straggler and the share rises; above it the excess *is* the GPU arm's
+    // overrun and its duration is recoverable as `cpu_ns + excess`.
+    let baseline = state.min_join_ns;
+    state.min_join_ns = Some(baseline.map_or(join_ns, |m| m.min(join_ns)));
+    let waited_extra = waited_extra_ns(join_ns, baseline);
+    let gpu_waited = waited_extra > 0;
+    if gpu_waited && cpu_ns + waited_extra > 0 {
+        let sample = bytes_per_s(
+            rows_gpu as f64 * row_bytes as f64,
+            cpu_ns + waited_extra,
+        );
         state.r_gpu = Some(match state.r_gpu {
             Some(mut ewma) => {
                 ewma.update(sample);
@@ -434,8 +489,10 @@ fn observe(
             }
             None => Ewma::new(sample),
         });
+        state.gpu_samples += 1;
     }
     state.samples += 1;
+    state.last_waited = gpu_waited;
     if state.frozen || state.samples % APPLY_EVERY != 0 {
         return;
     }
@@ -450,6 +507,7 @@ fn observe(
     );
     let delta = (next - state.share).abs();
     state.share = next;
+    state.last_target = Some(next);
     if !had_signal {
         return;
     }
@@ -545,8 +603,12 @@ fn measure_both(
         if launch_op_rows(gpu, ctx, probe, Some(0..w.m)).is_err() {
             return Ok(None);
         }
-        gpu.sync_with_deadline(Gpu::GPU_SYNC_DEADLINE)
-            .map_err(hip_err)?;
+        // A real blocking sync, NOT `sync_with_deadline`: that one polls with
+        // `SYNC_POLL_INTERVAL` (2 ms) of sleep granularity, which on a sub-
+        // millisecond kernel *is* the measurement — it reports ~4 GB/s for an
+        // 8 MiB weight whose true rate is ~32 GB/s. Deadline-bearing paths still
+        // use it; a timed benchmark must not.
+        gpu.hip.device_synchronize().map_err(hip_err)?;
         gpu_ns.push(t.elapsed().as_nanos() as f64);
     }
     let size = (w.m * row_bytes) as f64;
@@ -824,7 +886,7 @@ pub fn run_with(
     launch_op_rows(gpu, ctx, step, Some(0..g))?;
     let (gemv_ns, join_ns) = cpu_exec::cpu_arm_finish(gpu, &arm)?;
     let cpu_ns = arm.d2h_ns + gemv_ns;
-    observe(key, w.m - g, g, row_bytes, cpu_ns, gemv_ns, join_ns);
+    observe(key, w.m - g, g, row_bytes, cpu_ns, join_ns);
     cpu_exec::finish_step(
         arm.q,
         w,
@@ -896,6 +958,63 @@ mod tests {
         let up = next_share(SHARE_MIN, Some(1.0), Some(1e12), true);
         assert!(up > SHARE_MIN && up <= SHARE_MAX, "up={up}");
         assert!((up - (SHARE_MIN + ALPHA * (SHARE_MAX - SHARE_MIN))).abs() < 1e-12);
+    }
+
+    #[test]
+    fn observe_raises_the_share_at_the_join_floor_and_samples_above_it() {
+        // A distinct key so the process-global scheduler cannot interfere with
+        // the other tests in this binary.
+        let key = (DType::Q8_0, 1234);
+        seed_shape(key, 0.375);
+
+        // A join that sits at the shape's own floor is a copy, not a wait: the
+        // CPU is the straggler, no GPU rate is observable, and the share rises.
+        for _ in 0..4 {
+            observe(key, 3072, 1024, 2176, 500_000, 40_000);
+        }
+        let floor = shape_state(key.0, key.1).expect("seeded");
+        assert_eq!(floor.gpu_samples, 0, "no wait, no GPU sample");
+        assert!(
+            floor.share > 0.375,
+            "the share must rise while every join sits at the floor, got {}",
+            floor.share
+        );
+
+        // A join *at* the floor, or within the hysteresis margin of it, is still
+        // noise: no sample, and the share keeps rising.
+        for _ in 0..4 {
+            observe(key, 3072, 1024, 2176, 500_000, 45_000);
+        }
+        let noise = shape_state(key.0, key.1).expect("seeded");
+        assert_eq!(
+            noise.gpu_samples, 0,
+            "an excess inside the margin is not a wait"
+        );
+        assert!(noise.share > floor.share, "the share keeps rising");
+
+        // A join that *exceeds* the floor by more than the margin is a wait: the
+        // GPU arm's duration is recoverable as `cpu_ns + excess`, and its (slow)
+        // rate pulls the share toward the balance point it implies.
+        for _ in 0..4 {
+            observe(key, 3072, 1024, 2176, 500_000, 600_000);
+        }
+        let waited = shape_state(key.0, key.1).expect("seeded");
+        assert!(waited.gpu_samples > 0, "a wait must yield a GPU sample");
+        assert!(
+            waited.share < noise.share,
+            "a slow GPU arm must pull the share down ({} -> {})",
+            noise.share,
+            waited.share
+        );
+        // 1024 rows * 2176 B over (500 µs CPU arm + 550 µs excess over floor +
+        // margin) = 2.12 GB/s: the sample is the excess, not the raw join.
+        let r_gpu = waited.gpu_bytes_per_s.expect("sampled");
+        let expected = 1024.0 * 2176.0 * 1e9 / 1_050_000.0;
+        assert!(
+            (r_gpu - expected).abs() / expected < 0.01,
+            "sampled {r_gpu:e}, expected {expected:e}"
+        );
+        assert!(waited.cpu_bytes_per_s.is_some());
     }
 
     #[test]
