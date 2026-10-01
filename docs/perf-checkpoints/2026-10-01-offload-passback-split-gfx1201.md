@@ -53,11 +53,13 @@ new record.
    balance point independently at **0.28–0.45** by format and 0.36–0.40 for the same
    `k=4096` shapes and sizes. No host constant is load-bearing: the seeding probe times
    both engines on the step's own weight buffer and the online controller corrects it.
-6. **The GPU arm of a split reads host-mapped weight bytes at 19.6–28.5 GB/s**, against
-   29–73 GB/s for the CPU arm on the same bytes — i.e. the ~1.4× two-engine bound the
-   headroom record predicted
-   ([`2026-10-01-offload-passback-headroom-idle.md`](2026-10-01-offload-passback-headroom-idle.md)),
-   with this host's link at 27.3 GB/s bulk.
+6. **The GPU arm of a split reads host-mapped weight bytes at 22.8–28.2 GB/s**, against
+   34.7–68.4 GB/s for the CPU arm on the same bytes (§ 2's table, `--reps 7`, the
+   corrected blocking sync) — i.e. the two-engine bound the headroom record predicted
+   is real on this host, whose link measures 27.3 GB/s bulk. `[amended]` An earlier
+   version of this bullet quoted 19.6–28.5 and 29–73 GB/s: the 19.6 and the 29 came
+   from the pre-fix probe table § 3 keeps as a discarded comparison, so quoting them
+   here contradicted § 2.
 7. **Forensic: `Gpu::sync_with_deadline` is unusable for timing.** It polls completion
    with `std::thread::sleep(SYNC_POLL_INTERVAL)`, `SYNC_POLL_INTERVAL = 2 ms`
    (`crates/rdna-compute/src/dispatch.rs:1264`), so a probe that times
@@ -198,7 +200,9 @@ split: step gemv m=4096 k=4096 quant=Mq4G256 gpu_rows=1472/4096 share=0.360 (gpu
 split: step gemv m=12288 k=4096 quant=Mq4G256 gpu_rows=4425/12288 share=0.360 (gpu samples 9931, last waited=true, target=0.360, 68 applied, frozen) rotated=false residual=false awq=false | 4096 calls | 15871 steps (10752 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.03ms gemv=0.46ms join=0.05ms | cpu=35.1GB/s gpu≥18.1GB/s
 ```
 
-Read: the probe seeds ~0.23–0.36, the controller pushes while every join sits at the
+Read: `[amended]` the probe seeds ~0.36 (the `0.233` a pre-fix run started from is
+quoted in the commit that fixed the probe's sync, not here), the controller pushes while
+every join sits at the
 shape's own no-wait floor, and it converges and freezes at 0.279–0.360 once joins
 exceed that floor. `gpu≥GB/s` is a lower bound by construction (the CPU arm is the
 straggler there), which is why the share rests on the sampled `target` and not on it.
@@ -332,9 +336,14 @@ same stall the headroom record documents at 27B load.
 | **`passback` (auto)** | **17.10** | 588 | 4730 |
 | `pcie` | 14.40 | 591 | 4758 |
 
-**+18.8 % over `cpu`**, against +8.5 % for the 9B at 8 of 32 spilled: a bigger model
-at the same *number* of spilled layers gains more, because each spilled projection
-is a larger vector and the CPU arm's serialized host time per step is longer. Note
+**+18.8 % over `cpu`.** The honest control is *spill fraction*, not spill count: 8 of
+64 is 12.5 % of the model, the same fraction as the 9B's 4-of-32 point, which gains
++8.4 % — so the 27B more than doubles the gain at equal spill fraction, which isolates
+model size from spill amount. (Comparing at equal *counts* — 8 of 64 versus 8 of 32 —
+confounds the two: the 27B wins there as well, despite spilling half the fraction.)
+The mechanism is per-step bytes: each spilled projection is a larger vector, so the
+CPU arm's serialized host time per step is longer and there is more of it to
+recover. Note
 `pcie` ties `cpu` exactly here (14.40 both) rather than winning or losing — the
 "GPU route is ~20 % slower per byte than the CPU route" from the headroom record
 lands on a tie once the spill is only 8 of 64 layers and the resident work dominates.
@@ -360,9 +369,11 @@ A 32k-token greedy completion per backend (cpu / passback / pcie) at budget 24
 a self-verifying task ("write the integers from 1 upward, one per line"), so a
 reviewer can check monotonicity and completeness directly instead of reading prose.
 
-Outputs are **not quoted here** (32k tokens each): they are local files, not
-checkpoint content, and are listed with sizes, digests and per-arm wall times in
-§ 10.1 so a reviewer can work from the bytes rather than from a transcription.
+Outputs are **not quoted here** (32k tokens each): they are local, gitignored files
+under `.codeinsight+research/arc-2026-10-01/`, which also carries a `README.md`
+briefing with the fixture identity and the checks worth running. Sizes, digests,
+per-arm wall times and the completeness check land in § 10.1 when the three arms
+finish (the run outlives this commit).
 
 ## Appendix: whole `hipfire bench --json` per arm (9 arms)
 
