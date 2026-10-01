@@ -117,6 +117,8 @@ pub(crate) enum Commands {
     Ps(OutputArgs),
     /// Benchmark a model through the native daemon protocol.
     Bench(BenchArgs),
+    /// Measure this host's GPU share for a split offload step.
+    OffloadBench(OffloadBenchArgs),
     /// Report compiled kernel inventory for the detected architecture.
     Profile(ProfileArgs),
     /// Print build, source-checkout, and installed-daemon identity.
@@ -633,6 +635,29 @@ pub(crate) struct BenchArgs {
 }
 
 #[derive(Args, Debug)]
+struct OffloadBenchArgs {
+    /// Emit machine-readable JSON.
+    #[arg(short = 'j', long)]
+    json: bool,
+    /// Measure one format instead of the default matrix: a quant name (`mq4`,
+    /// `mq4g256v2`, …) or a `.hfq` wire quant_type number.
+    #[arg(long, value_name = "NAME|QT")]
+    format: Option<String>,
+    /// Activation width to measure at (default: the 9B trunk's hidden size).
+    #[arg(long, value_name = "N")]
+    k: Option<usize>,
+    /// Weight megabytes per format.
+    #[arg(long, value_name = "MB")]
+    buffer_mb: Option<usize>,
+    /// Timed reps per engine; the median is reported.
+    #[arg(long, value_name = "N")]
+    reps: Option<usize>,
+    /// Persist the recommended share for the largest format measured.
+    #[arg(long)]
+    write: bool,
+}
+
+#[derive(Args, Debug)]
 struct ProfileArgs {
     model: Option<String>,
     #[arg(long)]
@@ -800,6 +825,7 @@ fn run() -> Result<()> {
         Some(Commands::Diag(output)) => diag_command(&paths, output),
         Some(Commands::Ps(output)) => ps_command(&paths, output),
         Some(Commands::Bench(args)) => bench_command(&paths, args),
+        Some(Commands::OffloadBench(args)) => offload_bench_command(&paths, args),
         Some(Commands::Profile(args)) => profile_command(&paths, args),
         Some(Commands::Version(output)) => version_command(&paths, output),
         Some(Commands::Update(args)) => update_command(&paths, args),
@@ -2558,6 +2584,147 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
         println!();
     }
     let _ = engine.unload();
+    Ok(())
+}
+
+/// PIDs named by a live `~/.hipfire/daemon*.pid`.
+///
+/// Advisory by construction: it cannot prevent a daemon started mid-benchmark, but
+/// it stops the common case (a serve instance already running), which would make
+/// both engine rates meaningless. A real fix would move the measurement behind the
+/// daemon protocol, which is deliberately not done here.
+fn live_daemon_pids(paths: &Paths) -> Vec<i32> {
+    let mut live = Vec::new();
+    let Ok(entries) = std::fs::read_dir(&paths.root) else {
+        return live;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("daemon") || !name.ends_with(".pid") {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Ok(pid) = raw.trim().parse::<i32>() else {
+            continue;
+        };
+        // Safety: signal 0 only probes for existence and permission.
+        if pid > 0 && unsafe { libc::kill(pid, 0) } == 0 {
+            live.push(pid);
+        }
+    }
+    live.sort_unstable();
+    live.dedup();
+    live
+}
+
+/// `hipfire offload-bench`: measure this host's GPU share for a split offload step
+/// (`memory.offload_exec=passback`, `memory.offload_passback_share`).
+///
+/// A raw device benchmark — no model, no daemon — so it refuses while a daemon pid
+/// file names a live process.
+fn offload_bench_command(paths: &Paths, args: OffloadBenchArgs) -> Result<()> {
+    let live = live_daemon_pids(paths);
+    if !live.is_empty() {
+        bail!(
+            "a hipfire daemon is live (pid {}); stop it first (`hipfire stop`) — offload-bench \
+             measures the device directly, and a concurrent daemon makes both engine rates \
+             meaningless",
+            live.iter()
+                .map(|pid| pid.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let mut gpu = rdna_compute::Gpu::init()
+        .map_err(|e| anyhow!("offload-bench needs a GPU: {} [code {}]", e.message, e.code))?;
+    let opts = hipfire_runtime::offload_calibrate::CalibrateOptions {
+        format: args.format.clone(),
+        k: args.k,
+        buffer_mb: args
+            .buffer_mb
+            .unwrap_or(hipfire_runtime::offload_calibrate::DEFAULT_BUFFER_MB),
+        reps: args
+            .reps
+            .unwrap_or(hipfire_runtime::offload_calibrate::DEFAULT_REPS),
+    };
+    let reports = hipfire_runtime::offload_calibrate::calibrate(&mut gpu, &opts)?;
+    // The recommendation is the largest format's: a real spilled projection is MBs
+    // of weight bytes, and the matrix's smallest entry is the one where the copies
+    // and the launch overhead distort the balance the most.
+    let recommended = reports
+        .iter()
+        .max_by_key(|report| report.bytes)
+        .map(|report| (report.format.clone(), report.share));
+    if args.json {
+        let rows: Vec<serde_json::Value> = reports
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "format": r.format,
+                    "m": r.m,
+                    "k": r.k,
+                    "bytes": r.bytes,
+                    "cpu_bytes_per_s": r.cpu_bytes_per_s,
+                    "gpu_bytes_per_s": r.gpu_bytes_per_s,
+                    "share": r.share,
+                    "predicted_speedup": r.predicted_speedup,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "arch": gpu.arch,
+                "recommended": recommended
+                    .as_ref()
+                    .map(|(format, share)| serde_json::json!({ "format": format, "share": share })),
+                "formats": rows,
+            }))?
+        );
+    } else {
+        println!(
+            "arch {} — GPU share for a split offload step (memory.offload_exec=passback)",
+            gpu.arch
+        );
+        println!(
+            "{:<12} {:>8} {:>6} {:>8} {:>12} {:>12} {:>7} {:>9}",
+            "format", "m", "k", "MiB", "cpu GB/s", "gpu GB/s", "share", "speedup"
+        );
+        for r in &reports {
+            println!(
+                "{:<12} {:>8} {:>6} {:>8.1} {:>12.1} {:>12.1} {:>7.3} {:>8.2}x",
+                r.format,
+                r.m,
+                r.k,
+                r.bytes as f64 / (1 << 20) as f64,
+                r.cpu_bytes_per_s / 1e9,
+                r.gpu_bytes_per_s / 1e9,
+                r.share,
+                r.predicted_speedup,
+            );
+        }
+        if let Some((format, share)) = recommended.as_ref() {
+            println!();
+            println!("recommended for {format}: memory.offload_passback_share = {share:.3}");
+        }
+    }
+    if args.write {
+        let Some((_, share)) = recommended.as_ref() else {
+            bail!("offload-bench: nothing measured, nothing to write");
+        };
+        let mut loaded = load_global(&paths.config)?;
+        loaded
+            .layer
+            .set_cli("memory.offload_passback_share", &format!("{share:.3}"))?;
+        write_global_toml(&paths.config, &loaded.layer)?;
+        println!(
+            "wrote memory.offload_passback_share = {share:.3} to {}",
+            paths.config.config_toml.display()
+        );
+    }
     Ok(())
 }
 
@@ -7519,6 +7686,10 @@ fn config_rule_json(rule: ValueRule) -> serde_json::Value {
             "type": "string",
             "format": "kv-adaptive-policy",
         }),
+        ValueRule::PassbackShare => serde_json::json!({
+            "type": "string",
+            "format": "auto-or-share",
+        }),
         ValueRule::Deepseek4Placement => serde_json::json!({
             "type": "string",
             "format": "deepseek4-compute-placement",
@@ -7543,6 +7714,7 @@ fn config_rule_label(rule: ValueRule) -> &'static str {
         ValueRule::NullableInteger { .. } => "integer|null",
         ValueRule::NullableFloat { .. } => "number|null",
         ValueRule::KvAdaptive => "kv-adaptive",
+        ValueRule::PassbackShare => "auto-or-share",
         ValueRule::Deepseek4Placement => "deepseek4-placement",
     }
 }
