@@ -1,0 +1,922 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+//! Pass-back row split: a spilled step runs on *both* engines
+//! (`memory.offload_exec=passback`).
+//!
+//! A CPU-executed step is a host sync point: a blocking D2H, a host GEMV, a
+//! blocking H2D. Over a decode-only span the GPU is therefore idle for most of
+//! the wall (`docs/perf-checkpoints/2026-10-01-offload-passback-headroom-idle.md`
+//! measured 77.3–94.6 % on the 9B at 8–24 of 32 layers spilled), while a CPU GEMV
+//! stream and a GPU PCIe read of the *same* host-mapped pages are near-additive
+//! up to 75–78 GB/s combined against ~52 GB/s for the CPU alone.
+//!
+//! A spilled step's output rows are independent, so this module **splits the step
+//! by output rows**: rows `[0, g)` go back to the GPU — the production kernel,
+//! reading the same host-mapped weight over the link — and rows `[g, m)` stay on
+//! the CPU, with the two arms running concurrently.
+//!
+//! Two properties make it correct and cheap:
+//!
+//! * **Both arms are the existing paths, over a row range.** The GPU arm is
+//!   `pcie` mode's launch restricted to rows `[0, g)`
+//!   ([`crate::pipeline::steps::launch_op_rows`]); the CPU arm is `cpu` mode's
+//!   step restricted to rows `[g, m)` ([`crate::cpu_exec::cpu_arm_prepare`] /
+//!   [`crate::cpu_exec::cpu_arm_finish`]). No third engine and no new numerics,
+//!   which is also why a share of `0` is byte-identical to
+//!   `memory.offload_exec=cpu`.
+//! * **No second stream and no events.** The overlap is an ordering result:
+//!   issue the blocking D2H *before* enqueueing the GPU arm (so it drains only
+//!   the step's producer), enqueue the GPU arm (async), run the CPU multiply
+//!   while that kernel executes, then do the blocking H2D of the CPU's rows —
+//!   which is stream-ordered after the GPU arm because both are on the same
+//!   (default) stream. The copies are `k*4` bytes down and `(m-g)*4` up (~30 KB
+//!   at 9B shapes) against tens of MB of weight bytes, so a two-stream design
+//!   would buy the overlap of a ~2 µs copy.
+//!
+//! The **share** `g` is scheduled, not hardcoded: the optimum is a property of
+//! the host (link width, DRAM peak, core count, AVX2), so the first
+//! split-eligible step of each `(dtype, k)` seeds itself by timing both engines
+//! on that step's own weight buffer, and every split step then refines the share
+//! from its own arm timings. No host constant is load-bearing: the probe
+//! accelerates convergence and the online controller corrects it.
+//!
+//! The controller reads exactly one thing out of a step: whether the blocking H2D
+//! (`join`) outlasted the CPU's own multiply (`gemv`). If it did, the H2D waited
+//! for the GPU arm, the GPU arm is the straggler, and `cpu_ns + join` recovers its
+//! duration — the only regime in which a GPU *rate* is observable at all. If it
+//! did not (the common one: the CPU multiply is hundreds of microseconds against
+//! tens for the copy), the CPU is the straggler and the share rises. Reading the
+//! join as a GPU duration in that second regime is how a split ends up pinned to
+//! its own floor with both engines idle in turn.
+//!
+//! Scope is the dense qwen3.5 seam only (the step lists that carry
+//! `qkv_via_execute_steps`, `qkvza_via_execute_steps`,
+//! `gate_up_via_execute_steps` and the dense `Step::GemvResidual` sites). MoE /
+//! routed-expert paths never reach it and get no arms here.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{LazyLock, Mutex};
+use std::time::Instant;
+
+use hipfire_config::memory::PassbackShare;
+use rdna_compute::{DType, Gpu, GpuTensor};
+
+use crate::context::DispatchCtx;
+use crate::cpu_exec::{self, HostExec, StepTiming};
+use crate::families::gemv::{weight_row_bytes, WeightRef};
+use crate::pipeline::steps::{launch_op_rows, GemvInput, Step};
+use crate::types::{dtype_rotation_plan, DispatchError, KernelKey, RotationPlan};
+
+/// Split offsets are rounded down to a multiple of this many rows: 2 covers the
+/// residual kernels' `row0 = blockIdx.x << 1` + `float2` store at `y + row0` (an
+/// odd offset would misalign that store) and 8 keeps every covered format's
+/// weight byte offset 4-byte aligned (their row strides are multiples of 8).
+const ROW_ALIGN: usize = 8;
+
+/// Below this many weight bytes the extra launch + join outweighs the overlap;
+/// the step runs wholly on the CPU. At 9B shapes the covered projections are
+/// 4–50 MB, so this only catches the tiny ones (the DeltaNet beta/alpha rows,
+/// ~64 KB).
+pub const MIN_SPLIT_BYTES: usize = 2 << 20;
+
+/// First-trial share before either engine has been timed, and the floor/ceiling
+/// of every scheduled share. 0.375 is the 2026-10-01 probe's balance point on
+/// gfx1201 (27.3 GB/s link vs 46 GB/s contended CPU) — a starting guess the
+/// controller corrects, not a hardware assumption the feature depends on.
+const DEFAULT_GPU_SHARE: f64 = 0.375;
+const SHARE_MIN: f64 = 0.05;
+const SHARE_MAX: f64 = 0.50;
+
+/// Reps per engine in the seeding probe: the median of three is enough to reject
+/// a cold first touch, and each rep is one full pass over the step's weight
+/// buffer.
+const PROBE_REPS: usize = 3;
+
+/// How much of the controller's proposal to apply per adjustment, and how often
+/// to adjust.
+const ALPHA: f64 = 0.3;
+const APPLY_EVERY: u64 = 4;
+
+/// EWMA weight for a rate sample, and the convergence threshold: a shape freezes
+/// once it has applied this many adjustments and the last four were all small, so
+/// a converged decode stops being perturbed.
+const EWMA_ALPHA: f64 = 0.25;
+const FROZEN_APPLIED: u32 = 64;
+const FREEZE_EPS: f64 = 0.005;
+
+/// `enabled` + `share` supplied by the caller, so the parity test and the
+/// planner tests need no process snapshot.
+#[derive(Clone, Copy, Debug)]
+pub struct PassbackOptions {
+    pub enabled: bool,
+    pub share: PassbackShare,
+}
+
+impl PassbackOptions {
+    /// The configuration for this process: `memory.offload_exec=passback` and
+    /// `memory.offload_passback_share`.
+    pub fn from_process() -> Self {
+        PassbackOptions {
+            enabled: enabled(),
+            share: hipfire_config::memory::offload_passback_share(),
+        }
+    }
+}
+
+/// The seam's entry point: reads the process config snapshot.
+pub fn run(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<bool, DispatchError> {
+    run_with(gpu, ctx, step, &PassbackOptions::from_process())
+}
+
+/// `memory.offload_exec == passback` (via the cached CPU-exec predicate, which
+/// covers both modes that execute spilled steps host-side).
+pub fn enabled() -> bool {
+    cpu_exec::passback_enabled()
+}
+
+/// Whether `dtype` can be *split*: a CPU decoder exists **and** its vector row dot
+/// is available. With the scalar decoder the CPU rate (~10 GMAC/s) is well below
+/// the GPU's PCIe read rate, so the best share is all-GPU — which plain `pcie`
+/// does better. The load-time coverage line counts a splittable layer with this.
+pub fn passback_capable_format(dtype: DType) -> bool {
+    cpu_exec::cpu_quant_for(dtype).is_some_and(|q| hipfire_cpu::simd::row_dot_enabled(q, None))
+}
+
+/// Bytes per weight row for `dtype` at `k`, or `None` when there is no CPU
+/// decoder for it.
+///
+/// Re-exported for callers that size a probe without depending on `hipfire-cpu`
+/// (the CLI's `hipfire offload-bench` route reaches this through
+/// `hipfire-runtime`): the CPU decoder is the single source of truth for the row
+/// stride, which is also the invariant the feasibility gate checks the weight's
+/// byte length against.
+pub fn row_bytes_for(dtype: DType, k: usize) -> Option<usize> {
+    cpu_exec::cpu_quant_for(dtype).map(|q| hipfire_cpu::gemv::row_bytes(q, k))
+}
+
+/// The share of a step's rows the GPU takes, chosen from `(m, row_bytes, share)`.
+///
+/// `None` when the step must run wholly on the CPU: a share that is not strictly
+/// inside `(0, 1)`, fewer than two alignment quanta of rows, or a weight below
+/// [`MIN_SPLIT_BYTES`]. `share = 0` therefore lands here, which is what makes
+/// `memory.offload_passback_share = 0` byte-identical to
+/// `memory.offload_exec=cpu`.
+pub(crate) fn plan_rows(m: usize, row_bytes: usize, share: f64) -> Option<usize> {
+    if !(share > 0.0 && share < 1.0) {
+        return None;
+    }
+    if m < 2 * ROW_ALIGN {
+        return None;
+    }
+    if row_bytes.checked_mul(m)? < MIN_SPLIT_BYTES {
+        return None;
+    }
+    let g = align_down((m as f64 * share) as usize, ROW_ALIGN);
+    Some(g.clamp(ROW_ALIGN, m - ROW_ALIGN))
+}
+
+fn align_down(v: usize, align: usize) -> usize {
+    v / align * align
+}
+
+fn clamp_share(share: f64) -> f64 {
+    share.clamp(SHARE_MIN, SHARE_MAX)
+}
+
+// ── The scheduler ──────────────────────────────────────
+
+/// An exponentially weighted moving average of one engine's measured rate.
+#[derive(Clone, Copy, Debug)]
+struct Ewma {
+    value: f64,
+}
+
+impl Ewma {
+    fn new(sample: f64) -> Self {
+        Ewma { value: sample }
+    }
+
+    /// The first sample *is* the state; later samples move it by [`EWMA_ALPHA`].
+    fn update(&mut self, sample: f64) {
+        self.value += EWMA_ALPHA * (sample - self.value);
+    }
+}
+
+/// A shape's split state: the share in force, the two engines' contended rates,
+/// and the convergence bookkeeping.
+struct ShapeState {
+    share: f64,
+    r_cpu: Option<Ewma>,
+    r_gpu: Option<Ewma>,
+    samples: u64,
+    applied: u32,
+    /// The last four adjustment magnitudes, seeded above the freeze threshold so
+    /// a shape cannot freeze on its first few no-op adjustments.
+    deltas: [f64; 4],
+    frozen: bool,
+}
+
+impl ShapeState {
+    fn new(share: f64) -> Self {
+        ShapeState {
+            share,
+            r_cpu: None,
+            r_gpu: None,
+            samples: 0,
+            applied: 0,
+            deltas: [f64::MAX; 4],
+            frozen: false,
+        }
+    }
+}
+
+/// Keyed by `(dtype, k)`: the CPU kernels differ per format and their throughput
+/// per `k`.
+struct SplitScheduler {
+    shapes: BTreeMap<(DType, usize), ShapeState>,
+    /// Shapes already seeded in this process, so the two-engine probe (a full
+    /// pass on each engine) runs once per shape, not once per layer.
+    probed: BTreeSet<(DType, usize)>,
+    /// A calibration installed by [`seed`], which replaces the seeding probe for
+    /// every shape that has no state yet.
+    fallback: Option<SplitCalibration>,
+}
+
+impl Default for SplitScheduler {
+    fn default() -> Self {
+        SplitScheduler {
+            shapes: BTreeMap::new(),
+            probed: BTreeSet::new(),
+            fallback: None,
+        }
+    }
+}
+
+static SCHEDULER: LazyLock<Mutex<SplitScheduler>> =
+    LazyLock::new(|| Mutex::new(SplitScheduler::default()));
+
+/// One shape's read-only scheduler state, for diagnostics and the bench.
+#[derive(Clone, Copy, Debug)]
+pub struct ShapeSnapshot {
+    pub dtype: DType,
+    pub k: usize,
+    pub share: f64,
+    pub cpu_bytes_per_s: Option<f64>,
+    pub gpu_bytes_per_s: Option<f64>,
+    pub samples: u64,
+    pub applied: u32,
+    pub frozen: bool,
+}
+
+/// Every shape the scheduler has state for. Read-only; no device, no locks held
+/// on return.
+pub fn scheduler_snapshot() -> Vec<ShapeSnapshot> {
+    let Ok(scheduler) = SCHEDULER.lock() else {
+        return Vec::new();
+    };
+    scheduler
+        .shapes
+        .iter()
+        .map(|((dtype, k), state)| ShapeSnapshot {
+            dtype: *dtype,
+            k: *k,
+            share: state.share,
+            cpu_bytes_per_s: state.r_cpu.map(|e| e.value),
+            gpu_bytes_per_s: state.r_gpu.map(|e| e.value),
+            samples: state.samples,
+            applied: state.applied,
+            frozen: state.frozen,
+        })
+        .collect()
+}
+
+/// Install a calibration measured elsewhere (by [`probe_synthetic`], the
+/// `hipfire offload-bench` path, or a test) as this process's starting point: a
+/// shape with no state yet starts from this share and rate, and no seeding probe
+/// runs for it. The online controller still refines it.
+pub fn seed(calibration: &SplitCalibration) {
+    let Ok(mut scheduler) = SCHEDULER.lock() else {
+        return;
+    };
+    scheduler.fallback = Some(*calibration);
+}
+
+/// The share in force for `dtype`'s `k`, if the scheduler has state for it.
+///
+/// The split trace reads this so the printed share is the one actually used,
+/// pinned or scheduled.
+pub(crate) fn shape_share(dtype: DType, k: usize) -> Option<f64> {
+    SCHEDULER
+        .lock()
+        .ok()?
+        .shapes
+        .get(&(dtype, k))
+        .map(|state| state.share)
+}
+
+/// The scheduler's fallback share, when one was installed.
+fn fallback_share() -> Option<f64> {
+    SCHEDULER.lock().ok()?.fallback.map(|c| c.share)
+}
+
+/// Whether this shape has already been probed (or seeded) in this process.
+fn is_seeded(key: (DType, usize)) -> bool {
+    SCHEDULER
+        .lock()
+        .map(|scheduler| scheduler.probed.contains(&key))
+        .unwrap_or(true)
+}
+
+/// Insert a shape's state from a share, once. `probed` is marked so a later step
+/// of the same shape neither probes nor re-seeds it.
+fn seed_shape(key: (DType, usize), share: f64) {
+    let Ok(mut scheduler) = SCHEDULER.lock() else {
+        return;
+    };
+    scheduler.probed.insert(key);
+    scheduler
+        .shapes
+        .entry(key)
+        .or_insert_with(|| ShapeState::new(clamp_share(share)));
+}
+
+/// Record a pinned share so the trace and the snapshot can report it.
+fn note_pinned(key: (DType, usize), share: f64) {
+    let Ok(mut scheduler) = SCHEDULER.lock() else {
+        return;
+    };
+    scheduler
+        .shapes
+        .entry(key)
+        .or_insert_with(|| ShapeState::new(share));
+}
+
+/// The share to use for a shape whose state should already exist.
+fn scheduled_share(key: (DType, usize)) -> f64 {
+    SCHEDULER
+        .lock()
+        .ok()
+        .and_then(|scheduler| {
+            scheduler
+                .shapes
+                .get(&key)
+                .map(|state| state.share)
+                .or_else(|| scheduler.fallback.map(|c| c.share))
+        })
+        .unwrap_or(DEFAULT_GPU_SHARE)
+}
+
+/// The controller's proposal after one step's measurements.
+///
+/// With both rates present, move toward the balance point
+/// `r_gpu / (r_gpu + r_cpu)`. With no GPU rate and a join that did *not* outlast
+/// the CPU's own multiply — the common regime, where the H2D of the CPU's rows
+/// costs tens of microseconds against a CPU multiply of hundreds — the CPU is the
+/// straggler, so raise the share. Otherwise the step carries no usable signal and
+/// the share is unchanged.
+fn next_share(cur: f64, r_cpu: Option<f64>, r_gpu: Option<f64>, gpu_waited: bool) -> f64 {
+    match (r_cpu, r_gpu) {
+        (Some(cpu), Some(gpu)) if cpu + gpu > 0.0 => {
+            clamp_share(cur + ALPHA * (clamp_share(gpu / (gpu + cpu)) - cur))
+        }
+        _ if !gpu_waited => clamp_share(cur + 0.02),
+        _ => cur,
+    }
+}
+
+/// One split step's measurements. Rates are bytes per **second**, matching
+/// [`SplitCalibration`]; the controller only uses them as a ratio.
+///
+/// `cpu_ns` is the CPU arm's own duration (the blocking D2H plus the multiply),
+/// `gemv_ns` its multiply alone, and `join_ns` the blocking H2D — which is
+/// `copy + max(0, gpu_ns - cpu_ns)`.
+///
+/// **`join_ns > gemv_ns` is the only case in which the join carries GPU-rate
+/// information.** Then the H2D demonstrably waited for the GPU arm, so
+/// `cpu_ns + join_ns` recovers the GPU arm's duration (ignoring the small copy).
+/// Below that, `cpu_ns + join_ns` is the *CPU's* duration and would yield a GPU
+/// rate an order of magnitude too low — which is exactly what drags a share to
+/// the floor forever. Such a step carries the opposite signal, and
+/// [`next_share`]'s raise branch uses it.
+fn observe(
+    key: (DType, usize),
+    rows_cpu: usize,
+    rows_gpu: usize,
+    row_bytes: usize,
+    cpu_ns: u64,
+    gemv_ns: u64,
+    join_ns: u64,
+) {
+    let Ok(mut scheduler) = SCHEDULER.lock() else {
+        return;
+    };
+    let Some(state) = scheduler.shapes.get_mut(&key) else {
+        return;
+    };
+    if cpu_ns > 0 {
+        let sample = bytes_per_s(rows_cpu as f64 * row_bytes as f64, cpu_ns);
+        state.r_cpu = Some(match state.r_cpu {
+            Some(mut ewma) => {
+                ewma.update(sample);
+                ewma
+            }
+            None => Ewma::new(sample),
+        });
+    }
+    let gpu_waited = join_ns > gemv_ns;
+    if gpu_waited && cpu_ns + join_ns > 0 {
+        let sample = bytes_per_s(rows_gpu as f64 * row_bytes as f64, cpu_ns + join_ns);
+        state.r_gpu = Some(match state.r_gpu {
+            Some(mut ewma) => {
+                ewma.update(sample);
+                ewma
+            }
+            None => Ewma::new(sample),
+        });
+    }
+    state.samples += 1;
+    if state.frozen || state.samples % APPLY_EVERY != 0 {
+        return;
+    }
+    // Mirrors `next_share`'s two signal branches: only an adjustment that had
+    // information counts toward freezing the shape.
+    let had_signal = (state.r_cpu.is_some() && state.r_gpu.is_some()) || !gpu_waited;
+    let next = next_share(
+        state.share,
+        state.r_cpu.map(|e| e.value),
+        state.r_gpu.map(|e| e.value),
+        gpu_waited,
+    );
+    let delta = (next - state.share).abs();
+    state.share = next;
+    if !had_signal {
+        return;
+    }
+    state.applied += 1;
+    state.deltas.rotate_left(1);
+    state.deltas[3] = delta;
+    if state.applied >= FROZEN_APPLIED && state.deltas.iter().all(|d| *d < FREEZE_EPS) {
+        state.frozen = true;
+    }
+}
+
+fn bytes_per_s(bytes: f64, ns: u64) -> f64 {
+    bytes * 1e9 / ns.max(1) as f64
+}
+
+// ── The seeding probe ──────────────────────────────────
+
+/// What one two-engine measurement of a `(format, m, k)` shape found.
+#[derive(Clone, Copy, Debug)]
+pub struct SplitCalibration {
+    /// The CPU arm's rate over the shape's weight bytes.
+    pub cpu_bytes_per_s: f64,
+    /// The GPU arm's rate over the same bytes.
+    pub gpu_bytes_per_s: f64,
+    /// `clamp(gpu / (gpu + cpu), SHARE_MIN, SHARE_MAX)`: the starting share.
+    pub share: f64,
+}
+
+fn hip_err(e: hip_bridge::HipError) -> DispatchError {
+    DispatchError::Hip(e.to_string())
+}
+
+/// The activation a probe should read, and whether the CPU arm would rotate it.
+fn probe_activation<'a>(step: &'a Step<'a>, w: &WeightRef) -> Option<(&'a GpuTensor, bool)> {
+    match step {
+        Step::Gemv { input, .. } | Step::GemvResidual { input, .. } => match input {
+            GemvInput::Raw(t) => Some((*t, dtype_rotation_plan(w.dtype) == RotationPlan::FwhtG256)),
+            GemvInput::Prerotated(t) => Some((*t, false)),
+        },
+        _ => None,
+    }
+}
+
+/// `GemvInput` holds references, so a probe step borrows the *real* input rather
+/// than owning a copy: a `Raw` probe therefore rotates exactly as the real arm
+/// will.
+fn clone_input<'a>(input: &GemvInput<'a>) -> GemvInput<'a> {
+    match input {
+        GemvInput::Raw(t) => GemvInput::Raw(t),
+        GemvInput::Prerotated(t) => GemvInput::Prerotated(t),
+    }
+}
+
+fn median(mut samples: Vec<f64>) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    samples[samples.len() / 2]
+}
+
+/// Time both engines on `probe`'s weight buffer, `reps` times each, and return
+/// the median rates. `Ok(None)` when the format has no launchable GPU arm (the
+/// scheduler then keeps [`DEFAULT_GPU_SHARE`] and the online controller converges
+/// from there).
+///
+/// Both engines are timed *alone*, sequentially, so both rates are overestimates
+/// and the derived share is only a starting point.
+fn measure_both(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    probe: &Step,
+    w: &WeightRef,
+    q: hipfire_cpu::quant::CpuQuant,
+    row_bytes: usize,
+    x_host: &[f32],
+    reps: usize,
+) -> Result<Option<SplitCalibration>, DispatchError> {
+    let reps = reps.max(1);
+    let Some(bytes) = gpu.host_bytes(w.buf) else {
+        return Ok(None);
+    };
+    let mut y = vec![0.0f32; w.m];
+    let mut cpu_ns = Vec::with_capacity(reps);
+    for _ in 0..reps {
+        let t = Instant::now();
+        hipfire_cpu::gemv::gemv(q, bytes, w.m, w.k, x_host, &mut y);
+        cpu_ns.push(t.elapsed().as_nanos() as f64);
+    }
+    let mut gpu_ns = Vec::with_capacity(reps);
+    for _ in 0..reps {
+        let t = Instant::now();
+        if launch_op_rows(gpu, ctx, probe, Some(0..w.m)).is_err() {
+            return Ok(None);
+        }
+        gpu.sync_with_deadline(Gpu::GPU_SYNC_DEADLINE)
+            .map_err(hip_err)?;
+        gpu_ns.push(t.elapsed().as_nanos() as f64);
+    }
+    let size = (w.m * row_bytes) as f64;
+    let cpu_bytes_per_s = bytes_per_s(size, median(cpu_ns).max(1.0) as u64);
+    let gpu_bytes_per_s = bytes_per_s(size, median(gpu_ns).max(1.0) as u64);
+    let share = clamp_share(gpu_bytes_per_s / (gpu_bytes_per_s + cpu_bytes_per_s));
+    Ok(Some(SplitCalibration {
+        cpu_bytes_per_s,
+        gpu_bytes_per_s,
+        share,
+    }))
+}
+
+/// The seeding probe (4.3): time both engines on **this step's own weight
+/// buffer**, once per shape per process.
+///
+/// The GPU arm is measured through a probe `Step` built over a scratch output,
+/// never through the real step: for the residual form a probe write into the real
+/// accumulator would be double-counted by the following real arm.
+pub fn probe_weight(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    step: &Step,
+    w: &WeightRef,
+    reps: usize,
+) -> Result<Option<SplitCalibration>, DispatchError> {
+    let Some(q) = cpu_exec::cpu_quant_for(w.dtype) else {
+        return Ok(None);
+    };
+    let Some(row_bytes) = weight_row_bytes(w) else {
+        return Ok(None);
+    };
+    if row_bytes == 0 || w.m == 0 || w.k == 0 {
+        return Ok(None);
+    }
+    let Some((activation, rotate_input)) = probe_activation(step, w) else {
+        return Ok(None);
+    };
+    // The activation as the CPU arm will see it, once: the real arm downloads (and
+    // rotates) it once per step, so re-deriving it per rep would measure a
+    // transform the step does not repeat.
+    let (x_host, _) = cpu_exec::prepare_activation(gpu, w, activation, rotate_input)?;
+    let scratch = gpu.alloc_tensor(&[w.m], DType::F32).map_err(hip_err)?;
+    let acc_scratch = match step {
+        Step::GemvResidual { .. } => match gpu.alloc_tensor(&[w.m], DType::F32) {
+            Ok(acc) => Some(acc),
+            Err(e) => {
+                let _ = gpu.free_tensor(scratch);
+                return Err(hip_err(e));
+            }
+        },
+        _ => None,
+    };
+    let input = match step {
+        Step::Gemv { input, .. } => input,
+        Step::GemvResidual { input, .. } => input,
+        _ => unreachable!("probe_activation admitted only the two GEMV shapes"),
+    };
+    let input = clone_input(input);
+    let probe = match acc_scratch.as_ref() {
+        Some(acc) => Step::GemvResidual {
+            w,
+            input,
+            residual: acc,
+            out: acc,
+        },
+        None => Step::Gemv {
+            w,
+            input,
+            out: &scratch,
+        },
+    };
+    let result = measure_both(gpu, ctx, &probe, w, q, row_bytes, &x_host, reps);
+    let _ = gpu.free_tensor(scratch);
+    if let Some(acc) = acc_scratch {
+        let _ = gpu.free_tensor(acc);
+    }
+    result
+}
+
+/// The same two-engine measurement over a **synthetic** host-mapped weight, for
+/// `hipfire offload-bench`: no model and no step list needed.
+///
+/// Allocates, uses and frees its own buffers (a host-mapped weight of `m` rows —
+/// system RAM the GPU reads over the link — an f32 activation of `k`, an f32
+/// output of `m`). The weight's *contents* are irrelevant: both engines decode
+/// the same bytes and the measurement is memory traffic.
+pub fn probe_synthetic(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    dtype: DType,
+    m: usize,
+    k: usize,
+    reps: usize,
+) -> Result<SplitCalibration, DispatchError> {
+    let q = cpu_exec::cpu_quant_for(dtype).ok_or_else(|| {
+        DispatchError::Hip(format!(
+            "passback probe: no CPU decoder for {dtype:?}; nothing to measure"
+        ))
+    })?;
+    let row_bytes = hipfire_cpu::gemv::row_bytes(q, k);
+    if m == 0 || k == 0 || row_bytes == 0 {
+        return Err(DispatchError::Hip(
+            "passback probe: m, k and the format's row stride must all be non-zero".into(),
+        ));
+    }
+    let weight = gpu
+        .upload_raw_host(&vec![0u8; m * row_bytes], &[m, k])
+        .map_err(hip_err)?;
+    let x_act = match gpu.upload_f32(&vec![0.0f32; k], &[k]) {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = gpu.free_tensor(weight);
+            return Err(hip_err(e));
+        }
+    };
+    let scratch = match gpu.alloc_tensor(&[m], DType::F32) {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = gpu.free_tensor(x_act);
+            let _ = gpu.free_tensor(weight);
+            return Err(hip_err(e));
+        }
+    };
+    let result = {
+        let w_ref = WeightRef {
+            buf: &weight,
+            dtype,
+            m,
+            k,
+            row_stride: 0,
+            rotation: None,
+            awq_scale: None,
+            lloyd_lut_e4m3: None,
+            lloyd_lut_f16: None,
+            lloyd_lut_c16: None,
+        };
+        // `Raw`, not `Prerotated`: the probe needs no producer to have warmed the
+        // rotation scratch, and the extra rotate is `k` floats against MBs of
+        // weight bytes. The real split of a `Raw` step does exactly this too.
+        let probe = Step::Gemv {
+            w: &w_ref,
+            input: GemvInput::Raw(&x_act),
+            out: &scratch,
+        };
+        let rotate = dtype_rotation_plan(dtype) == RotationPlan::FwhtG256;
+        let (x_host, _) = cpu_exec::prepare_activation(gpu, &w_ref, &x_act, rotate)?;
+        measure_both(gpu, ctx, &probe, &w_ref, q, row_bytes, &x_host, reps)?
+    };
+    let _ = gpu.free_tensor(scratch);
+    let _ = gpu.free_tensor(x_act);
+    let _ = gpu.free_tensor(weight);
+    result.ok_or_else(|| {
+        DispatchError::Hip(format!(
+            "passback probe: {dtype:?} has no launchable GPU arm at m={m}, k={k}"
+        ))
+    })
+}
+
+// ── The seam ───────────────────────────────────────────
+
+/// The weight of a row-splittable step, or `None` for any other kind.
+fn step_weight<'a, 'b>(step: &'b Step<'a>) -> Option<&'a WeightRef<'a>> {
+    match step {
+        Step::Gemv { w, .. } | Step::GemvResidual { w, .. } => Some(*w),
+        _ => None,
+    }
+}
+
+/// The step's output rows that must be covered by the two arms, in order: the
+/// output, plus the residual for the residual form.
+fn output_extent(w: &WeightRef, step: &Step) -> bool {
+    let out_ok = |t: &GpuTensor| t.dtype == DType::F32 && t.numel() >= w.m;
+    match step {
+        Step::Gemv { out, .. } => out_ok(out),
+        Step::GemvResidual { residual, out, .. } => out_ok(residual) && out_ok(out),
+        _ => false,
+    }
+}
+
+/// Execute `step` as a pass-back split, or `Ok(false)` to leave it wholly to
+/// `memory.offload_exec=cpu`.
+///
+/// Every refusal below is silent-with-a-fallback rather than an error: the mode
+/// has a correct whole-CPU route for every step, so an unsplittable shape runs
+/// exactly as `cpu` mode runs it (never as `pcie`).
+pub fn run_with(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    step: &Step,
+    opts: &PassbackOptions,
+) -> Result<bool, DispatchError> {
+    if !opts.enabled {
+        return Ok(false);
+    }
+    // 1–2: the CPU must be able to take the step at all, and the step must be one
+    // of the four row-splittable shapes.
+    let Some(plan) = cpu_exec::plan_step(gpu, step) else {
+        return Ok(false);
+    };
+    let Some(w) = step_weight(step) else {
+        return Ok(false);
+    };
+    let residual = matches!(step, Step::GemvResidual { .. });
+    if residual && KernelKey::for_gemv_residual(w.dtype).is_err() {
+        // The GPU arm of a residual step is `dispatch_residual`, whose dtype set
+        // is exactly `for_gemv_residual`'s. A `Raw` step outside it would take
+        // `launch_op`'s multi-launch fallback (GEMV into a whole-tensor scratch,
+        // then `residual += out`), and a `Prerotated` one would simply fail to
+        // launch. Both must fall back to the whole-CPU step — this mode is never
+        // allowed to be less robust than `memory.offload_exec=cpu`, which handles
+        // every format the CPU decodes.
+        return Ok(false);
+    }
+    // 3–6: host-mapped, unpadded, and consistent with the CPU decoder.
+    if !gpu.host_located(w.buf) || w.row_stride != 0 || w.m == 0 {
+        return Ok(false);
+    }
+    let Some(row_bytes) = weight_row_bytes(w) else {
+        return Ok(false);
+    };
+    let Some(q) = cpu_exec::cpu_quant_for(w.dtype) else {
+        return Ok(false);
+    };
+    // The correctness-critical invariant: it is what makes `&host_bytes[g *
+    // row_bytes..]` the CPU arm's row `g`. A mismatch falls back rather than
+    // reading the wrong rows.
+    if row_bytes != hipfire_cpu::gemv::row_bytes(q, w.k) {
+        return Ok(false);
+    }
+    if !hipfire_cpu::simd::row_dot_enabled(q, None) {
+        return Ok(false);
+    }
+    // 7: both write targets must be F32 and cover every row.
+    if !output_extent(w, step) {
+        return Ok(false);
+    }
+    // 8: the share.
+    let key = (w.dtype, w.k);
+    let share = match opts.share {
+        PassbackShare::Share(f) => {
+            note_pinned(key, f);
+            f
+        }
+        PassbackShare::Auto => {
+            if !is_seeded(key) {
+                match fallback_share() {
+                    Some(f) => seed_shape(key, f),
+                    None => {
+                        // A failed or unavailable probe must not fail a step that
+                        // plain `cpu` mode would have run: fall back to
+                        // `DEFAULT_GPU_SHARE` and let the online controller correct
+                        // it from the arm timings.
+                        let calibration = probe_weight(gpu, ctx, step, w, PROBE_REPS)
+                            .ok()
+                            .flatten()
+                            .map(|c| c.share);
+                        seed_shape(key, calibration.unwrap_or(DEFAULT_GPU_SHARE));
+                    }
+                }
+            }
+            scheduled_share(key)
+        }
+    };
+    // 9: is this shape splittable at this share?
+    let Some(g) = plan_rows(w.m, row_bytes, share) else {
+        return Ok(false);
+    };
+
+    // The ordering *is* the mechanism: prepare (blocking D2H) before the GPU arm,
+    // GPU arm async, CPU multiply, then the blocking H2D of the CPU's rows as the
+    // join.
+    let step_start = Instant::now();
+    let arm = cpu_exec::cpu_arm_prepare(gpu, &plan, g..w.m)?;
+    launch_op_rows(gpu, ctx, step, Some(0..g))?;
+    let (gemv_ns, join_ns) = cpu_exec::cpu_arm_finish(gpu, &arm)?;
+    let cpu_ns = arm.d2h_ns + gemv_ns;
+    observe(key, w.m - g, g, row_bytes, cpu_ns, gemv_ns, join_ns);
+    cpu_exec::finish_step(
+        arm.q,
+        w,
+        arm.rotate_input,
+        residual,
+        HostExec::Split { gpu_rows: g },
+        step_start,
+        StepTiming {
+            d2h_ns: arm.d2h_ns,
+            gemv_ns,
+            h2d_ns: join_ns,
+        },
+    );
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plan_rows_balances_and_refuses() {
+        // The plan's pinned example: 0.375 of 12288 rows at 2720 B/row.
+        assert_eq!(plan_rows(12288, 2720, 0.375), Some(4608));
+        // A share outside (0, 1) never splits — 0 is the cpu byte-identity twin.
+        assert_eq!(plan_rows(12288, 2720, 0.0), None);
+        assert_eq!(plan_rows(12288, 2720, 1.0), None);
+        assert_eq!(plan_rows(12288, 2720, -0.1), None);
+        assert_eq!(plan_rows(12288, 2720, f64::NAN), None);
+        // Too few rows to align on.
+        assert_eq!(plan_rows(8, 1 << 20, 0.5), None);
+        // A weight below the minimum split size.
+        assert_eq!(plan_rows(1024, 1024, 0.5), None);
+        assert!(1024 * 1024 < MIN_SPLIT_BYTES);
+    }
+
+    #[test]
+    fn plan_rows_is_aligned_and_inside_its_bounds() {
+        for m in [16usize, 17, 63, 1000, 12288, 40961] {
+            for share in [0.01f64, 0.05, 0.1, 0.375, 0.5, 0.9, 0.99] {
+                let Some(g) = plan_rows(m, 2720, share) else {
+                    continue;
+                };
+                assert_eq!(g % ROW_ALIGN, 0, "m={m} share={share} g={g}");
+                assert!(g >= ROW_ALIGN && g <= m - ROW_ALIGN, "m={m} share={share} g={g}");
+            }
+        }
+    }
+
+    #[test]
+    fn next_share_moves_toward_the_balance_point() {
+        // CPU at 52 GB/s, GPU at 27.3 GB/s -> balance 0.344; from 0.375 it moves
+        // down by ALPHA times the gap.
+        let moved = next_share(0.375, Some(52e9), Some(27.3e9), true);
+        let target = 27.3 / (27.3 + 52.0);
+        assert!(moved < 0.375 && moved > target, "moved={moved}");
+        assert!((moved - (0.375 + ALPHA * (target - 0.375))).abs() < 1e-12);
+        // A join that did not outlast the CPU's multiply means the CPU is the
+        // straggler: the share rises by 0.02 ...
+        assert!(
+            (next_share(0.2, Some(52e9), None, false) - 0.22).abs() < 1e-12,
+            "the push-up branch must fire on the common no-wait regime"
+        );
+        // ... and clamps at the ceiling.
+        assert_eq!(next_share(SHARE_MAX, Some(52e9), None, false), SHARE_MAX);
+        // A join that waited with no GPU rate yet is no information: unchanged.
+        assert_eq!(next_share(0.3, Some(52e9), None, true), 0.3);
+        // With both rates the balance point wins even when the join waited.
+        let up = next_share(SHARE_MIN, Some(1.0), Some(1e12), true);
+        assert!(up > SHARE_MIN && up <= SHARE_MAX, "up={up}");
+        assert!((up - (SHARE_MIN + ALPHA * (SHARE_MAX - SHARE_MIN))).abs() < 1e-12);
+    }
+
+    #[test]
+    fn ewma_seeds_on_the_first_sample() {
+        let mut e = Ewma::new(10.0);
+        assert_eq!(e.value, 10.0);
+        e.update(20.0);
+        assert_eq!(e.value, 10.0 + EWMA_ALPHA * 10.0);
+        e.update(0.0);
+        assert!(e.value > 0.0 && e.value < 20.0);
+    }
+
+    #[test]
+    fn share_always_lands_inside_the_ceiling_and_floor() {
+        for start in [0.0f64, 0.05, 0.375, 0.5, 0.9] {
+            for (cpu, gpu) in [(1e9, 1e12), (1e12, 1e9), (1.0, 1.0)] {
+                for waited in [true, false] {
+                    let s = next_share(start, Some(cpu), Some(gpu), waited);
+                    assert!((SHARE_MIN..=SHARE_MAX).contains(&s), "s={s}");
+                }
+            }
+        }
+    }
+}
