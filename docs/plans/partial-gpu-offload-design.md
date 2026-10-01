@@ -378,6 +378,101 @@ PCIe link (27.1 GB/s measured, §7) instead of device DRAM: this is llama.cpp's
   first readings:
   [`docs/perf-checkpoints/2026-09-27-gfx1201-cpu-exec-offload.md`](../perf-checkpoints/2026-09-27-gfx1201-cpu-exec-offload.md).
 
+#### 6.2.2 Pass-back to the idle GPU (`memory.offload_exec=passback`)
+
+Shipped 2026-10-01. §6.2.1's CPU arm is a host sync point, so the GPU is idle for
+most of its wall — 77.7 % of the decode wall at 8/32 layers spilled on the 9B,
+89.8 % at 16/32, 94.6 % at 24/32, and 66.0 % on a 27B at 8/64
+([`2026-10-01-offload-passback-headroom-idle.md`](../perf-checkpoints/2026-10-01-offload-passback-headroom-idle.md)).
+The same record measured the headroom: a CPU GEMV stream and a GPU PCIe read of the
+*same* host-mapped bytes are near-additive to **75–78 GB/s** combined (the CPU keeps
+86–94 % of its solo ~52 GB/s while the GPU pulls its 27.3–28.4 GB/s unchanged),
+against ~46 GB/s for the CPU while the GPU reads — a ~1.4× ceiling, and one bounded
+by host DRAM rather than by either engine. This mode turns that idle window into
+work. *(The record is `historical`; the numbers below are its, not a current
+product claim.)*
+
+- **The split.** A spilled step's output rows are independent, so the step is split
+  **by output rows**: rows `[0, g)` go back to the GPU — the production kernel,
+  reading the same host-mapped weight over the link — and rows `[g, m)` stay on the
+  CPU. Per-layer placement cannot capture any of this: consecutive layers are
+  serially dependent through the residual stream, so moving a whole layer across
+  swaps who idles instead of overlapping anything. The split must be *within* a step.
+- **Config.** `memory.offload_exec` gains `passback` (env
+  `HIPFIRE_OFFLOAD_EXEC`). The GPU's share `g/m` is `memory.offload_passback_share`
+  (env `HIPFIRE_OFFLOAD_PASSBACK_SHARE`): `auto` (default) schedules it, a number in
+  `(0, 0.5]` pins it, and `0` disables the pass-back — the mode is then
+  byte-identical to `cpu` (the A/B twin and the byte-identity test). The key is read
+  only in `passback` mode; set in another mode it is inert and prints one
+  informational line at load. The upper bound is 0.5 because a step that should hand
+  more than half its rows to the GPU is better expressed by switching the mode to
+  `pcie`.
+- **Both arms are the existing paths, over a row range.** The GPU arm is `pcie`'s
+  launch restricted to rows `[0, g)` (`launch_op_rows`); the CPU arm is `cpu`'s step
+  restricted to `[g, m)` (`cpu_arm_prepare` / `cpu_arm_finish`). No third engine and
+  no new numerics, which is what makes the GPU arm bit-identical, row for row, to a
+  full `pcie` launch and `share = 0` byte-identical to `cpu`.
+- **Ordering, not streams.** Today's step is `D2H(x) → CPU GEMV → H2D(y)`. The
+  overlap is an ordering result: issue the blocking D2H *before* enqueueing the GPU
+  arm (so it drains only the step's producer, never the arm), enqueue the GPU arm
+  async, run the CPU multiply while it executes, then do the blocking H2D of the
+  CPU's rows — stream-ordered after the GPU arm because both are on the same
+  (default) stream. The copies are `k*4` bytes down and `(m-g)*4` up (~30 KB at 9B
+  shapes) against tens of MB of weight bytes, so a second stream plus an event pair
+  would buy the overlap of a ~2 µs copy. If a measurement ever shows a split step's
+  copies stalling, the fix is pre-decided: one non-blocking stream, an event recorded
+  on the current stream right after the producer, `stream_wait_event(aux, ev)`, the
+  D2H on `aux`, and an event pair back before the H2D — `hip-bridge` already exposes
+  all of it. Not built speculatively.
+- **Covered shapes (4).** `Gemv{Raw}`, `Gemv{Prerotated}`,
+  `GemvResidual{Prerotated}`, and `GemvResidual{Raw}` when the dtype has a fused
+  residual kernel. The mechanism is that every covered kernel indexes its weight as
+  `A + row*row_stride` from the passed base and writes `y[row]`, so a byte view of the
+  weight plus a pointer-offset output *is* a row-shifted launch. Split offsets are
+  8-row aligned: 2 for the residual kernels' `row0 = blockIdx.x << 1` + `float2`
+  store, 8 to keep every covered format's weight byte offset 4-byte aligned.
+- **Refusals.** Each of these falls back to the *whole-CPU* step — never to `pcie` —
+  so the mode has exactly one degraded behaviour: not host-mapped; a padded
+  `row_stride`; a weight whose byte length is not exactly `m * row_bytes(q, k)` (the
+  correctness-critical invariant: it is what makes `&host_bytes[g*row_bytes..]` the
+  CPU arm's row `g`); no vector row dot for the format (with the scalar decoder the
+  best share is all-GPU, which `pcie` does better); a non-F32 or short output; a
+  weight below 2 MiB (the launch and the join outweigh the overlap); and
+  `GemvResidual{Raw}` without a fused residual kernel (its fallback scratch and
+  accumulate are whole-tensor). A failed seeding probe degrades the same way: the
+  shape keeps `DEFAULT_GPU_SHARE` and the controller converges from there.
+- **Scheduler.** The optimum is a property of the *host* (link width, DRAM peak, core
+  count, AVX2), so no constant is load-bearing. The first split-eligible step of each
+  `(dtype, k)` seeds itself by timing both engines on that step's *own* weight buffer
+  (median of 3 reps; the GPU arm through a scratch-output probe, so a residual probe
+  cannot be double-counted by the following real arm) and every split step then
+  refines the share from its own arm timings: `r_cpu` from the contended CPU arm
+  every step, `r_gpu` only when the join outlasts the CPU's own multiply — the one
+  regime in which the blocking H2D waited for the GPU arm, making its duration
+  recoverable as `cpu_ns + join`. Below that (the common case: a CPU multiply of
+  hundreds of microseconds against a tens-of-microseconds copy) the join carries
+  the *opposite* signal — the CPU is the straggler — and the share rises. Reading
+  the join as a GPU duration there yields a rate an order of magnitude too low and
+  pins the split to its floor with both engines idle in turn. Shares are
+  clamped to `[0.05, 0.50]`, adjusted every 4 steps (step 0.3 of the way toward
+  `r_gpu/(r_gpu+r_cpu)`), and frozen once a shape has applied 64 adjustments with the
+  last four all under 0.005.
+- **Accounting and diagnostics.** A split step is *not* charged to the CPU-idle
+  numerator (its wall contains GPU work, so it would inflate the lower bound §6.2.1
+  documents) and gets its own `split: …` trace line under
+  `HIPFIRE_CPU_EXEC_TRACE=1`, whose `join` is the blocking H2D
+  (`copy + max(0, gpu_ns − cpu_ns)`): `join > gemv` means the H2D waited for the
+  GPU arm, so the GPU is the straggler (lower the share); `join ≪ gemv` means the
+  CPU is (raise it) — the same signal the controller uses, and the reason `gpu≥` on
+  that line is printed as a lower bound rather than a rate. `hipfire offload-bench` measures the host
+  independently (its own `--format`/`--buffer-mb`/`--reps`, `--json`, and `--write` to
+  persist the recommended share), and refuses while a daemon pid file names a live
+  process.
+- **Scope.** The dense qwen3.5 seam only — the step lists that carry
+  `qkv_via_execute_steps`, `qkvza_via_execute_steps`, `gate_up_via_execute_steps` and
+  the dense `Step::GemvResidual` sites. MoE / routed-expert paths never reach it and
+  get no arms.
+
 ### 6.3 Dispatch substrate (`hipfire-dispatch/.../superop.rs`)
 - The executor binds by index today; add a residency-aware bind step: for each `WeightSlot`, pick
   the device pointer (resident) or staging scratch pointer (spilled). `OpBinding` stays POD; the

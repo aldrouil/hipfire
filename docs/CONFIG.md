@@ -1046,6 +1046,7 @@ Deprecated since 0.4.0, removal in 0.5.0:
 | `memory.mmq.screen` | `mmq_screen` | `HIPFIRE_MMQ_SCREEN` | stable |
 | `memory.mmq.screen_threshold` | `mmq_screen_threshold` | `HIPFIRE_MMQ_SCREEN_THRESHOLD` | stable |
 | `memory.offload_exec` | `offload_exec` | `HIPFIRE_OFFLOAD_EXEC` | stable |
+| `memory.offload_passback_share` | `offload_passback_share` | `HIPFIRE_OFFLOAD_PASSBACK_SHARE` | stable |
 | `memory.oom_guard` | `oom_guard` | `HIPFIRE_OOM_GUARD` | stable |
 | `memory.prompt_cache_capacity` | `prompt_cache_capacity` | `HIPFIRE_PROMPT_CACHE_CAP` | stable |
 | `memory.prompt_cache_unbounded` | `prompt_cache_unbounded` | `HIPFIRE_PROMPT_CACHE_UNBOUNDED` | experimental |
