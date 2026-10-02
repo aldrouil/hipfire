@@ -459,31 +459,33 @@ product claim.)*
   overlap); and `GemvResidual{Raw}` without a fused residual kernel (its fallback
   scratch and accumulate are whole-tensor). A failed seeding probe leaves the shape on
   `DEFAULT_GPU_SHARE` and the controller converges from there.
-- **Scheduler.** The schedule's optimum is a property of the *host* (link width, DRAM
-  peak, core count, AVX2), so no constant is load-bearing. The first eligible step of
-  each `(dtype, k)` seeds itself by timing both engines on that step's *own* weight
-  buffer (median of 3 reps; the GPU arm through a scratch-output probe, so a residual
-  probe cannot be double-counted by the following real arm), and every split step then
+- **Scheduler.** The optimum is a property of the *host* (link width, DRAM peak, core
+  count, AVX2), so no constant is load-bearing. The first split-eligible step of each
+  `(dtype, k)` seeds itself by timing both engines on that step's *own* weight buffer
+  (median of 3 reps; the GPU arm through a scratch-output probe, so a residual probe
+  cannot be double-counted by the following real arm) and every split step then
   refines the share from its own arm timings. The join is `copy + max(0, gpu_ns −
-  cpu_ns)`; the controller reads it against the shape's own copy floor (the smallest
-  join seen) plus a hysteresis margin, and only the excess over `floor + margin` can be
-  the GPU arm overrunning the CPU multiply, where `gemv_ns + excess` is that arm's
-  duration. The GPU arm's time-per-byte is a **censored (Tobit) EM estimate** over both
-  exact (overrun) and censored (finished-first) observations, anchored by the probe's
-  directly measured rate — the estimator's identifiability anchor and its guard against
-  a floor-noise runaway. The setpoint is the DLT balance point `r_gpu/(r_gpu+r_cpu)`;
-  shares are clamped to `[0.05, 0.50]` and the estimate re-runs once per 64-observation
-  window. There is **no permanent freeze** — the schedule keeps
-  adapting for the whole decode. Sources and the estimator's known limits are at
-  `estimate_tau_gpu` in `crates/hipfire-dispatch/src/offload_split.rs`.
+  cpu_ns)`, and the controller reads it **relative to the shape's own no-wait floor**
+  — the smallest join it has seen, i.e. what the copy costs when the GPU arm finished
+  first — with a hysteresis margin (10 µs, or a quarter of the floor). Only the excess
+  over `floor + margin` can be a wait: when there is one, `r_gpu` is sampled as
+  `rows_gpu·row_bytes / (cpu_ns + excess)` and the share moves toward the balance
+  point; when there is not, the CPU is the straggler and the share rises. Both an
+  absolute microsecond threshold (the measured copy alone is 30–50 µs for the ~30 KB
+  this mode copies back, so any threshold below that samples on *every* step) and the
+  raw join (`cpu_ns + join` is the *CPU's* duration whenever the CPU is the straggler,
+  which reports a GPU rate an order of magnitude too low and pins the split to its
+  floor with both engines idle in turn) are wrong here; the floor is measured, not
+  assumed. Shares are clamped to `[0.05, 0.50]`, adjusted every 4 steps (step 0.3 of
+  the way toward `r_gpu/(r_gpu+r_cpu)`), and frozen once a shape has applied 64
+  adjustments with the last four all under 0.005.
 - **Accounting and diagnostics.** A split step is *not* charged to the CPU-idle
   numerator (its wall contains GPU work, so it would inflate the lower bound §6.2.1
   documents) and gets its own `split: …` trace line under
   `HIPFIRE_CPU_EXEC_TRACE=1`, whose `join` is the blocking H2D
-  (`copy + max(0, gpu_ns − cpu_ns)`): the line also prints the controller's own state —
-  `est_cpu`/`est_gpu` (the pair the share was computed from, both from the same state),
-  `anchor` (whether the probe ran), `gpu samples`, `floor`, the last overrun, the last
-  `target`, `applied` — so a share nobody can explain is diagnosable from one run.
+  (`copy + max(0, gpu_ns − cpu_ns)`): the line also prints the controller's own state
+  (`gpu samples`, the last `waited`, the last `target`, `applied`, `frozen`), so a share
+  nobody can explain is diagnosable from one run.
   `gpu≥GB/s` is a lower bound by construction (it divides the GPU's bytes by the *whole*
   step wall) and is printed as a bound for that reason. `hipfire offload-bench` measures
   the host independently (its own `--format`/`--buffer-mb`/`--reps`, `--json`, and
