@@ -289,7 +289,7 @@ PCIe link (27.1 GB/s measured, §7) instead of device DRAM: this is llama.cpp's
   then the CPU GEMV plus residual. Under `passback` it now hands that residual
   GEMV to the co-inference seam as a `Step::GemvResidual` (falling back to the
   whole-CPU path when the seam declines), so the dense FFN down-projection is
-  co-inferenced instead of run wholly on the CPU — measured **+4.0 % / +5.0 %** on
+  co-inferenced instead of run wholly on the CPU — measured **+3.8 % / +2.6 %** on
   the 9B at 8 / 16 of 32 spilled (interleaved fresh-process pairs, passback mode;
   § 6.2.2).
 - **Two launcher properties the CPU path must reproduce exactly**, both of which
