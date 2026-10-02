@@ -11,11 +11,13 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-# tag -> (layers, jsonl)
+# tag -> (layers, [jsonl files]). Files resolve beside this script so the
+# committed figure regenerates from the committed data; argv overrides a tag.
+_HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULTS = {
-    "2b":  (24, "/tmp/sp_2b.jsonl"),
-    "9b":  (32, "/tmp/sp_9b.jsonl"),
-    "27b": (64, "/tmp/sp_27b.jsonl"),
+    "2b":  (24, ["sp_2b.jsonl"]),
+    "9b":  (32, ["sp_9b.jsonl"]),
+    "27b": (64, ["sp_27b.jsonl", "sp_27b_extra.jsonl", "sp_27b_60.jsonl"]),
 }
 MODELS = ["2b", "9b", "27b"]
 LABEL = {"2b": "Qwen3.5-2B mq4 (24 layers)",
@@ -25,9 +27,11 @@ COLOR = {"2b": "#e67e22", "9b": "#1f77b4", "27b": "#2c3e50"}
 MARKER = {"2b": "o", "9b": "s", "27b": "^"}
 
 
-def series(layers, path):
-    """(spill_fraction, arm) -> (median_decode, values, n)."""
-    rows = [json.loads(l) for l in open(path) if '"decode"' in l]
+def series(layers, paths):
+    """(spill_fraction, arm) -> (median_decode, values, n). Reads every path."""
+    rows = []
+    for p in paths:
+        rows += [json.loads(l) for l in open(p) if '"decode"' in l]
     by = {}
     for r in rows:
         if r["decode"] is None:
@@ -42,9 +46,13 @@ def series(layers, path):
 
 def main():
     src = {}
-    for tag, (layers, default) in DEFAULTS.items():
-        path = sys.argv[1 + MODELS.index(tag)] if len(sys.argv) > 1 + MODELS.index(tag) else default
-        src[tag] = series(layers, path)
+    for tag, (layers, files) in DEFAULTS.items():
+        i = MODELS.index(tag)
+        if len(sys.argv) > 1 + i and sys.argv[1 + i]:
+            paths = [sys.argv[1 + i]]
+        else:
+            paths = [os.path.join(_HERE, f) for f in files]
+        src[tag] = series(layers, paths)
 
     fig, (axa, axb) = plt.subplots(1, 2, figsize=(13.5, 5.6))
 
