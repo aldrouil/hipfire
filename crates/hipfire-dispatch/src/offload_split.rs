@@ -1,20 +1,36 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
-//! Pass-back row split: a spilled step runs on *both* engines
+//! Pass-back: **scheduled co-inference of the layers spilled into system RAM**
 //! (`memory.offload_exec=passback`).
 //!
-//! A CPU-executed step is a host sync point: a blocking D2H, a host GEMV, a
-//! blocking H2D. Over a decode-only span the GPU is therefore idle for most of
-//! the wall (`docs/perf-checkpoints/2026-10-01-offload-passback-headroom-idle.md`
-//! measured 77.3–94.6 % on the 9B at 8–24 of 32 layers spilled), while a CPU GEMV
-//! stream and a GPU PCIe read of the *same* host-mapped pages are near-additive
-//! up to 75–78 GB/s combined against ~52 GB/s for the CPU alone.
+//! The partial-offload feature spills a contiguous prefix of layers to pinned
+//! host RAM (`memory.gpu_layer_budget`) and executes their weight-reading GEMVs
+//! through one of two engines: `pcie` — the GPU reading the host-mapped weights
+//! over the link — or `cpu` — the CPU SIMD kernels reading host RAM directly.
+//! Pass-back **runs both engines on the same spilled step, concurrently**. It is a
+//! mixture of those two existing paths working in concert, not a third engine and
+//! not a fallback: the GPU arm *is* the `pcie` path restricted to a row range, the
+//! CPU arm *is* the `cpu` path restricted to the rest, and `share = 0` is
+//! byte-identical to `memory.offload_exec=cpu`.
 //!
-//! A spilled step's output rows are independent, so this module **splits the step
-//! by output rows**: rows `[0, g)` go back to the GPU — the production kernel,
-//! reading the same host-mapped weight over the link — and rows `[g, m)` stay on
-//! the CPU, with the two arms running concurrently.
+//! Why it pays: a CPU-only step is a host sync point — a blocking D2H, a host
+//! GEMV, a blocking H2D — so the GPU sits idle for most of its wall
+//! (`docs/perf-checkpoints/2026-10-01-offload-passback-headroom-idle.md` measured
+//! 77.3–94.6 % on the 9B at 8–24 of 32 layers spilled), while a CPU GEMV stream
+//! and a GPU PCIe read of the *same* host-mapped pages are near-additive up to
+//! 75–78 GB/s combined against ~52 GB/s for the CPU alone. Co-inference spends
+//! that idle window on the same host bytes.
+//!
+//! **The schedule is per step, not per layer.** Consecutive layers are serially
+//! dependent through the residual stream, so moving a whole *layer* between the
+//! engines only swaps who idles; the mixture has to be *within* a step. A spilled
+//! step's output rows are independent, so the step is divided by output rows: rows
+//! `[0, g)` go to the GPU (the `pcie` path) and rows `[g, m)` stay on the CPU (the
+//! `cpu` path), concurrently. A step that ends up wholly on one engine is a
+//! **degenerate point of this schedule** (`g → 0` for an all-CPU step), not a
+//! validation failure and not a fallback to a worse path — the eligibility gates
+//! below only bound which steps can be co-inferenced at all.
 //!
 //! Two properties make it correct and cheap:
 //!
@@ -41,22 +57,27 @@
 //! from its own arm timings. No host constant is load-bearing: the probe
 //! accelerates convergence and the online controller corrects it.
 //!
-//! The controller reads the blocking H2D (`join`) relative to the shape's own
-//! no-wait floor — the smallest join it has seen, i.e. what the copy costs when
-//! the GPU arm finished first. Only the excess over that floor can be a wait for
-//! the GPU arm; when there is one, `cpu_ns + excess` recovers the arm's duration
-//! and the share moves toward the balance point. When there is not (the common
-//! regime: a CPU multiply of hundreds of microseconds against a
-//! tens-of-microseconds copy) the CPU is the straggler and the share rises.
-//! Reading the raw join as a GPU duration in that regime is how a split ends up
-//! pinned to its own floor with both engines idle in turn.
+//! The controller reads the blocking H2D (`join`) against the shape's own copy
+//! floor — the smallest join it has seen, i.e. what the copy costs when the GPU
+//! finished first — plus a hysteresis margin. Only the excess over
+//! `floor + margin` can be the GPU arm overrunning the CPU multiply, and then
+//! `gemv_ns + excess` *is* the arm's duration. Below the balance point the GPU
+//! finishes first on every step, so its duration is only *bounded*; those steps
+//! are kept as censored observations, and the arm's time-per-byte is a censored
+//! (Tobit) EM estimate over both exact and censored observations, anchored by the
+//! one-time probe's directly measured rate — the estimator's identifiability
+//! anchor and its guard against a floor-noise runaway. The setpoint is the DLT
+//! balance point `r_gpu/(r_gpu+r_cpu)`. Reading the raw join as a GPU duration in
+//! the CPU-straggler regime is how a split ends up pinned to its own floor with
+//! both engines idle in turn. The estimator's sources and its known limits are
+//! documented above [`estimate_tau_gpu`].
 //!
 //! Scope is the dense qwen3.5 seam only (the step lists that carry
 //! `qkv_via_execute_steps`, `qkvza_via_execute_steps`,
 //! `gate_up_via_execute_steps` and the dense `Step::GemvResidual` sites). MoE /
 //! routed-expert paths never reach it and get no arms here.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
 
@@ -105,10 +126,18 @@ const APPLY_EVERY: u64 = 4;
 /// EWMA weight for the CPU arm's time-per-byte sample.
 const EWMA_ALPHA: f64 = 0.25;
 
-/// The GPU estimator: split steps between censored-MLE updates, the assumed
-/// coefficient of variation of the GPU arm's per-byte time, the weight — in
-/// online pseudo-observations — of the probe's directly measured GPU rate, and
-/// the EM iteration cap.
+/// The GPU estimator: the number of online observations it keeps (a rolling
+/// window), how often it re-estimates, the assumed coefficient of variation of
+/// the GPU arm's per-byte time, the weight — in online pseudo-observations — of
+/// the probe's directly measured GPU rate, and the EM iteration cap.
+///
+/// `ESTIMATE_EVERY` is the estimator's *lag* and is deliberately small: the
+/// investigation doc's §1.2 weakness 1 is "lag, not offset" — the share trails the
+/// drifting balance point by roughly the estimator's time constant — and §5
+/// Phase 1 names "reduce the target EWMA's lag" as the first lever. A rolling
+/// window of [`ESTIMATE_WINDOW`] observations re-estimated every
+/// `ESTIMATE_EVERY` steps keeps the sample count while cutting the lag from the
+/// window length to the cadence.
 ///
 /// `TAU_PRIOR_WEIGHT` and `TAU_CV` are the two knobs a reader should scrutinise:
 /// * `TAU_PRIOR_WEIGHT` is the identifiability anchor, not a tuning knob. If
@@ -123,9 +152,8 @@ const EWMA_ALPHA: f64 = 0.25;
 ///   share uses. [`estimate_tau_gpu_is_insensitive_to_the_iteration_cap`] pins the
 ///   cap; the CV is deliberately left as an assumption rather than fitted to a
 ///   placement.
-/// * `ESTIMATE_EVERY` trades update latency against samples per update; the share
-///   still moves every [`APPLY_EVERY`] steps on the current estimate.
-const ESTIMATE_EVERY: u64 = 64;
+const ESTIMATE_WINDOW: usize = 64;
+const ESTIMATE_EVERY: u64 = 8;
 const TAU_CV: f64 = 0.5;
 const TAU_PRIOR_WEIGHT: f64 = 16.0;
 const ESTIMATE_ITERS: usize = 8;
@@ -424,9 +452,12 @@ struct ShapeState {
     /// a sustained overrun (which would let overrun detection wash out), and the
     /// margin in [`waited_extra_ns`] absorbs a single unusually fast copy.
     min_join_ns: Option<u64>,
-    /// This window's observations, in ns/byte.
-    exact_tau: Vec<f64>,
-    censored_tau: Vec<f64>,
+    /// The rolling window of observations, in ns/byte: exact overrun durations and
+    /// censoring thresholds. A rolling window rather than a fixed batch, so the
+    /// estimate re-runs every [`ESTIMATE_EVERY`] steps (a short lag, doc §1.2
+    /// weakness 1) over the last [`ESTIMATE_WINDOW`] observations.
+    exact_tau: VecDeque<f64>,
+    censored_tau: VecDeque<f64>,
     samples: u64,
     /// Steps the GPU arm overran the CPU multiply — the only ones that yield an
     /// exact arm duration, as opposed to a censoring bound. Printed with the shape
@@ -448,8 +479,8 @@ impl ShapeState {
             tau_gpu: None,
             tau_gpu_prior: None,
             min_join_ns: None,
-            exact_tau: Vec::new(),
-            censored_tau: Vec::new(),
+            exact_tau: VecDeque::new(),
+            censored_tau: VecDeque::new(),
             samples: 0,
             gpu_samples: 0,
             exact_total: 0,
@@ -703,7 +734,10 @@ fn observe(
     let gpu_waited = excess > 0;
     let bytes_gpu = (rows_gpu as f64 * row_bytes as f64).max(1.0);
     if gpu_waited {
-        state.exact_tau.push((gemv_ns + excess) as f64 / bytes_gpu);
+        state.exact_tau.push_back((gemv_ns + excess) as f64 / bytes_gpu);
+        while state.exact_tau.len() > ESTIMATE_WINDOW {
+            state.exact_tau.pop_front();
+        }
         state.gpu_samples += 1;
         state.exact_total += 1;
     } else {
@@ -711,21 +745,22 @@ fn observe(
         // everything the join could be hiding (the margin).
         state
             .censored_tau
-            .push((gemv_ns as f64 + margin as f64) / bytes_gpu);
+            .push_back((gemv_ns as f64 + margin as f64) / bytes_gpu);
+        while state.censored_tau.len() > ESTIMATE_WINDOW {
+            state.censored_tau.pop_front();
+        }
     }
     state.samples += 1;
     state.last_waited = gpu_waited;
     if state.samples % ESTIMATE_EVERY == 0 {
-        if let Some(mu) = estimate_tau_gpu(
-            &state.exact_tau,
-            &state.censored_tau,
-            state.tau_gpu_prior,
-            TAU_PRIOR_WEIGHT,
-        ) {
+        let mu = {
+            let exact = state.exact_tau.make_contiguous();
+            let censored = state.censored_tau.make_contiguous();
+            estimate_tau_gpu(exact, censored, state.tau_gpu_prior, TAU_PRIOR_WEIGHT)
+        };
+        if let Some(mu) = mu {
             state.tau_gpu = Some(mu);
         }
-        state.exact_tau.clear();
-        state.censored_tau.clear();
         // Unanchored (no probe) and never an overrun: every observation was
         // censored, so the estimate is degenerate — it equals the censoring bound,
         // which makes the setpoint equal the current share. There is neither
@@ -1048,9 +1083,10 @@ pub fn run_with(
         // is exactly `for_gemv_residual`'s. A `Raw` step outside it would take
         // `launch_op`'s multi-launch fallback (GEMV into a whole-tensor scratch,
         // then `residual += out`), and a `Prerotated` one would simply fail to
-        // launch. Both must fall back to the whole-CPU step — this mode is never
-        // allowed to be less robust than `memory.offload_exec=cpu`, which handles
-        // every format the CPU decodes.
+        // launch. Either way the step cannot be co-inferenced: it runs on the CPU
+        // engine alone (the schedule's degenerate point), never `pcie` — this mode
+        // is never allowed to be less robust than `memory.offload_exec=cpu`, which
+        // handles every format the CPU decodes.
         return Ok(false);
     }
     // 3–6: host-mapped, unpadded, and consistent with the CPU decoder.
