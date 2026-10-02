@@ -63,32 +63,42 @@ use crate::families::gemv::WeightRef;
 use crate::pipeline::steps::{GemvInput, Step};
 use crate::types::{dtype_rotation_plan, DispatchError, RotationPlan};
 
-/// Cached `memory.offload_exec` selects CPU execution, mirroring the
-/// `forward_lowered_enabled` precedent: resolved once from the process snapshot,
-/// never re-read per step.
+/// `memory.offload_exec` resolved once from the process snapshot, mirroring the
+/// `forward_lowered_enabled` precedent: read once, never per step.
 ///
-/// `true` for both `cpu` and `passback` — in either mode the CPU multiplies some
-/// or all of a spilled step ([`passback_enabled`] distinguishes the split form).
-/// Every Cpu-only mechanism in this module keys on this predicate, so the third
-/// mode is covered without renaming a single call site.
-pub fn cpu_exec_enabled() -> bool {
-    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
-        matches!(
-            hipfire_config::memory::offload_exec(),
-            hipfire_config::memory::OffloadExec::Cpu
-                | hipfire_config::memory::OffloadExec::Passback
-        )
-    });
-    *ENABLED
+/// One cached snapshot backs both predicates below, so the mode is resolved
+/// exactly once for the process rather than once per boolean derived from it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HostExecMode {
+    Pcie,
+    Cpu,
+    Passback,
 }
 
-/// Cached `memory.offload_exec == passback`: the CPU runs a spilled step and
-/// hands part of its output rows back to the GPU ([`crate::offload_split`]).
-pub fn passback_enabled() -> bool {
-    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
-        hipfire_config::memory::offload_exec() == hipfire_config::memory::OffloadExec::Passback
+fn host_exec_mode() -> HostExecMode {
+    static MODE: LazyLock<HostExecMode> = LazyLock::new(|| {
+        match hipfire_config::memory::offload_exec() {
+            hipfire_config::memory::OffloadExec::Cpu => HostExecMode::Cpu,
+            hipfire_config::memory::OffloadExec::Passback => HostExecMode::Passback,
+            hipfire_config::memory::OffloadExec::Pcie => HostExecMode::Pcie,
+        }
     });
-    *ENABLED
+    *MODE
+}
+
+/// `memory.offload_exec` executes some or all of a spilled step host-side
+/// (`cpu` or `passback`), so the CPU multiplies its weights
+/// ([`passback_enabled`] distinguishes the split form). Every host-exec
+/// mechanism in this module keys on this predicate, so both modes are covered
+/// without renaming a call site.
+pub fn cpu_exec_enabled() -> bool {
+    host_exec_mode() != HostExecMode::Pcie
+}
+
+/// `memory.offload_exec == passback`: the CPU runs a spilled step and hands part
+/// of its output rows back to the GPU ([`crate::offload_split`]).
+pub fn passback_enabled() -> bool {
+    host_exec_mode() == HostExecMode::Passback
 }
 
 /// (steps executed on the CPU, host-mapped steps that stayed on the GPU).
