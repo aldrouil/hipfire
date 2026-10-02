@@ -853,7 +853,7 @@ fn trace_step(
             Some(s) => (
                 format!("{:.3}", s.share),
                 format!(
-                    " (gpu samples {}, floor={}, last waited={}, target={}, {} applied{})",
+                    " (gpu samples {}, floor={}, last waited={}, target={}, {} applied, {} reopens{})",
                     s.gpu_samples,
                     s.min_join_ns
                         .map(|ns| format!("{:.2}ms", ns as f64 / 1e6))
@@ -863,6 +863,7 @@ fn trace_step(
                         .map(|t| format!("{t:.3}"))
                         .unwrap_or_else(|| "—".into()),
                     s.applied,
+                    s.reopens,
                     if s.frozen { ", frozen" } else { "" },
                 ),
             ),

@@ -125,14 +125,37 @@ const EWMA_ALPHA: f64 = 0.25;
 const FROZEN_APPLIED: u32 = 64;
 const FREEZE_EPS: f64 = 0.005;
 
-/// The latch's re-open band. A latched shape keeps measuring, and unlatches when a
-/// freshly computed balance point differs from the latched share by more than this.
-/// It sits above the largest proposal a just-latched shape can be holding — the
-/// freeze band is `FREEZE_EPS / ALPHA ≈ 0.0167`, so at latch time the proposal is
-/// within that of the share — which gives the latch hysteresis: it absorbs the
-/// converged value and its noise, but follows a genuine move (the balance shifting
-/// as context or host load changes).
-const REOPEN_EPS: f64 = 0.02;
+/// The latch's re-open band, on the proposal axis (`ALPHA ×` the balance-point
+/// move). A latched shape keeps measuring, and unlatches when a freshly computed
+/// proposal exceeds this in the same direction for [`REOPEN_CONFIRM`]
+/// consecutive adjustments. Its floor is the freeze band: a shape latches with
+/// its last four proposals under `FREEZE_EPS` (0.005), so a band at or below
+/// that would re-open the latch on the very noise the freeze rejected — measured
+/// on the model, `REOPEN_EPS = 0.002` re-opens a *clean* static plant nine times
+/// in 1024 steps. `0.01` is twice the freeze band, which holds a margin for the
+/// rate EWMAs to settle after latching. It is deliberately tighter than the
+/// original `0.02`: on the balance-point axis that was a `0.02 / ALPHA ≈ 0.067`
+/// dead zone, so a slow host-load drift could slide the optimum by up to 6.7
+/// points before the latch noticed — a step change tripped it, a ramp did not.
+/// On the model's ramp, `0.01` cuts the drift regret by ~28 % with no static- or
+/// step-scenario cost. The band is not field-identifiable: a four-arm A/B (0.005
+/// without the streak, 0.005/0.01/0.02 with it, 3 interleaved rounds at 8 and 16
+/// of 32 spilled) left every arm inside its own run-to-run spread and flipped the
+/// ordering between budgets, so the static fixture does not resolve the band —
+/// the 0.005 penalty an earlier spread measured did not reproduce. So the value
+/// rests on the freeze-band margin and the drift model, not on a field win.
+const REOPEN_EPS: f64 = 0.01;
+
+/// Consecutive out-of-band proposals, in the same direction, a latched shape must
+/// produce before it unlatches. One is not enough: a host-load transient or a
+/// single badly-sampled join can push one proposal past the band, and unlatching
+/// on it hands the controller the noise it was latched to reject. A genuine move
+/// drives the balance point one way for many adjustments, while noise flips sign,
+/// so requiring a same-sign run separates the two without a bigger dead zone.
+/// It is insurance, not a win: the model's genuine-move scenarios cost ~1–2 µs of
+/// extra reopen latency per move and no measured throughput change, while it
+/// removes the reopens a noisy static host produced without it.
+const REOPEN_CONFIRM: i32 = 3;
 
 /// `enabled` + `share` supplied by the caller, so the parity test and the
 /// planner tests need no process snapshot.
@@ -253,10 +276,19 @@ struct ShapeState {
     last_target: Option<f64>,
     last_waited: bool,
     applied: u32,
+    /// Times this shape has unlatched (frozen -> unfrozen). Nonzero proves the
+    /// fixture actually exercised the re-open path, which a `frozen` flag alone
+    /// cannot show, and it is the first number to read when a share has moved
+    /// after latching.
+    reopens: u32,
     /// The last four adjustment magnitudes, seeded above the freeze threshold so
     /// a shape cannot freeze on its first few no-op adjustments.
     deltas: [f64; 4],
     frozen: bool,
+    /// Consecutive out-of-band proposals while latched, signed by direction
+    /// (positive = the balance point moved up). Reset whenever a proposal lands
+    /// back inside the band.
+    reopen_streak: i32,
 }
 
 impl ShapeState {
@@ -271,8 +303,10 @@ impl ShapeState {
             last_target: None,
             last_waited: false,
             applied: 0,
+            reopens: 0,
             deltas: [f64::MAX; 4],
             frozen: false,
+            reopen_streak: 0,
         }
     }
 }
@@ -322,6 +356,8 @@ pub struct ShapeSnapshot {
     pub last_target: Option<f64>,
     pub applied: u32,
     pub frozen: bool,
+    /// Times this shape has unlatched; see `ShapeState::reopens`.
+    pub reopens: u32,
 }
 
 /// Every shape the scheduler has state for. Read-only; no device, no locks held
@@ -368,6 +404,7 @@ fn shape_of(((dtype, k), state): (&(DType, usize), &ShapeState)) -> ShapeSnapsho
         last_target: state.last_target,
         applied: state.applied,
         frozen: state.frozen,
+        reopens: state.reopens,
     }
 }
 
@@ -540,15 +577,23 @@ fn observe(
     );
     // A latched shape keeps *measuring* — the rate EWMAs above never stop — so it
     // can notice that the balance point has moved. If the fresh proposal departs
-    // from the latched share by more than the re-open band, unlatch and track it;
-    // otherwise hold. This is what lets the latch be periodic without being
-    // permanent: it absorbs the converged value (and its noise) but follows a
-    // genuine move, e.g. the balance shifting as context or host load changes.
+    // from the latched share by more than the re-open band, and does so in the
+    // same direction for [`REOPEN_CONFIRM`] consecutive adjustments, unlatch and
+    // track it; otherwise hold. This is what lets the latch be periodic without
+    // being permanent: it absorbs the converged value (and its noise) but follows
+    // a genuine move (the balance point is a property of the host, so only host
+    // state — competing load, thermal/DPM — moves it; a shape's rows and the
+    // context length do not).
+    // Requiring the run to hold one direction is what keeps a noisy static host
+    // from unlatching the shape onto the noise the latch exists to reject.
     if state.frozen {
-        if (next - state.share).abs() <= REOPEN_EPS {
+        state.reopen_streak = advance_reopen_streak(state.reopen_streak, next - state.share);
+        if state.reopen_streak.unsigned_abs() < REOPEN_CONFIRM.unsigned_abs() {
             return;
         }
         state.frozen = false;
+        state.reopens += 1;
+        state.reopen_streak = 0;
         state.deltas = [f64::MAX; 4];
     }
     let delta = (next - state.share).abs();
@@ -567,6 +612,22 @@ fn observe(
 
 fn bytes_per_s(bytes: f64, ns: u64) -> f64 {
     bytes * 1e9 / ns.max(1) as f64
+}
+
+/// Fold one latched-step proposal into its re-open streak. A proposal inside
+/// [`REOPEN_EPS`] clears the streak; one outside it extends a same-direction run
+/// or restarts the streak in the new direction. `REOPEN_CONFIRM` consecutive
+/// same-direction proposals are what actually unlatch the shape.
+fn advance_reopen_streak(current: i32, off: f64) -> i32 {
+    if off.abs() <= REOPEN_EPS {
+        return 0;
+    }
+    let dir = if off > 0.0 { 1 } else { -1 };
+    if current.signum() == dir {
+        current + dir
+    } else {
+        dir
+    }
 }
 
 // ── The seeding probe ──────────────────────────────────
@@ -1098,6 +1159,133 @@ mod tests {
             "the share must follow the move: {before} -> {}",
             after.share
         );
+    }
+
+    // ── Latch dynamics harness ─────────────────────────────────────────
+    //
+    // A latch can only be exercised by a *moving* balance point, which no static
+    // fixture produces, so `simulate` drives the real `observe` /
+    // `scheduled_share` / `plan_rows` path over a scripted host-load schedule.
+    // The plant is the one the module documents: `join = copy + max(0, gpu_ns -
+    // cpu_ns)`, with deterministic jitter so joins cross the no-wait floor.
+    struct Plant {
+        m: usize,
+        rb: usize,
+        copy_ns: u64,
+        jitter: u64,
+        seed: u64,
+    }
+    impl Plant {
+        fn noise(&mut self) -> i64 {
+            self.seed = self.seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let x = (self.seed >> 33) as i64;
+            (x % (2 * self.jitter as i64 + 1)) - self.jitter as i64
+        }
+        /// `(cpu_ns, join_ns)`, both carrying deterministic jitter so joins
+        /// cross the shape's no-wait floor the way they do on a real host.
+        fn measure(&mut self, g: usize, r_cpu: f64, r_gpu: f64) -> (u64, u64) {
+            let cpu = ((self.m - g) as f64 * self.rb as f64 * 1e9 / r_cpu) as i64 + self.noise();
+            let gpu = (g as f64 * self.rb as f64 * 1e9 / r_gpu) as i64 + self.noise();
+            let cpu = cpu.max(1) as u64;
+            let gpu = gpu.max(1) as u64;
+            (cpu, self.copy_ns + gpu.saturating_sub(cpu))
+        }
+    }
+
+    /// The field 9B shape: `m=12288 k=4096` at 2176 B/row, a ~40 µs no-wait
+    /// floor and ±60 µs host jitter (the checkpoint's `d2h=0.03 / join=0.04ms`).
+    fn plant(seed: u64) -> Plant {
+        Plant { m: 12288, rb: 2176, copy_ns: 40_000, jitter: 60_000, seed }
+    }
+
+    /// Drive a shape through the real `observe`/`scheduled_share`/`plan_rows`
+    /// path over a scripted host-load schedule, returning `(reopens,
+    /// final_share)`. `reopens` counts frozen -> unfrozen transitions after the
+    /// shape first latched.
+    fn simulate(
+        key: (DType, usize),
+        mut plant: Plant,
+        start: f64,
+        steps: usize,
+        rates: &dyn Fn(usize) -> (f64, f64),
+    ) -> (u32, f64) {
+        seed_shape(key, start);
+        let mut was_frozen = false;
+        let mut reopens = 0u32;
+        let mut share = start;
+        for step in 0..steps {
+            share = scheduled_share(key);
+            let g = plan_rows(plant.m, plant.rb, share).expect("splittable");
+            let (r_cpu, r_gpu) = rates(step);
+            let (cpu_ns, join_ns) = plant.measure(g, r_cpu, r_gpu);
+            let frozen = shape_state(key.0, key.1).expect("seeded").frozen;
+            if was_frozen && !frozen {
+                reopens += 1;
+            }
+            was_frozen = frozen;
+            observe(key, plant.m - g, g, plant.rb, cpu_ns, join_ns);
+        }
+        (reopens, share)
+    }
+
+    #[test]
+    fn a_latched_shape_holds_through_a_noisy_static_host() {
+        // A static optimum must not re-open the latch: this is the property the
+        // streak and the band exist to preserve. A 0.005 band measured worst in
+        // one real-bench spread (9c722823c) and thrashes this model under heavy
+        // jitter; the bench never established why, so the shipped band is 0.01
+        // (twice the freeze band) and the streak rejects the sign-alternating
+        // noise that would unlatch it.
+        let (reopens, end) = simulate((DType::Q8_0, 9101), plant(7), 0.36, 1024, &|_| (35e9, 18e9));
+        assert_eq!(reopens, 0, "a static optimum re-opened the latch");
+        assert_eq!(
+            shape_state(DType::Q8_0, 9101).expect("seeded").reopens,
+            0,
+            "the trace-visible re-open counter must agree"
+        );
+        let optimum = 18.0 / (35.0 + 18.0);
+        assert!((end - optimum).abs() < 0.05, "share {end} vs optimum {optimum}");
+    }
+
+    #[test]
+    fn a_latched_shape_follows_a_sustained_move() {
+        // The changed-host-load case: the balance point steps and the latch must
+        // reopen and track it.
+        let moved = |s: usize| if s < 512 { (35e9, 18e9) } else { (22e9, 18e9) };
+        let (reopens, end) = simulate((DType::Q8_0, 9102), plant(11), 0.36, 1024, &moved);
+        assert!(reopens >= 1, "a step change did not re-open the latch");
+        assert!(
+            shape_state(DType::Q8_0, 9102).expect("seeded").reopens >= 1,
+            "the trace-visible re-open counter must move with the latch"
+        );
+        let optimum = 18.0 / (22.0 + 18.0);
+        assert!((end - optimum).abs() < 0.03, "share {end} vs optimum {optimum}");
+    }
+
+    #[test]
+    fn a_latched_shape_follows_a_slow_drift() {
+        // The reopen band is on the *proposal* axis (ALPHA x the balance-point
+        // move), so a ramp that shifts the optimum a little per adjustment must
+        // still trip the latch more than once instead of locking at its first
+        // plateau — the regression the original fixed-0.02 band had.
+        let ramp = |s: usize| {
+            let t = (s as f64 / 4096.0).min(1.0);
+            (35e9 - 13e9 * t, 18e9)
+        };
+        let (reopens, end) = simulate((DType::Q8_0, 9103), plant(31), 0.36, 4096, &ramp);
+        assert!(reopens >= 2, "a slow drift left the latch shut: reopens={reopens}");
+        let optimum = 18.0 / (18.0 + 22.0);
+        assert!(end > optimum - 0.05, "the share did not track the drift: {end} vs {optimum}");
+    }
+
+    #[test]
+    fn a_reopen_needs_a_same_sign_run() {
+        assert_eq!(advance_reopen_streak(0, 0.001), 0, "in band clears the run");
+        assert_eq!(advance_reopen_streak(0, 0.03), 1);
+        assert_eq!(advance_reopen_streak(1, 0.03), 2, "a same-sign run extends");
+        assert_eq!(advance_reopen_streak(1, -0.03), -1, "noise flips sign, the run restarts");
+        assert_eq!(advance_reopen_streak(-2, -0.03), -3);
+        assert_eq!(advance_reopen_streak(-2, 0.001), 0);
     }
 
     #[test]
