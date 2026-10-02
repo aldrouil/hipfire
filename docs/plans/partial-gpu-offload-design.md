@@ -517,6 +517,13 @@ product claim.)*
     static-optimum-under-±300 µs-host-jitter scenario, where the share parked at ~0.24
     against a ~0.34 optimum. The same
     estimate feeds the `!gpu_waited` upward ratchet, which has no downward counterpart.
+    (The ratchet is latent, not a live bug: a shape pinned at `SHARE_MAX` only stays
+    there while the GPU is genuinely faster — the cap is right there — and if the balance
+    moves against it, joins start waiting, `r_gpu` reappears and the both-rates branch
+    reopens it.) None of this is where this fixture's gap is: the share already sits
+    where the probe says it should (perf-gap § 5), and the skipped-step wall term measures
+    3.7–6.3 %
+    ([`2026-10-02-offload-passback-coverage-phase0.md`](../perf-checkpoints/2026-10-02-offload-passback-coverage-phase0.md)).
 - **Accounting and diagnostics.** A split step is *not* charged to the CPU-idle
   numerator (its wall contains GPU work, so it would inflate the lower bound §6.2.1
   documents) and gets its own `split: …` trace line under
