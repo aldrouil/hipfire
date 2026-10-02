@@ -467,8 +467,8 @@ product claim.)*
   exact (overrun) and censored (finished-first) observations, anchored by the probe's
   directly measured rate — the estimator's identifiability anchor and its guard against
   a floor-noise runaway. The setpoint is the DLT balance point `r_gpu/(r_gpu+r_cpu)`;
-  shares are clamped to `[0.05, 0.50]` and the estimate re-runs every 8 steps over a
-  64-observation rolling window. There is **no permanent freeze** — the schedule keeps
+  shares are clamped to `[0.05, 0.50]` and the estimate re-runs once per 64-observation
+  window. There is **no permanent freeze** — the schedule keeps
   adapting for the whole decode. Sources and the estimator's known limits are at
   `estimate_tau_gpu` in `crates/hipfire-dispatch/src/offload_split.rs`.
 - **Accounting and diagnostics.** A split step is *not* charged to the CPU-idle

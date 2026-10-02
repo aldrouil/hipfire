@@ -131,13 +131,14 @@ const EWMA_ALPHA: f64 = 0.25;
 /// the GPU arm's per-byte time, the weight — in online pseudo-observations — of
 /// the probe's directly measured GPU rate, and the EM iteration cap.
 ///
-/// `ESTIMATE_EVERY` is the estimator's *lag* and is deliberately small: the
-/// investigation doc's §1.2 weakness 1 is "lag, not offset" — the share trails the
-/// drifting balance point by roughly the estimator's time constant — and §5
-/// Phase 1 names "reduce the target EWMA's lag" as the first lever. A rolling
-/// window of [`ESTIMATE_WINDOW`] observations re-estimated every
-/// `ESTIMATE_EVERY` steps keeps the sample count while cutting the lag from the
-/// window length to the cadence.
+/// `ESTIMATE_EVERY` is the estimator's update cadence and is set equal to
+/// `ESTIMATE_WINDOW`, so each update sees one full, disjoint window (the rolling
+/// buffer degenerates to the batch it replaced). A shorter cadence — a sliding
+/// window — was tried against the investigation doc's §1.2 "lag, not offset" lever
+/// and measured as a **regression** on the 9B fixture: 31.60 vs 32.50 tok/s
+/// (median of five interleaved fresh-process pairs, 5/5 lost), because the lag was
+/// low-pass-filtering the anchor bias rather than costing throughput. Do not
+/// shorten it again without a paired measurement that says otherwise.
 ///
 /// `TAU_PRIOR_WEIGHT` and `TAU_CV` are the two knobs a reader should scrutinise:
 /// * `TAU_PRIOR_WEIGHT` is the identifiability anchor, not a tuning knob. If
@@ -153,7 +154,7 @@ const EWMA_ALPHA: f64 = 0.25;
 ///   cap; the CV is deliberately left as an assumption rather than fitted to a
 ///   placement.
 const ESTIMATE_WINDOW: usize = 64;
-const ESTIMATE_EVERY: u64 = 8;
+const ESTIMATE_EVERY: u64 = 64;
 const TAU_CV: f64 = 0.5;
 const TAU_PRIOR_WEIGHT: f64 = 16.0;
 const ESTIMATE_ITERS: usize = 8;
