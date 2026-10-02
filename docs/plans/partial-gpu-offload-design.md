@@ -480,20 +480,50 @@ product claim.)*
   the way toward `r_gpu/(r_gpu+r_cpu)`), and latched once a shape has applied 64
   adjustments with the last four all under 0.005. The latch is **not permanent**: a
   latched shape keeps measuring (the rate EWMAs never stop), and re-opens — re-tracking
-  and re-latching — when the fresh balance point differs from the latched share by more
-  than `REOPEN_EPS` (0.02), so a long run whose context or host load moves the optimum
-  is followed instead of being stuck at its first plateau. The band sits above the
-  largest proposal a just-latched shape can hold (`FREEZE_EPS / ALPHA ≈ 0.0167`), which
-  is the hysteresis that keeps it from thrashing; a measured spread put 0.02 above that
-  floor (0.005 — below it — was the worst, −1.8 %/−5.2 %) but could not resolve 0.01 vs
-  0.02 vs 0.05 on a static optimum. Deriving the band from the proposal scatter at
-  runtime is the next step.
+  and re-latching — when the fresh proposal leaves `REOPEN_EPS` (0.01) in the same
+  direction for `REOPEN_CONFIRM` (3) consecutive adjustments. `REOPEN_EPS` is a
+  *proposal-axis* band, so the balance-point dead zone is `REOPEN_EPS / ALPHA ≈ 0.033`;
+  it holds a 2× margin over the freeze band (`FREEZE_EPS` = 0.005, the largest proposal a
+  just-latched shape can be holding), which is the hysteresis that keeps it from
+  thrashing. The same-direction run is the other half: one out-of-band proposal can come
+  from a host-load transient or a single badly sampled join, and unlatching on it hands
+  the controller the noise the latch exists to reject. The original `0.02` was a
+  `0.02 / ALPHA ≈ 0.067` dead zone — it tripped on a *step* change but let a slow
+  host-load *drift* slide the optimum by 6.7 points before the latch noticed; `0.01`
+  halves that, at no static- or step-scenario cost in `offload_split`'s deterministic
+  host-load model. The band is deliberately **not** field-identifiable: the re-open path
+  is live on serving runs (the trace's `reopens` counter shows unlatches), yet a four-arm
+  A/B (0.005 without the streak, 0.005/0.01/0.02 with it, 3 interleaved fresh-process
+  rounds at 8 and 16 of 32 spilled) left every arm inside its own run-to-run spread and
+  flipped the ordering between budgets, so the static fixture does not resolve the band —
+  and the 0.005 penalty the earlier spread measured (−1.8 %/−5.2 %) did not reproduce on
+  this host, which is why the value rests on the freeze-band margin and the drift model,
+  not on a field win. A runtime calibration of the band was considered and rejected: the
+  only per-shape scatter the loop holds is the converged proposal magnitude, which the
+  freeze guarantees is under `FREEZE_EPS`, so a scatter-derived band would land at the
+  freeze band with no margin — where the model shows a clean static plant re-opening nine
+  times in 1024 steps.
+- **Known estimator limitations (not latch defects, not fixed here).** They feed the
+  reopen signal, so they are the next work in this path:
+  - `min_join_ns` is a monotone running *minimum* that never rises. Once host/PCIe
+    contention lifts the true no-wait floor above the fastest join ever seen, every later
+    join reads as a wait and its reconstructed `r_gpu` reads low — biasing the balance
+    point, and hence the reopen comparison, downward. A decayed or windowed percentile
+    floor would track the regime.
+  - `r_gpu` is refreshed only on a *waited* join. A shape whose joins sit at the floor
+    carries a dead anchor (the live trace showed `m=4096 k=12288` with ~655 `gpu samples`
+    over 6400 steps and `last waited=false`), so any reopen for it is CPU-rate drift
+    measured against a stale GPU rate — the likely mechanism behind the model's
+    static-optimum-under-±300 µs-host-jitter scenario, where the share parked at ~0.24
+    against a ~0.34 optimum. The same
+    estimate feeds the `!gpu_waited` upward ratchet, which has no downward counterpart.
 - **Accounting and diagnostics.** A split step is *not* charged to the CPU-idle
   numerator (its wall contains GPU work, so it would inflate the lower bound §6.2.1
   documents) and gets its own `split: …` trace line under
   `HIPFIRE_CPU_EXEC_TRACE=1`, whose `join` is the blocking H2D
   (`copy + max(0, gpu_ns − cpu_ns)`): the line also prints the controller's own state
-  (`gpu samples`, the last `waited`, the last `target`, `applied`, `frozen`), so a share
+  (`gpu samples`, `floor`, the last `waited`, the last `target`, `applied`, `reopens`,
+  `frozen`), so a share
   nobody can explain is diagnosable from one run.
   `gpu≥GB/s` is a lower bound by construction (it divides the GPU's bytes by the *whole*
   step wall) and is printed as a bound for that reason. `hipfire offload-bench` measures
