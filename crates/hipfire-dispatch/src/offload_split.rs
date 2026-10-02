@@ -95,16 +95,40 @@ const SHARE_MAX: f64 = 0.50;
 const PROBE_REPS: usize = 3;
 
 /// How much of the controller's proposal to apply per adjustment, and how often
-/// to adjust.
+/// to adjust. The proposal is the DLT balance point (see [`next_share`]); the
+/// gain only paces how fast the share walks to it. No integral term is needed —
+/// the target *is* the estimate's own balance point, so there is no offset to
+/// remove.
 const ALPHA: f64 = 0.3;
 const APPLY_EVERY: u64 = 4;
 
-/// EWMA weight for a rate sample, and the convergence threshold: a shape freezes
-/// once it has applied this many adjustments and the last four were all small, so
-/// a converged decode stops being perturbed.
+/// EWMA weight for the CPU arm's time-per-byte sample.
 const EWMA_ALPHA: f64 = 0.25;
-const FROZEN_APPLIED: u32 = 64;
-const FREEZE_EPS: f64 = 0.005;
+
+/// The GPU estimator: split steps between censored-MLE updates, the assumed
+/// coefficient of variation of the GPU arm's per-byte time, the weight — in
+/// online pseudo-observations — of the probe's directly measured GPU rate, and
+/// the EM iteration cap.
+///
+/// `TAU_PRIOR_WEIGHT` and `TAU_CV` are the two knobs a reader should scrutinise:
+/// * `TAU_PRIOR_WEIGHT` is the identifiability anchor, not a tuning knob. If
+///   every observation is censored (the GPU always finishing first) the GPU mean
+///   is not identified by the data at all — the likelihood is flat in the mean —
+///   so the estimator must lean on the one direct measurement. It is stated as a
+///   number of online samples, and the estimate moves monotonically with it; a
+///   value near 16 keeps it a strong prior without freezing out a sustained run
+///   of genuine overruns.
+/// * `TAU_CV` is an *assumed* shape parameter, not fitted — a normal model with a
+///   plausible spread is all the EM needs for the mean, and the mean is what the
+///   share uses. [`estimate_tau_gpu_is_insensitive_to_the_iteration_cap`] pins the
+///   cap; the CV is deliberately left as an assumption rather than fitted to a
+///   placement.
+/// * `ESTIMATE_EVERY` trades update latency against samples per update; the share
+///   still moves every [`APPLY_EVERY`] steps on the current estimate.
+const ESTIMATE_EVERY: u64 = 64;
+const TAU_CV: f64 = 0.5;
+const TAU_PRIOR_WEIGHT: f64 = 16.0;
+const ESTIMATE_ITERS: usize = 8;
 
 /// `enabled` + `share` supplied by the caller, so the parity test and the
 /// planner tests need no process snapshot.
@@ -186,65 +210,252 @@ fn clamp_share(share: f64) -> f64 {
 }
 
 // ── The scheduler ──────────────────────────────────────
+//
+// Sources. The scheduler is the standard two-processor result plus a censored
+// estimator, not a bespoke controller. Entries are marked [read] where the cited
+// text was actually read in this worktree, [index] where only a bibliographic
+// record was available — do not treat an [index] entry as verified.
+//
+// * Setpoint: divisible load theory's optimality principle — "All the processors
+//   should finish computing at the same moment to achieve the smallest T_f" — and
+//   the closed form T_f = α_i·W_i·T_cp, so the optimal partition α_i ∝ 1/W_i, the
+//   processor's rate: Wu, Cao & Robertazzi, "Optimal Divisible Load Scheduling
+//   for Resource-Sharing Network," arXiv:1902.01898 §II-A (2019) [read]. That
+//   paper attributes the optimality proof to Cheng & Robertazzi, *IEEE Trans.
+//   Computers* 1994 [index] — the specific closed-form result was not read here.
+// * Processors whose speed drifts with background load (this host's contention)
+//   are the subject of the same paper [read].
+// * Censored estimation is the Tobit model: Tobin, "Estimation of Relationships
+//   for Limited Dependent Variables," *Econometrica* 26(1), 1958 [index]. The
+//   identifiability caveat that motivates the probe anchor — a censored model can
+//   be non-identifiable without a priori information — is Wang, "Identifiability
+//   and Estimation of Censored Errors-in-Variables Models," ASA 1994 Proceedings
+//   §2 [read].
+// * Rejected on the doc's own terms. Gradient-free perturbation methods
+//   (SPSA: Spall, "An Overview of the Simultaneous Perturbation Method," *JHU APL
+//   Technical Digest* 19(4), 1998 [read], which requires "L(u) sufficiently smooth
+//   (several times differentiable) near u*"; extremum seeking: Krstić & Wang,
+//   *Automatica*, doi:10.1016/S0005-1098(99)00183-1 [index]) inject a probing
+//   signal — the deliberate excitation `docs/investigations/2026-10-01-offload-passback-scheduling-algorithms-revised.md`
+//   §0.3 rules out for a production path. Classical PID tuning (ZN, Cohen–Coon,
+//   IMC) is rejected there §2, as targeting a steady-state offset this plant does
+//   not have (§1.1).
+//
+// Portability. The next host may have a different link width, DRAM peak, core
+// count, ISA and contention. Nothing in the estimator encodes this host's rates:
+// * every rate it uses is *measured on the target host* — the CPU arm's online,
+//   and the GPU arm's from the one-time probe plus the online censored samples —
+//   so a different machine is a different measurement, not a different constant;
+// * its parameters are dimensionless (EWMA weights, an EM iteration cap, a
+//   prior described in "online samples", an assumed shape) or timer-resolution
+//   (`JOIN_MARGIN_NS`, bounded by the clock, not the hardware);
+// * the only value that even *mentions* this host, `DEFAULT_GPU_SHARE`, is a
+//   starting guess the probe overrides on the first split step.
+// Two host-scaling hazards remain and are recorded here rather than hidden: the
+// fixed equilibrium term `margin/((τ0+τ_cpu)·B)` grows for small shapes and fast
+// hosts (the margin is absolute; `B` and the rates are the host's), and
+// `SHARE_MAX` caps the optimum outright on a host whose GPU is far faster than
+// its CPU. Both are pre-existing bounds, not properties of the estimator.
+//
+// A third failure mode is the automatic probe not running or failing on an
+// unknown host. Then there is no anchor, and below the balance point the
+// estimator is unidentifiable (every observation censored), so left alone it
+// would sit at `DEFAULT_GPU_SHARE`. It does not: [`observe`] escalates the share
+// upward while unanchored and unobserved-by-overrun, until an overrun yields the
+// first exact sample and the estimate becomes identifiable. The trace marks the
+// state (`anchor=none`), and `hipfire offload-bench`'s `seed()`/`fallback`
+// installs a measured anchor outright, so the escape is a floor, not the plan.
 
-/// An exponentially weighted moving average of one engine's measured rate.
-#[derive(Clone, Copy, Debug)]
-struct Ewma {
-    value: f64,
+/// Φ(x), the standard normal CDF, via the Abramowitz & Stegun 7.1.26 erf
+/// approximation (|ε| ≤ 1.5e-7) — accurate enough for the EM below and free of a
+/// dependency.
+fn normal_cdf(x: f64) -> f64 {
+    0.5 * (1.0 + erf(x / std::f64::consts::SQRT_2))
 }
 
-impl Ewma {
-    fn new(sample: f64) -> Self {
-        Ewma { value: sample }
-    }
+/// φ(x), the standard normal density.
+fn normal_pdf(x: f64) -> f64 {
+    (-0.5 * x * x).exp() / (2.0 * std::f64::consts::PI).sqrt()
+}
 
-    /// The first sample *is* the state; later samples move it by [`EWMA_ALPHA`].
-    fn update(&mut self, sample: f64) {
-        self.value += EWMA_ALPHA * (sample - self.value);
+fn erf(x: f64) -> f64 {
+    // Abramowitz & Stegun 7.1.26, valid for x >= 0; odd-symmetric otherwise.
+    let t = 1.0 / (1.0 + 0.3275911 * x.abs());
+    let y = 1.0
+        - ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t
+            + 0.254829592)
+            * t
+            * (-x * x).exp();
+    if x >= 0.0 {
+        y
+    } else {
+        -y
     }
 }
 
-/// A shape's split state: the share in force, the two engines' contended rates,
-/// and the convergence bookkeeping.
+/// Estimate the GPU arm's **time per weight byte**, from right-censored
+/// observations, by EM under a fixed-coefficient-of-variation normal model.
+///
+/// A split step yields one of two observations of the GPU arm's duration `D_g`:
+/// * the arm **overran** the CPU multiply, and `D_g = gemv_ns + excess` is exact
+///   (`exact`, in ns/byte); or
+/// * the arm **finished first**, and all the data say is `D_g ≤ gemv_ns + margin`
+///   (`censored`, a threshold in ns/byte).
+///
+/// The shipped estimator averaged only the exact samples, which conditions the
+/// estimate on the GPU's slow tail and drives the share below the balance point.
+/// This is the regular censored-regression (Tobit) likelihood; `prior` is the
+/// probe's directly measured time per byte, entering as [`TAU_PRIOR_WEIGHT`]
+/// pseudo-observations, and it is what makes the estimate identifiable when every
+/// online observation is censored.
+///
+/// **Known limit of this estimator.** Its fixed point is where the anchor `τ0` and
+/// the censoring bound disagree no more, `τ0·s·B = (1−s)·τ_cpu·B + margin`. The
+/// anchor is a *solo* measurement while the optimum is defined on *contended*
+/// rates, so that fixed point is not the DLT balance: on the reference fixture it
+/// lands near 0.46 against a measured optimum of ~0.42. No value of
+/// [`TAU_PRIOR_WEIGHT`] removes it — above the fixed point the bound votes against
+/// the anchor — so closing the gap needs a contended GPU-rate measurement, which
+/// the censored data cannot supply below the balance point (the identifiability
+/// limit noted above).
+///
+/// It also means the estimator does **not** converge the GPU level over a long
+/// horizon. The anchor is fixed and load-bearing, not only for identifiability:
+/// the exact (overrun) samples are contaminated by floor-noise overruns whose
+/// reconstructed `τ = (gemv + excess)/(s·B)` grows as the share falls, so fading
+/// the anchor lets the estimate run away downward — measured on the reference
+/// fixture as `est_gpu` collapsing to 2–9 GB/s and the share to 0.06–0.21. The
+/// CPU side tracks fully (online EWMA); the GPU side is pinned to the one-time
+/// probe. Removing that pin needs a floor that separates genuine overruns from
+/// copy noise, which is the place to work next.
+fn estimate_tau_gpu(
+    exact: &[f64],
+    censored: &[f64],
+    prior: Option<f64>,
+    prior_weight: f64,
+) -> Option<f64> {
+    estimate_tau_gpu_iters(exact, censored, prior, prior_weight, ESTIMATE_ITERS)
+}
+
+/// [`estimate_tau_gpu`] with an explicit iteration cap, so a test can show the cap
+/// is not load-bearing.
+fn estimate_tau_gpu_iters(
+    exact: &[f64],
+    censored: &[f64],
+    prior: Option<f64>,
+    prior_weight: f64,
+    iters: usize,
+) -> Option<f64> {
+    // A starting value that cannot be a local artifact: the anchor, else the exact
+    // mean, else the largest censoring threshold (an upper bound on the mean).
+    let mut mu = prior
+        .or_else(|| (!exact.is_empty()).then(|| exact.iter().sum::<f64>() / exact.len() as f64))
+        .or_else(|| {
+            censored
+                .iter()
+                .copied()
+                .fold(None, |acc: Option<f64>, u| Some(acc.map_or(u, |a| a.max(u))))
+        })?;
+    if !(mu.is_finite() && mu > 0.0) {
+        return None;
+    }
+    for _ in 0..iters {
+        let sigma = TAU_CV * mu;
+        let mut sum = 0.0f64;
+        let mut n = 0.0f64;
+        for t in exact {
+            sum += *t;
+            n += 1.0;
+        }
+        for u in censored {
+            let alpha = (u - mu) / sigma;
+            let cdf = normal_cdf(alpha);
+            // E[tau | tau <= u] = mu - sigma * phi(alpha)/Phi(alpha). The Mills
+            // ratio tends to `u` as `u` falls below `mu` (a hard bound pulls the
+            // estimate down to it) and to 0 as `u` rises above it (no information).
+            let imputed = if cdf > 1e-9 {
+                mu - sigma * normal_pdf(alpha) / cdf
+            } else {
+                *u
+            };
+            sum += imputed.max(0.0);
+            n += 1.0;
+        }
+        if let Some(p) = prior {
+            sum += prior_weight * p;
+            n += prior_weight;
+        }
+        if n <= 0.0 {
+            break;
+        }
+        let next = sum / n;
+        if !(next.is_finite() && next > 0.0) {
+            break;
+        }
+        let converged = (next - mu).abs() <= 1e-4 * mu;
+        mu = next;
+        if converged {
+            break;
+        }
+    }
+    Some(mu)
+}
+
+/// The probe's directly measured GPU rate as a time per weight byte.
+fn tau_from_rate(gpu_bytes_per_s: f64) -> Option<f64> {
+    (gpu_bytes_per_s > 0.0 && gpu_bytes_per_s.is_finite()).then(|| 1e9 / gpu_bytes_per_s)
+}
+
+/// A shape's split state: the share in force, the two engines' estimated
+/// time-per-byte, and the copy floor the join is read against.
 struct ShapeState {
     share: f64,
-    r_cpu: Option<Ewma>,
-    r_gpu: Option<Ewma>,
-    samples: u64,
-    /// Steps whose join exceeded the shape's no-wait floor plus the margin — the
-    /// only ones `r_gpu` is sampled from. Printed with the shape so an operator can
-    /// see whether the GPU rate the share rests on was ever actually observed.
-    gpu_samples: u64,
-    /// The smallest blocking-H2D time seen for this shape: the step's own
-    /// no-wait floor, i.e. what the copy costs when the GPU arm finished first.
-    /// Every larger join is measured *against* it, so the controller needs no
-    /// host constant for the copy (the measured one is 30–50 µs for the ~30 KB
-    /// this mode copies back — above any threshold guessed from the link rate).
+    /// The CPU arm's time per weight byte (ns/byte), from the multiply alone —
+    /// never the preceding D2H, which is not part of the arm's throughput.
+    tau_cpu: Option<f64>,
+    /// The GPU arm's time per weight byte: the censored-MLE estimate, or the
+    /// probe's direct measurement until the first update.
+    tau_gpu: Option<f64>,
+    /// The probe's directly measured GPU time per byte — the identifiability
+    /// anchor the censored estimate leans on.
+    tau_gpu_prior: Option<f64>,
+    /// The smallest blocking-H2D time seen for this shape: the copy floor every
+    /// join is read against. A running minimum, deliberately: it never rises onto
+    /// a sustained overrun (which would let overrun detection wash out), and the
+    /// margin in [`waited_extra_ns`] absorbs a single unusually fast copy.
     min_join_ns: Option<u64>,
-    /// The last adjustment's proposal and whether that step's join had waited.
+    /// This window's observations, in ns/byte.
+    exact_tau: Vec<f64>,
+    censored_tau: Vec<f64>,
+    samples: u64,
+    /// Steps the GPU arm overran the CPU multiply — the only ones that yield an
+    /// exact arm duration, as opposed to a censoring bound. Printed with the shape
+    /// so an operator can see whether the estimate rests on direct observations.
+    gpu_samples: u64,
+    /// Cumulative exact samples ever seen, which set the anchor's decayed weight
+    /// (see [`anchor_weight`]).
+    exact_total: u64,
     last_target: Option<f64>,
     last_waited: bool,
     applied: u32,
-    /// The last four adjustment magnitudes, seeded above the freeze threshold so
-    /// a shape cannot freeze on its first few no-op adjustments.
-    deltas: [f64; 4],
-    frozen: bool,
 }
 
 impl ShapeState {
     fn new(share: f64) -> Self {
         ShapeState {
             share,
-            r_cpu: None,
-            r_gpu: None,
+            tau_cpu: None,
+            tau_gpu: None,
+            tau_gpu_prior: None,
+            min_join_ns: None,
+            exact_tau: Vec::new(),
+            censored_tau: Vec::new(),
             samples: 0,
             gpu_samples: 0,
-            min_join_ns: None,
+            exact_total: 0,
             last_target: None,
             last_waited: false,
             applied: 0,
-            deltas: [f64::MAX; 4],
-            frozen: false,
         }
     }
 }
@@ -280,20 +491,24 @@ pub struct ShapeSnapshot {
     pub dtype: DType,
     pub k: usize,
     pub share: f64,
+    /// Each arm's rate over its own bytes (`1/tau`); the CPU value is the
+    /// multiply alone, the GPU value the censored estimate.
     pub cpu_bytes_per_s: Option<f64>,
     pub gpu_bytes_per_s: Option<f64>,
     pub samples: u64,
-    /// Steps whose join exceeded the shape's no-wait floor plus the margin — the
-    /// only ones the GPU rate above can come from.
+    /// Steps the GPU arm overran the CPU multiply — the only exact arm-duration
+    /// observations behind `gpu_bytes_per_s`; the rest are censoring bounds.
     pub gpu_samples: u64,
-    /// The smallest blocking-H2D time seen for this shape: the no-wait floor the
-    /// controller measures every join against, and the reason a "wait" needs no
-    /// host constant.
+    /// Whether the estimate has a probe anchor. `false` means the automatic probe
+    /// did not run or failed — the operator-visible signal that the GPU level is
+    /// resting on the online escape rather than a direct measurement.
+    pub anchored: bool,
+    /// The smallest blocking-H2D time seen for this shape: the copy floor the
+    /// controller reads every join against, so an overrun needs no host constant.
     pub min_join_ns: Option<u64>,
     pub last_waited: bool,
     pub last_target: Option<f64>,
     pub applied: u32,
-    pub frozen: bool,
 }
 
 /// Every shape the scheduler has state for. Read-only; no device, no locks held
@@ -327,25 +542,31 @@ pub(crate) fn shape_state(dtype: DType, k: usize) -> Option<ShapeSnapshot> {
 }
 
 fn shape_of(((dtype, k), state): (&(DType, usize), &ShapeState)) -> ShapeSnapshot {
+    let rate = |tau: Option<f64>| tau.filter(|t| *t > 0.0).map(|t| 1e9 / t);
     ShapeSnapshot {
         dtype: *dtype,
         k: *k,
         share: state.share,
-        cpu_bytes_per_s: state.r_cpu.map(|e| e.value),
-        gpu_bytes_per_s: state.r_gpu.map(|e| e.value),
+        cpu_bytes_per_s: rate(state.tau_cpu),
+        gpu_bytes_per_s: rate(state.tau_gpu),
         samples: state.samples,
         gpu_samples: state.gpu_samples,
+        anchored: state.tau_gpu_prior.is_some(),
         min_join_ns: state.min_join_ns,
         last_waited: state.last_waited,
         last_target: state.last_target,
         applied: state.applied,
-        frozen: state.frozen,
     }
 }
 
 /// The scheduler's fallback share, when one was installed.
 fn fallback_share() -> Option<f64> {
     SCHEDULER.lock().ok()?.fallback.map(|c| c.share)
+}
+
+/// The fallback calibration's GPU time per byte, when one was installed.
+fn fallback_tau() -> Option<f64> {
+    tau_from_rate(SCHEDULER.lock().ok()?.fallback.map(|c| c.gpu_bytes_per_s)?)
 }
 
 /// Whether this shape has already been probed (or seeded) in this process.
@@ -356,17 +577,21 @@ fn is_seeded(key: (DType, usize)) -> bool {
         .unwrap_or(true)
 }
 
-/// Insert a shape's state from a share, once. `probed` is marked so a later step
-/// of the same shape neither probes nor re-seeds it.
-fn seed_shape(key: (DType, usize), share: f64) {
+/// Insert a shape's state from a starting share and the probe's measured GPU time
+/// per byte (the estimator's identifiability anchor), once. `probed` is marked so
+/// a later step of the same shape neither probes nor re-seeds it.
+fn seed_shape(key: (DType, usize), share: f64, tau_gpu_prior: Option<f64>) {
     let Ok(mut scheduler) = SCHEDULER.lock() else {
         return;
     };
     scheduler.probed.insert(key);
-    scheduler
-        .shapes
-        .entry(key)
-        .or_insert_with(|| ShapeState::new(clamp_share(share)));
+    scheduler.shapes.entry(key).or_insert_with(|| {
+        let mut state = ShapeState::new(clamp_share(share));
+        state.tau_gpu_prior = tau_gpu_prior;
+        // The probe's measurement *is* an estimate; the censored MLE refines it.
+        state.tau_gpu = tau_gpu_prior;
+        state
+    });
 }
 
 /// Record a pinned share so the trace and the snapshot can report it.
@@ -395,64 +620,65 @@ fn scheduled_share(key: (DType, usize)) -> f64 {
         .unwrap_or(DEFAULT_GPU_SHARE)
 }
 
-/// Hysteresis on the join, in nanoseconds: an excess over the shape's no-wait
-/// floor smaller than this is host-timer noise around the copy, not a wait.
-///
-/// Needed because the floor is the *minimum* join ever seen, so most joins exceed
-/// it by a few microseconds; without the margin nearly every step would read as a
-/// wait and the samples would be noise. Ten microseconds is well above that jitter
-/// and far below the waits this mode acts on (hundreds of microseconds to
-/// milliseconds). It is a timer-resolution constant, not a host performance one.
+/// Hysteresis on the join, in nanoseconds: an excess over the copy floor smaller
+/// than this is host-timer noise around the copy, not a GPU overrun. A
+/// timer-resolution constant, not a host performance one.
 const JOIN_MARGIN_NS: u64 = 10_000;
 
-/// The excess of `join_ns` over the shape's no-wait floor that can be a wait: the
-/// hysteresis margin, or a quarter of the floor for a host whose copy is itself
-/// slow (the copy's own jitter scales with it).
+/// The hysteresis margin for a given copy floor: the timer margin, or a quarter
+/// of the floor for a host whose copy is itself slow (the copy's own jitter
+/// scales with it).
+fn copy_margin_ns(floor_ns: Option<u64>) -> u64 {
+    JOIN_MARGIN_NS.max(floor_ns.unwrap_or(0) / 4)
+}
+
+/// The excess of `join_ns` over the copy floor that can be a GPU overrun: the
+/// join past the floor and its hysteresis margin. Zero when no floor exists yet.
 fn waited_extra_ns(join_ns: u64, floor_ns: Option<u64>) -> u64 {
-    let Some(floor) = floor_ns else {
-        return 0;
-    };
-    let margin = JOIN_MARGIN_NS.max(floor / 4);
-    join_ns.saturating_sub(floor.saturating_add(margin))
+    match floor_ns {
+        Some(floor) => join_ns.saturating_sub(floor.saturating_add(copy_margin_ns(floor_ns))),
+        None => 0,
+    }
 }
 
 /// The controller's proposal after one step's measurements.
 ///
-/// With both rates present, move toward the balance point
-/// `r_gpu / (r_gpu + r_cpu)`. With no GPU rate yet and a join that sat at the
-/// shape's no-wait floor — the common regime, where the H2D of the CPU's rows
-/// costs tens of microseconds against a CPU multiply of hundreds — the CPU is the
-/// straggler, so raise the share. Otherwise the step carries no usable signal and
-/// the share is unchanged.
-fn next_share(cur: f64, r_cpu: Option<f64>, r_gpu: Option<f64>, gpu_waited: bool) -> f64 {
+/// The setpoint is the DLT balance point `r_gpu / (r_gpu + r_cpu)` — the share at
+/// which both arms finish together (Cheng & Robertazzi, *IEEE Trans. Computers*
+/// 1994); the gain [`ALPHA`] only paces the walk to it. There is no integral term,
+/// because the target *is* the estimate's own balance point and so no offset
+/// exists to remove, and no blind ratchet, because the probe-anchored censored MLE
+/// supplies a direction on its own — including below the balance point, where no
+/// exact GPU sample exists. Until an estimate exists the share holds at the
+/// probe's value.
+fn next_share(cur: f64, r_cpu: Option<f64>, r_gpu: Option<f64>) -> f64 {
     match (r_cpu, r_gpu) {
         (Some(cpu), Some(gpu)) if cpu + gpu > 0.0 => {
             clamp_share(cur + ALPHA * (clamp_share(gpu / (gpu + cpu)) - cur))
         }
-        _ if !gpu_waited => clamp_share(cur + 0.02),
         _ => cur,
     }
 }
 
-/// One split step's measurements. Rates are bytes per **second**, matching
-/// [`SplitCalibration`]; the controller only uses them as a ratio.
+/// One split step's measurements, in the censored-estimation frame.
 ///
-/// `cpu_ns` is the CPU arm's own duration (the blocking D2H plus the multiply) and
-/// `join_ns` the blocking H2D, which is `copy + max(0, gpu_ns - cpu_ns)`.
+/// `gemv_ns` is the CPU arm's multiply over `rows_cpu` rows — the arm's
+/// weight-proportional work, never the blocking D2H that precedes it — and
+/// `join_ns` is the blocking H2D, `copy + max(0, gpu_ns - gemv_ns)`.
 ///
-/// The join is read relative to the shape's own no-wait floor ([`min_join_ns`]),
-/// never against an absolute threshold: only the excess over that floor can be a
-/// wait for the GPU arm, and in that case `cpu_ns + excess` recovers the arm's
-/// duration. Treating the raw join as a GPU duration in the other regime — the
-/// common one, where the CPU multiply is hundreds of microseconds against a
-/// tens-of-microseconds copy — reports a GPU rate an order of magnitude too low
-/// and drags the share to its floor with both engines idle in turn.
+/// The join is read against the shape's own copy floor ([`ShapeState::min_join_ns`]):
+/// only its excess over that floor plus the timer margin can be the GPU arm
+/// overrunning the CPU multiply, and then `gemv_ns + excess` *is* the arm's
+/// duration. Below the balance point the GPU finishes first on every step, so its
+/// duration is only *bounded* there; those steps are kept as censored
+/// observations, not dropped, which is what keeps the estimate from being
+/// conditioned on the GPU's slow tail (the shipped estimator's defect).
 fn observe(
     key: (DType, usize),
     rows_cpu: usize,
     rows_gpu: usize,
     row_bytes: usize,
-    cpu_ns: u64,
+    gemv_ns: u64,
     join_ns: u64,
 ) {
     let Ok(mut scheduler) = SCHEDULER.lock() else {
@@ -461,67 +687,66 @@ fn observe(
     let Some(state) = scheduler.shapes.get_mut(&key) else {
         return;
     };
-    if cpu_ns > 0 {
-        let sample = bytes_per_s(rows_cpu as f64 * row_bytes as f64, cpu_ns);
-        state.r_cpu = Some(match state.r_cpu {
-            Some(mut ewma) => {
-                ewma.update(sample);
-                ewma
-            }
-            None => Ewma::new(sample),
+    // CPU arm: the multiply alone, over the CPU arm's own rows.
+    if gemv_ns > 0 && rows_cpu > 0 && row_bytes > 0 {
+        let tau = gemv_ns as f64 / (rows_cpu as f64 * row_bytes as f64);
+        state.tau_cpu = Some(match state.tau_cpu {
+            Some(v) => v + EWMA_ALPHA * (tau - v),
+            None => tau,
         });
     }
-    // The join is `copy + max(0, gpu_ns - cpu_ns)`, and only its excess over this
-    // shape's own smallest join can be a wait for the GPU arm. Measuring against
-    // that floor (rather than a fixed microsecond threshold, or the CPU's own
-    // multiply) is what makes the sample honest on a host where the copy alone
-    // costs more than the link rate suggests: at the floor the CPU is the
-    // straggler and the share rises; above it the excess *is* the GPU arm's
-    // overrun and its duration is recoverable as `cpu_ns + excess`.
-    let baseline = state.min_join_ns;
-    state.min_join_ns = Some(baseline.map_or(join_ns, |m| m.min(join_ns)));
-    let waited_extra = waited_extra_ns(join_ns, baseline);
-    let gpu_waited = waited_extra > 0;
-    if gpu_waited && cpu_ns + waited_extra > 0 {
-        let sample = bytes_per_s(
-            rows_gpu as f64 * row_bytes as f64,
-            cpu_ns + waited_extra,
-        );
-        state.r_gpu = Some(match state.r_gpu {
-            Some(mut ewma) => {
-                ewma.update(sample);
-                ewma
-            }
-            None => Ewma::new(sample),
-        });
+    // Copy floor: the smallest join ever seen (see the field's note).
+    let floor = state.min_join_ns;
+    state.min_join_ns = Some(floor.map_or(join_ns, |f| f.min(join_ns)));
+    let margin = copy_margin_ns(floor);
+    let excess = waited_extra_ns(join_ns, floor);
+    let gpu_waited = excess > 0;
+    let bytes_gpu = (rows_gpu as f64 * row_bytes as f64).max(1.0);
+    if gpu_waited {
+        state.exact_tau.push((gemv_ns + excess) as f64 / bytes_gpu);
         state.gpu_samples += 1;
+        state.exact_total += 1;
+    } else {
+        // The GPU finished first: its duration is at most the CPU multiply plus
+        // everything the join could be hiding (the margin).
+        state
+            .censored_tau
+            .push((gemv_ns as f64 + margin as f64) / bytes_gpu);
     }
     state.samples += 1;
     state.last_waited = gpu_waited;
-    if state.frozen || state.samples % APPLY_EVERY != 0 {
+    if state.samples % ESTIMATE_EVERY == 0 {
+        if let Some(mu) = estimate_tau_gpu(
+            &state.exact_tau,
+            &state.censored_tau,
+            state.tau_gpu_prior,
+            TAU_PRIOR_WEIGHT,
+        ) {
+            state.tau_gpu = Some(mu);
+        }
+        state.exact_tau.clear();
+        state.censored_tau.clear();
+        // Unanchored (no probe) and never an overrun: every observation was
+        // censored, so the estimate is degenerate — it equals the censoring bound,
+        // which makes the setpoint equal the current share. There is neither
+        // identifiability nor an anchor, so the only escape is to push the share
+        // up until the GPU arm overruns and yields an exact sample. Bounded: it
+        // fires only in this state and stops the moment an overrun appears.
+        if state.tau_gpu_prior.is_none() && state.exact_total == 0 {
+            state.share = clamp_share(state.share + 0.02);
+            state.last_target = Some(state.share);
+            state.applied += 1;
+            return;
+        }
+    }
+    if state.samples % APPLY_EVERY != 0 {
         return;
     }
-    // Mirrors `next_share`'s two signal branches: only an adjustment that had
-    // information counts toward freezing the shape.
-    let had_signal = (state.r_cpu.is_some() && state.r_gpu.is_some()) || !gpu_waited;
-    let next = next_share(
-        state.share,
-        state.r_cpu.map(|e| e.value),
-        state.r_gpu.map(|e| e.value),
-        gpu_waited,
-    );
-    let delta = (next - state.share).abs();
+    let rate = |tau: Option<f64>| tau.filter(|t| *t > 0.0).map(|t| 1.0 / t);
+    let next = next_share(state.share, rate(state.tau_cpu), rate(state.tau_gpu));
     state.share = next;
     state.last_target = Some(next);
-    if !had_signal {
-        return;
-    }
     state.applied += 1;
-    state.deltas.rotate_left(1);
-    state.deltas[3] = delta;
-    if state.applied >= FROZEN_APPLIED && state.deltas.iter().all(|d| *d < FREEZE_EPS) {
-        state.frozen = true;
-    }
 }
 
 fn bytes_per_s(bytes: f64, ns: u64) -> f64 {
@@ -861,17 +1086,16 @@ pub fn run_with(
         PassbackShare::Auto => {
             if !is_seeded(key) {
                 match fallback_share() {
-                    Some(f) => seed_shape(key, f),
+                    Some(f) => seed_shape(key, f, fallback_tau()),
                     None => {
                         // A failed or unavailable probe must not fail a step that
                         // plain `cpu` mode would have run: fall back to
-                        // `DEFAULT_GPU_SHARE` and let the online controller correct
-                        // it from the arm timings.
-                        let calibration = probe_weight(gpu, ctx, step, w, PROBE_REPS)
-                            .ok()
-                            .flatten()
-                            .map(|c| c.share);
-                        seed_shape(key, calibration.unwrap_or(DEFAULT_GPU_SHARE));
+                        // `DEFAULT_GPU_SHARE` with no prior and let the online
+                        // censored estimator correct it from the arm timings.
+                        match probe_weight(gpu, ctx, step, w, PROBE_REPS).ok().flatten() {
+                            Some(c) => seed_shape(key, c.share, tau_from_rate(c.gpu_bytes_per_s)),
+                            None => seed_shape(key, DEFAULT_GPU_SHARE, None),
+                        }
                     }
                 }
             }
@@ -890,8 +1114,7 @@ pub fn run_with(
     let arm = cpu_exec::cpu_arm_prepare(gpu, &plan, g..w.m)?;
     launch_op_rows(gpu, ctx, step, Some(0..g))?;
     let (gemv_ns, join_ns) = cpu_exec::cpu_arm_finish(gpu, &arm)?;
-    let cpu_ns = arm.d2h_ns + gemv_ns;
-    observe(key, w.m - g, g, row_bytes, cpu_ns, join_ns);
+    observe(key, w.m - g, g, row_bytes, gemv_ns, join_ns);
     cpu_exec::finish_step(
         arm.q,
         w,
@@ -942,104 +1165,140 @@ mod tests {
     }
 
     #[test]
-    fn next_share_moves_toward_the_balance_point() {
+    fn next_share_moves_toward_the_dlt_balance_point() {
         // CPU at 52 GB/s, GPU at 27.3 GB/s -> balance 0.344; from 0.375 it moves
         // down by ALPHA times the gap.
-        let moved = next_share(0.375, Some(52e9), Some(27.3e9), true);
+        let moved = next_share(0.375, Some(52e9), Some(27.3e9));
         let target = 27.3 / (27.3 + 52.0);
         assert!(moved < 0.375 && moved > target, "moved={moved}");
         assert!((moved - (0.375 + ALPHA * (target - 0.375))).abs() < 1e-12);
-        // A join that did not outlast the CPU's multiply means the CPU is the
-        // straggler: the share rises by 0.02 ...
-        assert!(
-            (next_share(0.2, Some(52e9), None, false) - 0.22).abs() < 1e-12,
-            "the push-up branch must fire on the common no-wait regime"
-        );
-        // ... and clamps at the ceiling.
-        assert_eq!(next_share(SHARE_MAX, Some(52e9), None, false), SHARE_MAX);
-        // A join that waited with no GPU rate yet is no information: unchanged.
-        assert_eq!(next_share(0.3, Some(52e9), None, true), 0.3);
-        // With both rates the balance point wins even when the join waited.
-        let up = next_share(SHARE_MIN, Some(1.0), Some(1e12), true);
+        // No GPU estimate yet: the share holds at the probe's value — there is no
+        // blind ratchet any more.
+        assert_eq!(next_share(0.3, Some(52e9), None), 0.3);
+        assert_eq!(next_share(0.3, None, Some(52e9)), 0.3);
+        // A GPU rate below the CPU's walks the share down to the floor and clamps.
+        let down = next_share(SHARE_MIN, Some(1e12), Some(1.0));
+        assert_eq!(down, SHARE_MIN);
+        // A GPU rate above the CPU's walks it up, clamped at the ceiling.
+        let up = next_share(SHARE_MIN, Some(1.0), Some(1e12));
         assert!(up > SHARE_MIN && up <= SHARE_MAX, "up={up}");
         assert!((up - (SHARE_MIN + ALPHA * (SHARE_MAX - SHARE_MIN))).abs() < 1e-12);
     }
 
     #[test]
-    fn observe_raises_the_share_at_the_join_floor_and_samples_above_it() {
-        // A distinct key so the process-global scheduler cannot interfere with
-        // the other tests in this binary.
-        let key = (DType::Q8_0, 1234);
-        seed_shape(key, 0.375);
+    fn estimate_tau_gpu_uses_the_anchor_and_both_observation_kinds() {
+        // Nothing to go on: no estimate.
+        assert!(estimate_tau_gpu(&[], &[], None, TAU_PRIOR_WEIGHT).is_none());
 
-        // A join that sits at the shape's own floor is a copy, not a wait: the
-        // CPU is the straggler, no GPU rate is observable, and the share rises.
-        for _ in 0..4 {
-            observe(key, 3072, 1024, 2176, 500_000, 40_000);
-        }
-        let floor = shape_state(key.0, key.1).expect("seeded");
-        assert_eq!(floor.gpu_samples, 0, "no wait, no GPU sample");
-        assert!(
-            floor.share > 0.375,
-            "the share must rise while every join sits at the floor, got {}",
-            floor.share
-        );
+        // Exact samples only, no anchor: the estimate is their mean.
+        let exact = estimate_tau_gpu(&[2.0, 4.0, 4.0, 2.0], &[], None, TAU_PRIOR_WEIGHT).unwrap();
+        assert!((exact - 3.0).abs() < 1e-6, "exact={exact}");
 
-        // A join *at* the floor, or within the hysteresis margin of it, is still
-        // noise: no sample, and the share keeps rising.
-        for _ in 0..4 {
-            observe(key, 3072, 1024, 2176, 500_000, 45_000);
-        }
-        let noise = shape_state(key.0, key.1).expect("seeded");
-        assert_eq!(
-            noise.gpu_samples, 0,
-            "an excess inside the margin is not a wait"
-        );
-        assert!(noise.share > floor.share, "the share keeps rising");
+        // Exact samples with an anchor below them: pulled up, but only part way —
+        // the anchor keeps its weight.
+        let anchored =
+            estimate_tau_gpu(&[2.0, 4.0, 4.0, 2.0], &[], Some(1.0), TAU_PRIOR_WEIGHT).unwrap();
+        assert!(anchored > 1.0 && anchored < 3.0, "anchored={anchored}");
 
-        // A join that *exceeds* the floor by more than the margin is a wait: the
-        // GPU arm's duration is recoverable as `cpu_ns + excess`, and its (slow)
-        // rate pulls the share toward the balance point it implies.
-        for _ in 0..4 {
-            observe(key, 3072, 1024, 2176, 500_000, 600_000);
-        }
-        let waited = shape_state(key.0, key.1).expect("seeded");
-        assert!(waited.gpu_samples > 0, "a wait must yield a GPU sample");
-        assert!(
-            waited.share < noise.share,
-            "a slow GPU arm must pull the share down ({} -> {})",
-            noise.share,
-            waited.share
-        );
-        // 1024 rows * 2176 B over (500 µs CPU arm + 550 µs excess over floor +
-        // margin) = 2.12 GB/s: the sample is the excess, not the raw join.
-        let r_gpu = waited.gpu_bytes_per_s.expect("sampled");
-        let expected = 1024.0 * 2176.0 * 1e9 / 1_050_000.0;
-        assert!(
-            (r_gpu - expected).abs() / expected < 0.01,
-            "sampled {r_gpu:e}, expected {expected:e}"
-        );
-        assert!(waited.cpu_bytes_per_s.is_some());
+        // Censored observations *below* the anchor bind: pulled down, part way to
+        // the bound and not past it.
+        let pulled =
+            estimate_tau_gpu(&[], &[0.4, 0.4, 0.4, 0.4], Some(1.0), TAU_PRIOR_WEIGHT).unwrap();
+        assert!(pulled < 1.0 && pulled > 0.4, "pulled={pulled}");
+
+        // Censored observations *above* the anchor carry nothing the anchor lacks,
+        // so the estimate stays at the anchor (this is the identifiability limit:
+        // a GPU that always finishes first is only known to be at least this fast).
+        let inert = estimate_tau_gpu(&[], &[10.0; 8], Some(1.0), TAU_PRIOR_WEIGHT).unwrap();
+        assert!((inert - 1.0).abs() < 0.1, "inert={inert}");
     }
 
     #[test]
-    fn ewma_seeds_on_the_first_sample() {
-        let mut e = Ewma::new(10.0);
-        assert_eq!(e.value, 10.0);
-        e.update(20.0);
-        assert_eq!(e.value, 10.0 + EWMA_ALPHA * 10.0);
-        e.update(0.0);
-        assert!(e.value > 0.0 && e.value < 20.0);
+    fn an_unanchored_shape_escapes_upward_rather_than_sticking_at_default() {
+        let key = (DType::Q8_0, 7777);
+        // No anchor: the automatic probe did not run or failed.
+        seed_shape(key, 0.375, None);
+        // A full window of floor joins is entirely censored. Without an anchor the
+        // estimate is degenerate, so the share must climb instead of sticking.
+        for _ in 0..ESTIMATE_EVERY {
+            observe(key, 3072, 1024, 2176, 500_000, 40_000);
+        }
+        let s = shape_state(key.0, key.1).expect("seeded");
+        assert_eq!(s.gpu_samples, 0, "floor joins are not overruns");
+        assert!(!s.anchored, "no probe ran, so there is no anchor");
+        assert!(
+            s.share > 0.375,
+            "unanchored and censored must climb, got {}",
+            s.share
+        );
+        // And it is bounded — it never exceeds the ceiling.
+        for _ in 0..(ESTIMATE_EVERY * 20) {
+            observe(key, 3072, 1024, 2176, 500_000, 40_000);
+        }
+        let s = shape_state(key.0, key.1).expect("seeded");
+        assert!(s.share <= SHARE_MAX, "share={}", s.share);
+    }
+
+    #[test]
+    fn estimate_tau_gpu_is_insensitive_to_the_iteration_cap() {
+        // The EM contracts quickly; the shipped cap must already be converged. If
+        // this ever fails, the cap is load-bearing and the estimator is not at a
+        // fixed point — the thing to fix, not the cap.
+        let exact = [1.9, 2.05, 1.95, 2.1, 1.98];
+        let censored = [8.0, 9.0, 7.5];
+        let capped = estimate_tau_gpu_iters(
+            &exact,
+            &censored,
+            Some(1.0),
+            TAU_PRIOR_WEIGHT,
+            ESTIMATE_ITERS,
+        )
+        .unwrap();
+        let long =
+            estimate_tau_gpu_iters(&exact, &censored, Some(1.0), TAU_PRIOR_WEIGHT, 30).unwrap();
+        assert!(
+            (capped - long).abs() <= 1e-6 * long.abs(),
+            "cap {ESTIMATE_ITERS} vs 30 disagree: {capped} vs {long}"
+        );
+    }
+
+    #[test]
+    fn observe_separates_censored_from_exact_and_moves_toward_the_balance() {
+        // A distinct key so the process-global scheduler cannot interfere.
+        let key = (DType::Q8_0, 1234);
+        // Anchor the GPU at 25 GB/s (0.04 ns/byte). The CPU measures far below
+        // that, so the balance point is above the seed and the share must rise.
+        seed_shape(key, 0.3, Some(1e9 / 25e9));
+
+        // A join at the copy floor is censored: a bound on the arm, not an exact
+        // sample, and the anchored (fast) GPU pulls the share up.
+        for _ in 0..4 {
+            observe(key, 3072, 1024, 2176, 500_000, 40_000);
+        }
+        let censored = shape_state(key.0, key.1).expect("seeded");
+        assert_eq!(censored.gpu_samples, 0, "a floor join is not an overrun");
+        assert!(censored.share > 0.3, "share must rise, got {}", censored.share);
+        // CPU arm: 3072 rows * 2176 B over 500 µs, the multiply alone.
+        let r_cpu = censored.cpu_bytes_per_s.expect("cpu sampled");
+        assert!((r_cpu - 13.4e9).abs() / 13.4e9 < 0.05, "r_cpu={r_cpu:e}");
+
+        // A join well past the floor overruns: exact samples, and after a full
+        // window the slow GPU arm pulls the estimate's rate below the anchor.
+        for _ in 0..ESTIMATE_EVERY {
+            observe(key, 3072, 1024, 2176, 500_000, 900_000);
+        }
+        let overran = shape_state(key.0, key.1).expect("seeded");
+        assert!(overran.gpu_samples > 0, "an overrun must be an exact sample");
+        let r_gpu = overran.gpu_bytes_per_s.expect("estimated");
+        assert!(r_gpu < 25e9, "slow overruns must pull the rate down: {r_gpu:e}");
     }
 
     #[test]
     fn share_always_lands_inside_the_ceiling_and_floor() {
         for start in [0.0f64, 0.05, 0.375, 0.5, 0.9] {
             for (cpu, gpu) in [(1e9, 1e12), (1e12, 1e9), (1.0, 1.0)] {
-                for waited in [true, false] {
-                    let s = next_share(start, Some(cpu), Some(gpu), waited);
-                    assert!((SHARE_MIN..=SHARE_MAX).contains(&s), "s={s}");
-                }
+                let s = next_share(start, Some(cpu), Some(gpu));
+                assert!((SHARE_MIN..=SHARE_MAX).contains(&s), "s={s}");
             }
         }
     }
