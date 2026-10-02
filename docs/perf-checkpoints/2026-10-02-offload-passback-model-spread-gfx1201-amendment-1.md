@@ -78,36 +78,41 @@ statement is that the *recommended mode is size-dependent* (`pcie` small,
 `passback` mid/large), and the user's intuition ("bigger ⇒ bigger effect") is right
 once measured against the right baseline.
 
-## 5. Pass-back output is not bit-reproducible (`cpu` and `pcie` are)
+## 5. Output determinism: within-mode yes, cross-mode and pass-back no
 
-The original labelled the 2B/27B splits "smoke-loaded" and made no identity claim;
-the attempt to add one produced a **real, larger finding**. Greedy identity check
-on the 2B (same prompt, `-t 0 -n 1024`, budget 18), with controls:
+Correcting the original label ("smoke-loaded"): the modes are **not**
+interchangeable byte-wise, and the property is three-part.
+
+**Across modes the engines differ, so output may differ — expected, not a bug.**
+`cpu` runs a layer's GEMV on the CPU, `pcie` on the GPU; those are numerically
+different implementations, so `cpu` and `pcie` need not agree. Measured (2B, same
+prompt): `cpu` 2046 B vs `pcie` 3554 B — they differ.
+
+**Within a mode, at the same layer split, output is deterministic.** `cpu`×2 and
+`pcie`×2 are each byte-identical.
+
+**`passback` is the one mode that is *not* reproducible run-to-run**, because its
+scheduling — how many of a step's rows go to each engine — is derived per process
+from the probe plus online arm timings, so two identical invocations split a step
+differently, mix the engines differently, and can differ in output.
 
 | run pair | result |
 |---|---|
-| `cpu` vs `cpu` | **byte-identical** (2046 B) — deterministic |
-| `pcie` vs `pcie` | **byte-identical** (3554 B) — deterministic |
-| `cpu` vs `passback` | differs (2046 vs 3464 B) |
-| `passback` vs `passback` | **differs** (3670 vs 3078 B) |
+| `cpu` vs `cpu` (same split) | **byte-identical** (2046 B) |
+| `pcie` vs `pcie` (same split) | **byte-identical** (3554 B) |
+| `cpu` vs `pcie` (different engines) | **differ** (2046 vs 3554 B) — expected |
+| `passback` vs `passback` (different splits) | **differ** (3670 vs 3078 B) |
+| `cpu` vs `passback` | differ (2046 vs 3464 B) |
 | `HIPFIRE_OFFLOAD_PASSBACK_SHARE=0` vs `cpu` | **byte-identical** (2046 B) |
 
-So the seam machinery is sound — `share=0` *is* the `cpu` path exactly — and the
-difference is entirely the **scheduled share**: it is derived per process
-(`probe_weight` + online arm timings), so two identical invocations divide the
-same step differently, mix the two engines' numerics differently, and can flip
-greedy tokens. **`cpu` and `pcie` are deterministic modes; `passback` is not.**
-
-This reframes the 2026-10-01 record's § 6 byte-identity claim: it held on that
-record's specific 9B prompts, where the argmax happened to be insensitive; it is
-not a general property of the mode. Any gate that diffs pass-back output against a
-reference must pin `HIPFIRE_OFFLOAD_PASSBACK_SHARE` (or use `0` to reach the `cpu`
-twin). Recorded as a property of the mode, not a bug: any share > 0 is a documented
-mix of two numerically different engines.
+So `share = 0` *is* the `cpu` path exactly, and the seam is sound; the only
+run-to-run nondeterminism is the scheduled share. Any gate that diffs pass-back
+output against a reference must pin `memory.offload_passback_share` (or use `0`).
+The 2026-10-01 record's 9B byte-identity held on its own prompts, where the argmax
+was insensitive; it is not a general property of any mode pair.
 
 The 27B pair could not be formed (its `think` channel consumed the whole budget,
-leaving `content` empty on both arms), so 27B identity stays unverified; mq3
-identity is likewise unverified (throughput-only).
+leaving `content` empty on both arms), so 27B is throughput-only; mq3 likewise.
 
 ## Not changed
 
