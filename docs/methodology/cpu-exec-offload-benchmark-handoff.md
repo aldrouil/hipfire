@@ -205,7 +205,7 @@ decode wall spent inside CPU-executed steps, and since a CPU step is a host sync
 point (a blocking D2H, the multiplication, an H2D) and prefill never enters the
 seam, it is a **lower bound on the GPU's idle fraction**. Quote the last lines of
 a run (the windows that cover most of it); the first windows are cold. This is
-the headroom reading for "hand some of a spilled step back to the idle GPU" —
+the headroom reading for pass-back — scheduled co-inference of the spilled layers —
 not a rate and not a correctness signal. Also: `--runs N` decodes N times in one
 process, so use the per-window lines rather than any cumulative ratio.
 

@@ -378,7 +378,19 @@ PCIe link (27.1 GB/s measured, §7) instead of device DRAM: this is llama.cpp's
   first readings:
   [`docs/perf-checkpoints/2026-09-27-gfx1201-cpu-exec-offload.md`](../perf-checkpoints/2026-09-27-gfx1201-cpu-exec-offload.md).
 
-#### 6.2.2 Pass-back to the idle GPU (`memory.offload_exec=passback`)
+#### 6.2.2 Pass-back: scheduled co-inference of the spilled layers (`memory.offload_exec=passback`)
+
+**What this mode is.** Pass-back is a **mixture of the two single paths of §6.2.1** — the
+GPU reading the host-mapped weights over the link (`pcie`) and the CPU SIMD kernels
+reading host RAM (`cpu`) — run **concurrently on the same spilled step**. It is not a
+third engine, not a fallback, and not a per-layer choice: consecutive layers are serially
+dependent through the residual stream, so moving a whole layer between the engines only
+swaps who idles, and the mixture has to be *within* a step. The `share` is the
+**schedule** that divides a step's output rows — `[0, g)` to the GPU (the `pcie` path),
+`[g, m)` to the CPU (the `cpu` path). A step that ends up wholly on one engine is a
+**degenerate point of that schedule** (`share → 0`), not a validation failure and not a
+retreat to a worse path; the refusal gates below only bound which steps can be
+co-inferenced at all.
 
 Shipped 2026-10-01. §6.2.1's CPU arm is a host sync point, so the GPU is idle for
 most of its wall — 77.7 % of the decode wall at 8/32 layers spilled on the 9B,
@@ -431,48 +443,47 @@ product claim.)*
   weight plus a pointer-offset output *is* a row-shifted launch. Split offsets are
   8-row aligned: 2 for the residual kernels' `row0 = blockIdx.x << 1` + `float2`
   store, 8 to keep every covered format's weight byte offset 4-byte aligned.
-- **Refusals.** Each of these falls back to the *whole-CPU* step — never to `pcie` —
-  so the mode has exactly one degraded behaviour: not host-mapped; a padded
-  `row_stride`; a weight whose byte length is not exactly `m * row_bytes(q, k)` (the
-  correctness-critical invariant: it is what makes `&host_bytes[g*row_bytes..]` the
-  CPU arm's row `g`); no vector row dot for the format (with the scalar decoder the
-  best share is all-GPU, which `pcie` does better); a non-F32 or short output; a
-  weight below 2 MiB (the launch and the join outweigh the overlap); and
-  `GemvResidual{Raw}` without a fused residual kernel (its fallback scratch and
-  accumulate are whole-tensor). A failed seeding probe degrades the same way: the
-  shape keeps `DEFAULT_GPU_SHARE` and the controller converges from there.
-- **Scheduler.** The optimum is a property of the *host* (link width, DRAM peak, core
-  count, AVX2), so no constant is load-bearing. The first split-eligible step of each
-  `(dtype, k)` seeds itself by timing both engines on that step's *own* weight buffer
-  (median of 3 reps; the GPU arm through a scratch-output probe, so a residual probe
-  cannot be double-counted by the following real arm) and every split step then
+- **Eligibility (the schedule's degenerate point).** A step that fails any gate below is
+  not "rejected" — it simply runs **wholly on the CPU engine** (`share → 0`), the
+  degenerate point of the co-inference schedule, never on `pcie`. The gates: not
+  host-mapped; a padded `row_stride`; a weight whose byte length is not exactly
+  `m * row_bytes(q, k)` (the correctness-critical invariant: it is what makes
+  `&host_bytes[g*row_bytes..]` the CPU arm's row `g`); no vector row dot for the format
+  (with the scalar decoder the best share is all-GPU, which `pcie` does better); a
+  non-F32 or short output; a weight below 2 MiB (the launch and the join outweigh the
+  overlap); and `GemvResidual{Raw}` without a fused residual kernel (its fallback
+  scratch and accumulate are whole-tensor). A failed seeding probe leaves the shape on
+  `DEFAULT_GPU_SHARE` and the controller converges from there.
+- **Scheduler.** The schedule's optimum is a property of the *host* (link width, DRAM
+  peak, core count, AVX2), so no constant is load-bearing. The first eligible step of
+  each `(dtype, k)` seeds itself by timing both engines on that step's *own* weight
+  buffer (median of 3 reps; the GPU arm through a scratch-output probe, so a residual
+  probe cannot be double-counted by the following real arm), and every split step then
   refines the share from its own arm timings. The join is `copy + max(0, gpu_ns −
-  cpu_ns)`, and the controller reads it **relative to the shape's own no-wait floor**
-  — the smallest join it has seen, i.e. what the copy costs when the GPU arm finished
-  first — with a hysteresis margin (10 µs, or a quarter of the floor). Only the excess
-  over `floor + margin` can be a wait: when there is one, `r_gpu` is sampled as
-  `rows_gpu·row_bytes / (cpu_ns + excess)` and the share moves toward the balance
-  point; when there is not, the CPU is the straggler and the share rises. Both an
-  absolute microsecond threshold (the measured copy alone is 30–50 µs for the ~30 KB
-  this mode copies back, so any threshold below that samples on *every* step) and the
-  raw join (`cpu_ns + join` is the *CPU's* duration whenever the CPU is the straggler,
-  which reports a GPU rate an order of magnitude too low and pins the split to its
-  floor with both engines idle in turn) are wrong here; the floor is measured, not
-  assumed. Shares are clamped to `[0.05, 0.50]`, adjusted every 4 steps (step 0.3 of
-  the way toward `r_gpu/(r_gpu+r_cpu)`), and frozen once a shape has applied 64
-  adjustments with the last four all under 0.005.
+  cpu_ns)`; the controller reads it against the shape's own copy floor (the smallest
+  join seen) plus a hysteresis margin, and only the excess over `floor + margin` can be
+  the GPU arm overrunning the CPU multiply, where `gemv_ns + excess` is that arm's
+  duration. The GPU arm's time-per-byte is a **censored (Tobit) EM estimate** over both
+  exact (overrun) and censored (finished-first) observations, anchored by the probe's
+  directly measured rate — the estimator's identifiability anchor and its guard against
+  a floor-noise runaway. The setpoint is the DLT balance point `r_gpu/(r_gpu+r_cpu)`;
+  shares are clamped to `[0.05, 0.50]` and the estimate re-runs every 8 steps over a
+  64-observation rolling window. There is **no permanent freeze** — the schedule keeps
+  adapting for the whole decode. Sources and the estimator's known limits are at
+  `estimate_tau_gpu` in `crates/hipfire-dispatch/src/offload_split.rs`.
 - **Accounting and diagnostics.** A split step is *not* charged to the CPU-idle
   numerator (its wall contains GPU work, so it would inflate the lower bound §6.2.1
   documents) and gets its own `split: …` trace line under
   `HIPFIRE_CPU_EXEC_TRACE=1`, whose `join` is the blocking H2D
-  (`copy + max(0, gpu_ns − cpu_ns)`): the line also prints the controller's own state
-  (`gpu samples`, the last `waited`, the last `target`, `applied`, `frozen`), so a share
-  nobody can explain is diagnosable from one run. `gpu≥GB/s` is a lower bound by
-  construction (it divides the GPU's bytes by the *whole* step wall) and is printed as
-  a bound for that reason. `hipfire offload-bench` measures the host
-  independently (its own `--format`/`--buffer-mb`/`--reps`, `--json`, and `--write` to
-  persist the recommended share), and refuses while a daemon pid file names a live
-  process.
+  (`copy + max(0, gpu_ns − cpu_ns)`): the line also prints the controller's own state —
+  `est_cpu`/`est_gpu` (the pair the share was computed from, both from the same state),
+  `anchor` (whether the probe ran), `gpu samples`, `floor`, the last overrun, the last
+  `target`, `applied` — so a share nobody can explain is diagnosable from one run.
+  `gpu≥GB/s` is a lower bound by construction (it divides the GPU's bytes by the *whole*
+  step wall) and is printed as a bound for that reason. `hipfire offload-bench` measures
+  the host independently (its own `--format`/`--buffer-mb`/`--reps`, `--json`, and
+  `--write` to persist the recommended share), and refuses while a daemon pid file
+  names a live process.
 - **Scope.** The dense qwen3.5 seam only — the step lists that carry
   `qkv_via_execute_steps`, `qkvza_via_execute_steps`, `gate_up_via_execute_steps` and
   the dense `Step::GemvResidual` sites. MoE / routed-expert paths never reach it and
