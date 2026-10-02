@@ -841,12 +841,11 @@ fn trace_step(
     // ns -> ms, averaged over *this shape's* calls so far.
     let per_ms = |ns: u64| ns as f64 / 1e6 / stats.calls as f64;
     if stats.split {
-        // The controller's `r_cpu` is the CPU arm's multiply alone (the blocking
-        // D2H is not part of the arm's throughput), so `cpu=` is gemv-only to
-        // match it. `gpu≥` is a lower bound by construction; `est_gpu=` is the
-        // controller's own censored estimate, the number the share rests on.
+        // The CPU arm runs while the GPU arm streams the *same* host pages: `cpu`
+        // is the contended rate and `gpu≥` the lower bound the controller samples
+        // (see `offload_split`). bytes/ns is GB/s numerically.
         let row_bytes = (w.buf.buf.size() / w.m.max(1)) as f64;
-        let cpu_arm_ns = stats.gemv_ns.max(1) as f64;
+        let cpu_arm_ns = (stats.d2h_ns + stats.gemv_ns).max(1) as f64;
         let whole_ns = (stats.d2h_ns + stats.gemv_ns + stats.h2d_ns).max(1) as f64;
         let cpu_gbs = stats.split_cpu_rows as f64 * row_bytes / cpu_arm_ns;
         let gpu_gbs = stats.split_gpu_rows as f64 * row_bytes / whole_ns;
@@ -854,14 +853,7 @@ fn trace_step(
             Some(s) => (
                 format!("{:.3}", s.share),
                 format!(
-                    " (est_cpu={}, est_gpu={}, anchor={}, gpu samples {}, floor={}, last overrun={}, target={}, {} applied)",
-                    s.cpu_bytes_per_s
-                        .map(|r| format!("{:.1}GB/s", r / 1e9))
-                        .unwrap_or_else(|| "—".into()),
-                    s.gpu_bytes_per_s
-                        .map(|r| format!("{:.1}GB/s", r / 1e9))
-                        .unwrap_or_else(|| "—".into()),
-                    if s.anchored { "probe" } else { "none" },
+                    " (gpu samples {}, floor={}, last waited={}, target={}, {} applied{})",
                     s.gpu_samples,
                     s.min_join_ns
                         .map(|ns| format!("{:.2}ms", ns as f64 / 1e6))
@@ -871,6 +863,7 @@ fn trace_step(
                         .map(|t| format!("{t:.3}"))
                         .unwrap_or_else(|| "—".into()),
                     s.applied,
+                    if s.frozen { ", frozen" } else { "" },
                 ),
             ),
             None => ("n/a".to_string(), String::new()),
