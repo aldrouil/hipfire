@@ -335,10 +335,11 @@ pub enum ValueRule {
         max: f64,
     },
     KvAdaptive,
-    /// `auto` | a GPU share in `[0.0, 0.5]`. `0.0` disables the pass-back (the
-    /// step then runs exactly as `memory.offload_exec=cpu`); the upper bound is
-    /// 0.5 because a share above half the rows is better expressed by switching
-    /// `memory.offload_exec` to `pcie`.
+    /// `auto` | a GPU share in `[0.0, 0.5]`. The schedule divides a spilled step's
+    /// output rows between the two engines (GPU = the `pcie` path, CPU = the `cpu`
+    /// path); `0.0` collapses it to the CPU engine alone, i.e. the step runs exactly
+    /// as `memory.offload_exec=cpu`. The upper bound is 0.5 because a share above
+    /// half the rows is better expressed by switching `memory.offload_exec` to `pcie`.
     PassbackShare,
     /// `legacy` | `vmm`. Rejects the pre-rename `contiguous` spelling with a
     /// migration message rather than a generic enum failure.
@@ -716,7 +717,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         Some("HIPFIRE_OFFLOAD_EXEC"),
-        "Which engine executes the ops that read a spilled layer's weights: 'pcie' (default) runs the GPU kernels against host-mapped weights over the link, 'cpu' executes those GEMVs on the CPU instead, 'passback' runs each such step on both — the GPU takes the first rows of the output ('memory.offload_passback_share', scheduled by default) while the CPU takes the rest. Decides who multiplies, never what is spilled — placement stays memory.gpu_layer_budget, and the KV cache stays in VRAM either way. Unset, empty and unknown values all fall back to 'pcie'."
+        "Which engine executes the ops that read a spilled layer's weights: 'pcie' (default) runs the GPU kernels against host-mapped weights over the link; 'cpu' executes those GEMVs on the CPU instead; 'passback' is scheduled co-inference — both engines run the same spilled step concurrently (the GPU arm is the 'pcie' path, the CPU arm is the 'cpu' path), divided by output rows per 'memory.offload_passback_share'. Not a third engine and not a fallback: it decides who multiplies, never what is spilled — placement stays memory.gpu_layer_budget, and the KV cache stays in VRAM either way. Unset, empty and unknown values all fall back to 'pcie'."
     ),
     field!(
         "memory.offload_passback_share",
@@ -728,7 +729,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         Some("HIPFIRE_OFFLOAD_PASSBACK_SHARE"),
-        "Share of a spilled step's output rows handed back to the GPU while the CPU runs the rest (memory.offload_exec=passback only). 'auto' (default) schedules the share from this host's measured engine rates; a number in (0, 0.5] pins it; 0 disables the pass-back, so the mode is then byte-identical to memory.offload_exec=cpu."
+        "How a spilled step's output rows are divided between the two engines under scheduled co-inference (memory.offload_exec=passback only): the GPU takes the first rows (the 'pcie' arm) while the CPU runs the rest (the 'cpu' arm). 'auto' (default) schedules the split from this host's measured engine rates and refines it online; a number in (0, 0.5] pins it; 0 collapses the split onto the CPU engine alone, so the mode is then byte-identical to memory.offload_exec=cpu."
     ),
     // Process-scoped: the preflight guards snapshot this once at startup, and
     // a mid-serve flip would make the refusal policy depend on which load ran

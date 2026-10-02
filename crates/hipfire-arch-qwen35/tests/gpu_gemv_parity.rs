@@ -848,7 +848,7 @@ fn split_case(
         .unwrap_or_else(|e| panic!("{label}: uncovered residual shape errored: {e:?}"));
         assert!(
             !refused,
-            "{label}: a residual shape with no GPU arm must fall back to the whole-CPU step"
+            "{label}: a residual shape with no GPU arm must run on the CPU engine alone (not co-inferenced)"
         );
         eprintln!(
             "{label:44} m={m:<6} k={k:<6} row_bytes={row_bytes:<6} g={g:<6} \
