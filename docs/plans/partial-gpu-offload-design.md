@@ -477,8 +477,17 @@ product claim.)*
   which reports a GPU rate an order of magnitude too low and pins the split to its
   floor with both engines idle in turn) are wrong here; the floor is measured, not
   assumed. Shares are clamped to `[0.05, 0.50]`, adjusted every 4 steps (step 0.3 of
-  the way toward `r_gpu/(r_gpu+r_cpu)`), and frozen once a shape has applied 64
-  adjustments with the last four all under 0.005.
+  the way toward `r_gpu/(r_gpu+r_cpu)`), and latched once a shape has applied 64
+  adjustments with the last four all under 0.005. The latch is **not permanent**: a
+  latched shape keeps measuring (the rate EWMAs never stop), and re-opens — re-tracking
+  and re-latching — when the fresh balance point differs from the latched share by more
+  than `REOPEN_EPS` (0.02), so a long run whose context or host load moves the optimum
+  is followed instead of being stuck at its first plateau. The band sits above the
+  largest proposal a just-latched shape can hold (`FREEZE_EPS / ALPHA ≈ 0.0167`), which
+  is the hysteresis that keeps it from thrashing; a measured spread put 0.02 above that
+  floor (0.005 — below it — was the worst, −1.8 %/−5.2 %) but could not resolve 0.01 vs
+  0.02 vs 0.05 on a static optimum. Deriving the band from the proposal scatter at
+  runtime is the next step.
 - **Accounting and diagnostics.** A split step is *not* charged to the CPU-idle
   numerator (its wall contains GPU work, so it would inflate the lower bound §6.2.1
   documents) and gets its own `split: …` trace line under

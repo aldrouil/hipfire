@@ -118,12 +118,21 @@ const PROBE_REPS: usize = 3;
 const ALPHA: f64 = 0.3;
 const APPLY_EVERY: u64 = 4;
 
-/// EWMA weight for a rate sample, and the convergence threshold: a shape freezes
-/// once it has applied this many adjustments and the last four were all small, so
-/// a converged decode stops being perturbed.
+/// EWMA weight for a rate sample, and the convergence latch: a shape stops being
+/// perturbed once it has applied this many adjustments and the last four were all
+/// small.
 const EWMA_ALPHA: f64 = 0.25;
 const FROZEN_APPLIED: u32 = 64;
 const FREEZE_EPS: f64 = 0.005;
+
+/// The latch's re-open band. A latched shape keeps measuring, and unlatches when a
+/// freshly computed balance point differs from the latched share by more than this.
+/// It sits above the largest proposal a just-latched shape can be holding — the
+/// freeze band is `FREEZE_EPS / ALPHA ≈ 0.0167`, so at latch time the proposal is
+/// within that of the share — which gives the latch hysteresis: it absorbs the
+/// converged value and its noise, but follows a genuine move (the balance shifting
+/// as context or host load changes).
+const REOPEN_EPS: f64 = 0.02;
 
 /// `enabled` + `share` supplied by the caller, so the parity test and the
 /// planner tests need no process snapshot.
@@ -517,7 +526,7 @@ fn observe(
     }
     state.samples += 1;
     state.last_waited = gpu_waited;
-    if state.frozen || state.samples % APPLY_EVERY != 0 {
+    if state.samples % APPLY_EVERY != 0 {
         return;
     }
     // Mirrors `next_share`'s two signal branches: only an adjustment that had
@@ -529,6 +538,19 @@ fn observe(
         state.r_gpu.map(|e| e.value),
         gpu_waited,
     );
+    // A latched shape keeps *measuring* — the rate EWMAs above never stop — so it
+    // can notice that the balance point has moved. If the fresh proposal departs
+    // from the latched share by more than the re-open band, unlatch and track it;
+    // otherwise hold. This is what lets the latch be periodic without being
+    // permanent: it absorbs the converged value (and its noise) but follows a
+    // genuine move, e.g. the balance shifting as context or host load changes.
+    if state.frozen {
+        if (next - state.share).abs() <= REOPEN_EPS {
+            return;
+        }
+        state.frozen = false;
+        state.deltas = [f64::MAX; 4];
+    }
     let delta = (next - state.share).abs();
     state.share = next;
     state.last_target = Some(next);
@@ -1039,6 +1061,43 @@ mod tests {
             "sampled {r_gpu:e}, expected {expected:e}"
         );
         assert!(waited.cpu_bytes_per_s.is_some());
+    }
+
+    #[test]
+    fn a_latched_shape_reopens_when_the_balance_point_moves() {
+        // A distinct key so the process-global scheduler cannot interfere.
+        let key = (DType::Q8_0, 4242);
+        seed_shape(key, 0.246);
+        // First join sets the shape's no-wait floor; later joins overrun it by
+        // 10 µs, so `r_gpu` is sampled and the balance point is
+        // 1024·2176/(500 µs + 10 µs) over that plus the CPU arm — 0.2463, i.e.
+        // the seeded share, so the shape converges and latches.
+        observe(key, 3072, 1024, 2176, 500_000, 40_000);
+        for _ in 0..(APPLY_EVERY as usize * (FROZEN_APPLIED as usize + 8)) {
+            observe(key, 3072, 1024, 2176, 500_000, 60_000);
+        }
+        let latched = shape_state(key.0, key.1).expect("seeded");
+        assert!(
+            latched.frozen,
+            "a stable balance point must latch: share={} applied={}",
+            latched.share, latched.applied
+        );
+        let before = latched.share;
+
+        // The GPU arm is given four times the rows: the balance point jumps to
+        // ~0.57, far outside the re-open band. The latch must re-open and track it
+        // — this is the long-context / changed-host-load case the latch exists to
+        // not miss.
+        for _ in 0..(APPLY_EVERY as usize * 8) {
+            observe(key, 3072, 4096, 2176, 500_000, 60_000);
+        }
+        let after = shape_state(key.0, key.1).expect("seeded");
+        assert!(!after.frozen, "a moved balance point must re-open the latch");
+        assert!(
+            after.share > before + 0.05,
+            "the share must follow the move: {before} -> {}",
+            after.share
+        );
     }
 
     #[test]
