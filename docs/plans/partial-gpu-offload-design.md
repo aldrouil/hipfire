@@ -524,6 +524,16 @@ product claim.)*
     where the probe says it should (perf-gap § 5), and the skipped-step wall term measures
     3.7–6.3 %
     ([`2026-10-02-offload-passback-coverage-phase0.md`](../perf-checkpoints/2026-10-02-offload-passback-coverage-phase0.md)).
+- **Output is not bit-reproducible.** Any share `> 0` runs two engines that differ
+  numerically, and the share itself is derived per process (the seeding probe plus
+  online arm timings), so **two identical invocations of `passback` can emit different
+  tokens under greedy decoding** while `cpu` and `pcie` are deterministic. Measured on
+  the 2B: `cpu`×2 byte-identical, `passback`×2 differ, and
+  `HIPFIRE_OFFLOAD_PASSBACK_SHARE=0` is byte-identical to `cpu`
+  ([`2026-10-02-offload-passback-model-spread-gfx1201-amendment-1.md`](../perf-checkpoints/2026-10-02-offload-passback-model-spread-gfx1201-amendment-1.md) § 5).
+  Pinning the share makes a run reproducible; a validation gate that diffs pass-back
+  output against a reference must pin it. The 2026-10-01 record's 9B byte-identity held
+  on its own prompts, where the argmax was insensitive — not as a general property.
 - **Accounting and diagnostics.** A split step is *not* charged to the CPU-idle
   numerator (its wall contains GPU work, so it would inflate the lower bound §6.2.1
   documents) and gets its own `split: …` trace line under
