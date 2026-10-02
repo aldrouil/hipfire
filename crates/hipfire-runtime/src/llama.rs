@@ -1588,6 +1588,28 @@ pub fn weight_gemv_swiglu_residual(
                 awq_scale: w_down.awq_scale.as_ref(),
                 ..wr
             };
+            // Under `memory.offload_exec=passback` the down-projection is a
+            // co-inference candidate like any other `Step::GemvResidual`, but the
+            // seam only sees `Step`s — this op predates it, so it must hand itself
+            // over. Build the step and let the seam split it by output rows; it
+            // declines (`Ok(false)`) in `cpu` mode and for any shape it cannot
+            // co-infer, and the whole-CPU GEMV below is then exactly what `cpu`
+            // mode runs.
+            if hipfire_dispatch::offload_split::enabled() {
+                use hipfire_dispatch::pipeline::{GemvInput, Step};
+                let step = Step::GemvResidual {
+                    w: &wr_cpu,
+                    input: GemvInput::Raw(ffn_hidden_scratch),
+                    residual: x,
+                    out: x,
+                };
+                let opts = hipfire_dispatch::PassbackOptions::from_process();
+                let split = hipfire_dispatch::offload_split::run_with(gpu, &ctx, &step, &opts)
+                    .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+                if split {
+                    return Ok(());
+                }
+            }
             hipfire_dispatch::run_host_mapped_gemv_residual(gpu, &wr_cpu, ffn_hidden_scratch, x)
                 .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
         }

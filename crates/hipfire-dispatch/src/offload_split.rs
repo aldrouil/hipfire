@@ -74,8 +74,11 @@
 //!
 //! Scope is the dense qwen3.5 seam only (the step lists that carry
 //! `qkv_via_execute_steps`, `qkvza_via_execute_steps`,
-//! `gate_up_via_execute_steps` and the dense `Step::GemvResidual` sites). MoE /
-//! routed-expert paths never reach it and get no arms here.
+//! `gate_up_via_execute_steps` and the dense `Step::GemvResidual` sites), plus
+//! the dense FFN down-projection, which `weight_gemv_swiglu_residual` hands over
+//! as a `Step::GemvResidual` when passback is on (it cannot be seen as a step
+//! otherwise — the SiLU is fused into its launch). MoE / routed-expert paths
+//! never reach it and get no arms here.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{LazyLock, Mutex};
