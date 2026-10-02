@@ -286,7 +286,12 @@ PCIe link (27.1 GB/s measured, §7) instead of device DRAM: this is llama.cpp's
   accumulate (the residual is the destination; a residual step never writes its
   `out` scratch). `weight_gemv_swiglu_residual` — the one op family that fuses a
   GEMV into a kernel the seam cannot see — splits itself: GPU `silu_mul_f32`,
-  then the CPU GEMV plus residual.
+  then the CPU GEMV plus residual. Under `passback` it now hands that residual
+  GEMV to the co-inference seam as a `Step::GemvResidual` (falling back to the
+  whole-CPU path when the seam declines), so the dense FFN down-projection is
+  co-inferenced instead of run wholly on the CPU — measured **+4.0 % / +5.0 %** on
+  the 9B at 8 / 16 of 32 spilled (interleaved fresh-process pairs, passback mode;
+  § 6.2.2).
 - **Two launcher properties the CPU path must reproduce exactly**, both of which
   fail *silently* rather than erroring, and both now pinned by parity arms in
   `crates/hipfire-arch-qwen35/tests/gpu_gemv_parity.rs`: the per-channel **AWQ**
