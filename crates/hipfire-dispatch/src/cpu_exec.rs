@@ -335,6 +335,102 @@ pub fn host_mapped_cpu_capable(gpu: &Gpu, w: &WeightRef) -> bool {
     cpu_exec_enabled() && gpu.host_located(w.buf) && cpu_quant_for(w.dtype).is_some()
 }
 
+/// `HIPFIRE_MOE_CPU_ORACLE=1`: run the same host-mapped expert bytes that fed the
+/// GPU's routed-expert kernels through the CPU SIMD expert FFN
+/// ([`hipfire_cpu::moe::run_experts`]) and print the per-rank divergence.
+///
+/// Attribution, not a fallback. If the CPU path over the same blobs reproduces the
+/// GPU's own per-expert down outputs, the packed layout and the GPU's read of
+/// host-mapped memory are sound — a wrong token then cannot be explained by either
+/// and must come from the routing, the dtype/arm selection, or a non-expert tensor.
+/// If they disagree, the printed rank and element localize it in one run, which a
+/// resident control arm cannot do on a card too small to hold the model.
+///
+/// Lives here rather than in the arch because this crate owns the CPU seam and the
+/// arch intentionally has no `hipfire-cpu` dependency. Both candidate inputs are
+/// tried (activation as stored, and freshly rotated), so the report is evidence
+/// about which one the kernels consume instead of assuming it.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_cpu_oracle_report(
+    gpu: &Gpu,
+    quant: CpuQuant,
+    dim: usize,
+    mi: usize,
+    k: usize,
+    gate_up_owner: &GpuTensor,
+    down_owner: &GpuTensor,
+    x_norm: &GpuTensor,
+    topk_indices: &GpuTensor,
+    topk_weights: &GpuTensor,
+    down_expanded: &GpuTensor,
+    layer_idx: u16,
+) {
+    let (x, ti, tw, dn_gpu) = match (
+        download_f32(gpu, x_norm, dim),
+        download_f32(gpu, topk_indices, k),
+        download_f32(gpu, topk_weights, k),
+        download_f32(gpu, down_expanded, k * dim),
+    ) {
+        (Ok(a), Ok(b), Ok(c), Ok(d)) => (a, b, c, d),
+        _ => {
+            eprintln!("[moe-cpu-oracle] layer {layer_idx}: scratch download failed");
+            return;
+        }
+    };
+    let (gu, dn) = match (gpu.host_bytes(gate_up_owner), gpu.host_bytes(down_owner)) {
+        (Some(a), Some(b)) => (a, b),
+        _ => {
+            eprintln!("[moe-cpu-oracle] layer {layer_idx}: expert blobs are not host-mapped");
+            return;
+        }
+    };
+    let blobs = hipfire_cpu::moe::ExpertBlobs {
+        gate_up: gu,
+        down: dn,
+        gate_up_stride: hipfire_cpu::gemv::row_bytes(quant, dim) * 2 * mi,
+        down_stride: hipfire_cpu::gemv::row_bytes(quant, mi) * dim,
+        quant,
+        dim,
+        mi,
+    };
+    for rotated in [false, true] {
+        if x.len() < dim || (rotated && dim % 256 != 0) {
+            break;
+        }
+        let mut xin = x[..dim].to_vec();
+        if rotated {
+            rotate_x(&mut xin);
+        }
+        let mut worst_rel = 0.0f64;
+        let mut worst_at = (usize::MAX, usize::MAX);
+        let mut ranks = 0usize;
+        for krank in 0..k.min(ti.len()).min(tw.len()) {
+            let expert = (ti[krank].to_bits() as i32) as u16 as usize;
+            let base = krank * dim;
+            if base + dim > dn_gpu.len() {
+                break;
+            }
+            let mut out = vec![0.0f32; dim];
+            if hipfire_cpu::moe::run_experts(&blobs, &xin, &[(expert, 1.0)], &mut out).is_err() {
+                continue;
+            }
+            ranks += 1;
+            for j in 0..dim {
+                let (a, b) = (out[j] as f64, dn_gpu[base + j] as f64);
+                let rel = (a - b).abs() / a.abs().max(b.abs()).max(1e-6);
+                if rel > worst_rel {
+                    worst_rel = rel;
+                    worst_at = (krank, j);
+                }
+            }
+        }
+        eprintln!(
+            "[moe-cpu-oracle] layer {layer_idx} quant {quant:?} ranks {ranks} input {}: max |cpu-gpu|/max|.| = {worst_rel:.3e} at (rank, elem) {worst_at:?}",
+            if rotated { "fwht-rotated" } else { "as-stored" },
+        );
+    }
+}
+
 fn host_mapped_quant(gpu: &Gpu, w: &WeightRef) -> Result<CpuQuant, DispatchError> {
     if !cpu_exec_enabled() {
         return Err(cpu_err("cpu exec is not enabled (memory.offload_exec)"));
