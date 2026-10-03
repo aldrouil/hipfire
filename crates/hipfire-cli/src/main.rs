@@ -7373,7 +7373,9 @@ fn quantize_command(paths: &Paths, mut args: QuantizeArgs) -> Result<()> {
 
 // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
 fn sidecar_command(paths: &Paths, args: SidecarArgs) -> Result<()> {
-    eprintln!("warning: CASK is deprecated and will be removed in 0.5.0; not supported (sidecar-gen)");
+    eprintln!(
+        "warning: CASK is deprecated and will be removed in 0.5.0; not supported (sidecar-gen)"
+    );
     if !(1..=1_000_000).contains(&args.max_tokens) {
         bail!("--max-tokens must be between 1 and 1000000");
     }
@@ -8048,6 +8050,13 @@ fn config_rule_json(rule: ValueRule) -> serde_json::Value {
             "minimum": min,
             "maximum": max,
         }),
+        ValueRule::NullableIntegerOrAuto { min, max } => serde_json::json!({
+            "type": ["integer", "string", "null"],
+            "minimum": min,
+            "maximum": max,
+            "enum": ["auto"],
+            "nullable": true,
+        }),
         ValueRule::NullableFloat { min, max } => serde_json::json!({
             "type": ["number", "null"],
             "minimum": min,
@@ -8079,6 +8088,7 @@ fn config_rule_label(rule: ValueRule) -> &'static str {
         ValueRule::NullableString => "string|null",
         ValueRule::NullableEnum(_) => "enum|null",
         ValueRule::NullableInteger { .. } => "integer|null",
+        ValueRule::NullableIntegerOrAuto { .. } => "integer|auto|null",
         ValueRule::NullableFloat { .. } => "number|null",
         ValueRule::KvAdaptive => "kv-adaptive",
         ValueRule::Deepseek4Placement => "deepseek4-placement",
@@ -12617,7 +12627,11 @@ mod tests {
         assert_eq!(status, 200, "{text}");
         let health = serve_health(h.port()).1;
         assert_eq!(health["model"], serde_json::json!(h.model()));
-        assert_eq!(health["n_ctx"], serde_json::json!(4096), "the load ack's max_seq");
+        assert_eq!(
+            health["n_ctx"],
+            serde_json::json!(4096),
+            "the load ack's max_seq"
+        );
 
         fs::write(h.paths.models.join("t20-load-fail.hfq"), b"x").unwrap();
         let mut bad = h.base_body("t11-stop-text", false);
@@ -12626,12 +12640,18 @@ mod tests {
         assert_ne!(status, 200, "{text}");
         let health = serve_health(h.port()).1;
         assert!(health["model"].is_null());
-        assert!(health["n_ctx"].is_null(), "no context is advertised with nothing resident");
+        assert!(
+            health["n_ctx"].is_null(),
+            "no context is advertised with nothing resident"
+        );
 
         let (status, _, text) = post_status(h.port(), &h.base_body("t11-stop-text", false));
         assert_eq!(status, 200, "{text}");
         let loads = Task11HttpHarness::ops_of_type(&h.read_requests_log(), "load").len();
-        assert_eq!(loads, 3, "initial load, failed switch, reload of the old model");
+        assert_eq!(
+            loads, 3,
+            "initial load, failed switch, reload of the old model"
+        );
     }
 
     /// A daemon that exits (crash, or a sticky GPU fault after which it exits
@@ -12660,7 +12680,10 @@ mod tests {
     #[test]
     fn serve_health_is_unhealthy_until_the_daemon_is_back() {
         let h = Task11HttpHarness::spawn("respawn-health");
-        assert_eq!(post_status(h.port(), &h.base_body("t11-stop-text", false)).0, 200);
+        assert_eq!(
+            post_status(h.port(), &h.base_body("t11-stop-text", false)).0,
+            200
+        );
         let daemon = {
             let mut runtime = h.shared.runtime.lock().unwrap();
             std::mem::replace(
@@ -12682,7 +12705,10 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(health["status"], "ok");
         assert_eq!(health["model"], serde_json::json!(h.model()));
-        assert_eq!(post_status(h.port(), &h.base_body("t11-stop-text", false)).0, 200);
+        assert_eq!(
+            post_status(h.port(), &h.base_body("t11-stop-text", false)).0,
+            200
+        );
         // The supervisor reloaded the model; the request did not load again.
         let loads = Task11HttpHarness::ops_of_type(&h.read_requests_log(), "load").len();
         assert_eq!(loads, 2);
@@ -12776,8 +12802,7 @@ mod tests {
         let choice = &json["choices"][0];
         assert_eq!(choice["finish_reason"], "tool_calls", "{text}");
         assert_eq!(
-            choice["message"]["tool_calls"][0]["function"]["name"],
-            "read_file",
+            choice["message"]["tool_calls"][0]["function"]["name"], "read_file",
             "{text}"
         );
     }
