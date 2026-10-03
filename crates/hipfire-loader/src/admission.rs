@@ -169,6 +169,127 @@ pub(crate) fn qwen4_mtp_with_host_mapped_experts(
     host_mapped_experts == 0 || spec.mtp == Some(true)
 }
 
+/// True when either partial-offload budget is configured. The loader asks this
+/// before it resolves a placement, so it is a *request*, not a resolved spill.
+pub(crate) fn partial_offload_requested() -> bool {
+    use hipfire_config::memory::{gpu_layer_budget, moe_expert_budget, OffloadBudget};
+    let full = OffloadBudget::Full;
+    gpu_layer_budget() != full || moe_expert_budget() != full
+}
+
+/// Fail-closed list for partial GPU offload, raised where the arch is dispatched.
+///
+/// An arch that never reaches the placement resolver must still be refused rather
+/// than handed a resident load: "arch crates are typed declarations and the loader
+/// owns placement" is only enforceable if an arch that cannot honour a placement
+/// never quietly receives one. Returns `Err` naming the offending key and the
+/// reason; `Ok(())` when no spill was requested or the source can honour it.
+pub(crate) fn partial_offload_refusal(
+    arch_id: u32,
+    source: &ModelSource,
+    tp: usize,
+    pp: usize,
+    ep_experts: Option<usize>,
+) -> Result<(), String> {
+    use hipfire_config::memory::{gpu_layer_budget, moe_expert_budget, OffloadBudget};
+    let budgets = (gpu_layer_budget(), moe_expert_budget());
+    if budgets == (OffloadBudget::Full, OffloadBudget::Full) {
+        return Ok(());
+    }
+    let keys = "memory.gpu_layer_budget / memory.moe_expert_budget";
+    // Only the Qwen3.5 storage seam places a layer or a routed expert in host
+    // RAM. Qwen4 has its own expert-residency route and the other arches have
+    // none, so either knob is a request this loader cannot honour.
+    if !matches!(arch_id, 5 | 6) {
+        return Err(format!(
+            "load refused: partial GPU offload ({keys}) is implemented for Qwen3.5 dense and MoE \
+             only; this source is arch id {arch_id}. Unset both keys for this model"
+        ));
+    }
+    if tp > 1 {
+        return Err(format!(
+            "load refused: partial GPU offload ({keys}) supports the single-GPU topology only; \
+             tp={tp} loads every layer on every rank and never places one in host RAM. Unset both \
+             keys for this model"
+        ));
+    }
+    if pp > 1 {
+        return Err(format!(
+            "load refused: partial GPU offload ({keys}) supports the single-GPU topology only; \
+             pp={pp} would place the first pipeline band's spilled weights in host RAM mapped by \
+             device 0, which has never been run. Unset both keys for this model"
+        ));
+    }
+    if ep_experts.is_some_and(|experts| experts > 0) {
+        return Err(format!(
+            "load refused: partial GPU offload ({keys}) cannot be combined with expert parallelism \
+             — an expert is pinned to one rank and its weights stay on that rank's device. Unset \
+             both keys for this model"
+        ));
+    }
+    let ModelSource::Hfq(hfq) = source else {
+        return Ok(());
+    };
+    // Tower *tensor* presence decides text-vs-VL, never config metadata
+    // (`config.is_vl_text` is the nested-name text wrapper, which a plain text
+    // checkpoint carries too), so ask the same probe the admission record uses.
+    if probe_vision(source, arch_id)? {
+        return Err(format!(
+            "load refused: partial GPU offload ({keys}) cannot place the Qwen3.5-VL vision tower, \
+             which loads through its own lowered loader. Unset both keys for this model"
+        ));
+    }
+    let config = hipfire_arch_qwen35::qwen35::config_from_hfq(hfq)
+        .map_err(|e| format!("qwen35 config: {e}"))?;
+    if config.paged_experts {
+        return Err(format!(
+            "load refused: partial GPU offload ({keys}) cannot be combined with paged experts — \
+             the weight pager owns those buffers and would move them behind the placement's back. \
+             Unset both keys for this model"
+        ));
+    }
+    if config.reap_keep.is_some() {
+        return Err(format!(
+            "load refused: partial GPU offload ({keys}) cannot be combined with a REAP keep-map — \
+             the pruned expert load has no host-placement path. Unset both keys for this model"
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a speculation mechanism that a spill cannot support.
+///
+/// Speculative decode composes with a spill only in the PCIe arm, and the MTP
+/// head's own expert loader allocates device-side unconditionally, so a spill
+/// cannot silently cover it. An explicitly requested mechanism is a load error;
+/// MTP that was not requested is dropped with one line, the Qwen4 behaviour.
+pub(crate) fn qwen35_spill_spec_refusal(
+    spec: SpecLoadCfg,
+    spill_active: bool,
+) -> Result<(), String> {
+    if !spill_active {
+        return Ok(());
+    }
+    if spec.mtp == Some(true) {
+        return Err(
+            "load refused: partial GPU offload (memory.gpu_layer_budget / memory.moe_expert_budget) \
+             cannot be combined with an explicitly requested MTP draft \
+             (speculation.mtp / --spec mtp): the MTP head's expert loader allocates device-side \
+             and the spill cannot cover it. Unset the offload keys, or use --spec off"
+                .to_string(),
+        );
+    }
+    if spec.ngram_draft == Some(true) {
+        return Err(
+            "load refused: partial GPU offload (memory.gpu_layer_budget / memory.moe_expert_budget) \
+             cannot be combined with an explicitly requested n-gram draft \
+             (speculation.ngram_draft). Unset the offload keys, or use --spec off"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// The source-only portion of Qwen4 admission. The validated config and
 /// inventory are reused by the executable Single carrier without reopening
 /// or reclassifying the HFQM path.
@@ -974,39 +1095,10 @@ pub fn admit_source_with_options(
         };
         (topology, Some(carrier))
     };
-    // Partial GPU offload (#793): a spilled prefix lands in host RAM mapped by
-    // the device that owns it, which exists for the single/dense topology only.
-    // Refuse tp>1 (every rank loads every layer and never hosts one) and pp>1
-    // (the first band's spill would be mapped by device 0, a path nobody has run)
-    // before any teardown. The remaining fail-closed cases — ParoQuant, the VL
-    // tower, paged/REAP experts, EP, and every arch that has not adopted the
-    // storage seam — are handled where the arch is dispatched.
-    if matches!(arch_id, 5 | 6)
-        && (hipfire_config::memory::gpu_layer_budget()
-            != hipfire_config::memory::OffloadBudget::Full
-            || hipfire_config::memory::moe_expert_budget()
-                != hipfire_config::memory::OffloadBudget::Full)
-    {
-        let why = if tp > 1 {
-            Some(format!(
-                "tp={tp} loads every layer on every rank and never places one in host RAM"
-            ))
-        } else if pp > 1 {
-            Some(format!(
-                "pp={pp} would place the first pipeline band's spilled layers in host RAM mapped \
-                 by device 0, which has never been run"
-            ))
-        } else {
-            None
-        };
-        if let Some(why) = why {
-            return Err(format!(
-                "load refused: partial GPU offload (memory.gpu_layer_budget / \
-                 memory.moe_expert_budget) supports the single-GPU topology only; {why}. Unset \
-                 both keys for this model"
-            ));
-        }
-    }
+    // Partial GPU offload: fail closed where the arch is dispatched, before any
+    // teardown, so a source that cannot honour a configured spill never receives
+    // a resident load.
+    partial_offload_refusal(arch_id, &source, tp, pp, qwen35_ep_experts)?;
     let heterogeneous_reason = hints.deepseek4_heterogeneous && arch_id == 9;
     let unsupported = if heterogeneous_reason {
         Some(
@@ -1300,6 +1392,45 @@ pub fn admit_source_with_options(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Speculation only composes with a spill in the PCIe arm, and the MTP head's
+    /// expert loader allocates device-side: an explicit request must be a load
+    /// error naming both keys, while an unrequested mechanism is dropped by the
+    /// caller (no error here). This is the only proof the rule has on this box —
+    /// see the report: no fixture is both packable-MoE and MTP-bearing.
+    #[test]
+    fn spill_spec_refusal_refuses_only_explicit_requests() {
+        let mtp_on = SpecLoadCfg {
+            mtp: Some(true),
+            ..Default::default()
+        };
+        let ngram_on = SpecLoadCfg {
+            ngram_draft: Some(true),
+            ..Default::default()
+        };
+        let mtp_off = SpecLoadCfg {
+            mtp: Some(false),
+            ..Default::default()
+        };
+        let unrequested = SpecLoadCfg::default();
+
+        for spec in [mtp_on, ngram_on] {
+            let message = qwen35_spill_spec_refusal(spec, true)
+                .expect_err("an explicit request under a spill must be refused");
+            assert!(message.contains("memory."), "{message}");
+            assert!(message.contains("load refused"), "{message}");
+        }
+        let mtp_message = qwen35_spill_spec_refusal(mtp_on, true).unwrap_err();
+        assert!(mtp_message.contains("speculation.mtp"), "{mtp_message}");
+
+        for spec in [mtp_off, unrequested] {
+            assert!(qwen35_spill_spec_refusal(spec, true).is_ok());
+        }
+        // No spill at all: nothing is refused, whatever was requested.
+        for spec in [mtp_on, ngram_on, mtp_off, unrequested] {
+            assert!(qwen35_spill_spec_refusal(spec, false).is_ok());
+        }
+    }
     fn admit_source(
         path: &str,
         tp: usize,

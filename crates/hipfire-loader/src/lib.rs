@@ -2170,6 +2170,15 @@ fn finish_qwen35_load(
     } else {
         None
     };
+    // Partial GPU offload composes with speculative decode only in the PCIe arm,
+    // and the MTP head's own expert loader allocates device-side unconditionally,
+    // so a spill cannot cover it. An explicitly requested mechanism is a load
+    // error; an unrequested MTP is dropped with one line.
+    let offload_spill = crate::admission::partial_offload_requested();
+    crate::admission::qwen35_spill_spec_refusal(ctx.spec, offload_spill)?;
+    if offload_spill && matches!(arch_id, 5 | 6) && ctx.spec.mtp != Some(false) {
+        eprintln!("qwen35 MTP: off with host-mapped experts; opt in with --spec mtp");
+    }
     // ── qwen35 MTP head (single resolver: bundled .mq4-mtp trailer then .mtp sidecar) ──
     // Precedence: DSpark > DFlash > MTP > n-gram. Gate: only arch 5/6, no adaptive/eviction,
     // and typed mtp != off. Bundled first, then the sidecar the CLI resolved
@@ -2179,6 +2188,7 @@ fn finish_qwen35_load(
     let mtp: Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead> = if adaptive_blocks_generic_spec
         || eviction.is_some()
         || !matches!(arch_id, 5 | 6)
+        || offload_spill
         || ctx.spec.mtp == Some(false)
         || dflash.is_some()
         || dspark_speculator.is_some()
@@ -4696,9 +4706,14 @@ mod ep_admission_tests {
         let before = active.request();
         let mut effects = LoadEffects::default();
         let refusal = attempt_candidate_swap(
-            &candidate, 1, admission::KvBackendRequest::Explicit(hipfire_runtime::kv_backend::KvBackend::Vmm),
-            "gfx1100", &mut active, &mut effects,
-        ).unwrap_err();
+            &candidate,
+            1,
+            admission::KvBackendRequest::Explicit(hipfire_runtime::kv_backend::KvBackend::Vmm),
+            "gfx1100",
+            &mut active,
+            &mut effects,
+        )
+        .unwrap_err();
         assert!(refusal.contains("vmm") && refusal.contains("unsupported"));
         assert_eq!(effects, LoadEffects::default());
         assert_eq!(active.request(), before);
