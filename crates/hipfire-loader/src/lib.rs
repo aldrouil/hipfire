@@ -2170,20 +2170,34 @@ fn finish_qwen35_load(
     } else {
         None
     };
+    // Drafts stay on the GPU — they are device-resident and a trunk spill must
+    // not move or disable them — but the MTP verify/prefill path is not yet
+    // host-expert aware: with a spill active it takes a GPU memory access fault
+    // (`Memory access fault ... address 0xac000`, SIGABRT) during prefill, on
+    // `ornith-1.5:35b-a3b` with `moe_expert_budget=auto`. Refuse the combination
+    // at load with a message that says so, rather than faulting the card.
+    // `--spec off` on the same spill loads and decodes.
+    let offload_spill = crate::admission::partial_offload_requested();
+    if offload_spill && matches!(arch_id, 5 | 6) && ctx.spec.mtp != Some(false) {
+        return Err(
+            "load refused: partial GPU offload cannot yet be combined with an MTP draft. The MTP \
+             verify/prefill path is not host-expert aware and faults the GPU during prefill \
+             (measured on ornith-1.5:35b-a3b with memory.moe_expert_budget=auto). The draft itself \
+             stays on the GPU; run --spec off with the spill, or unset memory.gpu_layer_budget / \
+             memory.moe_expert_budget to keep MTP"
+                .to_string(),
+        );
+    }
     // ── qwen35 MTP head (single resolver: bundled .mq4-mtp trailer then .mtp sidecar) ──
     // Precedence: DSpark > DFlash > MTP > n-gram. Gate: only arch 5/6, no adaptive/eviction,
     // and typed mtp != off. Bundled first, then the sidecar the CLI resolved
     // (`ctx.mtp_path`), else `<trunk>.mtp`; physical_cap is the KV window. A head
     // whose hidden size or vocab differs from the trunk is refused before upload.
     // On missing/refused/failed: error when forced on (mtp=on), auto logs/falls back.
-    //
-    // A partial-offload spill does NOT disable this: the head is device-resident,
-    // so it stays on the GPU beside a spilled trunk. Its bytes are reserved out of
-    // the placement's capacity instead (see the carrier), so a spill cannot
-    // over-place the trunk and then fail the head's own load.
     let mtp: Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead> = if adaptive_blocks_generic_spec
         || eviction.is_some()
         || !matches!(arch_id, 5 | 6)
+        || offload_spill
         || ctx.spec.mtp == Some(false)
         || dflash.is_some()
         || dspark_speculator.is_some()

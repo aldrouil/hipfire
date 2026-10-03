@@ -38,18 +38,18 @@ use crate::grammar;
 use crate::qwen35::{
     self, DeltaNetState, LayerType, PrefillBatchScratch, Qwen35Scratch, Qwen35Weights,
 };
-use hipfire_runtime::scheduler::{
-    is_runnable_decode, is_runnable_prefill, PendingWork, Scheduler, SpecKind, VlPrefill,
-};
-use hipfire_runtime::slot_batch::SlotBatch;
 use crate::speculative::DeltaNetSnapshot;
 use hipfire_runtime::llama::{KvCache, VMode};
 use hipfire_runtime::prefix_index::{Handle, PinTicket, PrefixIndex};
+use hipfire_runtime::scheduler::{
+    is_runnable_decode, is_runnable_prefill, PendingWork, Scheduler, SpecKind, VlPrefill,
+};
 use hipfire_runtime::serve_contract::{
     CacheDomain, DrafterDecision, PrefixLookup, PrefixLookupResult,
 };
 use hipfire_runtime::serve_fairness::{FairQueue, Grant, Selection};
 use hipfire_runtime::serve_wait::WaitQueue;
+use hipfire_runtime::slot_batch::SlotBatch;
 use hipfire_runtime::tokenizer::Tokenizer;
 
 /// Internal control plane for the engine thread. Public methods map onto these
@@ -295,7 +295,6 @@ impl Drop for SlotEngine {
     }
 }
 
-
 impl hipfire_runtime::serve::SlotEngineHandle for SlotEngine {
     fn submit(&self, req: SubmitRequest) -> Result<(), String> {
         SlotEngine::submit(self, req)
@@ -324,7 +323,6 @@ impl hipfire_runtime::serve::SlotEngineHandle for SlotEngine {
 /// window buffer is sized by this; the daemon clamps requests to the same
 /// bound so a client cannot ask for an unbounded scan.
 const REPEAT_WINDOW_MAX: usize = 2048;
-
 
 /// All model-owned GPU state for the slot engine, grouped so `Rig`'s other
 /// fields stay family-neutral. Field-for-field with the former `Rig` model
@@ -447,7 +445,6 @@ impl ModelRig {
         )
     }
 }
-
 
 struct Rig {
     gpu: Gpu,
@@ -633,6 +630,65 @@ pub(crate) fn tensor_layer_index(name: &str) -> Option<usize> {
 }
 
 impl Rig {
+    /// Resolve the placement the slots path loads with.
+    ///
+    /// `Full`/`Full` returns the all-device placement with no capacity check — the
+    /// no-knob load must stay byte-identical to the pre-offload loader. With a knob
+    /// set the capacity is the measured free VRAM minus the slot engine's own KV
+    /// footprint, the prefill floor and any device-resident draft, and the pinned
+    /// host bytes are admitted against host RAM and TTM's GTT cap before any
+    /// allocation.
+    fn resolve_slot_offload(
+        layer_bytes: &hipfire_runtime::offload::LayerBytes,
+        config: &crate::qwen35::Qwen35Config,
+        cfg: &EngineConfig,
+        gpu: &Gpu,
+        free_vram: u64,
+        kv_bytes: u64,
+    ) -> Result<hipfire_runtime::offload::Placement, String> {
+        use hipfire_config::memory::{gpu_layer_budget, moe_expert_budget, OffloadBudget};
+        use hipfire_runtime::offload;
+        let budgets = (gpu_layer_budget(), moe_expert_budget());
+        if budgets == (OffloadBudget::Full, OffloadBudget::Full) {
+            return Ok(offload::Placement::all_device(config.n_layers));
+        }
+        let pbs = crate::qwen35::prefill::minimum_prefill_reservation_bytes(config, &gpu.arch)
+            .unwrap_or(0) as u64;
+        // The MTP head the slots path resolves for itself is the `<trunk>.mtp`
+        // sidecar, so that is the draft it must reserve for (the bundled trailer
+        // is already part of the trunk file the placement charges).
+        let draft = if cfg.mtp_k > 0 {
+            let mut sidecar = cfg.model_path.clone().into_os_string();
+            sidecar.push(".mtp");
+            crate::carrier::draft_file_reserve_bytes(std::path::Path::new(&sidecar))
+        } else {
+            0
+        };
+        let capacity = offload::weight_capacity(free_vram, kv_bytes, pbs, draft, 128 << 20);
+        let (placement, line) = offload::plan(
+            layer_bytes,
+            budgets,
+            &capacity,
+            offload::Orientation::SuffixResident,
+        )?;
+        eprintln!("  {line}");
+        eprintln!(
+            "  kv reserved: {} MiB; pbs floor {} MiB; draft {} MiB; slack 128 MiB; weight budget \
+             {} MiB of {} MiB free",
+            kv_bytes / (1 << 20),
+            pbs / (1 << 20),
+            draft / (1 << 20),
+            capacity.weight_bytes / (1 << 20),
+            free_vram / (1 << 20),
+        );
+        let host_bytes = layer_bytes.host_bytes(&placement);
+        if !placement.is_fully_resident() {
+            eprintln!("  {}", offload::report(&placement, layer_bytes, host_bytes));
+        }
+        offload::admit_host_placement(host_bytes)?;
+        Ok(placement)
+    }
+
     /// Build the GPU rig.
     ///
     /// CPU arch/tensor preflight precedes this loader — `SlotBackend::cpu_preflight`
@@ -822,31 +878,10 @@ impl Rig {
             }
         };
 
+        // Model-file size doubles as the load identity (`model_hash` below).
         let weight_bytes = std::fs::metadata(&cfg.model_path)
             .map_err(|e| format!("stat model: {e}"))?
             .len();
-        // Charge only what actually lands on the device. With partial offload the
-        // prefix `[0 .. i_gpu_start)` lives in host RAM (`hipHostMalloc`, which
-        // costs the device heap nothing), so charging the whole file here would
-        // make offload unable to buy the KV capacity it exists to buy: the gate
-        // would refuse the very context the freed VRAM affords. Summed from the
-        // tensor index rather than estimated per layer, because the split is
-        // contiguous but the layers are not uniform (linear-attention vs
-        // full-attention, different MLP widths). Non-layer tensors (token_embd,
-        // output_norm, lm_head) are always resident and always charged.
-        let resident_weight_bytes = if config.i_gpu_start == 0 {
-            weight_bytes
-        } else {
-            resident_weight_bytes(&hfq, config.i_gpu_start)
-        };
-        let cap_rounded = cfg.cap_tokens.div_ceil(128) * 128;
-        let kv_pages = paged_pages.unwrap_or(cfg.n_slots * cap_rounded / 128);
-        let kv_bytes = (n_fa_layers as u64)
-            * (kv_pages as u64)
-            * (PAGE_TOKENS as u64)
-            * (per_pos_bytes as u64 + per_pos_v_bytes as u64);
-        let planned = resident_weight_bytes + kv_bytes + 768 * 1024 * 1024;
-
         // GPU context only before preflight — no device allocations yet. Free/
         // total come from the live device so gfx1100 is not over-admitted
         // against a hardcoded R9700 budget.
@@ -855,6 +890,40 @@ impl Rig {
             .hip
             .get_vram_info()
             .map_err(|e| format!("vram info: {e}"))?;
+
+        let cap_rounded = cfg.cap_tokens.div_ceil(128) * 128;
+        let kv_pages = paged_pages.unwrap_or(cfg.n_slots * cap_rounded / 128);
+        let kv_bytes = (n_fa_layers as u64)
+            * (kv_pages as u64)
+            * (PAGE_TOKENS as u64)
+            * (per_pos_bytes as u64 + per_pos_v_bytes as u64);
+
+        // Partial GPU offload is resolved here, once, before the preflight — the
+        // same call the sequential carrier makes, so both routes place
+        // identically. `Full`/`Full` (both knobs unset) yields the all-device
+        // placement and skips the capacity check entirely, keeping a no-knob load
+        // byte-identical to the pre-offload loader.
+        let layer_bytes = qwen35::load::qwen35_layer_bytes(&hfq, &config);
+        let placement = Self::resolve_slot_offload(
+            &layer_bytes,
+            &config,
+            cfg,
+            &gpu,
+            vram_free as u64,
+            kv_bytes,
+        )?;
+
+        // Charge only what actually lands on the device. With partial offload the
+        // spilled weights live in host RAM (`hipHostMalloc`, which costs the
+        // device heap nothing), so charging the whole file here would make
+        // offload unable to buy the KV capacity it exists to buy: the gate would
+        // refuse the very context the freed VRAM affords. Summed from the same
+        // per-tensor census the placement was resolved against, so the charge and
+        // the placement cannot disagree — and this replaces the old
+        // `tensor_layer_index` prefix walk, which knew only about whole layers.
+        let resident_weight_bytes = layer_bytes.device_bytes(&placement);
+        let planned = resident_weight_bytes + kv_bytes + 768 * 1024 * 1024;
+
         preflight_alloc(planned, vram_free as u64, "SlotEngine")
             .map_err(|e| format!("preflight refused: {e}"))?;
         // Discrete GPUs: keep model pages in page cache (fadvise-per-tensor
@@ -868,12 +937,13 @@ impl Rig {
                 .map(|v| v != "0")
                 .unwrap_or_else(|| gpu.is_uma()),
         );
-        let weights: Qwen35Weights = {
+        let (weights, pinned_host_bytes): (Qwen35Weights, u64) = {
             let mut src = qwen35::HfqSource::new(&mut hfq, &config);
-            let layout = qwen35::Layout::single(config.n_layers);
-            qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &layout)
-        }
-        .map_err(|e| format!("load weights: {e}"))?;
+            let layout = qwen35::Layout::single(config.n_layers).with_placement(placement.clone());
+            let weights = qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &layout)
+                .map_err(|e| format!("load weights: {e}"))?;
+            (weights, layer_bytes.host_bytes(&placement))
+        };
 
         // ── Vision tower loading ──────────────────────────────────────────
         // When `vl_path` is set, vision weights load from the standalone .vl
@@ -1382,8 +1452,13 @@ impl Rig {
 
         let mut adm = AdmissionController::new(
             ModelFootprint {
+                // `weights_bytes` is the loader's *device* number, so the VRAM
+                // charge cannot over-admit against what was really placed, and the
+                // unreclaimable `hipHostMalloc` bytes are charged to the host tier
+                // that exists for them.
                 weights_bytes: resident_weight_bytes,
                 kv_bytes_per_token: (n_fa_layers * (per_pos_bytes + per_pos_v_bytes)) as u64,
+                pinned_host_bytes,
             },
             vram_total as u64,
         );
@@ -1770,7 +1845,6 @@ impl Rig {
             None => Ok(()),
         }
     }
-
 }
 
 impl ModelRig {
@@ -1864,128 +1938,127 @@ impl ModelRig {
         image_pad_id: u32,
         mut grammar: Option<&mut GrammarConstraint>,
     ) -> Result<u32, String> {
-    let mut vl = work
-        .vl_prefill
-        .take()
-        .ok_or_else(|| "vl_forward_remaining: slot has no VL state".to_string())?;
-    let first_step = vl.embeddings.is_empty();
-    if first_step {
-        let weights = self
-            .vision_weights
-            .as_ref()
-            .ok_or_else(|| "VL request but model has no vision encoder".to_string())?;
-        let config = self
-            .vision_config
-            .as_ref()
-            .ok_or_else(|| "VL request but model has no vision config".to_string())?;
-        let emb = hipfire_arch_qwen35_vl::qwen35_vl::vision_forward(
-            &mut gpu,
-            weights,
-            config,
-            &vl.patches,
-            vl.grid_h,
-            vl.grid_w,
-        )
-        .map_err(|e| format!("vision_forward: {e}"))?;
-        vl.embeddings = emb;
-        vl.dim = self.config.dim;
-        vl.patches.clear();
-        hipfire_runtime::llama::reset_cpu_sampler_rng(sample_params[slot.0].seed);
-    }
-
-    let prompt_tokens = std::mem::take(&mut work.remaining_prompt);
-    let mut pos = work.next_pos;
-    let mut kv_cache = self.slot_kv_view(pool, slot);
-    let mrope_ctx = qwen35::MropeCtx::new(
-        &self.config,
-        vl.base,
-        vl.mrope_positions.clone(),
-        vl.rope_delta,
-    );
-    let mut visual_idx = vl.visual_idx;
-    for &token in &prompt_tokens {
-        if token == image_pad_id && visual_idx < vl.n_visual_tokens {
-            let dim = vl.dim;
-            let start = visual_idx * dim;
-            let emb = vl
-                .embeddings
-                .get(start..start + dim)
-                .ok_or_else(|| "VL embedding slice out of range".to_string())?;
-            qwen35::forward_scratch_embed_mrope(
+        let mut vl = work
+            .vl_prefill
+            .take()
+            .ok_or_else(|| "vl_forward_remaining: slot has no VL state".to_string())?;
+        let first_step = vl.embeddings.is_empty();
+        if first_step {
+            let weights = self
+                .vision_weights
+                .as_ref()
+                .ok_or_else(|| "VL request but model has no vision encoder".to_string())?;
+            let config = self
+                .vision_config
+                .as_ref()
+                .ok_or_else(|| "VL request but model has no vision config".to_string())?;
+            let emb = hipfire_arch_qwen35_vl::qwen35_vl::vision_forward(
                 &mut gpu,
-                &self.weights,
-                &self.config,
-                emb,
-                pos,
-                &mut kv_cache,
-                &mut self.dn_states[slot.0],
-                &self.scratch,
-                Some(&mrope_ctx),
+                weights,
+                config,
+                &vl.patches,
+                vl.grid_h,
+                vl.grid_w,
             )
-            .map_err(|e| format!("VL prefill embed: {e}"))?;
-            visual_idx += 1;
-        } else {
-            qwen35::forward_scratch_mrope(
-                &mut gpu,
-                &self.weights,
-                &self.config,
-                token,
-                pos,
-                &mut kv_cache,
-                &mut self.dn_states[slot.0],
-                &self.scratch,
-                Some(&mrope_ctx),
-            )
-            .map_err(|e| format!("VL forward: {e}"))?;
+            .map_err(|e| format!("vision_forward: {e}"))?;
+            vl.embeddings = emb;
+            vl.dim = self.config.dim;
+            vl.patches.clear();
+            hipfire_runtime::llama::reset_cpu_sampler_rng(sample_params[slot.0].seed);
         }
-        pos += 1;
-    }
-    vl.visual_idx = visual_idx;
-    work.next_pos = pos;
-    pool
-        .set_seq_len(slot, pos)
-        .map_err(|e| format!("VL set_seq_len: {e}"))?;
-    work.vl_prefill = Some(vl);
 
-    let mut logits = gpu
-        .download_f32(&self.scratch.logits)
-        .map_err(|e| format!("VL download logits: {e}"))?;
-    // Hard grammar mask BEFORE the host sampler (spec §7.2 G2 — the same
-    // contract the batched path enforces on logits_out). This sequential
-    // path used to sample unconstrained: a schema-violating first token
-    // could leave the matcher accepting and sail through as a success.
-    if let Some(constraint) = grammar.as_deref_mut() {
-        let mask = constraint
-            .build_mask(&tokenizer, self.config.vocab_size)
-            .map_err(|e| format!("VL grammar mask: {e}"))?;
-        for (i, &allowed) in mask.iter().enumerate() {
-            if !allowed && i < logits.len() {
-                logits[i] = f32::NEG_INFINITY;
+        let prompt_tokens = std::mem::take(&mut work.remaining_prompt);
+        let mut pos = work.next_pos;
+        let mut kv_cache = self.slot_kv_view(pool, slot);
+        let mrope_ctx = qwen35::MropeCtx::new(
+            &self.config,
+            vl.base,
+            vl.mrope_positions.clone(),
+            vl.rope_delta,
+        );
+        let mut visual_idx = vl.visual_idx;
+        for &token in &prompt_tokens {
+            if token == image_pad_id && visual_idx < vl.n_visual_tokens {
+                let dim = vl.dim;
+                let start = visual_idx * dim;
+                let emb = vl
+                    .embeddings
+                    .get(start..start + dim)
+                    .ok_or_else(|| "VL embedding slice out of range".to_string())?;
+                qwen35::forward_scratch_embed_mrope(
+                    &mut gpu,
+                    &self.weights,
+                    &self.config,
+                    emb,
+                    pos,
+                    &mut kv_cache,
+                    &mut self.dn_states[slot.0],
+                    &self.scratch,
+                    Some(&mrope_ctx),
+                )
+                .map_err(|e| format!("VL prefill embed: {e}"))?;
+                visual_idx += 1;
+            } else {
+                qwen35::forward_scratch_mrope(
+                    &mut gpu,
+                    &self.weights,
+                    &self.config,
+                    token,
+                    pos,
+                    &mut kv_cache,
+                    &mut self.dn_states[slot.0],
+                    &self.scratch,
+                    Some(&mrope_ctx),
+                )
+                .map_err(|e| format!("VL forward: {e}"))?;
+            }
+            pos += 1;
+        }
+        vl.visual_idx = visual_idx;
+        work.next_pos = pos;
+        pool.set_seq_len(slot, pos)
+            .map_err(|e| format!("VL set_seq_len: {e}"))?;
+        work.vl_prefill = Some(vl);
+
+        let mut logits = gpu
+            .download_f32(&self.scratch.logits)
+            .map_err(|e| format!("VL download logits: {e}"))?;
+        // Hard grammar mask BEFORE the host sampler (spec §7.2 G2 — the same
+        // contract the batched path enforces on logits_out). This sequential
+        // path used to sample unconstrained: a schema-violating first token
+        // could leave the matcher accepting and sail through as a success.
+        if let Some(constraint) = grammar.as_deref_mut() {
+            let mask = constraint
+                .build_mask(&tokenizer, self.config.vocab_size)
+                .map_err(|e| format!("VL grammar mask: {e}"))?;
+            for (i, &allowed) in mask.iter().enumerate() {
+                if !allowed && i < logits.len() {
+                    logits[i] = f32::NEG_INFINITY;
+                }
             }
         }
+        let sp = &sample_params[slot.0];
+        let cfg = hipfire_runtime::sampler::SamplerConfig {
+            temperature: sp.temperature,
+            top_p: sp.top_p,
+            // Apply the REQUESTED penalties/min_p: this sequential path used to
+            // hardcode neutral values, silently downgrading a penalized VL
+            // request's semantics (spec §6 X2: "An optimization bypass is
+            // allowed, a silent semantic downgrade is not").
+            repeat_penalty: sp.repeat_penalty,
+            repeat_window: sp.repeat_window.max(0) as usize,
+            presence_penalty: sp.presence_penalty,
+            frequency_penalty: sp.frequency_penalty,
+            blocked_tokens: Vec::new(),
+            top_k: if sp.top_k > 0 {
+                Some(sp.top_k as u32)
+            } else {
+                None
+            },
+            min_p: (sp.min_p > 0.0).then_some(sp.min_p),
+        };
+        Ok(hipfire_runtime::sampler::sample_cpu(&mut logits, &[], &cfg))
     }
-    let sp = &sample_params[slot.0];
-    let cfg = hipfire_runtime::sampler::SamplerConfig {
-        temperature: sp.temperature,
-        top_p: sp.top_p,
-        // Apply the REQUESTED penalties/min_p: this sequential path used to
-        // hardcode neutral values, silently downgrading a penalized VL
-        // request's semantics (spec §6 X2: "An optimization bypass is
-        // allowed, a silent semantic downgrade is not").
-        repeat_penalty: sp.repeat_penalty,
-        repeat_window: sp.repeat_window.max(0) as usize,
-        presence_penalty: sp.presence_penalty,
-        frequency_penalty: sp.frequency_penalty,
-        blocked_tokens: Vec::new(),
-        top_k: if sp.top_k > 0 {
-            Some(sp.top_k as u32)
-        } else {
-            None
-        },
-        min_p: (sp.min_p > 0.0).then_some(sp.min_p),
-    };
-    Ok(hipfire_runtime::sampler::sample_cpu(&mut logits, &[], &cfg))
-}
 }
 
 /// Advance slot `s`'s batched-VL vision-tower encode by ONE layer, starting
@@ -2023,69 +2096,69 @@ impl ModelRig {
         let config = &self.config;
         let job = &mut self.vl_tower_jobs[s];
         if job.is_none() {
+            let weights = vision_weights
+                .as_ref()
+                .ok_or("VL request but model has no vision encoder")?;
+            let vconfig = vision_config
+                .as_ref()
+                .ok_or("VL request but model has no vision config")?;
+            let started = hipfire_arch_qwen35_vl::qwen35_vl::VisionTowerJob::new(
+                gpu,
+                weights,
+                vconfig,
+                &vl.patches,
+                vl.grid_h,
+                vl.grid_w,
+            )
+            .map_err(|e| format!("vision_forward: {e}"))?;
+            *job = Some(started);
+            // Patches now live on-device for the rest of the encode; free the
+            // host copy (~48 MB at the 2 MP budget).
+            vl.patches = Vec::new();
+        }
         let weights = vision_weights
             .as_ref()
             .ok_or("VL request but model has no vision encoder")?;
         let vconfig = vision_config
             .as_ref()
             .ok_or("VL request but model has no vision config")?;
-        let started = hipfire_arch_qwen35_vl::qwen35_vl::VisionTowerJob::new(
-            gpu,
-            weights,
-            vconfig,
-            &vl.patches,
-            vl.grid_h,
-            vl.grid_w,
-        )
-        .map_err(|e| format!("vision_forward: {e}"))?;
-        *job = Some(started);
-        // Patches now live on-device for the rest of the encode; free the
-        // host copy (~48 MB at the 2 MP budget).
-        vl.patches = Vec::new();
-    }
-    let weights = vision_weights
-        .as_ref()
-        .ok_or("VL request but model has no vision encoder")?;
-    let vconfig = vision_config
-        .as_ref()
-        .ok_or("VL request but model has no vision config")?;
-    let done = match job
-        .as_mut()
-        .expect("vision tower job present")
-        .step_layer(gpu, weights, vconfig)
-    {
-        Ok(done) => done,
-        Err(e) => {
-            let reason = format!("vision_forward: {e}");
-            if let Some(j) = job.take() {
-                let _ = j.free(gpu);
+        let done = match job
+            .as_mut()
+            .expect("vision tower job present")
+            .step_layer(gpu, weights, vconfig)
+        {
+            Ok(done) => done,
+            Err(e) => {
+                let reason = format!("vision_forward: {e}");
+                if let Some(j) = job.take() {
+                    let _ = j.free(gpu);
+                }
+                return Err(reason);
             }
-            return Err(reason);
+        };
+        if !done {
+            return Ok(false);
         }
-    };
-    if !done {
-        return Ok(false);
-    }
-    let j = job.take().expect("vision tower job present");
-    // `finish` consumes the job and frees its own device buffers on every
-    // error path (the tower's working set is neither pooled nor released by
-    // Drop, so a failed merger epilogue must not leak it).
-    let emb = j
-        .finish(gpu, weights, vconfig)
-        .map_err(|e| format!("vision_forward: {e}"))?;
-    let dev = gpu
-        .zeros(&[emb.len()], DType::F32)
-        .map_err(|e| format!("vl ext alloc: {e}"))?;
-    let bytes: &[u8] =
-        unsafe { std::slice::from_raw_parts(emb.as_ptr() as *const u8, emb.len() * 4) };
-    if let Err(e) = gpu.hip.memcpy_htod(&dev.buf, bytes) {
-        let _ = gpu.free_tensor(dev);
-        return Err(format!("vl ext upload: {e}"));
-    }
-    *vl_ext_devs.get_mut(s).expect("vl_ext_devs slot") = Some(dev);
-    vl.embeddings = emb;
-    vl.dim = config.dim;
-    Ok(true)
+        let j = job.take().expect("vision tower job present");
+        // `finish` consumes the job and frees its own device buffers on every
+        // error path (the tower's working set is neither pooled nor released by
+        // Drop, so a failed merger epilogue must not leak it).
+        let emb = j
+            .finish(gpu, weights, vconfig)
+            .map_err(|e| format!("vision_forward: {e}"))?;
+        let dev = gpu
+            .zeros(&[emb.len()], DType::F32)
+            .map_err(|e| format!("vl ext alloc: {e}"))?;
+        let bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(emb.as_ptr() as *const u8, emb.len() * 4) };
+        if let Err(e) = gpu.hip.memcpy_htod(&dev.buf, bytes) {
+            let _ = gpu.free_tensor(dev);
+            return Err(format!("vl ext upload: {e}"));
+        }
+        *vl_ext_devs.get_mut(s).expect("vl_ext_devs slot") = Some(dev);
+        vl.embeddings = emb;
+        vl.dim = config.dim;
+        Ok(true)
     }
 }
 
@@ -2208,8 +2281,7 @@ impl ModelRig {
         // Seed hidden for the first draft cycle: the (normed) trunk hidden of
         // the chunk's last token — same convention as the verify-path capture.
         let hidden_outcome = mtp_outcome.and_then(|()| {
-            gpu
-                .hip
+            gpu.hip
                 .memcpy_dtod_at(
                     &state.prev_hidden.buf,
                     0,
@@ -2243,79 +2315,76 @@ impl ModelRig {
         slot: SlotId,
         work: &mut PendingWork,
     ) -> Result<crate::mtp_spec::MtpDraftOutput, String> {
-    let head = self
-        .mtp_head
-        .as_ref()
-        .ok_or_else(|| "mtp_draft_step: MTP head not loaded".to_string())?;
+        let head = self
+            .mtp_head
+            .as_ref()
+            .ok_or_else(|| "mtp_draft_step: MTP head not loaded".to_string())?;
 
-    if self.mtp_states[slot.0].is_none() {
-        let state = crate::mtp_spec::MtpSpecState::new_for_components(
-            &mut gpu,
-            &self.config,
-            &self.dn_states[slot.0],
-            head,
-            self.mtp_k,
-            crate::mtp_head::MtpKvMode::Q8,
-        )
-        .map_err(|e| format!("mtp state alloc: {e}"))?;
+        if self.mtp_states[slot.0].is_none() {
+            let state = crate::mtp_spec::MtpSpecState::new_for_components(
+                &mut gpu,
+                &self.config,
+                &self.dn_states[slot.0],
+                head,
+                self.mtp_k,
+                crate::mtp_head::MtpKvMode::Q8,
+            )
+            .map_err(|e| format!("mtp state alloc: {e}"))?;
+            self.mtp_states[slot.0] = Some(state);
+        }
+        let mut state = self.mtp_states[slot.0]
+            .take()
+            .expect("just ensured it exists");
+
+        if let Some(cvs) = head.weights.compressed_vocab_size {
+            if let Err(e) = state.ensure_compressed_lm_logits(&mut gpu, cvs) {
+                self.mtp_states[slot.0] = Some(state);
+                return Err(format!("ensure compressed logits: {e}"));
+            }
+            // Head-side compressed buffer for the draft phase (see the alloc
+            // comment in `mtp_head_prefill_chunk`).
+            if let Err(e) = state.mtp_scratch.ensure_compressed_logits(&mut gpu, cvs) {
+                self.mtp_states[slot.0] = Some(state);
+                return Err(format!("ensure head compressed logits: {e}"));
+            }
+        }
+
+        let prompt_tokens = std::mem::take(&mut work.remaining_prompt);
+        let pos = work.next_pos;
+
+        let outcome: Result<crate::mtp_spec::MtpDraftOutput, String> = (|| {
+            if prompt_tokens.is_empty() {
+                return Err("mtp_draft_step: no seed token".to_string());
+            }
+            let seed = *prompt_tokens.last().unwrap();
+
+            // Save DN snapshot for rollback during verify phase.
+            state
+                .trunk_snap
+                .save_from(&mut self.dn_states[slot.0], &mut gpu)
+                .map_err(|e| format!("mtp dn snapshot: {e}"))?;
+
+            let draft_outcome = crate::mtp_spec::mtp_draft_phase_inner(
+                &mut gpu,
+                &self.weights,
+                &self.config,
+                head,
+                &mut state,
+                pos,
+                seed,
+                self.mtp_k,
+                /* skip_proposal_graph */ true,
+            )
+            .map_err(|e| format!("mtp draft: {e}"));
+            if crate::mtp_spec::mtp_trace_enabled() {
+                eprintln!("[mtp-trace] draft done pos={pos} seed={seed}");
+            }
+            draft_outcome
+        })();
+
         self.mtp_states[slot.0] = Some(state);
+        outcome
     }
-    let mut state = self.mtp_states[slot.0]
-        .take()
-        .expect("just ensured it exists");
-
-    if let Some(cvs) = head.weights.compressed_vocab_size {
-        if let Err(e) = state.ensure_compressed_lm_logits(&mut gpu, cvs) {
-            self.mtp_states[slot.0] = Some(state);
-            return Err(format!("ensure compressed logits: {e}"));
-        }
-        // Head-side compressed buffer for the draft phase (see the alloc
-        // comment in `mtp_head_prefill_chunk`).
-        if let Err(e) = state
-            .mtp_scratch
-            .ensure_compressed_logits(&mut gpu, cvs)
-        {
-            self.mtp_states[slot.0] = Some(state);
-            return Err(format!("ensure head compressed logits: {e}"));
-        }
-    }
-
-    let prompt_tokens = std::mem::take(&mut work.remaining_prompt);
-    let pos = work.next_pos;
-
-    let outcome: Result<crate::mtp_spec::MtpDraftOutput, String> = (|| {
-        if prompt_tokens.is_empty() {
-            return Err("mtp_draft_step: no seed token".to_string());
-        }
-        let seed = *prompt_tokens.last().unwrap();
-
-        // Save DN snapshot for rollback during verify phase.
-        state
-            .trunk_snap
-            .save_from(&mut self.dn_states[slot.0], &mut gpu)
-            .map_err(|e| format!("mtp dn snapshot: {e}"))?;
-
-        let draft_outcome = crate::mtp_spec::mtp_draft_phase_inner(
-            &mut gpu,
-            &self.weights,
-            &self.config,
-            head,
-            &mut state,
-            pos,
-            seed,
-            self.mtp_k,
-            /* skip_proposal_graph */ true,
-        )
-        .map_err(|e| format!("mtp draft: {e}"));
-        if crate::mtp_spec::mtp_trace_enabled() {
-            eprintln!("[mtp-trace] draft done pos={pos} seed={seed}");
-        }
-        draft_outcome
-    })();
-
-    self.mtp_states[slot.0] = Some(state);
-    outcome
-}
 }
 
 /// MTP verify/accept phase: after the batched forward, run the trunk lm_head
@@ -2351,55 +2420,54 @@ impl ModelRig {
         max_tokens: usize,
         sess_len: usize,
     ) -> Result<Vec<u32>, String> {
-    let mut state = self.mtp_states[slot.0]
-        .take()
-        .expect("mtp state must exist from draft phase");
+        let mut state = self.mtp_states[slot.0]
+            .take()
+            .expect("mtp state must exist from draft phase");
 
-    let pos = work.next_pos;
+        let pos = work.next_pos;
 
-    // How many tokens of this burst the commit path can keep before a
-    // terminator fires: the request's remaining max_tokens budget and its
-    // remaining context room (`commit_sampled_token` stops decode when
-    // `sess.tokens.len() + 1 >= cap`, so room is `cap - len`).
-    let commit_budget = max_tokens
-        .saturating_sub(produced)
-        .min(cap_tokens.saturating_sub(sess_len))
-        .max(1);
+        // How many tokens of this burst the commit path can keep before a
+        // terminator fires: the request's remaining max_tokens budget and its
+        // remaining context room (`commit_sampled_token` stops decode when
+        // `sess.tokens.len() + 1 >= cap`, so room is `cap - len`).
+        let commit_budget = max_tokens
+            .saturating_sub(produced)
+            .min(cap_tokens.saturating_sub(sess_len))
+            .max(1);
 
-    let outcome: Result<Vec<u32>, String> = (|| {
-        let result = crate::mtp_spec::mtp_batched_verify_accept_from_batch(
-            &mut gpu,
-            &self.weights,
-            &self.config,
-            &mut self.dn_states[slot.0],
-            &self.pbs,
-            &mut state,
-            &draft,
-            hidden_row_offset,
-            self.spec_verify_tape
-                .as_ref()
-                .expect("MTP drafts require the verify tape"),
-            self.spec_rows,
-            slot.0,
-            tokenizer.eos_id,
-            tokenizer.eot_id,
-            commit_budget,
-        )
-        .map_err(|e| format!("mtp verify: {e}"))?;
+        let outcome: Result<Vec<u32>, String> = (|| {
+            let result = crate::mtp_spec::mtp_batched_verify_accept_from_batch(
+                &mut gpu,
+                &self.weights,
+                &self.config,
+                &mut self.dn_states[slot.0],
+                &self.pbs,
+                &mut state,
+                &draft,
+                hidden_row_offset,
+                self.spec_verify_tape
+                    .as_ref()
+                    .expect("MTP drafts require the verify tape"),
+                self.spec_rows,
+                slot.0,
+                tokenizer.eos_id,
+                tokenizer.eot_id,
+                commit_budget,
+            )
+            .map_err(|e| format!("mtp verify: {e}"))?;
 
-        // Update position and seq_len. Stale KV rows past the new frontier
-        // (rejected drafts) are overwritten before any later forward reads
-        // them: every subsequent write is position-ordered.
-        let new_pos = pos + result.advance;
-        work.next_pos = new_pos;
-        pool
-            .set_seq_len(slot, new_pos)
-            .map_err(|e| format!("mtp set_seq_len: {e}"))?;
+            // Update position and seq_len. Stale KV rows past the new frontier
+            // (rejected drafts) are overwritten before any later forward reads
+            // them: every subsequent write is position-ordered.
+            let new_pos = pos + result.advance;
+            work.next_pos = new_pos;
+            pool.set_seq_len(slot, new_pos)
+                .map_err(|e| format!("mtp set_seq_len: {e}"))?;
 
-        Ok(result.committed)
-    })();
-    self.mtp_states[slot.0] = Some(state);
-    outcome
+            Ok(result.committed)
+        })();
+        self.mtp_states[slot.0] = Some(state);
+        outcome
     }
 }
 
@@ -2448,7 +2516,6 @@ impl ModelRig {
         outcome
     }
 }
-
 
 /// DFlash2 verify/accept phase: norm the slot's verify rows out of
 /// `pbs.x_batch`, run the trunk lm_head, greedy-accept, repair DN state on
@@ -2551,12 +2618,7 @@ impl ModelRig {
         let st = self.dflash_states[slot.0].as_mut().unwrap();
         let shared = self.dflash.as_ref().unwrap();
         crate::dflash_slot::scatter_staging_rows_to_interleaved(
-            &mut gpu,
-            shared,
-            st,
-            row_off,
-            chunk_pos,
-            m,
+            &mut gpu, shared, st, row_off, chunk_pos, m,
         )
         .map_err(|e| format!("dflash prefill scatter: {e}"))?;
         st.scratch.thlog.append_committed(chunk_pos, m, 0);
@@ -3715,7 +3777,16 @@ fn run_loop(
                 }
                 let pad = image_pad_id.unwrap_or(u32::MAX);
                 let grammar = slots[s].as_mut().and_then(|f| f.grammar.as_mut());
-                match rig.model.vl_forward_remaining(&mut rig.gpu, &mut rig.pool, &rig.tokenizer, &mut rig.sample_params, SlotId(s), &mut work[s], pad, grammar) {
+                match rig.model.vl_forward_remaining(
+                    &mut rig.gpu,
+                    &mut rig.pool,
+                    &rig.tokenizer,
+                    &mut rig.sample_params,
+                    SlotId(s),
+                    &mut work[s],
+                    pad,
+                    grammar,
+                ) {
                     Ok(tok) => commit_sampled_token(&mut rig, &mut slots, &mut work, s, tok),
                     Err(reason) => {
                         if let Some(mut f) = slots[s].take() {
@@ -3827,7 +3898,8 @@ fn run_loop(
                         }
                         continue;
                     }
-                    if !spec_verify_fits_cap(work[s].next_pos, rig.model.spec_rows, rig.cap_tokens) {
+                    if !spec_verify_fits_cap(work[s].next_pos, rig.model.spec_rows, rig.cap_tokens)
+                    {
                         // Context-cap guard: the batched verify writes spec_rows
                         // rows at next_pos..next_pos+spec_rows-1; a frontier
                         // past the cap fails the forward's provision CLOSED,
@@ -3847,14 +3919,14 @@ fn run_loop(
                         // can restore it.
                         let seed = work[s].remaining_prompt.last().copied();
                         let outcome = match work[s].spec {
-                            SpecKind::Mtp => {
-                                rig.model.mtp_draft_step(&mut rig.gpu, SlotId(s), &mut work[s])
-                                    .map(SpecDraftRows::Mtp)
-                            }
-                            SpecKind::Dflash => {
-                                rig.model.dflash_draft_step(&mut rig.gpu, SlotId(s), &mut work[s])
-                                    .map(SpecDraftRows::Dflash)
-                            }
+                            SpecKind::Mtp => rig
+                                .model
+                                .mtp_draft_step(&mut rig.gpu, SlotId(s), &mut work[s])
+                                .map(SpecDraftRows::Mtp),
+                            SpecKind::Dflash => rig
+                                .model
+                                .dflash_draft_step(&mut rig.gpu, SlotId(s), &mut work[s])
+                                .map(SpecDraftRows::Dflash),
                             SpecKind::None => {
                                 unreachable!("spec.active() gate above")
                             }
@@ -5848,7 +5920,10 @@ fn admit(
                     .len()
                     .saturating_add(req.max_tokens.max(1))
                     .min(rig.cap_tokens);
-                if let Err(e) = rig.sessions.resize_grant(&mut rig.adm, existing, turn_grant) {
+                if let Err(e) = rig
+                    .sessions
+                    .resize_grant(&mut rig.adm, existing, turn_grant)
+                {
                     // A real budget shortfall is a capacity signal (429
                     // Overload — retryable), not an internal fault (500).
                     // UnknownSession/PoolFull are engine inconsistencies and

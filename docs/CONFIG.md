@@ -997,6 +997,7 @@ Deprecated since 0.4.0, removal in 0.5.0:
 | `memory.cask.handoff_tokens` | `cask_handoff_tokens` |  | deprecated |
 | `memory.cask.sidecar` | `cask_sidecar` | `HIPFIRE_CASK_SIDECAR` | deprecated |
 | `memory.gpu_layer_budget` | `gpu_layer_budget` | `HIPFIRE_GPU_LAYER_BUDGET` | stable |
+| `memory.moe_expert_budget` | `moe_expert_budget` | `HIPFIRE_MOE_EXPERT_BUDGET` | stable |
 | `memory.kv_adaptive` | `kv_adaptive` | `HIPFIRE_KV_ADAPTIVE` | stable |
 | `memory.kv_backend` | `kv_backend` |  | stable |
 | `memory.kv_cache` | `kv_cache` | `HIPFIRE_KV_MODE` | stable |
