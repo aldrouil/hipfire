@@ -40,6 +40,49 @@ pub struct Qwen35Bundle {
     /// `ArchModel::free_gpu`. Previously lived on `LoadedModel`.
     pub qwen35_decode_batch: Option<Qwen35DecodeBatchState>,
 }
+/// Device bytes a draft will take when it loads beside a spilled trunk.
+///
+/// Drafts stay on the GPU — they are not part of the trunk spill — so their
+/// bytes come out of the capacity the placement may spend. Estimated the way the
+/// loader's own admission estimates a weight file (file bytes + 1/8 for the
+/// expanded/AWQ tensors + 512 MiB of scratch), which is an over-estimate for a
+/// head that loads only its own layers. 0 when no draft is in play.
+fn draft_device_reserve_bytes(hfq: &HfqFile, ctx: &LoadCtx) -> u64 {
+    let mut bytes = 0u64;
+    let mut add = |path: Option<&std::path::Path>| {
+        let Some(path) = path else { return };
+        let Ok(meta) = std::fs::metadata(path) else {
+            return;
+        };
+        let file = meta.len();
+        bytes = bytes.saturating_add(file + file / 8 + (512 << 20));
+    };
+    // The MTP head, unless speculation was explicitly turned off.
+    if ctx.spec.mtp != Some(false) {
+        match ctx.mtp_path.clone() {
+            Some(path) => add(Some(&path)),
+            None => {
+                let sidecar = trunk_mtp_sidecar(hfq);
+                add(sidecar.as_deref());
+            }
+        }
+    }
+    // DFlash draft. (DSpark is a DeepSeek4 module and never attaches here.)
+    if let Some(draft) = ctx.draft_path {
+        add(Some(std::path::Path::new(draft)));
+    }
+    bytes
+}
+
+/// The default MTP sidecar the loader resolves when the CLI named none:
+/// `<trunk>.mtp`.
+fn trunk_mtp_sidecar(hfq: &HfqFile) -> Option<std::path::PathBuf> {
+    let mut path = hfq.path().to_path_buf().into_os_string();
+    path.push(".mtp");
+    let path = std::path::PathBuf::from(path);
+    path.is_file().then_some(path)
+}
+
 /// Resolve partial GPU offload before the first allocation.
 ///
 /// Returns `None` when neither knob is set, which is the *only* case that must
@@ -102,10 +145,17 @@ fn resolve_partial_offload(
         crate::qwen35::prefill::minimum_prefill_reservation_bytes(config, &ctx.gpu.arch);
     let pbs = pbs_reservation.unwrap_or(0) as u64;
     let slack = 128u64 << 20;
+    // A draft stays on the GPU: MTP (bundled trailer or `.mtp` sidecar), the
+    // DFlash draft and the DSpark module are all device-resident and are *not*
+    // part of the trunk spill, so they must be reserved out of the capacity the
+    // placement spends — otherwise `auto` would over-place the trunk and the
+    // head's own load would OOM after the weights landed.
+    let draft_reservation = draft_device_reserve_bytes(hfq, ctx);
     let reserved = kv
         .bytes
         .checked_add(pbs)
         .and_then(|bytes| bytes.checked_add(slack))
+        .and_then(|bytes| bytes.checked_add(draft_reservation))
         .ok_or("Qwen offload reservation overflow")?;
     let capacity = offload::Capacity {
         weight_bytes: free_vram.saturating_sub(reserved),
@@ -121,7 +171,7 @@ fn resolve_partial_offload(
     eprintln!("  {line}");
     let host_bytes = layer_bytes.host_expert_bytes(&placement);
     eprintln!(
-        "  kv reserved: {} tokens x {stride} B = {} MiB; pbs floor {}; slack {} MiB; \
+        "  kv reserved: {} tokens x {stride} B = {} MiB; pbs floor {}; draft {} MiB; slack {} MiB; \
          weight budget {} MiB of {} MiB free",
         kv.rows,
         kv.bytes / (1 << 20),
@@ -129,6 +179,7 @@ fn resolve_partial_offload(
             Some(bytes) => format!("{} MiB", bytes / (1 << 20)),
             None => "0 MiB (no MoE prefill sizing)".to_string(),
         },
+        draft_reservation / (1 << 20),
         slack / (1 << 20),
         capacity.weight_bytes / (1 << 20),
         free_vram / (1 << 20),
