@@ -77,8 +77,8 @@ pub fn retained_redline_default(
 }
 
 fn cpu_offload_configured() -> bool {
-    use hipfire_config::memory::{gpu_layer_budget, offload_exec, GpuLayerBudget, OffloadExec};
-    offload_exec() == OffloadExec::Cpu && matches!(gpu_layer_budget(), GpuLayerBudget::Layers(_))
+    use hipfire_config::memory::{gpu_layer_budget, offload_exec, OffloadBudget, OffloadExec};
+    offload_exec() == OffloadExec::Cpu && matches!(gpu_layer_budget(), OffloadBudget::Layers(_))
 }
 
 #[derive(Debug, Clone)]
