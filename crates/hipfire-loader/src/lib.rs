@@ -2226,25 +2226,20 @@ fn finish_qwen35_load(
     } else {
         None
     };
-    // Partial GPU offload composes with speculative decode only in the PCIe arm,
-    // and the MTP head's own expert loader allocates device-side unconditionally,
-    // so a spill cannot cover it. An explicitly requested mechanism is a load
-    // error; an unrequested MTP is dropped with one line.
-    let offload_spill = crate::admission::partial_offload_requested();
-    crate::admission::qwen35_spill_spec_refusal(ctx.spec, offload_spill)?;
-    if offload_spill && matches!(arch_id, 5 | 6) && ctx.spec.mtp != Some(false) {
-        eprintln!("qwen35 MTP: off with host-mapped experts; opt in with --spec mtp");
-    }
     // ── qwen35 MTP head (single resolver: bundled .mq4-mtp trailer then .mtp sidecar) ──
     // Precedence: DSpark > DFlash > MTP > n-gram. Gate: only arch 5/6, no adaptive/eviction,
     // and typed mtp != off. Bundled first, then the sidecar the CLI resolved
     // (`ctx.mtp_path`), else `<trunk>.mtp`; physical_cap is the KV window. A head
     // whose hidden size or vocab differs from the trunk is refused before upload.
     // On missing/refused/failed: error when forced on (mtp=on), auto logs/falls back.
+    //
+    // A partial-offload spill does NOT disable this: the head is device-resident,
+    // so it stays on the GPU beside a spilled trunk. Its bytes are reserved out of
+    // the placement's capacity instead (see the carrier), so a spill cannot
+    // over-place the trunk and then fail the head's own load.
     let mtp: Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead> = if adaptive_blocks_generic_spec
         || eviction.is_some()
         || !matches!(arch_id, 5 | 6)
-        || offload_spill
         || ctx.spec.mtp == Some(false)
         || dflash.is_some()
         || dspark_speculator.is_some()

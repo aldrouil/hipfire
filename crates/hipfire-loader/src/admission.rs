@@ -196,14 +196,6 @@ pub(crate) fn qwen4_mtp_with_host_mapped_experts(
     host_mapped_experts == 0 || spec.mtp == Some(true) || gpu_arch == "gfx1201"
 }
 
-/// True when either partial-offload budget is configured. The loader asks this
-/// before it resolves a placement, so it is a *request*, not a resolved spill.
-pub(crate) fn partial_offload_requested() -> bool {
-    use hipfire_config::memory::{gpu_layer_budget, moe_expert_budget, OffloadBudget};
-    let full = OffloadBudget::Full;
-    gpu_layer_budget() != full || moe_expert_budget() != full
-}
-
 /// Fail-closed list for partial GPU offload, raised where the arch is dispatched.
 ///
 /// An arch that never reaches the placement resolver must still be refused rather
@@ -280,39 +272,6 @@ pub(crate) fn partial_offload_refusal(
             "load refused: partial GPU offload ({keys}) cannot be combined with a REAP keep-map — \
              the pruned expert load has no host-placement path. Unset both keys for this model"
         ));
-    }
-    Ok(())
-}
-
-/// Refuse a speculation mechanism that a spill cannot support.
-///
-/// Speculative decode composes with a spill only in the PCIe arm, and the MTP
-/// head's own expert loader allocates device-side unconditionally, so a spill
-/// cannot silently cover it. An explicitly requested mechanism is a load error;
-/// MTP that was not requested is dropped with one line, the Qwen4 behaviour.
-pub(crate) fn qwen35_spill_spec_refusal(
-    spec: SpecLoadCfg,
-    spill_active: bool,
-) -> Result<(), String> {
-    if !spill_active {
-        return Ok(());
-    }
-    if spec.mtp == Some(true) {
-        return Err(
-            "load refused: partial GPU offload (memory.gpu_layer_budget / memory.moe_expert_budget) \
-             cannot be combined with an explicitly requested MTP draft \
-             (speculation.mtp / --spec mtp): the MTP head's expert loader allocates device-side \
-             and the spill cannot cover it. Unset the offload keys, or use --spec off"
-                .to_string(),
-        );
-    }
-    if spec.ngram_draft == Some(true) {
-        return Err(
-            "load refused: partial GPU offload (memory.gpu_layer_budget / memory.moe_expert_budget) \
-             cannot be combined with an explicitly requested n-gram draft \
-             (speculation.ngram_draft). Unset the offload keys, or use --spec off"
-                .to_string(),
-        );
     }
     Ok(())
 }
@@ -1440,44 +1399,6 @@ pub fn admit_source_with_options(
 mod tests {
     use super::*;
 
-    /// Speculation only composes with a spill in the PCIe arm, and the MTP head's
-    /// expert loader allocates device-side: an explicit request must be a load
-    /// error naming both keys, while an unrequested mechanism is dropped by the
-    /// caller (no error here). This is the only proof the rule has on this box —
-    /// see the report: no fixture is both packable-MoE and MTP-bearing.
-    #[test]
-    fn spill_spec_refusal_refuses_only_explicit_requests() {
-        let mtp_on = SpecLoadCfg {
-            mtp: Some(true),
-            ..Default::default()
-        };
-        let ngram_on = SpecLoadCfg {
-            ngram_draft: Some(true),
-            ..Default::default()
-        };
-        let mtp_off = SpecLoadCfg {
-            mtp: Some(false),
-            ..Default::default()
-        };
-        let unrequested = SpecLoadCfg::default();
-
-        for spec in [mtp_on, ngram_on] {
-            let message = qwen35_spill_spec_refusal(spec, true)
-                .expect_err("an explicit request under a spill must be refused");
-            assert!(message.contains("memory."), "{message}");
-            assert!(message.contains("load refused"), "{message}");
-        }
-        let mtp_message = qwen35_spill_spec_refusal(mtp_on, true).unwrap_err();
-        assert!(mtp_message.contains("speculation.mtp"), "{mtp_message}");
-
-        for spec in [mtp_off, unrequested] {
-            assert!(qwen35_spill_spec_refusal(spec, true).is_ok());
-        }
-        // No spill at all: nothing is refused, whatever was requested.
-        for spec in [mtp_on, ngram_on, mtp_off, unrequested] {
-            assert!(qwen35_spill_spec_refusal(spec, false).is_ok());
-        }
-    }
     fn admit_source(
         path: &str,
         tp: usize,
