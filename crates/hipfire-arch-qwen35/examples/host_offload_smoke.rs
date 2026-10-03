@@ -8,22 +8,21 @@
 //! changes *where*
 //! the bytes live and nothing else — same bytes, same dtype, same shape, so the
 //! GEMV numerics are unchanged. This example proves that promise on real data
-//! rather than by inspection: it loads the same tensor through both readers and
-//! compares the code blobs bit-for-bit.
+//! rather than by inspection: it loads the same tensor through one reader at both
+//! `MemoryTarget`s and compares the code blobs bit-for-bit.
 //!
-//! It exists because the two readers share one quant-type match behind an
-//! injected uploader, and a partial swap would be invisible until it OOMs or
-//! silently spills to VRAM. One comparison covers every arm.
+//! It exists because one quant-type match sits behind a target parameter, and a
+//! partial swap of that parameter would be invisible until it OOMs or silently
+//! spills to VRAM. One comparison covers every arm.
 //!
 //! Usage:
 //!     cargo run --release -p hipfire-arch-qwen35 --example host_offload_smoke -- MODEL.hfq
 //!
 //! With no argument it defaults to `~/.hipfire/models/qwen3.5-9b.mq4`.
 
-use hipfire_arch_qwen35::qwen35::load::{
-    load_weight_tensor, load_weight_tensor_host, qwen35_tensor_name_candidates,
-};
+use hipfire_arch_qwen35::qwen35::load::{load_weight_tensor, qwen35_tensor_name_candidates};
 use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::weight_backend::MemoryTarget;
 use rdna_compute::Gpu;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -35,7 +34,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("model: {path}");
 
     let mut hfq = HfqFile::open(std::path::Path::new(&path))?;
-    // Keep the mmap alive: both readers take the zero-copy mmap path first.
+    // Keep the mmap alive: the reader takes the zero-copy mmap path first.
     let mut gpu = Gpu::init()?;
 
     // Select from the file's own index rather than hardcoding a name or shape:
@@ -45,7 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // reads the wrong tensor. RAW_CODE_QT lists quant types whose arms upload
     // opaque code blobs (the ones that actually get offloaded).
     const RAW_CODE_QT: &[u8] = &[44, 13, 17, 15, 14, 8, 7, 6];
-    // Own the name so the index borrow ends before the host reader takes `&mut hfq`.
+    // Own the name so the index borrow ends before the reader is called.
     let (name, m, k, qt) = {
         // Prefer a transformer-layer weight: that is what actually gets offloaded.
         // lm_head / embed_tokens are always resident, and lm_head is the largest
@@ -84,14 +83,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         hfq.find_tensor_info(name).map(|i| &i.shape)
     );
 
-    let device = load_weight_tensor(&hfq, &gpu, name, m, k, qwen35_tensor_name_candidates)?;
-    let host = load_weight_tensor_host(
-        &mut hfq,
+    let device = load_weight_tensor(
+        &hfq,
         &mut gpu,
         name,
         m,
         k,
         qwen35_tensor_name_candidates,
+        MemoryTarget::Device,
+    )?;
+    let host = load_weight_tensor(
+        &hfq,
+        &mut gpu,
+        name,
+        m,
+        k,
+        qwen35_tensor_name_candidates,
+        MemoryTarget::HostMapped,
     )?;
 
     assert_eq!(device.gpu_dtype, host.gpu_dtype, "dtype diverged");
@@ -107,8 +115,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Locality is the load-bearing assertion. Byte parity alone would still pass
-    // if `upload_raw_host` silently fell back to the device path, so the example
-    // would report PASS without having offloaded anything.
+    // if `MemoryTarget::HostMapped` silently fell back to the device path, so the
+    // example would report PASS without having offloaded anything.
     assert!(
         gpu.host_located(&host.buf),
         "host reader did not produce a host-located tensor - offload did not happen"
