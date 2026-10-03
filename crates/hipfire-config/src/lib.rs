@@ -6373,6 +6373,7 @@ pub mod memory {
 
         #[test]
         fn gpu_layer_budget_display() {
+            assert_eq!(OffloadBudget::Full.to_string(), "full");
             assert_eq!(OffloadBudget::Auto.to_string(), "auto");
             assert_eq!(OffloadBudget::Layers(5).to_string(), "5");
         }

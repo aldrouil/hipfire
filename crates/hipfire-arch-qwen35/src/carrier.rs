@@ -170,8 +170,15 @@ fn resolve_partial_offload(
         &capacity,
         offload::Orientation::SuffixResident,
     )?;
+    if let Some(refusal) = offload::unverified_host_refusal(&layer_bytes, &placement) {
+        return Err(refusal);
+    }
     eprintln!("  {line}");
-    let host_bytes = layer_bytes.host_expert_bytes(&placement);
+    // Every pinned host byte, not just the routed experts: a whole-layer spill
+    // hosts each layer's own weights too, and those are the largest host consumer
+    // a dense model has. `host_expert_bytes` remains the per-layer expert figure
+    // in the report line.
+    let host_bytes = layer_bytes.host_bytes(&placement);
     eprintln!(
         "  kv reserved: {} tokens x {stride} B = {} MiB; pbs floor {}; draft {} MiB; slack {} MiB; \
          weight budget {} MiB of {} MiB free",
