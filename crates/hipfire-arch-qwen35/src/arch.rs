@@ -76,6 +76,15 @@ impl Architecture for Qwen35 {
         cfg: &Self::Config,
         gpu: &mut Gpu,
     ) -> Result<Self::Weights, String> {
+        Self::load_weights_with_placement(hfq, cfg, gpu, None)
+    }
+
+    fn load_weights_with_placement(
+        hfq: &mut HfqFile,
+        cfg: &Self::Config,
+        gpu: &mut Gpu,
+        placement: Option<&hipfire_runtime::offload::Placement>,
+    ) -> Result<Self::Weights, String> {
         // One line when `memory.offload_exec=cpu`, naming which spilled formats
         // the CPU can actually execute (silent otherwise; see the fn's docs).
         // Before the source takes its mutable borrow of `hfq`.
@@ -83,10 +92,15 @@ impl Architecture for Qwen35 {
         // A retained-replay backend and CPU-executed steps are mutually
         // exclusive: the tape cannot express a step the CPU owns. Refuse the
         // load rather than replay a route with stale activations.
-        hipfire_dispatch::reject_cpu_exec_under_redline(cfg.i_gpu_start, gpu.replay.is_enabled())
+        let host_weights = placement.map_or(0, |p| p.host_layers() + p.host_expert_layers());
+        hipfire_dispatch::reject_cpu_exec_under_redline(host_weights, gpu.replay.is_enabled())
             .map_err(|e| format!("qwen35: {e}"))?;
         let mut source = HfqSource::new(hfq, cfg);
-        let layout = Layout::single(cfg.n_layers);
+        let layout = match placement {
+            // `None` = fully resident, byte-identical to the pre-offload loader.
+            None => Layout::single(cfg.n_layers),
+            Some(placement) => Layout::single(cfg.n_layers).with_placement(placement.clone()),
+        };
         qwen35_load_weights(&mut source, std::slice::from_mut(gpu), &layout)
             .map_err(|e| format!("qwen35: load_weights failed: {e:?}"))
     }

@@ -64,7 +64,7 @@ use hipfire_runtime::llama::{
 };
 use hipfire_runtime::weight_backend::{
     dequant_f32, dequant_norm, dequant_weight_raw, load_awq_scale_for, load_embedding, read_first,
-    HfqBackend, MemoryTarget,
+    HfqBackend, MemoryTarget, WeightResidency,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -312,7 +312,7 @@ fn load_drafter_layer(
         read_proj: load_weight_tensor_pread,
         layer: i,
         // DSpark drafter sidecar is always fully resident — no offload support.
-        host_local: false,
+        residency: WeightResidency::Resident,
     };
     load_layer(&mut b, cfg, q_out_dim, kv_dim, i)
         .map_err(|e| format!("qwen3_dspark layer {i}: {e:?}"))
