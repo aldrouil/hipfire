@@ -307,6 +307,39 @@ pub(crate) struct MoeExpertSourceRecord {
     pub(crate) down: MoeProjectionSource,
 }
 
+/// One-shot trace of the routed-expert arm's inputs, under `HIPFIRE_LOAD_TRACE=1`.
+///
+/// The arm the shared dispatch chooses depends on these values, and the
+/// selection code is not in this crate, so logging them is the only way to see
+/// which arm a given model takes. Fires once per stage per process.
+pub(crate) fn trace_moe_arm(
+    stage: &str,
+    routed_gate_up: DType,
+    routed_down: DType,
+    all_gate_up_mq4: bool,
+    host_mapped_experts: bool,
+    has_tier_tags: bool,
+) {
+    use std::sync::Once;
+    static PREFILL: Once = Once::new();
+    static DECODE: Once = Once::new();
+    if !rdna_compute::load_trace_enabled() {
+        return;
+    }
+    let once = if stage == "prefill" {
+        &PREFILL
+    } else {
+        &DECODE
+    };
+    once.call_once(|| {
+        eprintln!(
+            "[moe-arm] {stage}: routed_gate_up={routed_gate_up:?} routed_down={routed_down:?} \
+             all_gate_up_mq4={all_gate_up_mq4} expert_tier_tags={has_tier_tags} \
+             experts_host_mapped={host_mapped_experts}"
+        );
+    });
+}
+
 /// True when `name` is one of a layer's *routed-expert* weight tensors — the
 /// tensors `memory.moe_expert_budget` may move to host RAM.
 ///
