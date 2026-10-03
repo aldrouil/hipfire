@@ -112,8 +112,9 @@ impl ConfigState {
             Some("dflash_mode"),
             Some("prefill_compression"), // Prefill (pflash)
             Some("kv_cache"),
-            Some("gpu_layer_budget"), // Offload
-            Some("offload_exec"),     // Offload exec
+            Some("gpu_layer_budget"),  // Offload
+            Some("moe_expert_budget"), // Offload (MoE experts)
+            Some("offload_exec"),      // Offload exec
             Some("thinking"),
             Some("reasoning_effort"),
             Some("thinking_budget"),
@@ -160,6 +161,7 @@ impl ConfigState {
             self.is_override("prefill_compression"),              // Prefill
             self.is_override("kv_cache"),                         // KV cache
             self.is_override("gpu_layer_budget"),                 // Offload
+            self.is_override("moe_expert_budget"),                // Offload (MoE experts)
             self.is_override("offload_exec"),                     // Offload exec
             self.is_override("thinking"),                         // Thinking
             self.is_override("reasoning_effort"),                 // Reasoning effort
@@ -180,6 +182,7 @@ impl ConfigState {
             "prefill_compression", // Prefill
             "kv_cache",            // KV cache
             "gpu_layer_budget",    // Offload
+            "moe_expert_budget",   // Offload (MoE experts)
             "offload_exec",        // Offload exec
             "thinking",            // Thinking
             "reasoning_effort",    // Reasoning effort
@@ -255,11 +258,32 @@ impl ConfigState {
                         // rendering it as "N on GPU" would claim -1 layers are
                         // resident. The engine currently keeps every layer on the
                         // GPU for auto, which is what the explainer says.
-                        "-1" => "auto (engine decides)".into(),
+                        "-1" => "auto (fits to card)".into(),
                         v => format!("{v} on GPU"),
                     }
                 },
                 "How many layers stay on the GPU; the rest spill to system RAM. Frees VRAM, but much slower.",
+            ),
+            (
+                // The routed-expert tier: a MoE model's experts usually dwarf its
+                // attention weights, so this is the row that makes an over-VRAM
+                // MoE model loadable.
+                "Expert layers",
+                {
+                    match self
+                        .values
+                        .get("moe_expert_budget")
+                        .map(String::as_str)
+                        .unwrap_or("")
+                    {
+                        // Unset keeps every routed expert on the card, and says so
+                        // rather than showing an empty cell.
+                        "" => "all on GPU".into(),
+                        "-1" => "auto (fits to card)".into(),
+                        v => format!("{v} on GPU"),
+                    }
+                },
+                "MoE only: how many layers keep their routed experts on the GPU. Only experts move; attention, router, shared expert and KV stay.",
             ),
             (
                 // The other half of the offload decision: placement is the row
@@ -481,12 +505,30 @@ mod tests {
         assert_eq!(row(&[("gpu_layer_budget", "32")]), "32 on GPU");
         assert_eq!(
             row(&[("gpu_layer_budget", "-1")]),
-            "auto (engine decides)",
+            "auto (fits to card)",
             "-1 means auto, not -1 layers on the GPU"
         );
         // A cleared key is unset, not the literal string the JSON layer produces
         // for null — the bug this replaced rendered "null on GPU".
         assert_eq!(row(&[("gpu_layer_budget", "")]), "all on GPU");
+    }
+
+    /// The routed-expert row: same cell grammar as its `GPU layers` sibling, and
+    /// distinct labels so the two offload tiers cannot be confused in the UI.
+    #[test]
+    fn offload_expert_row_renders_unset_count_and_auto() {
+        let row = |pairs: &[(&str, &str)]| {
+            state_with(pairs)
+                .easy_rows()
+                .into_iter()
+                .find(|(l, _, _)| *l == "Expert layers")
+                .map(|(_, value, _)| value)
+                .expect("Expert layers row present")
+        };
+        assert_eq!(row(&[]), "all on GPU");
+        assert_eq!(row(&[("moe_expert_budget", "26")]), "26 on GPU");
+        assert_eq!(row(&[("moe_expert_budget", "-1")]), "auto (fits to card)");
+        assert_eq!(row(&[("moe_expert_budget", "")]), "all on GPU");
     }
 
     /// The exec row's two arms, in the same cell grammar as its sibling.

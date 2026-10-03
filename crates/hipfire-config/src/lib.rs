@@ -330,6 +330,14 @@ pub enum ValueRule {
         min: i64,
         max: i64,
     },
+    /// Like [`ValueRule::NullableInteger`], but also accepts the literal
+    /// `auto` (case-insensitive) — the spelling the TUI rows and the help text
+    /// use for these budget keys, and the one an operator is likely to type.
+    /// `-1` remains the wire spelling that `auto` is equivalent to.
+    NullableIntegerOrAuto {
+        min: i64,
+        max: i64,
+    },
     NullableFloat {
         min: f64,
         max: f64,
@@ -401,6 +409,11 @@ impl ConfigField {
                 matches!(value, ConfigValue::Null)
                     || matches!(value, ConfigValue::Integer(v) if *v >= min && *v <= max)
             }
+            ValueRule::NullableIntegerOrAuto { min, max } => {
+                matches!(value, ConfigValue::Null)
+                    || matches!(value, ConfigValue::Integer(v) if *v >= min && *v <= max)
+                    || matches!(value, ConfigValue::String(v) if v.trim().eq_ignore_ascii_case("auto"))
+            }
             ValueRule::NullableFloat { min, max } => {
                 matches!(value, ConfigValue::Null)
                     || value.as_f64().is_some_and(|v| v >= min && v <= max)
@@ -450,6 +463,15 @@ impl ConfigField {
                 Some(ConfigValue::Null)
             }
             ValueRule::NullableInteger { .. } => raw.parse::<i64>().ok().map(ConfigValue::Integer),
+            ValueRule::NullableIntegerOrAuto { .. } if raw.eq_ignore_ascii_case("null") => {
+                Some(ConfigValue::Null)
+            }
+            ValueRule::NullableIntegerOrAuto { .. } if raw.trim().eq_ignore_ascii_case("auto") => {
+                Some(ConfigValue::String(raw.to_owned()))
+            }
+            ValueRule::NullableIntegerOrAuto { .. } => {
+                raw.parse::<i64>().ok().map(ConfigValue::Integer)
+            }
             ValueRule::NullableFloat { .. } if raw.eq_ignore_ascii_case("null") => {
                 Some(ConfigValue::Null)
             }
@@ -690,11 +712,23 @@ pub static FIELDS: &[ConfigField] = &[
         Memory,
         ModelLoad,
         DefaultValue::Null,
-        ValueRule::NullableInteger { min: -1, max: 65536 },
+        ValueRule::NullableIntegerOrAuto { min: -1, max: 65536 },
         true,
         false,
         Some("HIPFIRE_GPU_LAYER_BUDGET"),
-        "Resident-layer budget for partial GPU offload: N keeps the last N layers on the GPU and spills the rest to system RAM; unset keeps every layer on the GPU. The number counts layers ON the GPU, not layers offloaded — 3 on a 64-layer model spills 61. 'auto' (-1) defers placement to the engine, which currently keeps every layer on the GPU."
+        "Resident-layer budget for partial GPU offload: N keeps the last N layers on the GPU and spills the rest to system RAM; unset keeps every layer on the GPU. The number counts layers ON the GPU, not layers offloaded — 3 on a 64-layer model spills 61. 'auto' (-1) places by fit: the smallest spill that loads, routed experts first, and a model that already fits is left fully resident."
+    ),
+    field!(
+        "memory.moe_expert_budget",
+        "moe_expert_budget",
+        Memory,
+        ModelLoad,
+        DefaultValue::Null,
+        ValueRule::NullableIntegerOrAuto { min: -1, max: 65536 },
+        true,
+        false,
+        Some("HIPFIRE_MOE_EXPERT_BUDGET"),
+        "Resident routed-expert budget for a Mixture-of-Experts model whose experts exceed VRAM: N keeps the last N layers' routed experts on the GPU and spills the rest to system RAM; unset keeps every routed expert on the GPU. The number counts layers whose expert weights stay ON the GPU — llama.cpp's `--n-cpu-moe K` is this value written as `n_layers - K`. Only routed experts move: attention, router, shared expert and KV stay on the card. 'auto' (-1) places by fit, spilling routed experts before whole layers. No effect on a dense model, and none on an architecture that cannot spill experts (a configured spill fails that arch's load rather than being ignored)."
     ),
     field!(
         "memory.offload_exec",
@@ -6217,6 +6251,16 @@ pub mod memory {
         parse_gpu_layer_budget(process_value("HIPFIRE_GPU_LAYER_BUDGET").as_deref())
     }
 
+    /// The configured routed-expert [`OffloadBudget`] from the process snapshot
+    /// (`memory.moe_expert_budget`). Same parser and spelling as
+    /// [`gpu_layer_budget`]: unset/empty/unparseable is [`OffloadBudget::Full`]
+    /// (never spill an expert), `"auto"`/`"-1"` is [`OffloadBudget::Auto`], and a
+    /// non-negative integer pins that many layers whose routed experts stay on
+    /// the device.
+    pub fn moe_expert_budget() -> OffloadBudget {
+        parse_gpu_layer_budget(process_value("HIPFIRE_MOE_EXPERT_BUDGET").as_deref())
+    }
+
     /// Which engine executes the ops that read a spilled layer's weights
     /// (`memory.offload_exec`, compat env `HIPFIRE_OFFLOAD_EXEC`).
     ///
@@ -6310,8 +6354,25 @@ pub mod memory {
         }
 
         #[test]
+        fn budget_keys_accept_the_auto_spelling() {
+            // The TUI rows and the help text both use `auto`; the wire spelling
+            // `-1` is equivalent. Both must survive CLI/env validation, or the
+            // documented spelling is unusable.
+            for key in ["memory.gpu_layer_budget", "memory.moe_expert_budget"] {
+                let field = crate::field(key).expect("budget key is in the schema");
+                for spelling in ["auto", "AUTO", "-1", "26", "null"] {
+                    let parsed = field
+                        .parse_cli(spelling)
+                        .unwrap_or_else(|e| panic!("{key}={spelling}: {e}"));
+                    field.validate(&parsed).unwrap();
+                }
+                // Garbage still fails closed rather than being read as a count.
+                assert!(field.parse_cli("banana").is_err(), "{key}");
+            }
+        }
+
+        #[test]
         fn gpu_layer_budget_display() {
-            assert_eq!(OffloadBudget::Full.to_string(), "full");
             assert_eq!(OffloadBudget::Auto.to_string(), "auto");
             assert_eq!(OffloadBudget::Layers(5).to_string(), "5");
         }

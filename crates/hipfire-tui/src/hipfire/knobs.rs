@@ -67,7 +67,17 @@ pub const KNOBS: &[KnobInfo] = &[
         effect: "Frees VRAM for a longer context, but decode slows sharply: a spilled layer's weights are read over PCIe every step instead of from VRAM. Load also takes much longer.",
         default: "",
         when: "Leave it unset for normal use — every layer then stays on the GPU. Set a count when the model or context will not otherwise fit.",
-        note: Some("The number counts layers ON THE GPU, not layers offloaded: 3 on a 64-layer model keeps 3 on the GPU and spills the other 61. 'auto' (-1) lets the engine choose, and it currently keeps every layer on the GPU."),
+        note: Some("The number counts layers ON THE GPU, not layers offloaded: 3 on a 64-layer model keeps 3 on the GPU and spills the other 61. 'auto' (-1) places by fit: the smallest spill that loads, routed experts first, and a model that already fits is left fully resident."),
+        options: &[],
+    },
+    KnobInfo {
+        key: "moe_expert_budget",
+        title: "Expert layers kept on the GPU",
+        summary: "For a Mixture-of-Experts model: how many layers keep their routed experts on the GPU. The rest spill to system RAM.",
+        effect: "Frees the VRAM a MoE model's experts dominate. A spilled expert is read over PCIe only when the router selects it, so a decode step pays for its few routed experts rather than the whole layer.",
+        default: "",
+        when: "Leave it unset for normal use. Set it (or 'auto') when a MoE model's experts do not fit, or when the row above still leaves too little VRAM.",
+        note: Some("Counts layers whose routed experts stay ON the GPU; llama.cpp's --n-cpu-moe K is this value written as n_layers - K. Only routed experts move — attention, router, shared expert and KV stay on the card. Needs the packed-expert layout (uniform, packable MQ4 experts). No effect on a dense model, and none on an architecture that cannot spill experts: a configured spill fails that model's load rather than being ignored."),
         options: &[],
     },
     KnobInfo {

@@ -131,6 +131,13 @@ pub const EDITABLE_FIELDS: &[FieldSpec] = &[
             max: 65536,
         },
     },
+    FieldSpec {
+        key: "moe_expert_budget",
+        kind: FieldKind::Int {
+            min: -1,
+            max: 65536,
+        },
+    },
     // The one value list comes from the schema (`hipfire_config::OFFLOAD_EXECS`),
     // which is also what its own field validates against, so the two cannot drift.
     FieldSpec {
