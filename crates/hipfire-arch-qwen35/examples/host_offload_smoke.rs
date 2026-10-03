@@ -23,7 +23,7 @@
 use hipfire_arch_qwen35::qwen35::load::{load_weight_tensor, qwen35_tensor_name_candidates};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::weight_backend::MemoryTarget;
-use rdna_compute::Gpu;
+use rdna_compute::{DType, Gpu};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args().nth(1).unwrap_or_else(|| {
@@ -59,10 +59,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 && t.shape[0] >= 1024
                 && t.shape[1] >= 1024
         };
-        let info = hfq
-            .tensor_infos()
+        let info = RAW_CODE_QT
             .iter()
-            .find(|t| big(t) && t.name.contains("layers."))
+            .find_map(|qt| {
+                hfq.tensor_infos()
+                    .iter()
+                    .find(|t| big(t) && t.quant_type == *qt && t.name.contains("layers."))
+            })
             .or_else(|| hfq.tensor_infos().iter().find(|t| big(t)))
             .or_else(|| {
                 hfq.tensor_infos()
@@ -159,5 +162,120 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "HOST_OFFLOAD_PARITY PASS ({} bytes identical, host-located confirmed)",
         dev_bytes.len()
     );
+
+    // The MoE decode arm for a packed expert is the *indexed* kernel, not the
+    // dense GEMV. Call it directly with a one-expert pointer table built from the
+    // device blob and again from the host blob, and compare — the direct test of
+    // whether a host-mapped expert reads correctly through the MoE arm.
+    let x_data: Vec<f32> = {
+        let mut s: u32 = 0x1234_5678;
+        (0..k)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 17;
+                s ^= s << 5;
+                (s as f32 / u32::MAX as f32) * 2.0 - 1.0
+            })
+            .collect()
+    };
+    let x = gpu.upload_f32(&x_data, &[k])?;
+    let topk = gpu.upload_raw(&0i32.to_ne_bytes(), &[4])?;
+    let mut results = Vec::new();
+    for (label, w) in [("device", &device), ("host", &host)] {
+        let ptrs = gpu.upload_raw(&(w.buf.buf.as_ptr() as u64).to_ne_bytes(), &[8])?;
+        let yg = gpu.zeros(&[m], DType::F32)?;
+        let yu = gpu.zeros(&[m], DType::F32)?;
+        gpu.gemv_mq4g256v2_moe_gate_up_k8_indexed(&ptrs, &topk, &x, &yg, &yu, m, k)?;
+        let (g, u) = (gpu.download_f32(&yg)?, gpu.download_f32(&yu)?);
+        let g1: f32 = g.iter().map(|v| v.abs()).sum();
+        let u1: f32 = u.iter().map(|v| v.abs()).sum();
+        println!(
+            "indexed gate_up [{label}]: |gate|_1={g1:.6e} |up|_1={u1:.6e} y[0]={:.6e} y[last]={:.6e}",
+            g[0],
+            g[m - 1]
+        );
+        results.push((g, u));
+    }
+    let (dg, du) = &results[0];
+    let (hg, hu) = &results[1];
+    let worst = |a: &[f32], b: &[f32]| {
+        a.iter()
+            .zip(b)
+            .fold(0.0f32, |acc, (p, q)| acc.max((p - q).abs()))
+    };
+    let scale = dg.iter().fold(0.0f32, |a, v| a.max(v.abs())).max(1e-6);
+    let (wg, wu) = (worst(dg, hg), worst(du, hu));
+    println!(
+        "indexed: max|dev-host| gate={wg:.6e} up={wu:.6e} (gate scale {scale:.6e}, rel {:.3e})",
+        wg / scale
+    );
+    assert!(
+        wg <= scale * 1e-4 && wu <= 1e-4 * hu.iter().fold(0.0f32, |a, v| a.max(v.abs())).max(1e-6),
+        "the INDEXED MoE gate_up kernel reads a host-mapped {:?} expert differently from its \
+         device twin: gate max|diff|={wg:.6e} (rel {:.3e}), up max|diff|={wu:.6e}",
+        device.gpu_dtype,
+        wg / scale
+    );
+    println!(
+        "INDEXED_MOE_HOST_READ_PARITY PASS (dtype {:?})",
+        device.gpu_dtype
+    );
+
+    // The packed path's real shape: ONE blob holding many experts, with the
+    // pointer table holding *view* addresses (`blob + slot * stride`). This
+    // kernel is k8-specialised (8 top-k slots), so use eight experts and eight
+    // slots — the configuration the decode path actually runs.
+    const EXPERTS: usize = 8;
+    let stride = source.len();
+    let mut blob = Vec::with_capacity(stride * EXPERTS);
+    for _ in 0..EXPERTS {
+        blob.extend_from_slice(&source);
+    }
+    let dev_blob = gpu.upload_raw(&blob, &[blob.len()])?;
+    let host_blob = gpu.upload_raw_host_mapped(&blob, &[blob.len()])?;
+    let topk8 = gpu.upload_raw(
+        &(0..EXPERTS as i32)
+            .flat_map(|i| i.to_ne_bytes())
+            .collect::<Vec<u8>>(),
+        &[4 * EXPERTS],
+    )?;
+    let mut outs = Vec::new();
+    for (label, owner) in [("device", &dev_blob), ("host", &host_blob)] {
+        let mut table = Vec::new();
+        for slot in 0..EXPERTS {
+            let view = owner.sub_offset(slot * stride, stride);
+            table.extend_from_slice(&(view.buf.as_ptr() as u64).to_ne_bytes());
+        }
+        let ptrs = gpu.upload_raw(&table, &[table.len()])?;
+        let yg = gpu.zeros(&[EXPERTS * m], DType::F32)?;
+        let yu = gpu.zeros(&[EXPERTS * m], DType::F32)?;
+        gpu.gemv_mq4g256v2_moe_gate_up_k8_indexed(&ptrs, &topk8, &x, &yg, &yu, m, k)?;
+        let (g, u) = (gpu.download_f32(&yg)?, gpu.download_f32(&yu)?);
+        println!(
+            "packed blob [{label}]: k_top=8 y[0]={:.6e} y[m]={:.6e} |gate|_1={:.6e}",
+            g[0],
+            g[m],
+            g.iter().map(|v| v.abs()).sum::<f32>()
+        );
+        outs.push((g, u));
+    }
+    let wg = worst(&outs[0].0, &outs[1].0);
+    let wu = worst(&outs[0].1, &outs[1].1);
+    let s2 = outs[0]
+        .0
+        .iter()
+        .fold(0.0f32, |a, v| a.max(v.abs()))
+        .max(1e-6);
+    println!(
+        "packed views: max|dev-host| gate={wg:.6e} up={wu:.6e} (scale {s2:.6e}, rel {:.3e})",
+        wg / s2
+    );
+    assert!(
+        wg <= s2 * 1e-4 && wu <= 1e-4 * s2,
+        "the indexed MoE kernel reads a host-mapped *packed view* (blob + slot*stride) differently \
+         from its device twin: gate max|diff|={wg:.6e} (rel {:.3e}), up max|diff|={wu:.6e}",
+        wg / s2
+    );
+    println!("INDEXED_PACKED_VIEW_HOST_READ_PARITY PASS");
     Ok(())
 }

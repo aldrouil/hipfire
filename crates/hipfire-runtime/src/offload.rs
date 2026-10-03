@@ -203,24 +203,9 @@ pub struct LayerBytes {
     pub non_expert: Vec<u64>,
     pub expert: Vec<u64>,
     pub always_resident: u64,
-    /// Layers that own a weight whose *host read* is not verified — the packed
-    /// MQ4-V2 family (MQ4G256V2 / MQ4CG256). Empty (the default) means every
-    /// layer is verified, so an arch that has not characterised its dtypes is
-    /// unaffected. The arch fills this from its own tensor index; the placement
-    /// resolver refuses a host-placed unverified layer, because a host read that
-    /// is wrong is worse than a load that refuses.
-    pub unverified_host: Vec<bool>,
 }
 
 impl LayerBytes {
-    /// The first host-placed layer whose host read is unverified, if any.
-    pub fn first_unverified_host(&self, placement: &Placement) -> Option<usize> {
-        (0..self.n_layers()).find(|layer| {
-            self.unverified_host.get(*layer).copied().unwrap_or(false)
-                && (placement.layer(*layer) == WeightResidency::HostMapped
-                    || placement.experts(*layer) == ExpertResidency::HostMapped)
-        })
-    }
     pub fn n_layers(&self) -> usize {
         self.non_expert.len()
     }
@@ -306,21 +291,6 @@ impl LayerBytes {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Capacity {
     pub weight_bytes: u64,
-}
-
-/// Refuse a placement that host-places a layer whose host read is unverified.
-///
-/// An arch marks such layers in [`LayerBytes::unverified_host`]; the refusal is
-/// raised here so both loaders and every arch share one message.
-pub fn unverified_host_refusal(layers: &LayerBytes, placement: &Placement) -> Option<String> {
-    let layer = layers.first_unverified_host(placement)?;
-    Some(format!(
-        "load refused: layer {layer} carries weights in the packed MQ4-V2 family \
-         (MQ4G256V2 / MQ4CG256), whose host-mapped read is not verified — under this style of \
-         spill the model produced a wrong *first* token (ornith-1.5:35b-a3b), while the qt-13 \
-         (MQ4G256) control produced the right one. Keep these layers resident by raising \
-         memory.moe_expert_budget / memory.gpu_layer_budget, or use a uniform qt-13 trunk"
-    ))
 }
 
 /// Device room a placement may spend, from the measured free VRAM and every
@@ -845,7 +815,6 @@ mod tests {
             non_expert: non_expert.to_vec(),
             expert: expert.to_vec(),
             always_resident: always,
-            unverified_host: Vec::new(),
         }
     }
 
