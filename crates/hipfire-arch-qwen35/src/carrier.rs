@@ -170,6 +170,9 @@ fn resolve_partial_offload(
         &capacity,
         offload::Orientation::SuffixResident,
     )?;
+    if let Some(refusal) = offload::unverified_host_refusal(&layer_bytes, &placement) {
+        return Err(refusal);
+    }
     eprintln!("  {line}");
     // Every pinned host byte, not just the routed experts: a whole-layer spill
     // hosts each layer's own weights too, and those are the largest host consumer
