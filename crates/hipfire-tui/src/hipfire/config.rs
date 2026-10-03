@@ -254,11 +254,10 @@ impl ConfigState {
                         .unwrap_or("")
                     {
                         "" => "all on GPU".into(),
-                        // `-1` is the schema's reserved auto spelling, not a count:
-                        // rendering it as "N on GPU" would claim -1 layers are
-                        // resident. The engine currently keeps every layer on the
-                        // GPU for auto, which is what the explainer says.
-                        "-1" => "auto (fits to card)".into(),
+                        // `-1` is the schema's reserved auto spelling, and the
+                        // rule also accepts a literal `auto`; both mean fit-to-card
+                        // and neither is a layer count.
+                        "-1" | "auto" => "auto (fits to card)".into(),
                         v => format!("{v} on GPU"),
                     }
                 },
@@ -279,7 +278,7 @@ impl ConfigState {
                         // Unset keeps every routed expert on the card, and says so
                         // rather than showing an empty cell.
                         "" => "all on GPU".into(),
-                        "-1" => "auto (fits to card)".into(),
+                        "-1" | "auto" => "auto (fits to card)".into(),
                         v => format!("{v} on GPU"),
                     }
                 },
@@ -508,6 +507,11 @@ mod tests {
             "auto (fits to card)",
             "-1 means auto, not -1 layers on the GPU"
         );
+        assert_eq!(
+            row(&[("gpu_layer_budget", "auto")]),
+            "auto (fits to card)",
+            "the literal auto spelling (accepted by the value rule) is not a count"
+        );
         // A cleared key is unset, not the literal string the JSON layer produces
         // for null — the bug this replaced rendered "null on GPU".
         assert_eq!(row(&[("gpu_layer_budget", "")]), "all on GPU");
@@ -528,6 +532,7 @@ mod tests {
         assert_eq!(row(&[]), "all on GPU");
         assert_eq!(row(&[("moe_expert_budget", "26")]), "26 on GPU");
         assert_eq!(row(&[("moe_expert_budget", "-1")]), "auto (fits to card)");
+        assert_eq!(row(&[("moe_expert_budget", "auto")]), "auto (fits to card)");
         assert_eq!(row(&[("moe_expert_budget", "")]), "all on GPU");
     }
 
