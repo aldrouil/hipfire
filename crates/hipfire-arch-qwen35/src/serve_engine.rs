@@ -671,9 +671,6 @@ impl Rig {
             &capacity,
             offload::Orientation::SuffixResident,
         )?;
-        if let Some(refusal) = offload::unverified_host_refusal(layer_bytes, &placement) {
-            return Err(refusal);
-        }
         eprintln!("  {line}");
         eprintln!(
             "  kv reserved: {} MiB; pbs floor {} MiB; draft {} MiB; slack 128 MiB; weight budget \
