@@ -4292,7 +4292,12 @@ impl Gpu {
     }
 
     /// Re-quantize f32 activations for the gfx1201 A8 MMQ consumer.
-    pub fn ensure_int8_mmq_x(&mut self, x: &GpuTensor, n: usize, k: usize) -> HipResult<*mut c_void> {
+    pub fn ensure_int8_mmq_x(
+        &mut self,
+        x: &GpuTensor,
+        n: usize,
+        k: usize,
+    ) -> HipResult<*mut c_void> {
         let needed = crate::scratch::int8_mmq_x_needed(k, n);
         if crate::scratch::scratch_will_grow(
             self.scratch.int8_mmq_x_scratch_bytes,
@@ -4302,15 +4307,28 @@ impl Gpu {
             self.invalidate_for_scratch_growth();
         }
         self.scratch.ensure_int8_mmq_x(
-            &self.hip, &mut self.compiler, &mut self.modules, &mut self.functions,
-            self.active_stream.as_ref(), &mut self.graphs.capture_blobs,
-            self.graphs.capture_mode, self.flags.force_blob_path, &mut self.replay,
-            self.device_id, x, n, k,
+            &self.hip,
+            &mut self.compiler,
+            &mut self.modules,
+            &mut self.functions,
+            self.active_stream.as_ref(),
+            &mut self.graphs.capture_blobs,
+            self.graphs.capture_mode,
+            self.flags.force_blob_path,
+            &mut self.replay,
+            self.device_id,
+            x,
+            n,
+            k,
         )
     }
 
     /// Reserve (without launching the quantizer) for a fused A8 producer.
-    pub fn reserve_int8_mmq(&mut self, k: usize, n: usize) -> HipResult<crate::scratch::Int8MmqReservation> {
+    pub fn reserve_int8_mmq(
+        &mut self,
+        k: usize,
+        n: usize,
+    ) -> HipResult<crate::scratch::Int8MmqReservation> {
         if k != 0 && n != 0 && k % 256 == 0 {
             let needed = crate::scratch::int8_mmq_x_needed(k, n);
             if crate::scratch::scratch_will_grow(
@@ -4325,7 +4343,10 @@ impl Gpu {
     }
 
     pub fn int8_mmq_prepared_ptr(
-        &self, prepared: &crate::scratch::Int8MmqPrepared, k: usize, n: usize,
+        &self,
+        prepared: &crate::scratch::Int8MmqPrepared,
+        k: usize,
+        n: usize,
     ) -> HipResult<*mut c_void> {
         let (generation, ptr) = self.scratch.int8_mmq_live();
         prepared.checked_ptr(generation, ptr, k, n)
@@ -4339,7 +4360,9 @@ impl Gpu {
             && !self.iu4_verify_scope
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
-            && n >= 64 && k > 0 && k % 256 == 0
+            && n >= 64
+            && k > 0
+            && k % 256 == 0
     }
 
     /// True when the portable producer-sidecar route is live for this call:
@@ -4898,6 +4921,7 @@ impl Gpu {
     }
 
 
+
     // ── Tensor allocation ───────────────────────────────────────
 
     pub fn ensure_gemv_residual_tmp(&mut self, min_elems: usize) -> HipResult<&GpuTensor> {
@@ -5202,7 +5226,24 @@ impl Gpu {
         // hipHostFree needs. They coincide on large-BAR boxes but need not.
         let dev_ptr = match self.hip.host_get_device_pointer(host_ptr, 0) {
             Ok(p) if !p.is_null() => p,
-            _ => host_ptr,
+            other => {
+                // Loud, once: HIP documents that the mapped device pointer differs
+                // from the host pointer on discrete GPUs and that
+                // `hipHostGetDevicePointer` is *required* to obtain the one a kernel
+                // may dereference (hipHostMallocDefault alone does not map). Falling
+                // back to the host pointer therefore hands kernels a pointer HIP
+                // calls invalid, which reads as zeros or garbage rather than an
+                // error -- indistinguishable from a bad weight downstream.
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    eprintln!(
+                        "[host-mapped] hipHostGetDevicePointer failed ({other:?}); using the host \
+                         pointer as the device alias -- GPU reads of these bytes are undefined \
+                         (CPU reads via host_bytes stay correct, so the two disagree silently)"
+                    );
+                });
+                host_ptr
+            }
         };
         let key = dev_ptr as usize;
         if self.host_mapped.insert(key, host_ptr as usize).is_some() {
