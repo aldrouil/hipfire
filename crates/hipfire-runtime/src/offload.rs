@@ -242,6 +242,23 @@ impl LayerBytes {
             .sum()
     }
 
+    /// Every pinned host byte a placement takes: a host-placed layer's own
+    /// weights *and* its experts (the layer knob dominates, so its experts are
+    /// counted once), plus the routed experts of layers whose experts moved
+    /// without the layer moving. This is what `hipHostMalloc` will hold, so it is
+    /// what the host tier must be charged for.
+    pub fn host_bytes(&self, placement: &Placement) -> u64 {
+        let mut bytes = 0u64;
+        for layer in 0..self.n_layers() {
+            if placement.layer(layer) == WeightResidency::HostMapped {
+                bytes += self.non_expert[layer] + self.expert[layer];
+            } else if placement.experts(layer) == ExpertResidency::HostMapped {
+                bytes += self.expert[layer];
+            }
+        }
+        bytes
+    }
+
     /// The largest number of routed-expert layers that can stay on the device,
     /// counted from `orientation`'s resident end, given this much device room.
     /// Returns `None` when even spilling every expert does not free enough.
@@ -274,6 +291,29 @@ impl LayerBytes {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Capacity {
     pub weight_bytes: u64,
+}
+
+/// Device room a placement may spend, from the measured free VRAM and every
+/// claim that has a prior call on it: the KV reservation, the prefill floor, any
+/// device-resident draft's bytes, and a fixed slack for the allocations nobody
+/// sized (screen caches, expanded tensors).
+///
+/// One function so the two loaders (slot and sequential) cannot drift: a spill
+/// that fits one must fit the other.
+pub fn weight_capacity(
+    free_vram: u64,
+    kv_bytes: u64,
+    prefill_bytes: u64,
+    draft_bytes: u64,
+    slack_bytes: u64,
+) -> Capacity {
+    let reserved = kv_bytes
+        .saturating_add(prefill_bytes)
+        .saturating_add(draft_bytes)
+        .saturating_add(slack_bytes);
+    Capacity {
+        weight_bytes: free_vram.saturating_sub(reserved),
+    }
 }
 
 /// The KV footprint a placement must leave room for.
