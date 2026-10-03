@@ -684,6 +684,11 @@ fn moe_ffn_decode_impl<'a>(
     }
     let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
     let bound = ffn.bound_experts()?;
+    // Captured before `moe_params` is consumed by `seal_decode`; only read when
+    // the oracle is enabled, and free otherwise.
+    let oracle_enabled = hipfire_config::developer_var("HIPFIRE_MOE_CPU_ORACLE").is_ok();
+    let oracle_input =
+        oracle_enabled.then_some((moe_params.x_norm, moe_params.dtypes.routed_gate_up));
     let sealed = hipfire_dispatch::pipeline::sealed_moe::seal_decode(bound, &ctx, moe_params)
         .map_err(HipError::from)?;
     hipfire_dispatch::pipeline::execute_steps(
@@ -692,6 +697,27 @@ fn moe_ffn_decode_impl<'a>(
         &[hipfire_dispatch::pipeline::Step::Moe(sealed)],
     )
     .map_err(HipError::from)?;
+    if let Some((x_norm, routed_gate_up)) = oracle_input {
+        if let (Some(q), Some(owners)) = (
+            hipfire_dispatch::cpu_exec::cpu_quant_for(routed_gate_up),
+            ffn.packed_expert_owners.as_ref(),
+        ) {
+            hipfire_dispatch::cpu_exec::moe_cpu_oracle_report(
+                gpu,
+                q,
+                config.dim,
+                config.moe_intermediate_size,
+                config.num_experts_per_tok,
+                &owners.gate_up,
+                &owners.down,
+                x_norm,
+                s.topk_indices,
+                s.topk_weights,
+                s.down_expanded,
+                ffn.layer_idx,
+            );
+        }
+    }
     #[cfg(feature = "moe-oracle")]
     {
         let oracle_pos =
