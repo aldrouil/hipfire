@@ -329,15 +329,155 @@ pub fn run_host_mapped_gemv_residual(
     Ok(())
 }
 
+/// Diagnostic CPU-down splice: recompute one decode token's routed down
+/// projection on the CPU from the intact host blob and accumulate into the
+/// residual. `rot_batch` is the already-rotated post-SiLU hidden (`[k × mi]`);
+/// no rotation convention is needed. `down_owner` is the packed host-mapped
+/// down blob; `down_stride` is the file's per-expert `data_size`.
+///
+/// Fail-closed by construction: unavailable host bytes, an undecodable dtype,
+/// an AWQ sidecar (a bare `gemv` would ignore the scale), or short scratch
+/// downloads are all errors, never silent zeros.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_cpu_down_residual(
+    gpu: &Gpu,
+    quant: CpuQuant,
+    dim: usize,
+    mi: usize,
+    down_owner: &GpuTensor,
+    down_stride: usize,
+    rot_batch: &GpuTensor,
+    topk_indices: &GpuTensor,
+    topk_weights: &GpuTensor,
+    residual: &GpuTensor,
+    down_awq: bool,
+) -> Result<(), DispatchError> {
+    if gpu.graphs.capture_mode || gpu.replay.is_recording() {
+        return Err(cpu_err(
+            "moe cpu-down splice refuses graph capture / replay recording: a CPU step is a host sync point",
+        ));
+    }
+    if down_awq {
+        return Err(cpu_err(
+            "moe cpu-down splice refuses AWQ down weights: a bare gemv would ignore the per-expert scale",
+        ));
+    }
+    let down_bytes = gpu
+        .host_bytes(down_owner)
+        .ok_or_else(|| cpu_err("moe cpu-down splice: down blob has no host bytes"))?;
+    let k = topk_indices.numel().min(topk_weights.numel());
+    if k == 0 {
+        return Err(cpu_err("moe cpu-down splice: empty top-k scratch"));
+    }
+    let rot = download_f32(gpu, rot_batch, k.checked_mul(mi).ok_or_else(|| cpu_err("moe cpu-down splice: rot extent overflows"))?)?;
+    let ti = download_f32(gpu, topk_indices, k)?;
+    let tw = download_f32(gpu, topk_weights, k)?;
+    let row_bytes = hipfire_cpu::gemv::row_bytes(quant, mi);
+    let need = row_bytes.checked_mul(dim).ok_or_else(|| cpu_err("moe cpu-down splice: down extent overflows"))?;
+    if down_stride < need {
+        return Err(cpu_err(&format!(
+            "moe cpu-down splice: down_stride {down_stride} < expert bytes {need}"
+        )));
+    }
+    let mut acc = download_f32(gpu, residual, dim)?;
+    let mut down_out = vec![0.0f32; dim];
+    for krank in 0..k {
+        let slot = (ti[krank].to_bits() as i32) as u16 as usize;
+        let d0 = slot.checked_mul(down_stride).ok_or_else(|| cpu_err("moe cpu-down splice: down offset overflows"))?;
+        if d0.checked_add(need).is_none_or(|end| end > down_bytes.len()) {
+            return Err(cpu_err(&format!("moe cpu-down splice: down slot {slot} out of range")));
+        }
+        let x = rot.get(krank * mi..(krank + 1) * mi).ok_or_else(|| cpu_err("moe cpu-down splice: rot_batch short"))?;
+        down_out.fill(0.0);
+        gemv(quant, &down_bytes[d0..d0 + need], dim, mi, x, &mut down_out);
+        let w = tw[krank];
+        for (a, v) in acc.iter_mut().zip(down_out.iter()) {
+            *a += w * v;
+        }
+    }
+    upload_f32(gpu, residual, &acc)?;
+    CPU_STEPS.fetch_add(1, Ordering::Relaxed);
+    Ok(())
+}
+
 /// Whether [`run_host_mapped_gemv`] / [`run_host_mapped_gemv_residual`] can drive
 /// this weight: host-mapped *and* a decodable format.
 pub fn host_mapped_cpu_capable(gpu: &Gpu, w: &WeightRef) -> bool {
     cpu_exec_enabled() && gpu.host_located(w.buf) && cpu_quant_for(w.dtype).is_some()
 }
 
+/// Batched twin of [`moe_cpu_down_residual`] for the prefill path: `rot_batch`
+/// holds `n * k_top * mi` already-rotated post-SiLU rows and `residual` is the
+/// `[n × dim]` batch the combine accumulates into (`pbs.x_batch`). Same
+/// fail-closed contract: unavailable host bytes, an undecodable dtype, AWQ
+/// sidecars, or short scratch downloads are errors, never silent zeros.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_cpu_down_residual_batched(
+    gpu: &Gpu,
+    quant: CpuQuant,
+    dim: usize,
+    mi: usize,
+    n: usize,
+    k_top: usize,
+    down_stride: usize,
+    down_bytes: &[u8],
+    rot: &[f32],
+    ti: &[f32],
+    tw: &[f32],
+    residual: &mut [f32],
+    down_awq: bool,
+) -> Result<(), DispatchError> {
+    if gpu.graphs.capture_mode || gpu.replay.is_recording() {
+        return Err(cpu_err(
+            "moe cpu-down splice refuses graph capture / replay recording: a CPU step is a host sync point",
+        ));
+    }
+    if down_awq {
+        return Err(cpu_err(
+            "moe cpu-down splice refuses AWQ down weights: a bare gemv would ignore the per-expert scale",
+        ));
+    }
+    let row_bytes = hipfire_cpu::gemv::row_bytes(quant, mi);
+    let need = row_bytes.checked_mul(dim).ok_or_else(|| cpu_err("moe cpu-down splice: down extent overflows"))?;
+    if down_stride < need {
+        return Err(cpu_err(&format!(
+            "moe cpu-down splice: down_stride {down_stride} < expert bytes {need}"
+        )));
+    }
+    let slots = n.checked_mul(k_top).ok_or_else(|| cpu_err("moe cpu-down splice: slot extent overflows"))?;
+    if ti.len() < slots || tw.len() < slots {
+        return Err(cpu_err("moe cpu-down splice: top-k scratch short for batch"));
+    }
+    if rot.len() < slots.checked_mul(mi).ok_or_else(|| cpu_err("moe cpu-down splice: rot extent overflows"))? {
+        return Err(cpu_err("moe cpu-down splice: rot_batch short for batch"));
+    }
+    if residual.len() < n.checked_mul(dim).ok_or_else(|| cpu_err("moe cpu-down splice: residual extent overflows"))? {
+        return Err(cpu_err("moe cpu-down splice: residual short for batch"));
+    }
+    let mut down_out = vec![0.0f32; dim];
+    for tok in 0..n {
+        for krank in 0..k_top {
+            let slot_idx = tok * k_top + krank;
+            let slot = (ti[slot_idx].to_bits() as i32) as u16 as usize;
+            let d0 = slot.checked_mul(down_stride).ok_or_else(|| cpu_err("moe cpu-down splice: down offset overflows"))?;
+            if d0.checked_add(need).is_none_or(|end| end > down_bytes.len()) {
+                return Err(cpu_err(&format!("moe cpu-down splice: down slot {slot} out of range")));
+            }
+            let x = &rot[slot_idx * mi..(slot_idx + 1) * mi];
+            down_out.fill(0.0);
+            gemv(quant, &down_bytes[d0..d0 + need], dim, mi, x, &mut down_out);
+            let w = tw[slot_idx];
+            let acc = &mut residual[tok * dim..(tok + 1) * dim];
+            for (a, v) in acc.iter_mut().zip(down_out.iter()) {
+                *a += w * v;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `HIPFIRE_MOE_CPU_ORACLE=1`: run the same host-mapped expert bytes that fed the
 /// GPU's routed-expert kernels through the CPU SIMD expert FFN
-/// ([`hipfire_cpu::moe::run_experts`]) and print the per-rank divergence.
 ///
 /// Attribution, not a fallback. If the CPU path over the same blobs reproduces the
 /// GPU's own per-expert down outputs, the packed layout and the GPU's read of
