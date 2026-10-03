@@ -393,6 +393,41 @@ pub fn moe_cpu_oracle_report(
         dim,
         mi,
     };
+    // Which side is empty is the question, so report magnitudes, not just the
+    // worst relative difference: a layer whose GPU expert output is identically
+    // zero and whose CPU output is not is a *missing contribution*, a different
+    // fault from a layer that computes a similar-but-different number.
+    let sum_abs = |v: &[f32]| v.iter().map(|x| x.abs() as f64).sum::<f64>();
+    let zeros = |v: &[f32]| v.iter().filter(|x| **x == 0.0).count();
+    let mut xin = x[..dim.min(x.len())].to_vec();
+    if dim % 256 == 0 {
+        rotate_x(&mut xin);
+    }
+    let mut cpu_all = vec![0.0f32; k * dim];
+    let mut routed_ranks = 0usize;
+    for krank in 0..k.min(ti.len()).min(tw.len()) {
+        let expert = (ti[krank].to_bits() as i32) as u16 as usize;
+        if hipfire_cpu::moe::run_experts(
+            &blobs,
+            &xin,
+            &[(expert, 1.0)],
+            &mut cpu_all[krank * dim..(krank + 1) * dim],
+        )
+        .is_ok()
+        {
+            routed_ranks += 1;
+        }
+    }
+    eprintln!(
+        "[moe-cpu-oracle] layer {layer_idx} ranks {routed_ranks}/{k} |x| {:.4e} (zeros {}) |gpu-down| {:.4e} (zeros {}/{}) |cpu-down| {:.4e} (zeros {})",
+        sum_abs(&x[..dim.min(x.len())]),
+        zeros(&x[..dim.min(x.len())]),
+        sum_abs(&dn_gpu),
+        zeros(&dn_gpu),
+        dn_gpu.len(),
+        sum_abs(&cpu_all),
+        zeros(&cpu_all),
+    );
     for rotated in [false, true] {
         if x.len() < dim || (rotated && dim % 256 != 0) {
             break;
