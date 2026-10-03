@@ -2695,9 +2695,12 @@ pub fn qwen35_layer_bytes(hfq: &HfqFile, config: &Qwen35Config) -> LayerBytes {
         let bytes = info.data_size as u64;
         match crate::serve_engine::tensor_layer_index(&info.name) {
             Some(layer) if layer < n => {
-                // The packed MQ4-V2 family's host read is not verified (see
+                // The packed MQ4-V2 (qt 44/45) host path is unverified (see
                 // `LayerBytes::unverified_host`); flag the layer so the resolver
-                // refuses to host-place it.
+                // refuses to host-place it. Not a proven format defect: the
+                // kernels and the tensor-level host read both pass parity, and the
+                // evidenced failure compared two models that differ in more than
+                // the quant.
                 if matches!(info.quant_type, 44 | 45) {
                     unverified_host[layer] = true;
                 }
@@ -5638,8 +5641,11 @@ pub(crate) fn load_moe_ffn(
                              (memory.moe_expert_budget) but their packed dtype is {dtype:?}, which \
                              the host-expert path is not verified for; only MQ4G256 (qt 13) is \
                              proven (MQ4G256V2/qt 44 produced wrong logits on ornith-1.5:35b-a3b). \
-                             Raise memory.moe_expert_budget to keep these experts resident, or use \
-                             a uniform qt-13 expert trunk"
+                             The cause is not isolated — those two differ in model as well as \
+                             quant, and both the MQ4-V2 kernels and the tensor-level host read \
+                             pass parity — so treat this as an unverified path, not a proven \
+                             format defect. Raise memory.moe_expert_budget to keep these experts \
+                             resident"
                         ),
                     ),
                 ));
