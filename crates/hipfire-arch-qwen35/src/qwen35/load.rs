@@ -5644,13 +5644,13 @@ pub(crate) fn load_moe_ffn(
                         &format!(
                             "qwen35: layer {layer_idx} routed experts are host-placed \
                              (memory.moe_expert_budget) but their packed dtype is {dtype:?}, which \
-                             the host-expert path is not verified for; only MQ4G256 (qt 13) is \
-                             proven (MQ4G256V2/qt 44 produced wrong logits on ornith-1.5:35b-a3b). \
-                             The cause is not isolated — those two differ in model as well as \
-                             quant, and both the MQ4-V2 kernels and the tensor-level host read \
-                             pass parity — so treat this as an unverified path, not a proven \
-                             format defect. Raise memory.moe_expert_budget to keep these experts \
-                             resident"
+                             the host-expert path has no verified example: the one model \
+                             measured (ornith-1.5:35b-a3b) produced wrong logits under this \
+                             spill. Its tensor-level host read DOES pass parity (byte-identical, \
+                             host-located, indexed and packed-view arms) and so do the MQ4-V2 \
+                             kernels, so what is unverified is the end-to-end model under spill, \
+                             not the format. Raise memory.moe_expert_budget to keep these \
+                             experts resident"
                         ),
                     ),
                 ));
