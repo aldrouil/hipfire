@@ -56,17 +56,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Require a realistically-sized weight: the first `layers.` match can be
         // a degenerate 32-row linear-attention projection, which would exercise
         // the plumbing over 68 KB and prove nothing about a real offload target.
-        let big = |t: &hipfire_runtime::hfq::HfqTensorInfo| {
+        // `shaped` carries the class filter, and EVERY selection arm below must
+        // honour it -- otherwise a filter that matches nothing silently falls
+        // through to an unrelated tensor (which is exactly what an earlier
+        // version of this did, reporting a linear-attention projection while
+        // claiming to test a shared expert).
+        let shaped = |t: &hipfire_runtime::hfq::HfqTensorInfo| {
             RAW_CODE_QT.contains(&t.quant_type)
                 && t.shape.len() == 2
-                && t.shape[0] >= 1024
-                && t.shape[1] >= 1024
-                // An optional second argument forces the tensor class under test.
-                // Without it the first match can be a shared-expert or attention
-                // projection, which proves nothing about the routed-expert shape
-                // and stride the offload path actually spills.
                 && filter.as_deref().is_none_or(|f| t.name.contains(f))
         };
+        // The size gate exists so an unfiltered run tests something worth
+        // offloading; an explicit filter may name a small tensor (a router is
+        // [num_experts, hidden]) and must not be overridden by it.
+        let large = |t: &hipfire_runtime::hfq::HfqTensorInfo| {
+            filter.is_none() && t.shape[0] >= 1024 && t.shape[1] >= 1024
+        };
+        let big = |t: &hipfire_runtime::hfq::HfqTensorInfo| shaped(t) && large(t);
         let info = RAW_CODE_QT
             .iter()
             .find_map(|qt| {
@@ -75,12 +81,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .find(|t| big(t) && t.quant_type == *qt && t.name.contains("layers."))
             })
             .or_else(|| hfq.tensor_infos().iter().find(|t| big(t)))
-            .or_else(|| {
-                hfq.tensor_infos()
-                    .iter()
-                    .find(|t| RAW_CODE_QT.contains(&t.quant_type) && t.shape.len() == 2)
-            })
-            .unwrap_or_else(|| panic!("no 2-D raw-code tensor in {path}"));
+            .or_else(|| hfq.tensor_infos().iter().find(|t| shaped(t)))
+            .unwrap_or_else(|| {
+                panic!("no 2-D raw-code tensor in {path} matching filter {filter:?}")
+            });
         (
             info.name.clone(),
             info.shape[0] as usize,
