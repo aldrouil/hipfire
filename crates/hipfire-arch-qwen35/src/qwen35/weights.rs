@@ -1257,6 +1257,12 @@ pub struct MoeFfnWeights {
     /// kernel's output so the indexed MoE GEMV can stay capture-safe.
     pub expert_gate_up_ptrs: GpuTensor, // [num_experts * 2] f32 slots = num_experts × u64
     pub expert_down_ptrs: GpuTensor,      // [num_experts * 2] f32 slots = num_experts × u64
+    /// Diagnostic CPU-down splice (ornith qt44 spill): a zeroed device buffer of
+    /// exactly one packed down stride, rewritten into every down table entry so
+    /// the GPU down projection contributes 0 while the CPU recomputes it from
+    /// the intact host blob. `Some` only when the loader spliced it; freed as a
+    /// buffer in `free_moe_ffn_with`.
+    pub(crate) cpu_down_sink: Option<GpuTensor>,
 
     /// Route A MoE-AWQ: per-expert down `awq_scale` pointer table
     /// (`[num_experts * 2]` f32 = num_experts × u64). `Some` only when the
@@ -2402,6 +2408,10 @@ pub(crate) fn free_moe_ffn_with(ffn: MoeFfnWeights, free: &mut impl FnMut(GpuTen
     // points into are owned by `experts[i].down.awq_scale` and freed below via
     // `free_weight_with`.
     if let Some(t) = ffn.expert_down_awq_ptrs {
+        free(t);
+    }
+    // CPU-down splice sink (owns the zeroed buffer every down entry points at).
+    if let Some(t) = ffn.cpu_down_sink {
         free(t);
     }
     // Owned device buffer (built from per-expert gpu_dtype). Free it.

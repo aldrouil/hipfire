@@ -4995,6 +4995,8 @@ pub(crate) fn prefill_moe_ffn_body_batched_with_route<'a>(
         &params.prelude.route,
         PrefillRouteMode::ProduceRoot { .. } | PrefillRouteMode::AdoptRoot { .. }
     ) && bound.rank_count() > 1;
+    // The CPU-down splice below adds into `pbs.x_batch` directly, so it is
+    // correct on every down path: the GPU down contributed 0 through the sink.
     let sealed = if compact_ep {
         hipfire_dispatch::pipeline::sealed_moe::seal_prefill_ep(bound, ctx, params)
     } else {
@@ -5016,6 +5018,77 @@ pub(crate) fn prefill_moe_ffn_body_batched_with_route<'a>(
 
         execute_steps(gpu, ctx, &[Step::Moe(sealed)])
             .map_err(|e| HipError::new(0, &e.to_string()))?;
+        // Diagnostic CPU-down splice, batched twin of the decode hook: the
+        // loader rewrote every down entry to a zeroed sink, so the down above
+        // contributed 0 on every path. Recompute per (token, rank) on the CPU
+        // from the intact host blob and accumulate into `pbs.x_batch`.
+        // Fail closed: unavailable inputs are errors, never silent zeros.
+        if ffn.cpu_down_sink.is_some() {
+            let owners = ffn.packed_expert_owners.as_ref().ok_or_else(|| {
+                HipError::new(0, "moe cpu-down splice: layer has a down sink but no packed owners")
+            })?;
+            if ffn.expert_dtype_tags.is_some() {
+                return Err(HipError::new(
+                    0,
+                    "moe cpu-down splice: prefill refuses mixed-dtype layers (tag table present)",
+                ));
+            }
+            let down_dtype = ffn.experts.first().map(|e| e.down.gpu_dtype).ok_or_else(|| {
+                HipError::new(0, "moe cpu-down splice: layer has a down sink but no experts")
+            })?;
+            let quant = hipfire_dispatch::cpu_exec::cpu_quant_for(down_dtype).ok_or_else(|| {
+                HipError::new(
+                    0,
+                    &format!("moe cpu-down splice: no CPU decoder for down dtype {down_dtype:?}"),
+                )
+            })?;
+            let down_host = gpu.host_bytes(&owners.down).ok_or_else(|| {
+                HipError::new(0, "moe cpu-down splice: down blob has no host bytes")
+            })?;
+            let down_stride = owners.down.buf.size() / config.num_experts.max(1);
+            let slots = n.checked_mul(config.num_experts_per_tok).ok_or_else(|| {
+                HipError::new(0, "moe cpu-down splice: slot extent overflows")
+            })?;
+            let mi = config.moe_intermediate_size;
+            let dim = config.dim;
+            let rot_batch = pbs.moe_rot_batch.as_ref().expect("moe scratch");
+            let topk_indices = pbs.moe_topk_indices_batch.as_ref().expect("moe scratch");
+            let topk_weights = pbs.moe_topk_weights_batch.as_ref().expect("moe scratch");
+            let mut rot = vec![0.0f32; slots * mi];
+            let mut ti = vec![0.0f32; slots];
+            let mut tw = vec![0.0f32; slots];
+            let mut acc = vec![0.0f32; n * dim];
+            let f32_from = |t: &rdna_compute::GpuTensor, out: &mut [f32]| -> HipResult<()> {
+                let bytes = unsafe {
+                    std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, out.len() * 4)
+                };
+                gpu.memcpy_dtoh_auto(bytes, &t.buf)?;
+                Ok(())
+            };
+            f32_from(rot_batch, &mut rot)?;
+            f32_from(topk_indices, &mut ti)?;
+            f32_from(topk_weights, &mut tw)?;
+            f32_from(&pbs.x_batch, &mut acc)?;
+            hipfire_dispatch::cpu_exec::moe_cpu_down_residual_batched(
+                gpu,
+                quant,
+                dim,
+                mi,
+                n,
+                config.num_experts_per_tok,
+                down_stride,
+                down_host,
+                &rot,
+                &ti,
+                &tw,
+                &mut acc,
+                ffn.expert_down_awq_ptrs.is_some(),
+            )
+            .map_err(|e| HipError::new(0, &e.to_string()))?;
+            let acc_bytes =
+                unsafe { std::slice::from_raw_parts(acc.as_ptr() as *const u8, acc.len() * 4) };
+            gpu.memcpy_htod_auto(&pbs.x_batch.buf, acc_bytes)?;
+        }
 
         #[cfg(feature = "moe-oracle")]
         {

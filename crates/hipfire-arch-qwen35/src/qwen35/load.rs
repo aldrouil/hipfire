@@ -5131,6 +5131,7 @@ pub(crate) struct PendingMoeFfn {
     pub(crate) packed_expert_owners: Option<PackedExpertOwners>,
     pub(crate) expert_gate_up_ptrs: Option<GpuTensor>,
     pub(crate) expert_down_ptrs: Option<GpuTensor>,
+    pub(crate) cpu_down_sink: Option<GpuTensor>,
     pub(crate) expert_down_awq_ptrs: Option<GpuTensor>,
     pub(crate) expert_dtype_tags: Option<GpuTensor>,
     pub(crate) paro_shared: Option<MoeParoSidecars>,
@@ -5151,6 +5152,7 @@ impl PendingMoeFfn {
             packed_expert_owners: None,
             expert_gate_up_ptrs: None,
             expert_down_ptrs: None,
+            cpu_down_sink: None,
             expert_down_awq_ptrs: None,
             expert_dtype_tags: None,
             paro_shared: None,
@@ -5171,6 +5173,9 @@ impl PendingMoeFfn {
             let _ = gpu.free_tensor(tensor);
         }
         if let Some(tensor) = self.expert_down_awq_ptrs.take() {
+            let _ = gpu.free_tensor(tensor);
+        }
+        if let Some(tensor) = self.cpu_down_sink.take() {
             let _ = gpu.free_tensor(tensor);
         }
         if let Some(tensor) = self.expert_down_ptrs.take() {
@@ -5261,6 +5266,7 @@ impl PendingMoeFfn {
             packed_expert_owners,
             expert_gate_up_ptrs,
             expert_down_ptrs,
+            cpu_down_sink,
             expert_down_awq_ptrs,
             expert_dtype_tags,
             paro_shared,
@@ -5288,6 +5294,7 @@ impl PendingMoeFfn {
             shared_expert_gate: shared_gate_scalar.expect("pending MoE shared gate scalar"),
             expert_gate_up_ptrs: expert_gate_up_ptrs.expect("pending MoE gate/up pointer table"),
             expert_down_ptrs: expert_down_ptrs.expect("pending MoE down pointer table"),
+            cpu_down_sink,
             expert_down_awq_ptrs,
             expert_dtype_tags,
             layer_idx,
@@ -5371,6 +5378,7 @@ impl PendingMoeFfn {
             packed_expert_owners,
             expert_gate_up_ptrs,
             expert_down_ptrs,
+            cpu_down_sink,
             expert_down_awq_ptrs,
             expert_dtype_tags,
             paro_shared,
@@ -5402,6 +5410,7 @@ impl PendingMoeFfn {
             shared_expert_gate: shared_gate_scalar.expect("pending EP shared gate scalar"),
             expert_gate_up_ptrs: expert_gate_up_ptrs.expect("pending EP gate/up pointer table"),
             expert_down_ptrs: expert_down_ptrs.expect("pending EP down pointer table"),
+            cpu_down_sink,
             expert_down_awq_ptrs,
             expert_dtype_tags,
             layer_idx,
@@ -5775,6 +5784,49 @@ pub(crate) fn load_moe_ffn(
     };
     if let Err(error) = down_copy {
         return Err(pending.rollback(gpu, error));
+    }
+    // Diagnostic CPU-down splice: only under explicit `HIPFIRE_MOE_CPU_DOWN=1`
+    // (any other value, including `0`/unset, leaves the load untouched) on a
+    // host-placed packed layer, so resident loads are byte-identical. The sink
+    // owns one zeroed device buffer of exactly `down_stride` bytes and every
+    // down entry is rewritten to it; the real host blob stays intact for the
+    // CPU at forward time. AWQ layers stay refused: a bare `gemv` would ignore
+    // the per-expert scale.
+    let cpu_down_splice = hipfire_config::developer_var("HIPFIRE_MOE_CPU_DOWN")
+        .ok()
+        .as_deref()
+        != Some("0")
+        && residency.experts_host()
+        && pending.packed_expert_owners.is_some()
+        && pending.experts.first().is_some_and(|e| e.down.awq_scale.is_none());
+    if cpu_down_splice {
+        let down_stride = pending.experts[0].down.buf.buf.size();
+        let sink = match gpu.zeros(&[down_stride / 4], DType::F32) {
+            Ok(tensor) => tensor,
+            Err(error) => return Err(pending.rollback(gpu, error)),
+        };
+        let sink_ptr = sink.buf.as_ptr() as u64;
+        let sink_bytes: Vec<u8> = vec![sink_ptr; n_exp]
+            .iter()
+            .flat_map(|ptr| ptr.to_ne_bytes())
+            .collect();
+        let rewrite = {
+            let tensor = pending
+                .expert_down_ptrs
+                .as_ref()
+                .expect("pending down table");
+            gpu.hip.memcpy_htod(&tensor.buf, &sink_bytes)
+        };
+        if let Err(error) = rewrite {
+            let _ = gpu.free_tensor(sink);
+            return Err(pending.rollback(gpu, error));
+        }
+        if layer_idx == 0 {
+            eprintln!(
+                "  [moe-cpu-down] layer {layer_idx}: GPU down silenced via zeroed sink ({down_stride} B/entry); CPU recomputes from host blob"
+            );
+        }
+        pending.cpu_down_sink = Some(sink);
     }
 
     let moe_awq_enabled = hipfire_config::developer_var("HIPFIRE_MOE_AWQ")
