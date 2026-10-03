@@ -849,6 +849,43 @@ mod tests {
         }
     }
 
+    /// The fail-closed rule the packed MQ4-V2 arm depends on, pinned so it cannot
+    /// be dropped again on the premise that the qt-44 host read is exact — that
+    /// premise was an artifact (a comparison against a scratch tensor that is
+    /// never written, scored through a `rel > worst` test that NaN defeats).
+    #[test]
+    fn an_unverified_host_layer_refuses_by_name_and_a_verified_one_does_not() {
+        let mut layers = bytes(&[100, 100], &[400, 400], 50);
+        layers.unverified_host = vec![true, false];
+        let host_experts = Placement {
+            layer_residency: vec![WeightResidency::Resident; 2],
+            expert_residency: vec![ExpertResidency::HostMapped, ExpertResidency::Device],
+        };
+
+        let refusal = unverified_host_refusal(&layers, &host_experts)
+            .expect("host-placing an unverified layer's experts must refuse");
+        assert!(refusal.contains("layer 0"), "{refusal}");
+        assert!(refusal.contains("MQ4G256V2"), "{refusal}");
+        assert!(refusal.contains("moe_expert_budget"), "{refusal}");
+
+        // A whole-layer spill of the same layer takes its experts with it, so it
+        // is refused on the same rule rather than a second one.
+        let host_layer = Placement {
+            layer_residency: vec![WeightResidency::HostMapped, WeightResidency::Resident],
+            expert_residency: vec![ExpertResidency::Device, ExpertResidency::Device],
+        };
+        assert!(unverified_host_refusal(&layers, &host_layer).is_some());
+
+        // The qt-13 shape: verified layers host-place freely.
+        let verified = bytes(&[100, 100], &[400, 400], 50);
+        assert!(unverified_host_refusal(&verified, &host_experts).is_none());
+
+        // A resident placement never refuses, and an arch that has not
+        // characterised its dtypes (empty vector) is unaffected.
+        assert!(unverified_host_refusal(&layers, &Placement::all_device(2)).is_none());
+        assert!(unverified_host_refusal(&verified, &Placement::all_device(2)).is_none());
+    }
+
     #[test]
     fn a_model_that_fits_is_untouched() {
         let layers = bytes(&[100, 100, 100], &[400, 400, 400], 50);
