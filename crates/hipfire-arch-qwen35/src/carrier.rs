@@ -11,6 +11,7 @@ use hipfire_runtime::kv_mode;
 use hipfire_runtime::llama::KvCacheExt;
 use hipfire_runtime::llama::{self, KvCache, KvDims, KvLayers, KvTarget};
 use hipfire_runtime::loader_api::{LoadCtx, ModelSource};
+use hipfire_runtime::offload;
 
 pub struct Qwen35Bundle {
     pub config: Qwen35Config,
@@ -39,6 +40,109 @@ pub struct Qwen35Bundle {
     /// `ArchModel::free_gpu`. Previously lived on `LoadedModel`.
     pub qwen35_decode_batch: Option<Qwen35DecodeBatchState>,
 }
+/// Resolve partial GPU offload before the first allocation.
+///
+/// Returns `None` when neither knob is set, which is the *only* case that must
+/// stay byte-identical to the pre-offload loader: no measured capacity, no
+/// admission, no refusal — exactly as before. A model that does not fit still
+/// fails where it always did (the KV allocation), and the post-weight `card_cap`
+/// reduction is untouched.
+///
+/// With a knob set, the capacity is `free VRAM − KV reservation − prefill floor −
+/// 128 MiB`, the same KV footprint the post-weight path computes, so the
+/// placement and the KV admission cannot drift.
+fn resolve_partial_offload(
+    hfq: &HfqFile,
+    config: &Qwen35Config,
+    ctx: &LoadCtx,
+    plan: &Qwen35KvPlan,
+) -> Result<Option<offload::Placement>, String> {
+    use hipfire_config::memory::{moe_expert_budget, offload_exec, OffloadBudget, OffloadExec};
+    let budgets = (
+        hipfire_config::memory::gpu_layer_budget(),
+        moe_expert_budget(),
+    );
+    if budgets == (OffloadBudget::Full, OffloadBudget::Full) {
+        return Ok(None);
+    }
+    // A CPU-executed step is a host sync point, so hipGraph capture must be off
+    // for the model's lifetime — but the arch's capture gate reads the
+    // config-level split (`i_gpu_start`), which `auto` leaves at zero. Refuse the
+    // combination until the gate reads the loaded placement instead of the config.
+    if offload_exec() == OffloadExec::Cpu
+        && (matches!(budgets.0, OffloadBudget::Auto) || matches!(budgets.1, OffloadBudget::Auto))
+    {
+        return Err(
+            "memory.offload_exec=cpu cannot be combined with an `auto` offload budget: the \
+             placement search would spill layers while the capture gate still reads the \
+             config-level split (which `auto` leaves at zero), leaving hipGraph capture enabled \
+             over CPU-executed steps. Pin an explicit layer count (memory.gpu_layer_budget / \
+             memory.moe_expert_budget), or set memory.offload_exec=pcie"
+                .to_string(),
+        );
+    }
+
+    let free_vram = ctx
+        .gpu
+        .hip
+        .get_vram_info()
+        .map_err(|e| format!("Qwen pre-weight VRAM query: {e}"))?
+        .0 as u64;
+    let rows = plan.dims.physical_cap.unwrap_or(plan.dims.max_seq);
+    let stride =
+        crate::qwen35::prefill::vmm_kv_token_bytes(config, plan.pair, plan.adaptive.is_some())
+            .ok_or("Qwen KV stride overflow")?;
+    let kv = offload::kv_reserve(stride as u64, rows).ok_or("Qwen KV reservation overflow")?;
+    // A MoE model has no prefill-scratch sizing model
+    // (`dense_prefill_allocation_bytes` deliberately returns `None` for
+    // `num_experts != 0`), which is why the VMM path refuses MoE models outright.
+    // Reserve 0 and say so: the placement is then bounded by the KV reservation
+    // alone, and the shortfall is visible rather than hidden.
+    let pbs_reservation =
+        crate::qwen35::prefill::minimum_prefill_reservation_bytes(config, &ctx.gpu.arch);
+    let pbs = pbs_reservation.unwrap_or(0) as u64;
+    let slack = 128u64 << 20;
+    let reserved = kv
+        .bytes
+        .checked_add(pbs)
+        .and_then(|bytes| bytes.checked_add(slack))
+        .ok_or("Qwen offload reservation overflow")?;
+    let capacity = offload::Capacity {
+        weight_bytes: free_vram.saturating_sub(reserved),
+    };
+
+    let layer_bytes = crate::qwen35::load::qwen35_layer_bytes(hfq, config);
+    let (placement, line) = offload::plan(
+        &layer_bytes,
+        budgets,
+        &capacity,
+        offload::Orientation::SuffixResident,
+    )?;
+    eprintln!("  {line}");
+    let host_bytes = layer_bytes.host_expert_bytes(&placement);
+    eprintln!(
+        "  kv reserved: {} tokens x {stride} B = {} MiB; pbs floor {}; slack {} MiB; \
+         weight budget {} MiB of {} MiB free",
+        kv.rows,
+        kv.bytes / (1 << 20),
+        match pbs_reservation {
+            Some(bytes) => format!("{} MiB", bytes / (1 << 20)),
+            None => "0 MiB (no MoE prefill sizing)".to_string(),
+        },
+        slack / (1 << 20),
+        capacity.weight_bytes / (1 << 20),
+        free_vram / (1 << 20),
+    );
+    if !placement.is_fully_resident() {
+        eprintln!(
+            "  {}",
+            offload::report(&placement, &layer_bytes, host_bytes)
+        );
+    }
+    offload::admit_host_placement(host_bytes)?;
+    Ok(Some(placement))
+}
+
 /// Build the Qwen35 GPU bundle from an HFQ source.
 ///
 /// CPU-only config/compat validation runs **before** weight upload. Every
@@ -55,24 +159,40 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
 
     // ── CPU-only parse + compatibility (zero GPU allocation) ─────────
     let mut plan = plan_qwen35_gpu_stages(&config, ctx)?;
+    // Placement is resolved once, here, against the measured capacity a
+    // configured spill must fit — before any allocation. `None` (no knob) keeps
+    // the load byte-identical to the pre-offload loader.
+    let placement = resolve_partial_offload(&hfq, &config, ctx, &plan)?;
     let dn_quant = parse_state_quant(ctx.state_quant_override)?;
     eprintln!("  DeltaNet state: {}", state_quant_label(dn_quant));
     warn_tiny_model_state(&hfq, dn_quant);
 
     // ── Weight upload (first GPU ownership) ──────────────────────────
-    let weights = <Qwen35 as Architecture>::load_weights(&mut hfq, &config, ctx.gpu)?;
+    let weights = <Qwen35 as Architecture>::load_weights_with_placement(
+        &mut hfq,
+        &config,
+        ctx.gpu,
+        placement.as_ref(),
+    )?;
     hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);
     // The real card bound is determined only now: weights (including any
     // expanded tensors) already own VRAM, while KV and lazy PBS do not.
     if let Some(mut sequence) = ctx.sequence {
         let capacity = (|| -> Result<(usize, usize, usize, usize), String> {
-            let (free, _) = ctx.gpu.hip.get_vram_info().map_err(|e| format!("Qwen post-weight VRAM query: {e}"))?;
-            let minimum = crate::qwen35::prefill::minimum_prefill_reservation_bytes(
-                &config, &ctx.gpu.arch,
-            ).ok_or("Qwen minimum PBS sizing overflow")?;
+            let (free, _) = ctx
+                .gpu
+                .hip
+                .get_vram_info()
+                .map_err(|e| format!("Qwen post-weight VRAM query: {e}"))?;
+            let minimum =
+                crate::qwen35::prefill::minimum_prefill_reservation_bytes(&config, &ctx.gpu.arch)
+                    .ok_or("Qwen minimum PBS sizing overflow")?;
             let stride = crate::qwen35::prefill::vmm_kv_token_bytes(
-                &config, plan.pair, plan.adaptive.is_some(),
-            ).ok_or("Qwen KV stride overflow")?;
+                &config,
+                plan.pair,
+                plan.adaptive.is_some(),
+            )
+            .ok_or("Qwen KV stride overflow")?;
             let card_cap = free.saturating_sub(minimum).saturating_sub(128 << 20) / stride;
             Ok((free, minimum, stride, card_cap))
         })();
@@ -195,16 +315,26 @@ fn plan_qwen35_gpu_stages(config: &Qwen35Config, ctx: &LoadCtx) -> Result<Qwen35
         .unwrap_or_else(|| hipfire_runtime::config::get().kv_adaptive.clone());
     let adaptive_req = parse_kv_adaptive(&kv_adaptive_spec)?;
     let native_eligible = kv_mode::qwen35_native_eligible(
-        ctx.gpu.arch.as_str(), config.n_heads, config.n_kv_heads, config.head_dim,
-        ctx.pp, adaptive_req.is_some(), ctx.cask.sidecar.is_some(),
+        ctx.gpu.arch.as_str(),
+        config.n_heads,
+        config.n_kv_heads,
+        config.head_dim,
+        ctx.pp,
+        adaptive_req.is_some(),
+        ctx.cask.sidecar.is_some(),
     );
-    let policy = kv_mode::qwen35_policy_for_native(
-        &kv_mode::QWEN35_HFQ_POLICY, &mode_raw, native_eligible,
-    );
+    let policy =
+        kv_mode::qwen35_policy_for_native(&kv_mode::QWEN35_HFQ_POLICY, &mode_raw, native_eligible);
 
     let pair = kv_mode::resolve_kv_pair(
-        &mode_raw, k_raw, v_raw, &policy, ctx.gpu.arch.as_str(), ctx.qwen_default_q8,
-    ).map_err(|e| e.to_string())?;
+        &mode_raw,
+        k_raw,
+        v_raw,
+        &policy,
+        ctx.gpu.arch.as_str(),
+        ctx.qwen_default_q8,
+    )
+    .map_err(|e| e.to_string())?;
     let mode = pair.k();
     match pair {
         kv_mode::KvPair::Native(_) => eprintln!(
@@ -300,7 +430,10 @@ fn plan_qwen35_gpu_stages(config: &Qwen35Config, ctx: &LoadCtx) -> Result<Qwen35
         validate_cask_static_layout(ctx.cask.sidecar.is_some(), pair)?;
         if let kv_mode::KvPair::Split(_, static_v) = pair {
             if !matches!(static_v, llama::VMode::Q8)
-                && !matches!(mode, kv_mode::KvMode::Fwht2 | kv_mode::KvMode::Fwht3 | kv_mode::KvMode::Fwht4)
+                && !matches!(
+                    mode,
+                    kv_mode::KvMode::Fwht2 | kv_mode::KvMode::Fwht3 | kv_mode::KvMode::Fwht4
+                )
             {
                 return Err(format!(
                     "V={} requires an FWHT K mode (fwht2/3/4); resolved mode is {:?} (K={})",
@@ -335,8 +468,13 @@ pub fn validate_native_kv_admission(
         return Ok(());
     }
     if !kv_mode::qwen35_native_eligible(
-        ctx.gpu.arch.as_str(), config.n_heads, config.n_kv_heads, config.head_dim,
-        ctx.pp, adaptive, ctx.cask.sidecar.is_some(),
+        ctx.gpu.arch.as_str(),
+        config.n_heads,
+        config.n_kv_heads,
+        config.head_dim,
+        ctx.pp,
+        adaptive,
+        ctx.cask.sidecar.is_some(),
     ) {
         return Err(format!(
             "kv_mode {mode:?} requires exact gfx1201 H24/Hkv4/D256, single GPU, no adaptive/CASK (got {}, H{}/Hkv{}/D{}); use --kv-mode q8",
@@ -402,15 +540,14 @@ fn validate_adaptive_cask_handoff(
 /// The static CASK path remains limited to Q8 V and Givens legacy-asym K.
 /// Adaptive FWHT/Lloyd layouts use the separately validated plain-TriAttention
 /// handoff; m-folding still lacks the corresponding fold/requant kernels.
-fn validate_cask_static_layout(
-    cask_enabled: bool,
-    pair: kv_mode::KvPair,
-) -> Result<(), String> {
+fn validate_cask_static_layout(cask_enabled: bool, pair: kv_mode::KvPair) -> Result<(), String> {
     if !cask_enabled {
         return Ok(());
     }
     if !matches!(pair, kv_mode::KvPair::Split(_, llama::VMode::Q8)) {
-        return Err(format!("CASK currently requires split V=q8 (resolved KV is {pair:?})"));
+        return Err(format!(
+            "CASK currently requires split V=q8 (resolved KV is {pair:?})"
+        ));
     }
     if !matches!(
         pair.k(),
@@ -493,25 +630,44 @@ fn construct_kv_cache(
         let kv = match (ctx.kv_backend, plan.pair) {
             (KvBackend::Vmm, kv_mode::KvPair::Native(_)) => {
                 <KvCache as KvCacheExt>::from_mode_with_backend(
-                    mode, KvBackend::Vmm, KvTarget::Single(ctx.gpu), &plan.dims,
-                ).map_err(|e| format!("{e}"))?
+                    mode,
+                    KvBackend::Vmm,
+                    KvTarget::Single(ctx.gpu),
+                    &plan.dims,
+                )
+                .map_err(|e| format!("{e}"))?
             }
             (KvBackend::Vmm, kv_mode::KvPair::Split(_, vm)) => {
                 KvCache::new_gpu_vmm_capped_filtered(
-                    ctx.gpu, &plan.is_kv_layer, config.n_kv_heads, config.head_dim,
-                    ctx.max_seq, physical_cap, mode, vm,
-                ).map_err(|e| format!("{e}"))?
+                    ctx.gpu,
+                    &plan.is_kv_layer,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    ctx.max_seq,
+                    physical_cap,
+                    mode,
+                    vm,
+                )
+                .map_err(|e| format!("{e}"))?
             }
             (KvBackend::Legacy, kv_mode::KvPair::Native(_))
             | (KvBackend::Legacy, kv_mode::KvPair::Split(_, llama::VMode::Q8)) => {
                 <KvCache as KvCacheExt>::from_mode_with_backend(
-                    mode, KvBackend::Legacy, KvTarget::Single(ctx.gpu), &plan.dims,
-                ).map_err(|e| format!("{e}"))?
+                    mode,
+                    KvBackend::Legacy,
+                    KvTarget::Single(ctx.gpu),
+                    &plan.dims,
+                )
+                .map_err(|e| format!("{e}"))?
             }
             (KvBackend::Legacy, kv_mode::KvPair::Split(_, vm)) => {
                 let mut kv = <KvCache as KvCacheExt>::from_mode_with_backend(
-                    mode, KvBackend::Legacy, KvTarget::Single(ctx.gpu), &plan.dims,
-                ).map_err(|e| format!("{e}"))?;
+                    mode,
+                    KvBackend::Legacy,
+                    KvTarget::Single(ctx.gpu),
+                    &plan.dims,
+                )
+                .map_err(|e| format!("{e}"))?;
                 if let Err(e) = kv.set_v_mode_realloc(ctx.gpu, vm) {
                     let cleanup = kv.free_gpu(ctx.gpu).map_err(|fe| fe.to_string());
                     return Err(append_cleanup_context(format!("{e}"), cleanup));
@@ -846,13 +1002,18 @@ mod tests {
             validate_cask_static_layout(true, KvPair::Split(mode, VMode::Q8)).unwrap();
         }
         for mode in [KvMode::Fwht2, KvMode::Fwht3, KvMode::Fwht4] {
-            let err = validate_cask_static_layout(true, KvPair::Split(mode, VMode::Q8)).unwrap_err();
+            let err =
+                validate_cask_static_layout(true, KvPair::Split(mode, VMode::Q8)).unwrap_err();
             assert!(err.contains("legacy-asym"), "{err}");
         }
-        let err = validate_cask_static_layout(true, KvPair::Split(KvMode::Fwht3, VMode::Lloyd3)).unwrap_err();
+        let err = validate_cask_static_layout(true, KvPair::Split(KvMode::Fwht3, VMode::Lloyd3))
+            .unwrap_err();
         assert!(err.contains("V=q8"), "{err}");
-        assert!(validate_cask_static_layout(true, KvPair::Native(KvMode::Fp8))
-            .unwrap_err().contains("V=q8"));
+        assert!(
+            validate_cask_static_layout(true, KvPair::Native(KvMode::Fp8))
+                .unwrap_err()
+                .contains("V=q8")
+        );
     }
 
     #[test]

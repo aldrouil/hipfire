@@ -307,6 +307,22 @@ pub(crate) struct MoeExpertSourceRecord {
     pub(crate) down: MoeProjectionSource,
 }
 
+/// True when `name` is one of a layer's *routed-expert* weight tensors — the
+/// tensors `memory.moe_expert_budget` may move to host RAM.
+///
+/// Name knowledge stays in the arch: the shared `hipfire_runtime::offload`
+/// module never parses tensor names, it only consumes the byte census this
+/// classifier feeds.
+///
+/// Deliberately excludes the router (`mlp.gate.weight`), the shared expert
+/// (`mlp.shared_expert.*`), `mlp.shared_expert_gate` and the AWQ sidecars
+/// (`*.awq_scale.weight`): those stay with the layer, whose own residency
+/// decides their placement.
+pub(crate) fn is_routed_expert_weight(name: &str) -> bool {
+    name.contains(".mlp.experts.")
+        && (name.ends_with(".gate_up_proj.weight") || name.ends_with(".down_proj.weight"))
+}
+
 fn source_metadata(
     source: &MoeProjectionSource,
 ) -> hipfire_runtime::sealed_moe::ExpertSourceMetadata {
@@ -2810,6 +2826,33 @@ impl DeltaNetState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The classifier decides which tensors `memory.moe_expert_budget` may move,
+    /// so its accept/reject sets are the contract. Every spelling below is one
+    /// `qwen35_tensor_name_candidates` actually emits for the trunk.
+    #[test]
+    fn routed_expert_classifier_accepts_only_the_expert_projections() {
+        for accepted in [
+            "layers.0.mlp.experts.255.gate_up_proj.weight",
+            "model.language_model.layers.7.mlp.experts.0.down_proj.weight",
+            "model.layers.12.mlp.experts.3.gate_up_proj.weight",
+        ] {
+            assert!(is_routed_expert_weight(accepted), "{accepted}");
+        }
+        for rejected in [
+            "layers.0.mlp.gate.weight",
+            "layers.0.mlp.shared_expert.gate_proj.weight",
+            "layers.0.mlp.shared_expert.up_proj.weight",
+            "layers.0.mlp.shared_expert.down_proj.weight",
+            "layers.0.mlp.shared_expert_gate.weight",
+            "layers.0.mlp.experts.0.down_proj.awq_scale.weight",
+            "layers.0.mlp.experts.0.gate_up_proj.awq_scale.weight",
+            "layers.0.self_attn.q_proj.weight",
+            "layers.0.linear_attn.in_proj_qkv.weight",
+        ] {
+            assert!(!is_routed_expert_weight(rejected), "{rejected}");
+        }
+    }
     use rdna_compute::DType;
 
     #[test]

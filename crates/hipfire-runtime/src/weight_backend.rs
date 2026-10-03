@@ -1439,6 +1439,7 @@ pub const HOST_DECODE_REFUSAL: &str =
 use crate::augmentor::{try_augmentors, DEFAULT_AUGMENTORS};
 use crate::model_source::ModelSource;
 use crate::paro::{load_fp16_weight_from_source, paro_load_f32, paro_load_norm};
+pub use crate::weight_manifest::WeightResidency;
 
 /// Pluggable weight-loading backend. `rel` is a layer-relative path: for `proj`
 /// it carries NO file extension (the backend appends `.weight` / tries `.qweight`);
@@ -1476,17 +1477,18 @@ pub struct HfqBackend<'a> {
         MemoryTarget,
     ) -> HipResult<WeightTensor>,
     pub layer: usize,
-    /// When true, this layer's weight tensors allocate on host-mapped system RAM (
-    /// read over PCIe) instead of device memory — leaving VRAM free for a larger KV cache
-    /// while keeping numerics byte-identical to resident mode. Set per-layer by the loader
-    /// from the placement policy; `false` is the fully-resident, zero-diff default.
+    /// Where this layer's own weight tensors live. `HostMapped` allocates them in
+    /// pinned system RAM the kernels read over PCIe instead of device memory,
+    /// leaving VRAM free for a larger KV cache while keeping numerics
+    /// byte-identical to resident mode. Set per layer by the loader from the
+    /// resolved placement; `Resident` is the fully-resident, zero-diff default.
     ///
     /// It selects the [`MemoryTarget`] passed to [`Self::read_proj`] for projections
     /// and the host uploader for `norm`/`raw_f32`/`bias`. One upload path: an arch
     /// whose reader cannot honour `HostMapped` refuses inside its own decode (e.g.
     /// the f32-dequant fallback, [`HOST_DECODE_REFUSAL`]) rather than landing the
     /// weights in the VRAM the offload exists to free.
-    pub host_local: bool,
+    pub residency: WeightResidency,
 }
 
 impl<'a> WeightBackend for HfqBackend<'a> {
@@ -1498,15 +1500,11 @@ impl<'a> WeightBackend for HfqBackend<'a> {
         let name = hfq_proj_name(self.layer, rel);
         if rdna_compute::load_trace_enabled() {
             eprintln!(
-                "[load-trace] proj L{} {name} m={m} k={k} host_local={}",
-                self.layer, self.host_local
+                "[load-trace] proj L{} {name} m={m} k={k} residency={:?}",
+                self.layer, self.residency
             );
         }
-        let target = if self.host_local {
-            MemoryTarget::HostMapped
-        } else {
-            MemoryTarget::Device
-        };
+        let target = crate::offload::memory_target(self.residency);
         (self.read_proj)(self.hfq, self.gpu, &name, m, k, self.candidates, target)
     }
     fn norm(&mut self, rel: &str, shape: &[usize]) -> HipResult<GpuTensor> {
@@ -1517,7 +1515,7 @@ impl<'a> WeightBackend for HfqBackend<'a> {
         let (info, data) = read_first(self.hfq, &name, self.candidates)
             .unwrap_or_else(|| panic!("tensor not found: {name}"));
         let f32_data = dequantize_norm(info.quant_type, &data, shape, self.norm_bias);
-        if self.host_local {
+        if self.residency == WeightResidency::HostMapped {
             self.gpu.upload_f32_host(&f32_data, shape)
         } else {
             self.gpu.upload_f32(&f32_data, shape)
@@ -1531,7 +1529,7 @@ impl<'a> WeightBackend for HfqBackend<'a> {
         let (info, data) = read_first(self.hfq, &name, self.candidates)
             .unwrap_or_else(|| panic!("tensor not found: {name}"));
         let f32_data = dequantize_to_f32(info.quant_type, &data, n);
-        if self.host_local {
+        if self.residency == WeightResidency::HostMapped {
             self.gpu.upload_f32_host(&f32_data[..n], &[n])
         } else {
             self.gpu.upload_f32(&f32_data[..n], &[n])
@@ -1542,7 +1540,7 @@ impl<'a> WeightBackend for HfqBackend<'a> {
         let (info, data) = read_first(self.hfq, &name, self.candidates)
             .unwrap_or_else(|| panic!("tensor not found: {name}"));
         let f32_data = dequantize_to_f32(info.quant_type, &data, n);
-        let t = if self.host_local {
+        let t = if self.residency == WeightResidency::HostMapped {
             self.gpu.upload_f32_host(&f32_data[..n], &[n])?
         } else {
             self.gpu.upload_f32(&f32_data[..n], &[n])?

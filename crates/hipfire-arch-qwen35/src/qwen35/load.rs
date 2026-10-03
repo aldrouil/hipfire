@@ -47,6 +47,10 @@ use hipfire_runtime::model_load::LoadedWeights;
 pub use hipfire_runtime::model_load::StagedLoadFault;
 use hipfire_runtime::model_load::WeightSource;
 use hipfire_runtime::model_source::ModelSource;
+use hipfire_runtime::offload::expert_memory_target;
+use hipfire_runtime::offload::memory_target;
+use hipfire_runtime::offload::LayerBytes;
+use hipfire_runtime::offload::LayerResidency;
 use hipfire_runtime::paro::paro_load_norm;
 use hipfire_runtime::paro::paro_text_prefix;
 use hipfire_runtime::tp_shard::ExpertAssign;
@@ -60,6 +64,7 @@ use hipfire_runtime::weight_backend::reupload_f16_as_f32;
 use hipfire_runtime::weight_backend::HfqBackend;
 use hipfire_runtime::weight_backend::MemoryTarget;
 use hipfire_runtime::weight_backend::ParoBackend;
+use hipfire_runtime::weight_manifest::WeightResidency;
 use rdna_compute::DType;
 use rdna_compute::Gpu;
 use rdna_compute::GpuTensor;
@@ -2640,6 +2645,71 @@ pub fn report_cpu_exec_coverage(hfq: &HfqFile, config: &Qwen35Config) {
 
 // ── load_weights (thin assembler over runtime orchestrator) ───────────────
 
+/// Count and total size of the routed-expert tensors that left VRAM.
+///
+/// Counted from the *packed owners*, whose `GpuTensor`s carry the host-mapped
+/// ownership tag; the per-expert views are `sub_offset` slices and always report
+/// `Borrowed`, never `HostMapped`, so counting views would report zero.
+fn host_mapped_expert_accounting(layers: &[LayerWeights]) -> (usize, u64) {
+    let mut tensors = 0usize;
+    let mut bytes = 0u64;
+    let mut tally = |owner: &GpuTensor| {
+        if owner.buf.is_host_mapped() {
+            tensors += 1;
+            bytes += owner.byte_size() as u64;
+        }
+    };
+    for layer in layers {
+        let ffn = match layer {
+            LayerWeights::DeltaNetMoe(l) => &l.ffn,
+            LayerWeights::FullAttnMoe(l) => &l.ffn,
+            _ => continue,
+        };
+        if let Some(owners) = &ffn.packed_expert_owners {
+            tally(&owners.gate_up);
+            tally(&owners.down);
+        } else {
+            for expert in &ffn.experts {
+                tally(&expert.gate_up.buf);
+                tally(&expert.down.buf);
+            }
+        }
+    }
+    (tensors, bytes)
+}
+
+/// Per-layer byte census for the placement search, from the source's own index.
+///
+/// Routed experts are recognised by the arch's own classifier
+/// ([`is_routed_expert_weight`]); everything else a name's `layers.<N>` belongs
+/// to is that layer's non-expert bytes, and every global tensor (embedding,
+/// language head, final norm, vision tower) is always-resident. The shared
+/// placement module never parses a tensor name.
+pub fn qwen35_layer_bytes(hfq: &HfqFile, config: &Qwen35Config) -> LayerBytes {
+    let n = config.n_layers;
+    let mut non_expert = vec![0u64; n];
+    let mut expert = vec![0u64; n];
+    let mut always_resident = 0u64;
+    for info in hfq.tensor_infos() {
+        let bytes = info.data_size as u64;
+        match crate::serve_engine::tensor_layer_index(&info.name) {
+            Some(layer) if layer < n => {
+                if crate::qwen35::weights::is_routed_expert_weight(&info.name) {
+                    expert[layer] += bytes;
+                } else {
+                    non_expert[layer] += bytes;
+                }
+            }
+            _ => always_resident += bytes,
+        }
+    }
+    LayerBytes {
+        non_expert,
+        expert,
+        always_resident,
+    }
+}
+
 /// Drive a qwen35 `WeightSource` over the device slice (runtime orchestrator),
 /// then assemble `Qwen35Weights`. `pager` is always `None` here; paged-experts
 /// wiring is unchanged and set by the caller post-load.
@@ -2698,6 +2768,17 @@ fn load_weights_inner(
         PACKED_READ_MS.load(Ordering::Relaxed),
         PACKED_UPLOAD_MS.load(Ordering::Relaxed),
     );
+    // Honest accounting: how many routed-expert tensors actually left VRAM. A
+    // configured spill that host-locates nothing must be visible on the load line
+    // rather than silent — that is what turns "forgot to thread the residency"
+    // into a readable symptom instead of a quiet no-op.
+    let (host_expert_tensors, host_expert_bytes) = host_mapped_expert_accounting(&layers);
+    if host_expert_tensors > 0 {
+        eprintln!(
+            "  moe offload: {host_expert_tensors} expert tensors ({:.2} GiB) host-mapped",
+            host_expert_bytes as f64 / (1u64 << 30) as f64,
+        );
+    }
     Ok(Qwen35Weights {
         token_embd,
         embd_format,
@@ -2732,15 +2813,9 @@ impl WeightSource for HfqSource<'_> {
         self.hfq.mq4v2_symmetric()
     }
     fn prepare(&mut self, n_devices: usize) -> HipResult<()> {
-        // Partial GPU offload: this source is where the spilled prefix is
-        // placed, so the MoE / multi-device refusal backstops daemon admission
-        // here, and the residency line prints only once placement is applied.
-        if let Some(refusal) = super::config::offload_topology_refusal(self.c, 1, n_devices) {
-            return Err(HipError::new(0, &refusal));
-        }
-        if let Some(line) = super::config::offload_residency_report(self.c) {
-            eprintln!("{line}");
-        }
+        // Partial GPU offload is resolved by the loader (see
+        // `hipfire_runtime::offload`), which also prints the residency line; this
+        // source no longer decides or announces placement.
         // Keep the mmap alive on discrete GPUs (the carrier cleared
         // `evict_page_cache` there): weight uploads DMA straight out of
         // page-cache pages with no heap staging copy — measured 11–16 GB/s
@@ -2857,7 +2932,12 @@ impl WeightSource for HfqSource<'_> {
         Ok((output, aliases))
     }
 
-    fn read_layer(&mut self, gpu: &mut Gpu, layer_idx: usize) -> HipResult<LayerWeights> {
+    fn read_layer(
+        &mut self,
+        gpu: &mut Gpu,
+        layer_idx: usize,
+        residency: LayerResidency,
+    ) -> HipResult<LayerWeights> {
         let c = self.c;
         let is_moe = c.num_experts > 0;
         eprintln!(
@@ -2868,7 +2948,7 @@ impl WeightSource for HfqSource<'_> {
         );
         let p = format!("layers.{layer_idx}");
         let page = self.hfq.layer_data_range(&p);
-        let lw = load_layer_into(self.hfq, c, layer_idx, &p, gpu)?;
+        let lw = load_layer_into(self.hfq, c, layer_idx, &p, gpu, residency)?;
         if rdna_compute::load_trace_enabled() {
             let (free, total) = gpu.hip.get_vram_info().unwrap_or((0, 0));
             let (new, reused, alloc) = gpu.pool_stats();
@@ -2982,7 +3062,15 @@ impl WeightSource for ParoSource<'_> {
         )
     }
 
-    fn read_layer(&mut self, gpu: &mut Gpu, layer_idx: usize) -> HipResult<LayerWeights> {
+    fn read_layer(
+        &mut self,
+        gpu: &mut Gpu,
+        layer_idx: usize,
+        _residency: LayerResidency,
+    ) -> HipResult<LayerWeights> {
+        // ParoQuant loads through `ParoBackend`, which has no host-upload path:
+        // it never honours a spill, and the loader refuses a configured spill on
+        // this source before it reaches here.
         let c = self.c;
         eprintln!(
             "  loading layer {layer_idx}/{} ({:?}, ParoQuant)...",
@@ -3011,7 +3099,7 @@ fn qwen35_hfq_backend<'a>(
     hfq: &'a HfqFile,
     gpu: &'a mut Gpu,
     layer: usize,
-    host_local: bool,
+    residency: WeightResidency,
 ) -> HfqBackend<'a> {
     HfqBackend {
         hfq,
@@ -3020,10 +3108,10 @@ fn qwen35_hfq_backend<'a>(
         candidates: qwen35_tensor_name_candidates,
         read_proj: load_weight_tensor,
         layer,
-        // Offload plumbing. `host_local` selects the `MemoryTarget` handed to
-        // `read_proj` and the host uploader for `norm`/`raw_f32`/`bias`. Defaults
-        // to the resident path (zero-diff regression guard).
-        host_local,
+        // Offload plumbing: the layer's resolved storage tier. It selects the
+        // `MemoryTarget` handed to `read_proj` and the host uploader for
+        // `norm`/`raw_f32`/`bias`; `Resident` is the zero-diff default.
+        residency,
     }
 }
 
@@ -3054,14 +3142,22 @@ fn load_layer_into(
     layer_idx: usize,
     p: &str,
     gpu: &mut Gpu,
+    residency: LayerResidency,
 ) -> HipResult<LayerWeights> {
     debug_assert_eq!(p, &format!("layers.{layer_idx}"));
-    // Partial GPU offload: layers before the resident-tail split point load their
-    // weights into host-mapped system RAM. `i_gpu_start` defaults to 0, so an unset
-    // budget keeps every layer device-resident (the zero-diff regression guard).
-    let mut b = qwen35_hfq_backend(hfq, gpu, layer_idx, layer_idx < config.i_gpu_start);
+    // Partial GPU offload: the loader resolved this layer's storage tier once.
+    // `LayerResidency::DEVICE` (the unset default) keeps every tensor
+    // device-resident — the zero-diff regression guard.
+    let mut b = qwen35_hfq_backend(hfq, gpu, layer_idx, residency.weights);
     let moe = |bk: &mut HfqBackend, cfg: &Qwen35Config, li: usize| {
-        load_moe_ffn(bk.hfq, bk.gpu, &format!("layers.{li}"), cfg, li as u16)
+        load_moe_ffn(
+            bk.hfq,
+            bk.gpu,
+            &format!("layers.{li}"),
+            cfg,
+            li as u16,
+            residency,
+        )
     };
     let mut layer = crate::layer_driver::load_layer(&mut b, config, layer_idx, moe)?;
     if let LayerWeights::DeltaNet(dn) = &mut layer {
@@ -4742,6 +4838,7 @@ fn try_load_packed_mq4_experts(
     expert_ids: &[usize],
     mi: usize,
     dim: usize,
+    target: MemoryTarget,
 ) -> HipResult<Option<(Vec<ExpertWeights>, PackedExpertOwners)>> {
     use std::sync::atomic::Ordering;
     use std::time::Instant;
@@ -4907,9 +5004,16 @@ fn try_load_packed_mq4_experts(
         matches!(gate_up_host, HostBlob::Borrowed(_)) && matches!(down_host, HostBlob::Borrowed(_));
     let t_upload = Instant::now();
 
-    let gate_up_owner = gpu.upload_raw(gate_up_host.as_ref(), &[specs.len(), gate_up_stride])?;
+    let upload = |gpu: &mut Gpu, bytes: &[u8], shape: &[usize]| match target {
+        MemoryTarget::Device => gpu.upload_raw(bytes, shape),
+        // Host-mapped layer blob: one allocation per blob, read over PCIe. This
+        // is the only host expert path — a per-expert host tensor would pay
+        // `HOST_TAIL_PAD_BYTES` each (see the caller's packing refusal).
+        MemoryTarget::HostMapped => gpu.upload_raw_host_mapped(bytes, shape),
+    };
+    let gate_up_owner = upload(gpu, gate_up_host.as_ref(), &[specs.len(), gate_up_stride])?;
     drop(gate_up_host);
-    let down_owner = match gpu.upload_raw(down_host.as_ref(), &[specs.len(), down_stride]) {
+    let down_owner = match upload(gpu, down_host.as_ref(), &[specs.len(), down_stride]) {
         Ok(owner) => owner,
         Err(error) => {
             let _ = gpu.free_tensor(gate_up_owner);
@@ -5311,7 +5415,12 @@ pub(crate) fn load_moe_ffn(
     p: &str,
     config: &Qwen35Config,
     layer_idx: u16,
+    residency: LayerResidency,
 ) -> HipResult<MoeFfnWeights> {
+    // The layer's own MoE weights (router, shared expert) follow the layer's
+    // residency; only the routed experts follow `memory.moe_expert_budget`.
+    let moe_target = memory_target(residency.weights);
+    let expert_target = expert_memory_target(residency.experts);
     let n_exp = config.num_experts;
     let mi = config.moe_intermediate_size;
     let smi = config.shared_expert_intermediate_size;
@@ -5407,7 +5516,7 @@ pub(crate) fn load_moe_ffn(
             n_exp,
             config.dim,
             qwen35_tensor_name_candidates,
-            MemoryTarget::Device,
+            moe_target,
         ) {
             Ok(weight) => weight,
             Err(error) => return Err(pending.rollback(gpu, error)),
@@ -5421,7 +5530,7 @@ pub(crate) fn load_moe_ffn(
             smi,
             config.dim,
             qwen35_tensor_name_candidates,
-            MemoryTarget::Device,
+            moe_target,
         ) {
             Ok(weight) => weight,
             Err(error) => return Err(pending.rollback(gpu, error)),
@@ -5435,7 +5544,7 @@ pub(crate) fn load_moe_ffn(
             smi,
             config.dim,
             qwen35_tensor_name_candidates,
-            MemoryTarget::Device,
+            moe_target,
         ) {
             Ok(weight) => weight,
             Err(error) => return Err(pending.rollback(gpu, error)),
@@ -5449,7 +5558,7 @@ pub(crate) fn load_moe_ffn(
             config.dim,
             smi,
             qwen35_tensor_name_candidates,
-            MemoryTarget::Device,
+            moe_target,
         ) {
             Ok(weight) => weight,
             Err(error) => return Err(pending.rollback(gpu, error)),
@@ -5463,7 +5572,7 @@ pub(crate) fn load_moe_ffn(
             1,
             config.dim,
             qwen35_tensor_name_candidates,
-            MemoryTarget::Device,
+            moe_target,
         ) {
             Ok(weight) => weight,
             Err(error) => return Err(pending.rollback(gpu, error)),
@@ -5471,10 +5580,36 @@ pub(crate) fn load_moe_ffn(
     );
 
     let expert_ids = source_expert_ids;
-    let packed = match try_load_packed_mq4_experts(hfq, gpu, p, &expert_ids, mi, config.dim) {
+    let packed = match try_load_packed_mq4_experts(
+        hfq,
+        gpu,
+        p,
+        &expert_ids,
+        mi,
+        config.dim,
+        expert_target,
+    ) {
         Ok(packed) => packed,
         Err(error) => return Err(pending.rollback(gpu, error)),
     };
+    if packed.is_none() && residency.experts_host() {
+        // The packed blob is the only host expert path. Per-expert host tensors
+        // would each pay `HOST_TAIL_PAD_BYTES` (1 MiB) of tail pad — ~512 MiB per
+        // layer against a ~430 MB payload — so fail closed and name the layer.
+        return Err(pending.rollback(
+            gpu,
+            HipError::new(
+                0,
+                &format!(
+                    "qwen35: layer {layer_idx} routed experts are host-placed \
+                     (memory.moe_expert_budget) but expert packing does not apply: every routed \
+                     expert must share one dtype and stride, and only MQ4/MQ4V2/MQ4C are \
+                     packable. Refusing a per-expert host fallback, which would cost ~512 MiB \
+                     of tail pad per layer; re-quantize the experts to a packable MQ4 format"
+                ),
+            ),
+        ));
+    }
     if let Some((experts, owners)) = packed {
         if layer_idx == 0 {
             eprintln!(
@@ -5493,7 +5628,7 @@ pub(crate) fn load_moe_ffn(
                 fused_mi,
                 config.dim,
                 qwen35_tensor_name_candidates,
-                MemoryTarget::Device,
+                expert_target,
             ) {
                 Ok(weight) => weight,
                 Err(error) => return Err(pending.rollback(gpu, error)),
@@ -5505,7 +5640,7 @@ pub(crate) fn load_moe_ffn(
                 config.dim,
                 mi,
                 qwen35_tensor_name_candidates,
-                MemoryTarget::Device,
+                expert_target,
             ) {
                 Ok(weight) => weight,
                 Err(error) => {
@@ -5939,6 +6074,10 @@ pub(crate) fn load_moe_ffn_ep(
     let fused_mi = mi
         .checked_mul(2)
         .ok_or_else(|| HipError::new(0, "qwen35: fused expert dimension overflows"))?;
+    // EP is deliberately NOT offloadable: an expert is pinned to one rank, so a
+    // spill would break that rank's ownership. Every weight here stays on the
+    // device.
+    let moe_target = MemoryTarget::Device;
     // REAP was refused at the driver, so source ids are the identity map.
     let source_expert_ids: Vec<usize> = (0..n_exp).collect();
     let source_records = qwen35_hfq_expert_sources(hfq, p, config, &source_expert_ids)?;
@@ -6051,7 +6190,7 @@ pub(crate) fn load_moe_ffn_ep(
             n_exp,
             config.dim,
             qwen35_tensor_name_candidates,
-            MemoryTarget::Device,
+            moe_target,
         ) {
             Ok(weight) => weight,
             Err(error) => return Err(pending.rollback(gpu, error)),
@@ -6065,7 +6204,7 @@ pub(crate) fn load_moe_ffn_ep(
             smi,
             config.dim,
             qwen35_tensor_name_candidates,
-            MemoryTarget::Device,
+            moe_target,
         ) {
             Ok(weight) => weight,
             Err(error) => return Err(pending.rollback(gpu, error)),
@@ -6079,7 +6218,7 @@ pub(crate) fn load_moe_ffn_ep(
             smi,
             config.dim,
             qwen35_tensor_name_candidates,
-            MemoryTarget::Device,
+            moe_target,
         ) {
             Ok(weight) => weight,
             Err(error) => return Err(pending.rollback(gpu, error)),
@@ -6093,7 +6232,7 @@ pub(crate) fn load_moe_ffn_ep(
             config.dim,
             smi,
             qwen35_tensor_name_candidates,
-            MemoryTarget::Device,
+            moe_target,
         ) {
             Ok(weight) => weight,
             Err(error) => return Err(pending.rollback(gpu, error)),
@@ -6107,7 +6246,7 @@ pub(crate) fn load_moe_ffn_ep(
             1,
             config.dim,
             qwen35_tensor_name_candidates,
-            MemoryTarget::Device,
+            moe_target,
         ) {
             Ok(weight) => weight,
             Err(error) => return Err(pending.rollback(gpu, error)),
@@ -6123,7 +6262,7 @@ pub(crate) fn load_moe_ffn_ep(
             fused_mi,
             config.dim,
             qwen35_tensor_name_candidates,
-            MemoryTarget::Device,
+            moe_target,
         ) {
             Ok(weight) => weight,
             Err(error) => return Err(pending.rollback(gpu, error)),
@@ -6135,7 +6274,7 @@ pub(crate) fn load_moe_ffn_ep(
             config.dim,
             mi,
             qwen35_tensor_name_candidates,
-            MemoryTarget::Device,
+            moe_target,
         ) {
             Ok(weight) => weight,
             Err(error) => {
@@ -6443,7 +6582,7 @@ fn load_weights_ep_rank_inner(
             // backend), so the layer would be half-offloaded and an `offloaded=N` count
             // would still report it as spilled — the silent-partial shape the design doc
             // flags. Pin resident until MoE offload is designed deliberately.
-            let mut backend = qwen35_hfq_backend(hfq, gpu, layer_idx, false);
+            let mut backend = qwen35_hfq_backend(hfq, gpu, layer_idx, WeightResidency::Resident);
             crate::layer_driver::load_layer(&mut backend, config, layer_idx, |bk, cfg, li| {
                 load_moe_ffn_ep(
                     bk.hfq,
@@ -7227,6 +7366,7 @@ mod direct_load_fault_tests {
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::llama::{EmbeddingFormat, KvCache, WeightTensor};
     use hipfire_runtime::model_load::WeightSource;
+    use hipfire_runtime::offload::LayerResidency;
     use rdna_compute::{Gpu, GpuTensor};
 
     /// Env var naming the real dense-Qwen35 fixture for the fault-seam tests
@@ -7521,7 +7661,12 @@ mod direct_load_fault_tests {
             ) -> HipResult<(WeightTensor, bool)> {
                 unreachable!("source must not run without devices")
             }
-            fn read_layer(&mut self, _gpu: &mut Gpu, _layer_idx: usize) -> HipResult<Self::Layer> {
+            fn read_layer(
+                &mut self,
+                _gpu: &mut Gpu,
+                _layer_idx: usize,
+                _residency: LayerResidency,
+            ) -> HipResult<Self::Layer> {
                 unreachable!("source must not run without devices")
             }
             fn free_layer(&mut self, _gpu: &mut Gpu, _layer: Self::Layer) {

@@ -13,10 +13,12 @@ use crate::model_source::{
     SourceFileIdentity, SourceFormat, SourceIdentity, SourceRangeDescriptor, SourceRangeIdentity,
     SourceReader, SourceReaderImpl,
 };
+use crate::offload::LayerResidency;
 use crate::weight_backend::{
     decode_raw_codec, flat_name_candidates, load_embedding, raw_codec, resolve_lm_head,
     reupload_f16_as_f32, upload_decoded_bytes, HfqBackend, MemoryTarget, WeightBackend,
 };
+use crate::weight_manifest::WeightResidency;
 use hip_bridge::{HipError, HipResult};
 use memmap2::Mmap;
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -2518,7 +2520,12 @@ impl WeightSource for LlamaHfqSource<'_> {
         )
     }
 
-    fn read_layer(&mut self, gpu: &mut Gpu, i: usize) -> HipResult<LayerWeights> {
+    fn read_layer(
+        &mut self,
+        gpu: &mut Gpu,
+        i: usize,
+        _residency: LayerResidency,
+    ) -> HipResult<LayerWeights> {
         let cfg = self.cfg;
         let q_out_dim = cfg.n_heads * cfg.head_dim;
         let kv_dim = cfg.n_kv_heads * cfg.head_dim;
@@ -2531,7 +2538,7 @@ impl WeightSource for LlamaHfqSource<'_> {
             read_proj: load_weight_tensor,
             layer: i,
             // Generic llama-family reader is always fully resident — no offload support.
-            host_local: false,
+            residency: WeightResidency::Resident,
         };
         load_layer(&mut b, cfg, q_out_dim, kv_dim, i)
     }
