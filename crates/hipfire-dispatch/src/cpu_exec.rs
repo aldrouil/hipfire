@@ -364,6 +364,12 @@ pub fn moe_cpu_oracle_report(
     topk_weights: &GpuTensor,
     down_expanded: &GpuTensor,
     layer_idx: u16,
+    // `ffn.expert_down_awq_ptrs.is_some()`. Printed because it is a hard
+    // precondition of any CPU down projection: a bare `gemv` ignores a
+    // per-expert AWQ scale, so a fixture that gains sidecars later must not
+    // silently keep taking the CPU path. The index scan that established its
+    // absence here is a 60 MB window, not a guarantee.
+    down_awq: bool,
 ) {
     let (x, ti, tw, dn_gpu) = match (
         download_f32(gpu, x_norm, dim),
@@ -419,7 +425,7 @@ pub fn moe_cpu_oracle_report(
         }
     }
     eprintln!(
-        "[moe-cpu-oracle] layer {layer_idx} ranks {routed_ranks}/{k} |x| {:.4e} (zeros {}) |gpu-down| {:.4e} (zeros {}/{}) |cpu-down| {:.4e} (zeros {})",
+        "[moe-cpu-oracle] layer {layer_idx} ranks {routed_ranks}/{k} down_awq={down_awq} |x| {:.4e} (zeros {}) |gpu-down| {:.4e} (zeros {}/{}) |cpu-down| {:.4e} (zeros {})",
         sum_abs(&x[..dim.min(x.len())]),
         zeros(&x[..dim.min(x.len())]),
         sum_abs(&dn_gpu),
