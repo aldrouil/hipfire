@@ -1437,8 +1437,7 @@ pub fn admit_source_with_options(
     // places layers in host RAM. Refuse a budget that would spill under tp>1,
     // pp>1 or on a MoE model before any teardown. Unset budget: no parse.
     if matches!(arch_id, 5 | 6)
-        && hipfire_config::memory::gpu_layer_budget()
-            != hipfire_config::memory::GpuLayerBudget::Full
+        && hipfire_config::memory::gpu_layer_budget() != hipfire_config::memory::OffloadBudget::Full
     {
         if let ModelSource::Hfq(hfq) = &source {
             let config = hipfire_arch_qwen35::qwen35::config_from_hfq(hfq)

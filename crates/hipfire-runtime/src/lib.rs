@@ -91,6 +91,7 @@ pub mod slot_batch;
 pub mod spec;
 
 pub mod ngram_mod;
+pub mod offload;
 pub mod spec_ngram;
 pub mod spec_sampling;
 pub mod swap;
