@@ -92,7 +92,12 @@ impl Architecture for Qwen35 {
         // A retained-replay backend and CPU-executed steps are mutually
         // exclusive: the tape cannot express a step the CPU owns. Refuse the
         // load rather than replay a route with stale activations.
-        let host_weights = placement.map_or(0, |p| p.host_layers() + p.host_expert_layers());
+        // The `None` route is the pre-placement one, where `i_gpu_start` is the
+        // only statement of what spilled — so keep today's dense refusal there
+        // rather than reporting nothing spilled.
+        let host_weights = placement.map_or(cfg.i_gpu_start, |p| {
+            p.host_layers() + p.host_expert_layers()
+        });
         hipfire_dispatch::reject_cpu_exec_under_redline(host_weights, gpu.replay.is_enabled())
             .map_err(|e| format!("qwen35: {e}"))?;
         let mut source = HfqSource::new(hfq, cfg);
