@@ -597,8 +597,9 @@ mod imp {
         /// slice of the same BO.
         // A `Bo` is a cheap `Clone` handle over `Arc<BoState>`, so `&mut self`
         // would not buy real exclusivity (a clone can hand out the same view);
-        // the invariant is the caller contract documented above, which is the
-        // pattern clippy's `mut_from_ref` cannot model.
+        // `&self` is deliberate: the mapping is interior-mutable by contract
+        // and writers synchronize through [`Self::publish`], so the aliasing rule
+        // is the caller's, documented on [`Self::as_slice`].
         #[allow(clippy::mut_from_ref)]
         pub fn as_mut_slice(&self) -> &mut [u8] {
             // SAFETY: as above; device writes only happen between submit and
