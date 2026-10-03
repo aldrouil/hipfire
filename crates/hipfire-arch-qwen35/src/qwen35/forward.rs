@@ -684,6 +684,9 @@ fn moe_ffn_decode_impl<'a>(
     }
     let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
     let bound = ffn.bound_experts()?;
+    // The CPU-down splice needs the residual after `seal_decode` moves
+    // `moe_params`; capture the reference first (a shared borrow, no copy).
+    let splice_residual = moe_params.x_residual;
     // Only when explicitly asked: the oracle downloads the activation and the
     // route for every MoE layer, which is a host sync point on the decode path.
     let oracle_input = hipfire_config::developer_var("HIPFIRE_MOE_CPU_ORACLE")
@@ -697,6 +700,41 @@ fn moe_ffn_decode_impl<'a>(
         &[hipfire_dispatch::pipeline::Step::Moe(sealed)],
     )
     .map_err(HipError::from)?;
+    // Diagnostic CPU-down splice: the loader rewrote every down entry to a
+    // zeroed sink, so the sealed step above contributed 0 for the routed down
+    // projection. Recompute it here on the CPU from the intact host blob and
+    // accumulate into the residual. Fail closed: any unavailable input is an
+    // error, never silent zeros.
+    if let Some(sink) = ffn.cpu_down_sink.as_ref() {
+        let _ = sink;
+        let owners = ffn.packed_expert_owners.as_ref().ok_or_else(|| {
+            HipError::new(0, "moe cpu-down splice: layer has a down sink but no packed owners")
+        })?;
+        let down_dtype = ffn.experts.first().map(|e| e.down.gpu_dtype).ok_or_else(|| {
+            HipError::new(0, "moe cpu-down splice: layer has a down sink but no experts")
+        })?;
+        let quant = hipfire_dispatch::cpu_exec::cpu_quant_for(down_dtype).ok_or_else(|| {
+            HipError::new(
+                0,
+                &format!("moe cpu-down splice: no CPU decoder for down dtype {down_dtype:?}"),
+            )
+        })?;
+        let down_stride = owners.down.buf.size() / config.num_experts.max(1);
+        hipfire_dispatch::cpu_exec::moe_cpu_down_residual(
+            gpu,
+            quant,
+            config.dim,
+            config.moe_intermediate_size,
+            &owners.down,
+            down_stride,
+            s.rot_batch,
+            s.topk_indices,
+            s.topk_weights,
+            splice_residual,
+            ffn.expert_down_awq_ptrs.is_some(),
+        )
+        .map_err(HipError::from)?;
+    }
     if let Some((x_norm, routed_gate_up)) = oracle_input {
         if let (Some(q), Some(owners)) = (
             hipfire_dispatch::cpu_exec::cpu_quant_for(routed_gate_up),
