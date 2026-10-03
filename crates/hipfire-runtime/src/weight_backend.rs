@@ -502,16 +502,17 @@ pub fn hfq_weight_dtype(quant_type: u8) -> Option<DType> {
 }
 
 /// Decode a passthrough quant format: enforce the K%256 guard (via DType),
-/// upload bytes verbatim, build the `WeightTensor` with the dtype + its
-/// DType-derived row_stride. `name` is the caller context for the guard panic.
-/// AWQ sidecars are attached by the caller (hfq), never here.
+/// upload bytes verbatim to `target`, build the `WeightTensor` with the dtype +
+/// its DType-derived row_stride. `name` is the caller context for the guard
+/// error. AWQ sidecars are attached by the caller (hfq), never here.
 pub(crate) fn decode_raw_codec(
-    gpu: &Gpu,
+    gpu: &mut Gpu,
     codec: &RawCodec,
     data: &[u8],
     m: usize,
     k: usize,
     name: &str,
+    target: MemoryTarget,
 ) -> HipResult<WeightTensor> {
     // Low-bit layout validation — centralized before any upload/host-dequant.
     // TQ2G128: 34 B per 128-elem group, BQ1G128: 18 B per 128-elem group.
@@ -650,7 +651,12 @@ pub(crate) fn decode_raw_codec(
             ));
         }
     }
-    let buf = gpu.upload_raw(data, &[data.len()])?;
+    let buf = match target {
+        MemoryTarget::Device => gpu.upload_raw(data, &[data.len()])?,
+        // Zero-copy CPU copy into the registered host pointer; the pad past the
+        // logical bytes is zeroed so a tail overread reads deterministic zeros.
+        MemoryTarget::HostMapped => gpu.upload_raw_host_mapped(data, &[data.len()])?,
+    };
     Ok(WeightTensor {
         buf,
         gpu_dtype: codec.dtype,
@@ -739,21 +745,43 @@ fn validate_lowbit_layout(
     Ok(())
 }
 
-/// Quant `data` → device `WeightTensor [m, k]`. Moved from
+/// Upload bytes a host-decode arm produced (f16→f32, bf16→f32, or a raw F32
+/// payload) under `target`. No host-mapped upload exists for the widened form,
+/// so `HostMapped` fails closed ([`HOST_DECODE_REFUSAL`]) rather than silently
+/// consuming the VRAM an offloaded layer frees.
+pub(crate) fn upload_decoded_bytes(
+    gpu: &mut Gpu,
+    target: MemoryTarget,
+    bytes: &[u8],
+    shape: &[usize],
+) -> HipResult<GpuTensor> {
+    match target {
+        MemoryTarget::Device => gpu.upload_raw(bytes, shape),
+        MemoryTarget::HostMapped => Err(HipError::new(0, HOST_DECODE_REFUSAL)),
+    }
+}
+
+/// Quant `data` → `WeightTensor [m, k]` at `target`. Moved from
 /// `hipfire-arch-qwen35::qwen35::load_weight_tensor_raw` (Task 2).
+///
+/// The host-decode arms (qt 1/2/16) widen bytes in host memory and upload the
+/// widened form; there is no host-mapped upload for that, so they fail closed
+/// under [`MemoryTarget::HostMapped`] rather than silently consuming VRAM inside
+/// an offloaded layer.
 pub fn dequant_weight_raw(
-    gpu: &Gpu,
+    gpu: &mut Gpu,
     quant_type: u8,
     data: &[u8],
     m: usize,
     k: usize,
+    target: MemoryTarget,
 ) -> HipResult<WeightTensor> {
     // Host-decode formats stay explicit (NOT passthrough table rows):
     match quant_type {
         1 => {
             // F16 — keep as F16 bytes (the HFQ path host-decodes qt 1 to F32 instead;
             // this divergence is why qt 1 is not a RAW_CODECS row).
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            let buf = upload_decoded_bytes(gpu, target, data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::F16,
@@ -769,7 +797,7 @@ pub fn dequant_weight_raw(
         }
         2 => {
             // F32 — upload as [m, k].
-            let buf = gpu.upload_raw(data, &[m, k])?;
+            let buf = upload_decoded_bytes(gpu, target, data, &[m, k])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::F32,
@@ -789,7 +817,7 @@ pub fn dequant_weight_raw(
             let bytes: &[u8] = unsafe {
                 std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
             };
-            let buf = gpu.upload_raw(bytes, &[m, k])?;
+            let buf = upload_decoded_bytes(gpu, target, bytes, &[m, k])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::F32,
@@ -804,7 +832,7 @@ pub fn dequant_weight_raw(
             })
         }
         other => match raw_codec(other) {
-            Some(c) => decode_raw_codec(gpu, c, data, m, k, "dequant_weight_raw"),
+            Some(c) => decode_raw_codec(gpu, c, data, m, k, "dequant_weight_raw", target),
             None => Err(hip_bridge::HipError::new(
                 0,
                 &format!("unsupported quant_type {other} for dequant_weight_raw"),
@@ -1379,6 +1407,35 @@ pub fn dequantize_weight_to_f32(quant_type: u8, data: &[u8], n: usize) -> Vec<f3
 
 // ── WeightBackend trait ─────────────────────────────────────────────────────
 
+/// Where a weight's bytes physically land at load. One parameter, one upload
+/// path: `Device` puts them in VRAM, `HostMapped` in pinned system RAM that the
+/// *same* kernels dereference over PCIe through the device-visible alias
+/// (`hipHostGetDevicePointer`). Contents are byte-identical either way, so
+/// placement changes only where the bytes live, never the arithmetic.
+///
+/// This is the load-side placement of a weight's storage. It is deliberately not
+/// the execution question ("who multiplies these bytes") — that is the caller's
+/// `memory.offload_exec` policy and, from the loader's point of view, is recorded
+/// on the loaded weight (stage 2), not decided here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryTarget {
+    /// VRAM (`hip.malloc` / pool).
+    Device,
+    /// Pinned system RAM (`hipHostMalloc(hipHostMallocMapped)`), padded by
+    /// `rdna_compute::HOST_TAIL_PAD_BYTES`. Costs no device heap; a `Gpu` kernel
+    /// read traverses PCIe.
+    HostMapped,
+}
+
+/// Refusal for the host-decode arms (qt 1/2/16, and every f32 fallback) under
+/// [`MemoryTarget::HostMapped`]. Those arms widen to f32 in host memory and then
+/// upload the widened bytes; no host-mapped upload exists, so silently placing
+/// them on the device would consume exactly the VRAM an offloaded layer frees.
+pub const HOST_DECODE_REFUSAL: &str =
+    "quantized weight falls back to the f32 dequant path, which has no \
+     host-localized upload; refusing to silently place it in device memory \
+     inside an offloaded layer";
+
 use crate::augmentor::{try_augmentors, DEFAULT_AUGMENTORS};
 use crate::model_source::ModelSource;
 use crate::paro::{load_fp16_weight_from_source, paro_load_f32, paro_load_norm};
@@ -1409,39 +1466,27 @@ pub struct HfqBackend<'a> {
     pub gpu: &'a mut Gpu,
     pub norm_bias: f32,
     pub candidates: fn(&str) -> Vec<String>,
-    pub read_proj:
-        fn(&HfqFile, &Gpu, &str, usize, usize, fn(&str) -> Vec<String>) -> HipResult<WeightTensor>,
+    pub read_proj: fn(
+        &HfqFile,
+        &mut Gpu,
+        &str,
+        usize,
+        usize,
+        fn(&str) -> Vec<String>,
+        MemoryTarget,
+    ) -> HipResult<WeightTensor>,
     pub layer: usize,
     /// When true, this layer's weight tensors allocate on host-mapped system RAM (
     /// read over PCIe) instead of device memory — leaving VRAM free for a larger KV cache
     /// while keeping numerics byte-identical to resident mode. Set per-layer by the loader
-    /// from the placement policy; `false` is the fully-resident, zero-diff default. See
-    /// [`Gpu::upload_f32_host`] for the host upload path these weights use.
+    /// from the placement policy; `false` is the fully-resident, zero-diff default.
     ///
-    /// `proj` needs its own seam: quantized weights upload raw codes through an
-    /// arch-supplied fn pointer, and host-locating them requires `&mut Gpu`
-    /// (`Gpu::alloc_host_mapped_tensor` records the host pointer in the `Gpu`, so it is
-    /// not reachable through `read_proj`'s shared `&Gpu`). Hence the twin
-    /// `read_proj_host` field below rather than branching here. This flag governs
-    /// `norm`/`raw_f32`/`bias`, which run inline and do have `&mut Gpu`.
+    /// It selects the [`MemoryTarget`] passed to [`Self::read_proj`] for projections
+    /// and the host uploader for `norm`/`raw_f32`/`bias`. One upload path: an arch
+    /// whose reader cannot honour `HostMapped` refuses inside its own decode (e.g.
+    /// the f32-dequant fallback, [`HOST_DECODE_REFUSAL`]) rather than landing the
+    /// weights in the VRAM the offload exists to free.
     pub host_local: bool,
-    /// Host-localizing projection reader, used only when `host_local` is set.
-    ///
-    /// Takes `&mut Gpu` (unlike [`Self::read_proj`]) because host-locating a
-    /// tensor registers a VMM arena on the `Gpu`. `None` means the arch has no
-    /// offload support: an offloaded layer is then a hard error rather than a
-    /// silent device allocation, so a half-configured offload can never masquerade
-    /// as working. qwen35 dense is the only arch that sets this.
-    pub read_proj_host: Option<
-        fn(
-            &HfqFile,
-            &mut Gpu,
-            &str,
-            usize,
-            usize,
-            fn(&str) -> Vec<String>,
-        ) -> HipResult<WeightTensor>,
-    >,
 }
 
 impl<'a> WeightBackend for HfqBackend<'a> {
@@ -1457,24 +1502,12 @@ impl<'a> WeightBackend for HfqBackend<'a> {
                 self.layer, self.host_local
             );
         }
-        if self.host_local {
-            // An offloaded layer whose arch ships no host reader is a configuration
-            // error, not something to paper over with a device allocation: the
-            // weights would silently land in the VRAM the offload was meant to free.
-            let read_host = self.read_proj_host.ok_or_else(|| {
-                HipError::new(
-                    0,
-                    &format!(
-                        "layer {} is marked host_local but this backend has no host \
-                         projection reader; refusing to allocate the weights on the device",
-                        self.layer
-                    ),
-                )
-            })?;
-            read_host(self.hfq, self.gpu, &name, m, k, self.candidates)
+        let target = if self.host_local {
+            MemoryTarget::HostMapped
         } else {
-            (self.read_proj)(self.hfq, self.gpu, &name, m, k, self.candidates)
-        }
+            MemoryTarget::Device
+        };
+        (self.read_proj)(self.hfq, self.gpu, &name, m, k, self.candidates, target)
     }
     fn norm(&mut self, rel: &str, shape: &[usize]) -> HipResult<GpuTensor> {
         let name = hfq_plain_name(self.layer, rel);
