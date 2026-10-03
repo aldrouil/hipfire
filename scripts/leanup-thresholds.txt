@@ -44,18 +44,7 @@ required_features_daemon    == 0
 # 355eeb987) added the daemon load warnings for deprecated KV names and PFlash
 # plus their lifecycle markers (+23 lines, 5358 -> 5381 on land); fold/flash-next
 # took 4 back. The warnings go with the surfaces they announce in 0.5.0.
-# RATCHET-RAISE 5377 -> 5396: withhold the retained PM4 default for the legacy
-# (pre-V2) 6-bit dense formats HFQ6G256/MQ6G256, which share the
-# `gemv_hfq6g256_residual` kernel. The tape drops launches on that path
-# (redline_daemon_harness --pm4 exact=False; decode degrades to a repetition
-# attractor while the HIP AR route is coherent), so the daemon fails closed onto
-# the HIP route. 19 lines: the gate, its withheld log line, the
-# `retained_redline_default` call, and the rustfmt expansion of those added
-# lines (the file's pre-existing format debt is left untouched). The dtype
-# probe itself lives in hipfire-loader
-# (`LoadedModel::dense_down_retained_pm4_uncertified`) so the daemon's
-# `hipfire_arch_*` reference count stays 0.
-daemon_lines                <= 5396
+daemon_lines                <= 5377
 
 # Examples compile on every `cargo build --all-targets`. Archived research
 # probes are gated behind `--features lab`; this is the count still ungated.

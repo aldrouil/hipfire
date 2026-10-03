@@ -2334,34 +2334,15 @@ fn main() {
                         // back only `m` and keeps the prior usable.
                         let arch = hipfire_loader::arch_label(m.arch_id);
                         let drafter = m.speculator.as_ref().map(|speculator| speculator.name());
-                        // The retained Redline PM4 decode tape is not certified for
-                        // the legacy (pre-V2) 6-bit dense formats HFQ6G256/MQ6G256,
-                        // which share the `gemv_hfq6g256_residual` kernel: on
-                        // gfx1201 they are coherent on the HIP AR route but decode
-                        // to a repetition attractor under the retained default,
-                        // whose "byte-identical for any weight format" admission
-                        // claim does not hold for them. Fail closed onto the HIP
-                        // route until the tape is certified.
-                        let retained_uncertified = m.dense_down_retained_pm4_uncertified();
-                        let redline_default = !retained_uncertified
-                            && hipfire_runtime::config::retained_redline_default(
-                                &gpu.arch,
-                                arch,
-                                path,
-                                pp,
-                                tp,
-                                drafter.is_some(),
-                            );
-                        let retained_configured =
-                            gpu.replay.configure_model_default(redline_default);
-                        if retained_uncertified {
-                            eprintln!(
-                                "[redline] retained default withheld on {} (model_arch={arch}): \
-                                 legacy 6-bit (HFQ6G256/MQ6G256) dense weights are not \
-                                 certified for the retained PM4 tape; using the HIP route",
-                                gpu.arch
-                            );
-                        } else if retained_configured && redline_default {
+                        let redline_default = hipfire_runtime::config::retained_redline_default(
+                            &gpu.arch,
+                            arch,
+                            path,
+                            pp,
+                            tp,
+                            drafter.is_some(),
+                        );
+                        if gpu.replay.configure_model_default(redline_default) && redline_default {
                             eprintln!(
                                 "[redline] enabling fail-closed retained default on {} \
                                  (model_arch={arch}, drafter={}, transport={})",

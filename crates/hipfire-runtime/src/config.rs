@@ -32,15 +32,9 @@ pub fn mq4r_redline_default(gpu_arch: &str, model_path: &str, pp: usize, tp: usi
 /// with the lowering. DeepSeek4 MQ2R is narrower still: only the certified
 /// gfx1151 single-GPU AR route is admitted, and an installed drafter keeps the
 /// model on its speculative execution path. Qwen3.5 dense (arch 5) on exact
-/// gfx1201 is admitted for any *certified* weight format on the single-GPU
-/// plain-AR route (no drafter): its retained PM4 decode tape is byte-identical
-/// to the HIP AR graph. `replay.backend = "hip"` opts out. Legacy (pre-V2)
-/// 6-bit dense (`HFQ6G256`/`MQ6G256`) is NOT certified — the retained tape
-/// drops two dispatches per Qwen3.5 block on that path, so it is not byte-exact
-/// and decode degrades to a repetition attractor (verified on qwen3.5-2b.hf6
-/// and qwen3.5-9b.mq6 / gfx1201: coherent under `replay.backend = "hip"`) — so
-/// the daemon withholds admission for it and
-/// fails closed onto the HIP route. A Qwen3.5 process configured
+/// gfx1201 is admitted for any weight format on the single-GPU plain-AR route
+/// (no drafter): its retained PM4 decode tape is byte-identical to the HIP
+/// AR graph. `replay.backend = "hip"` opts out. A Qwen3.5 process configured
 /// for CPU-executed partial offload (`memory.offload_exec = "cpu"` with a
 /// `memory.gpu_layer_budget` layer count) gets no retained default: its spilled
 /// layers' GEMVs run on the host between GPU launches, which a retained tape

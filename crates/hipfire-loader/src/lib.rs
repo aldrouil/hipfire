@@ -1130,33 +1130,6 @@ impl LoadedModel {
             .and_then(|s| (s as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>())
     }
 
-    /// True when any dense (non-MoE) FFN down-projection in this model uses a
-    /// weight format whose retained Redline PM4 decode tape is not certified.
-    ///
-    /// The legacy (pre-V2) 6-bit formats `HFQ6G256` and `MQ6G256` share the
-    /// `gemv_hfq6g256_residual` kernel, and the retained tape's lowering of that
-    /// path drops two dispatches per Qwen3.5 block (qwen3.5-2b: 338 vs 290;
-    /// qwen3.5-9b: 427 vs 363), so its replay is not byte-exact vs the HIP
-    /// oracle and decode degrades to a repetition attractor (`replay.backend =
-    /// "hip"` is coherent). `hipfire-daemon` withholds the retained default for
-    /// such models and fails closed onto the HIP route. This probe lives here,
-    /// not in the daemon, because it needs the arch-typed layer weights and the
-    /// daemon must not reference `hipfire_arch_*` (layering ratchet).
-    pub fn dense_down_retained_pm4_uncertified(&self) -> bool {
-        use hipfire_arch_qwen35::qwen35::LayerWeights;
-        use rdna_compute::DType;
-        self.qwen35().is_some_and(|bundle| {
-            bundle.weights.layers.iter().any(|layer| {
-                let down = match layer {
-                    LayerWeights::DeltaNet(l) => &l.w_down,
-                    LayerWeights::FullAttn(l) => &l.w_down,
-                    LayerWeights::DeltaNetMoe(_) | LayerWeights::FullAttnMoe(_) => return false,
-                };
-                matches!(down.gpu_dtype, DType::HFQ6G256 | DType::MQ6G256)
-            })
-        })
-    }
-
     /// Qwen4 bundle if this model is arch_id=16, else None.
     pub fn qwen4(&self) -> Option<&hipfire_arch_qwen4::bundle::Qwen4Bundle> {
         self.state
