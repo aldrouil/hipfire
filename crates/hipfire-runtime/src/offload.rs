@@ -316,10 +316,12 @@ pub fn unverified_host_refusal(layers: &LayerBytes, placement: &Placement) -> Op
     let layer = layers.first_unverified_host(placement)?;
     Some(format!(
         "load refused: layer {layer} carries weights in the packed MQ4-V2 family \
-         (MQ4G256V2 / MQ4CG256), whose host-mapped read is not verified — under this style of \
-         spill the model produced a wrong *first* token (ornith-1.5:35b-a3b), while the qt-13 \
-         (MQ4G256) control produced the right one. Keep these layers resident by raising \
-         memory.moe_expert_budget / memory.gpu_layer_budget, or use a uniform qt-13 trunk"
+         (MQ4G256V2 / MQ4CG256), whose host-mapped path is not verified — under this style of \
+         spill that model produced a wrong *first* token (ornith-1.5:35b-a3b), while the qt-13 \
+         (MQ4G256) control produced the right one. The cause is not isolated: those two \
+         differ in model as well as quant, the MQ4-V2 kernels and the tensor-level host read \
+         both pass their parity checks, and no fixture on hand separates the variables. Keep \
+         these layers resident by raising memory.moe_expert_budget / memory.gpu_layer_budget"
     ))
 }
 
