@@ -32,6 +32,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_else(|_| "qwen3.5-9b.mq4".into())
     });
     println!("model: {path}");
+    // Optional second argument: a substring the tensor name must contain, so the
+    // harness can be pointed at the class the offload path actually spills.
+    let filter: Option<String> = std::env::args().nth(2);
 
     let mut hfq = HfqFile::open(std::path::Path::new(&path))?;
     // Keep the mmap alive: the reader takes the zero-copy mmap path first.
@@ -58,6 +61,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 && t.shape.len() == 2
                 && t.shape[0] >= 1024
                 && t.shape[1] >= 1024
+                // An optional second argument forces the tensor class under test.
+                // Without it the first match can be a shared-expert or attention
+                // projection, which proves nothing about the routed-expert shape
+                // and stride the offload path actually spills.
+                && filter.as_deref().is_none_or(|f| t.name.contains(f))
         };
         let info = RAW_CODE_QT
             .iter()
@@ -110,7 +118,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(device.k, host.k, "k diverged");
     assert_eq!(device.row_stride, host.row_stride, "row_stride diverged");
     println!(
-        "dtype={:?} m={} k={} bytes={}",
+        "dtype={:?} m={} k={} bytes={} name={name}",
         device.gpu_dtype,
         device.m,
         device.k,
