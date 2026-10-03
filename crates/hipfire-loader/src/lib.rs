@@ -2170,23 +2170,34 @@ fn finish_qwen35_load(
     } else {
         None
     };
-    // Drafts stay on the GPU — they are device-resident and a trunk spill must
-    // not move or disable them — but the MTP verify/prefill path is not yet
-    // host-expert aware: with a spill active it takes a GPU memory access fault
-    // (`Memory access fault ... address 0xac000`, SIGABRT) during prefill, on
-    // `ornith-1.5:35b-a3b` with `moe_expert_budget=auto`. Refuse the combination
-    // at load with a message that says so, rather than faulting the card.
-    // `--spec off` on the same spill loads and decodes.
+    // MTP with host-mapped experts: off by default (one line), kept only on an
+    // explicit request — the same shape as Qwen4's
+    // `qwen4_mtp_with_host_mapped_experts`. The head itself stays on the GPU and
+    // is charged to the placement's capacity; what is not ready is the MTP
+    // verify/prefill path over a spill, which takes a GPU memory access fault
+    // (`Memory access fault ... address 0xac000`, SIGABRT, on
+    // `ornith-1.5:35b-a3b` + `moe_expert_budget=auto`; the same spill with
+    // `--spec off` loads and decodes). An explicit request is refused with that
+    // evidence; an implicit one degrades.
     let offload_spill = crate::admission::partial_offload_requested();
-    if offload_spill && matches!(arch_id, 5 | 6) && ctx.spec.mtp != Some(false) {
-        return Err(
-            "load refused: partial GPU offload cannot yet be combined with an MTP draft. The MTP \
-             verify/prefill path is not host-expert aware and faults the GPU during prefill \
-             (measured on ornith-1.5:35b-a3b with memory.moe_expert_budget=auto). The draft itself \
-             stays on the GPU; run --spec off with the spill, or unset memory.gpu_layer_budget / \
-             memory.moe_expert_budget to keep MTP"
-                .to_string(),
-        );
+    if offload_spill && matches!(arch_id, 5 | 6) {
+        if ctx.spec.mtp == Some(true) {
+            return Err(
+                "load refused: partial GPU offload cannot yet be combined with an explicitly \
+                 requested MTP draft (speculation.mtp / --spec mtp). The MTP verify/prefill path is \
+                 not host-expert aware and faults the GPU during prefill (measured on \
+                 ornith-1.5:35b-a3b with memory.moe_expert_budget=auto). The draft itself stays on \
+                 the GPU; use --spec off with the spill, or unset memory.gpu_layer_budget / \
+                 memory.moe_expert_budget to keep MTP"
+                    .to_string(),
+            );
+        }
+        if ctx.spec.mtp != Some(false) {
+            eprintln!(
+                "  qwen35 MTP: off by default with host-mapped experts; opt in with --spec mtp \
+                 (currently refused: the MTP path is not spill-aware)"
+            );
+        }
     }
     // ── qwen35 MTP head (single resolver: bundled .mq4-mtp trailer then .mtp sidecar) ──
     // Precedence: DSpark > DFlash > MTP > n-gram. Gate: only arch 5/6, no adaptive/eviction,
