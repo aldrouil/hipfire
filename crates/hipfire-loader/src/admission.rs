@@ -1015,20 +1015,37 @@ pub fn admit_source_with_options(
         };
         (topology, Some(carrier))
     };
-    // Partial GPU offload (#793): only the single-GPU dense Qwen3.5 loader
-    // places layers in host RAM. Refuse a budget that would spill under tp>1,
-    // pp>1 or on a MoE model before any teardown. Unset budget: no parse.
+    // Partial GPU offload (#793): a spilled prefix lands in host RAM mapped by
+    // the device that owns it, which exists for the single/dense topology only.
+    // Refuse tp>1 (every rank loads every layer and never hosts one) and pp>1
+    // (the first band's spill would be mapped by device 0, a path nobody has run)
+    // before any teardown. The remaining fail-closed cases — ParoQuant, the VL
+    // tower, paged/REAP experts, EP, and every arch that has not adopted the
+    // storage seam — are handled where the arch is dispatched.
     if matches!(arch_id, 5 | 6)
-        && hipfire_config::memory::gpu_layer_budget() != hipfire_config::memory::OffloadBudget::Full
+        && (hipfire_config::memory::gpu_layer_budget()
+            != hipfire_config::memory::OffloadBudget::Full
+            || hipfire_config::memory::moe_expert_budget()
+                != hipfire_config::memory::OffloadBudget::Full)
     {
-        if let ModelSource::Hfq(hfq) = &source {
-            let config = hipfire_arch_qwen35::qwen35::config_from_hfq(hfq)
-                .map_err(|e| format!("qwen35 config: {e}"))?;
-            if let Some(refusal) =
-                hipfire_arch_qwen35::qwen35::offload_topology_refusal(&config, tp, pp)
-            {
-                return Err(refusal);
-            }
+        let why = if tp > 1 {
+            Some(format!(
+                "tp={tp} loads every layer on every rank and never places one in host RAM"
+            ))
+        } else if pp > 1 {
+            Some(format!(
+                "pp={pp} would place the first pipeline band's spilled layers in host RAM mapped \
+                 by device 0, which has never been run"
+            ))
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            return Err(format!(
+                "load refused: partial GPU offload (memory.gpu_layer_budget / \
+                 memory.moe_expert_budget) supports the single-GPU topology only; {why}. Unset \
+                 both keys for this model"
+            ));
         }
     }
     let heterogeneous_reason = hints.deepseek4_heterogeneous && arch_id == 9;

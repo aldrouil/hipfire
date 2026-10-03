@@ -38,7 +38,7 @@ use hipfire_runtime::llama::{gemv_family, weight_gemm, EmbeddingFormat, WeightTe
 use hipfire_runtime::model_source::ModelSource;
 use hipfire_runtime::weight_backend::{
     dequant_norm, dequant_weight_raw, flat_name_candidates, load_embedding, resolve_lm_head,
-    HfqBackend, MemoryTarget, WeightBackend,
+    HfqBackend, MemoryTarget, WeightBackend, WeightResidency,
 };
 use hipfire_runtime::{screen_weight_tensor, MmqScreenable};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -438,7 +438,7 @@ fn load_layer(
         read_proj: load_weight_tensor,
         layer: i,
         // qwen2 is always fully resident — no offload support.
-        host_local: false,
+        residency: WeightResidency::Resident,
     };
 
     Ok(Qwen2LayerWeights {

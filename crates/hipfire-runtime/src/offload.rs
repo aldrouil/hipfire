@@ -21,11 +21,40 @@
 //! refusal that prints numbers rather than an OOM later.
 
 use crate::weight_backend::MemoryTarget;
-use crate::weight_manifest::WeightResidency;
+pub use crate::weight_manifest::WeightResidency;
 use hipfire_config::memory::OffloadBudget;
 
 const MIB: u64 = 1 << 20;
 const GIB_F: f64 = (1u64 << 30) as f64;
+
+/// One layer's resolved residency: where its own weights live and where its
+/// routed experts live.
+///
+/// The pair the loader hands a `WeightSource::read_layer`, so an arch reads one
+/// value instead of two lookups and cannot mix the axes up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LayerResidency {
+    pub weights: WeightResidency,
+    pub experts: ExpertResidency,
+}
+
+impl LayerResidency {
+    /// Both axes on the device (the zero-diff default).
+    pub const DEVICE: Self = Self {
+        weights: WeightResidency::Resident,
+        experts: ExpertResidency::Device,
+    };
+
+    /// The layer's own weights are host-placed (dense partial offload).
+    pub fn weights_host(&self) -> bool {
+        self.weights == WeightResidency::HostMapped
+    }
+
+    /// The layer's routed experts are host-placed.
+    pub fn experts_host(&self) -> bool {
+        self.experts == ExpertResidency::HostMapped
+    }
+}
 
 /// Where one layer's routed-expert weights live.
 ///
@@ -83,6 +112,28 @@ impl Placement {
         }
     }
 
+    /// Dense partial offload: the first `i_gpu_start` layers' own weights are
+    /// host-placed and every routed expert stays on the device.
+    ///
+    /// The shape the dense loader used before the placement search landed, kept
+    /// as one constructor so the dense route is expressed through the same value
+    /// (and so it can be asserted against the search's output).
+    pub fn dense_prefix(n_layers: usize, i_gpu_start: usize) -> Self {
+        let host = i_gpu_start.min(n_layers);
+        Self {
+            layer_residency: (0..n_layers)
+                .map(|layer| {
+                    if layer < host {
+                        WeightResidency::HostMapped
+                    } else {
+                        WeightResidency::Resident
+                    }
+                })
+                .collect(),
+            expert_residency: vec![ExpertResidency::Device; n_layers],
+        }
+    }
+
     pub fn layer(&self, layer: usize) -> WeightResidency {
         self.layer_residency
             .get(layer)
@@ -130,6 +181,14 @@ pub fn memory_target(residency: WeightResidency) -> MemoryTarget {
         // `ExternalRows` never reaches the loader's upload path (it is census-only
         // in the manifest), and `Resident` is VRAM.
         WeightResidency::Resident | WeightResidency::ExternalRows { .. } => MemoryTarget::Device,
+    }
+}
+
+/// The routed-expert axis of the same translation.
+pub fn expert_memory_target(residency: ExpertResidency) -> MemoryTarget {
+    match residency {
+        ExpertResidency::HostMapped => MemoryTarget::HostMapped,
+        ExpertResidency::Device => MemoryTarget::Device,
     }
 }
 
@@ -307,6 +366,17 @@ pub fn plan(
     let fits_line = |placement: &Placement| -> String {
         if placement.is_fully_resident() {
             "partial offload: model fits - every layer resident".to_string()
+        } else if layers.expert_total() == 0 {
+            // A dense model has no routed-expert tier; saying "routed experts host
+            // on N layers" would be technically true (0 bytes) and actively
+            // misleading.
+            format!(
+                "partial offload: {} of {n} layers host-placed, device weights {} MiB of {} MiB \
+                 available",
+                placement.host_layers(),
+                layers.device_bytes(placement) / MIB,
+                capacity.weight_bytes / MIB,
+            )
         } else {
             format!(
                 "partial offload: {} of {n} layers host-placed, routed experts host on {} layers, \
@@ -412,6 +482,15 @@ fn refusal(layers: &LayerBytes, placement: &Placement, capacity: &Capacity, hint
 /// pick a count, plus the admission numbers.
 pub fn report(placement: &Placement, layers: &LayerBytes, host_bytes: u64) -> String {
     let n = placement.n_layers();
+    if layers.expert_total() == 0 {
+        return format!(
+            "partial offload: {} of {n} layers host-placed; pinned host {} MiB; device weights \
+             {} MiB",
+            placement.host_layers(),
+            host_bytes / MIB,
+            layers.device_bytes(placement) / MIB,
+        );
+    }
     let per_layer = if n == 0 {
         0
     } else {
