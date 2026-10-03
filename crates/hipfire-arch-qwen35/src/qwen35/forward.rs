@@ -571,6 +571,16 @@ fn moe_params_for_decode<'a>(
         per_expert_gate_up,
         per_expert_down,
     };
+    crate::qwen35::weights::trace_moe_arm(
+        "decode",
+        moe_dtypes.routed_gate_up,
+        moe_dtypes.routed_down,
+        moe_dtypes.experts_all_gate_up_mq4,
+        ffn.packed_expert_owners
+            .as_ref()
+            .is_some_and(|owners| owners.gate_up.buf.is_host_mapped()),
+        per_expert_gate_up.is_some() || per_expert_down.is_some(),
+    );
     let shared = Some(hipfire_dispatch::families::moe::MoeSharedDecode {
         weights: hipfire_dispatch::families::moe::MoeSharedWeights {
             selector: ffn.shared_expert_gate.dispatch_ref(),
@@ -7484,7 +7494,8 @@ mod tests {
     #[test]
     fn flash_partials_split_sizing_is_exact_gfx1100_only() {
         // Legacy: batch rows at min(q8 tile, 128, batched tile).
-        let legacy = |heads: usize, kv: usize, tile: usize| 16 * heads * kv.div_ceil(tile) * 258 * 4;
+        let legacy =
+            |heads: usize, kv: usize, tile: usize| 16 * heads * kv.div_ceil(tile) * 258 * 4;
 
         // gfx1100 Qwen3.8-27B at 8K (Q8 decode tile32, batched tile128): 32
         // batched rows at tile128 dominate one tile32 decode row, half the
@@ -7499,15 +7510,33 @@ mod tests {
         assert_eq!(len("gfx1100", 24, 8_192, 32, 128, Some(1)), 6_340_608);
         assert_eq!(len("gfx1100", 24, 8_192, 32, 128, Some(64)), 101_449_728);
         // Past 8K gfx1100 decodes at tile128 too: legacy sizing.
-        assert_eq!(len("gfx1100", 24, 65_536, 128, 128, None), legacy(24, 65_536, 128));
+        assert_eq!(
+            len("gfx1100", 24, 65_536, 128, 128, None),
+            legacy(24, 65_536, 128)
+        );
 
         // Every other arch keeps the legacy buffer, including the shapes whose
         // decode tile is finer than the batched tile.
-        assert_eq!(len("gfx1201", 24, 8_192, 128, 128, None), legacy(24, 8_192, 128));
-        assert_eq!(len("gfx1151", 24, 8_192, 128, 128, None), legacy(24, 8_192, 128));
-        assert_eq!(len("gfx1201", 8, 8_192, 16, 128, None), legacy(8, 8_192, 16));
-        assert_eq!(len("gfx1151", 16, 2_048, 32, 128, None), legacy(16, 2_048, 32));
-        assert_eq!(len("gfx1101", 24, 8_192, 32, 128, None), legacy(24, 8_192, 32));
+        assert_eq!(
+            len("gfx1201", 24, 8_192, 128, 128, None),
+            legacy(24, 8_192, 128)
+        );
+        assert_eq!(
+            len("gfx1151", 24, 8_192, 128, 128, None),
+            legacy(24, 8_192, 128)
+        );
+        assert_eq!(
+            len("gfx1201", 8, 8_192, 16, 128, None),
+            legacy(8, 8_192, 16)
+        );
+        assert_eq!(
+            len("gfx1151", 16, 2_048, 32, 128, None),
+            legacy(16, 2_048, 32)
+        );
+        assert_eq!(
+            len("gfx1101", 24, 8_192, 32, 128, None),
+            legacy(24, 8_192, 32)
+        );
     }
     #[test]
     fn gfx1201_fa_epilogue_admits_q8_and_fp8_tile() {

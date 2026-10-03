@@ -4754,6 +4754,16 @@ fn build_moe_prefill_params<'a>(
         per_expert_gate_up,
         per_expert_down,
     };
+    crate::qwen35::weights::trace_moe_arm(
+        "prefill",
+        moe_dtypes.routed_gate_up,
+        moe_dtypes.routed_down,
+        moe_dtypes.experts_all_gate_up_mq4,
+        ffn.packed_expert_owners
+            .as_ref()
+            .is_some_and(|owners| owners.gate_up.buf.is_host_mapped()),
+        per_expert_gate_up.is_some() || per_expert_down.is_some(),
+    );
 
     let paro_gate_up =
         ffn.paro_shared
@@ -16000,18 +16010,20 @@ mod tests {
         moe.num_experts_per_tok = 8;
         moe.moe_intermediate_size = 512;
         moe.shared_expert_intermediate_size = 512;
-        let moe_bytes = dense_prefill_allocation_bytes(&moe, 512)
-            .expect("a MoE config is chargeable");
+        let moe_bytes =
+            dense_prefill_allocation_bytes(&moe, 512).expect("a MoE config is chargeable");
         let dense_only = dense_layer_prefill_allocation_bytes(&moe, 512).unwrap();
         assert!(
             moe_bytes > dense_only,
             "the MoE charge must include the grouped scratch it allocates: {moe_bytes} vs {dense_only}"
         );
-        let mirror = crate::qwen35::batch::PrefillBatchScratch::projected_allocation_bytes(
-            &moe, 512, true,
-        )
-        .unwrap();
-        assert_eq!(moe_bytes as u64, mirror, "must be exactly the constructor mirror");
+        let mirror =
+            crate::qwen35::batch::PrefillBatchScratch::projected_allocation_bytes(&moe, 512, true)
+                .unwrap();
+        assert_eq!(
+            moe_bytes as u64, mirror,
+            "must be exactly the constructor mirror"
+        );
         // Wrong hidden_dim breaks the allocation envelope.
         let mut narrow = widened_test_config();
         narrow.hidden_dim = 3584;
