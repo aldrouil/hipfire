@@ -314,6 +314,21 @@ pub struct Capacity {
 /// raised here so both loaders and every arch share one message.
 pub fn unverified_host_refusal(layers: &LayerBytes, placement: &Placement) -> Option<String> {
     let layer = layers.first_unverified_host(placement)?;
+    // Dev escape hatch, loud and explicit: the only way to exercise the MQ4-V2
+    // host path at all (and therefore the only way to revalidate or debug it),
+    // since no fixture on hand can run that model without a spill. Warn once per
+    // process so a run that took this path is never mistaken for a verified one.
+    if hipfire_config::developer_var("HIPFIRE_MOE_V2_HOST_ALLOW").is_ok() {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            eprintln!(
+                "[offload] HIPFIRE_MOE_V2_HOST_ALLOW=1: host-placing an MQ4-V2 layer whose host \
+                 path is unverified. Output from this run is diagnostic only -- do not treat it \
+                 as a supported configuration."
+            );
+        });
+        return None;
+    }
     Some(format!(
         "load refused: layer {layer} carries weights in the packed MQ4-V2 family \
          (MQ4G256V2 / MQ4CG256), whose host-mapped path is not verified — under this style of \
@@ -321,7 +336,8 @@ pub fn unverified_host_refusal(layers: &LayerBytes, placement: &Placement) -> Op
          (MQ4G256) control produced the right one. The cause is not isolated: those two \
          differ in model as well as quant, the MQ4-V2 kernels and the tensor-level host read \
          both pass their parity checks, and no fixture on hand separates the variables. Keep \
-         these layers resident by raising memory.moe_expert_budget / memory.gpu_layer_budget"
+         these layers resident by raising memory.moe_expert_budget / memory.gpu_layer_budget, \
+         or set HIPFIRE_MOE_V2_HOST_ALLOW=1 to run the unverified path for diagnosis"
     ))
 }
 

@@ -5631,7 +5631,9 @@ pub(crate) fn load_moe_ffn(
             // than ship silent corruption; a device-vs-host parity check over one
             // layer's packed experts is what lifts this.
             let dtype = experts.first().map(|expert| expert.gate_up.gpu_dtype);
-            if dtype != Some(DType::MQ4G256) {
+            if dtype != Some(DType::MQ4G256)
+                && hipfire_config::developer_var("HIPFIRE_MOE_V2_HOST_ALLOW").is_err()
+            {
                 return Err(pending.rollback(
                     gpu,
                     HipError::new(
