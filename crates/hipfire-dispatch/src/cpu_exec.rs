@@ -403,6 +403,7 @@ pub fn moe_cpu_oracle_report(
         }
         let mut worst_rel = 0.0f64;
         let mut worst_at = (usize::MAX, usize::MAX);
+        let mut worst_vals = (0.0f32, 0.0f32);
         let mut ranks = 0usize;
         for krank in 0..k.min(ti.len()).min(tw.len()) {
             let expert = (ti[krank].to_bits() as i32) as u16 as usize;
@@ -421,12 +422,15 @@ pub fn moe_cpu_oracle_report(
                 if rel > worst_rel {
                     worst_rel = rel;
                     worst_at = (krank, j);
+                    worst_vals = (a as f32, b as f32);
                 }
             }
         }
         eprintln!(
-            "[moe-cpu-oracle] layer {layer_idx} quant {quant:?} ranks {ranks} input {}: max |cpu-gpu|/max|.| = {worst_rel:.3e} at (rank, elem) {worst_at:?}",
+            "[moe-cpu-oracle] layer {layer_idx} quant {quant:?} ranks {ranks} input {}: max |cpu-gpu|/max|.| = {worst_rel:.3e} at (rank, elem) {worst_at:?} cpu={} gpu={}",
             if rotated { "fwht-rotated" } else { "as-stored" },
+            worst_vals.0,
+            worst_vals.1,
         );
     }
 }
