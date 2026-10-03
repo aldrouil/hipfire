@@ -451,6 +451,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `experimental_budget_alert` | `HIPFIRE_EXPERIMENTAL_BUDGET_ALERT` |
 | `max_total_think_tokens` | `HIPFIRE_MAX_TOTAL_THINK_TOKENS` |
 | `memory.gpu_layer_budget` | `HIPFIRE_GPU_LAYER_BUDGET` |
+| `memory.moe_expert_budget` | `HIPFIRE_MOE_EXPERT_BUDGET` |
 | `memory.offload_exec` | `HIPFIRE_OFFLOAD_EXEC` |
 | `mtp_mode` / `mtp_k` | `HIPFIRE_MTP_MODE` / `HIPFIRE_MTP_K` |
 | `speculation.mtp_ngram` | `HIPFIRE_MTP_NGRAM` |

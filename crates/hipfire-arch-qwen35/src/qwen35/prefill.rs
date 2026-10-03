@@ -15989,10 +15989,29 @@ mod tests {
         let fp8_delta = (4096 - 512) * fp8_row_bytes_wide(&config).unwrap();
         assert_eq!(fp8_delta, 64_354_304);
         assert_eq!(dense_delta + fp8_delta, 2_664_144_896);
-        // MoE configs are out of scope for the byte ledger.
+        // MoE configs charge the same dense terms plus the Path-2 grouped-GEMM
+        // scratch `PrefillBatchScratch::new_opt` allocates for them, through the
+        // checked mirror of that constructor. This used to be `None` (out of
+        // scope), which left `minimum_prefill_reservation_bytes` undefined for
+        // every MoE model and made the partial-offload placement under-spill by
+        // exactly that scratch.
         let mut moe = widened_test_config();
         moe.num_experts = 256;
-        assert_eq!(dense_prefill_allocation_bytes(&moe, 512), None);
+        moe.num_experts_per_tok = 8;
+        moe.moe_intermediate_size = 512;
+        moe.shared_expert_intermediate_size = 512;
+        let moe_bytes = dense_prefill_allocation_bytes(&moe, 512)
+            .expect("a MoE config is chargeable");
+        let dense_only = dense_layer_prefill_allocation_bytes(&moe, 512).unwrap();
+        assert!(
+            moe_bytes > dense_only,
+            "the MoE charge must include the grouped scratch it allocates: {moe_bytes} vs {dense_only}"
+        );
+        let mirror = crate::qwen35::batch::PrefillBatchScratch::projected_allocation_bytes(
+            &moe, 512, true,
+        )
+        .unwrap();
+        assert_eq!(moe_bytes as u64, mirror, "must be exactly the constructor mirror");
         // Wrong hidden_dim breaks the allocation envelope.
         let mut narrow = widened_test_config();
         narrow.hidden_dim = 3584;

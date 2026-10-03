@@ -40,6 +40,19 @@ pub struct Qwen35Bundle {
     /// `ArchModel::free_gpu`. Previously lived on `LoadedModel`.
     pub qwen35_decode_batch: Option<Qwen35DecodeBatchState>,
 }
+/// Device bytes a draft file will take, estimated the way the loader's own
+/// admission estimates a weight file: file bytes + 1/8 for the expanded/AWQ
+/// tensors + 512 MiB of scratch. An over-estimate for a head that loads only its
+/// own layers, which is the safe direction — it can only make the trunk spill
+/// slightly more, never less. 0 for a path that does not exist.
+pub(crate) fn draft_file_reserve_bytes(path: &std::path::Path) -> u64 {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return 0;
+    };
+    let file = meta.len();
+    file + file / 8 + (512 << 20)
+}
+
 /// Device bytes a draft will take when it loads beside a spilled trunk.
 ///
 /// Drafts stay on the GPU — they are not part of the trunk spill — so their
@@ -50,12 +63,9 @@ pub struct Qwen35Bundle {
 fn draft_device_reserve_bytes(hfq: &HfqFile, ctx: &LoadCtx) -> u64 {
     let mut bytes = 0u64;
     let mut add = |path: Option<&std::path::Path>| {
-        let Some(path) = path else { return };
-        let Ok(meta) = std::fs::metadata(path) else {
-            return;
-        };
-        let file = meta.len();
-        bytes = bytes.saturating_add(file + file / 8 + (512 << 20));
+        if let Some(path) = path {
+            bytes = bytes.saturating_add(draft_file_reserve_bytes(path));
+        }
     };
     // The MTP head, unless speculation was explicitly turned off.
     if ctx.spec.mtp != Some(false) {
@@ -151,15 +161,7 @@ fn resolve_partial_offload(
     // placement spends — otherwise `auto` would over-place the trunk and the
     // head's own load would OOM after the weights landed.
     let draft_reservation = draft_device_reserve_bytes(hfq, ctx);
-    let reserved = kv
-        .bytes
-        .checked_add(pbs)
-        .and_then(|bytes| bytes.checked_add(slack))
-        .and_then(|bytes| bytes.checked_add(draft_reservation))
-        .ok_or("Qwen offload reservation overflow")?;
-    let capacity = offload::Capacity {
-        weight_bytes: free_vram.saturating_sub(reserved),
-    };
+    let capacity = offload::weight_capacity(free_vram, kv.bytes, pbs, draft_reservation, slack);
 
     let layer_bytes = crate::qwen35::load::qwen35_layer_bytes(hfq, config);
     let (placement, line) = offload::plan(
