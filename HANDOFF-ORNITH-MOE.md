@@ -1,10 +1,11 @@
 # HANDOFF — get `ornith-1.5:35b-a3b` decoding coherently
 
-**Point-in-time document.** Updated 2026-10-03 at commit `3b3d2ab45` on branch
-`feature/qwen35-moe-offload`. The uncommitted tree the prior revision described
-is committed; `git status --short` is clean, and `stash@{0}` remains archaeology
-(see Stash warning). Re-verify anything line-numbered before acting on it. Read
-`AGENTS.md`, `CLAUDE.md`, and `docs/QUANTIZATION.md` first.
+**RESOLVED — historical record, no longer maintained.** Ornith decodes coherently;
+the bring-up this document tracked is done, and the live status for MoE offload is
+`.omp/plans/MOE_OFFLOAD_TO_SYSTEM_RAM_STAGE_PLAN.md` (plus `docs/env-vars.md` /
+`docs/CONFIG.md` for the shipped knobs). Kept for the measurement record and the
+traps below; `stash@{0}` is archaeology (see Stash warning). Read `AGENTS.md`,
+`CLAUDE.md`, and `docs/QUANTIZATION.md` first.
 
 **RESOLVED 2026-10-03 — ornith decodes coherently.** The constant `!` was the
 V1 `MQ6G256` shared-expert path fogging `fused_gate_up_key_for`, whose catch-all
@@ -79,10 +80,11 @@ cargo build --release -p hipfire-daemon -p hipfire-cli   # MUST include the daem
 export HIPFIRE_HOME="$PWD/.redline-work/verify-home" \
        HIPFIRE_MODELS_DIR="$HOME/.hipfire/models" HIPFIRE_LOCAL=1 HIPFIRE_GRAPH=0
 
-HIPFIRE_MOE_V2_HOST_ALLOW=1 HIPFIRE_MOE_EXPERT_BUDGET=20 \
+HIPFIRE_MOE_EXPERT_BUDGET=20 \
   ./target/release/hipfire run ornith-1.5:35b-a3b -t 0 -n 4 --no-stream \
     --kv-mode fwht3 --spec off 'The capital of France is located in'
-# → !!!!   (~5 min; warns once that the run is diagnostic-only)
+# → The capital of France is Paris, which is located in the northern central
+#   part of the country, along the Seine River.   (no allow flag; coherent)
 ```
 
 (`HIPFIRE_GRAPH=0` is required once any CPU splice is active — a CPU step is a
@@ -97,7 +99,9 @@ the `LayerBytes::unverified_host` census, the qwen35 packed-expert refusal, the
 pinned test, and the env var are all removed. Ornith's qt44 experts now host-place
 unflagged, and the qt44 kernel host path is pinned by `tests/gpu_moe_cpu_parity.rs`
 (host ≡ device, rel 4.59e-7 / 1.66e-7). Dense qt44 spill
-(`qwen3.8-27b.mq4` + `GPU_LAYER_BUDGET=3`) likewise loads without a flag.
+(`qwen3.8-27b.mq4` + `GPU_LAYER_BUDGET=3`) likewise loads and decodes unflagged
+(measured). Placement identity on qt44 is measured too: three placements on ornith
+(layer / expert / both) → one digest `98be446cb4d153770b9c23181e666d66`.
 
 - **Symptom**: `!!!!` on every run. The NaN enters in **layer 1's DeltaNet
   attention block, pre-MoE**: layer-0 MoE exit finite (`|delta| 4.1`,
@@ -270,32 +274,20 @@ block earlier (that layer's MoE combine / `wo` / norms).
   `HIPFIRE_MOE_CPU_BOTH_*` bisect halves are subsumed by it.
 - `HIPFIRE_MOE_V2_HOST_ALLOW` — **removed** (`a7a60ed09`); the unverified-host
   guard it gated is gone.
-- `HIPFIRE_MOE_PACK_AUDIT=1` (uncommitted) — pack bytes vs file bytes (all
-  slots) + pointer-table audit per layer.
-- `HIPFIRE_MOE_RESIDUAL_DELTA=1` (uncommitted) — residual before/after the
-  sealed MoE step per layer; the only valid GPU routed reference on this arm.
 - `HIPFIRE_MOE_NINEPATH=0` — force off the ninepath-D4 arm.
-- `HIPFIRE_MOE_DN_STAGE=1` (uncommitted) — `[moe-dn-in]` (GDN inputs +
-  `dn_qkv`/`dn_normed` span split, quant, scales), `[moe-dn-stage]` (post-GDN
-  output + state), `[moe-dn-qkv]` (projection vs conv/split), `[moe-dn-ring]`
-  (pre-conv ring, decode `run_attend` + prefill batch-conv arm),
-  `[moe-dn-prefill-ring]` (prefill `dn_qkv_batch` vs ring per layer).
-- `HIPFIRE_MOE_NO_V2_FUSE=1` (uncommitted, dispatch `gate_fusable_mq4v2`
-  kill-switch) — forces the generic four-GEMV gate-side branch. Ornith fails
-  identically with and without: the V2 fused gate kernel is exonerated.
-- `HIPFIRE_MOE_ATTN_EXIT=1` (uncommitted) — `|x|` after attention `wo` per
-  layer, on both the legacy and lowered (default) decode paths.
 - `HIPFIRE_CONV_QKNORM=0` — force the plain `conv1d_silu_split_f32` arm.
-  No change: both conv variants consume the same poisoned ring.
-- `HIPFIRE_STATE_QUANT=fp32` (uncommitted TEMP-DIAG: loader `carriers.rs`
-  + CLI `main.rs` thread-through) — FP32 DeltaNet state. Layer-0 state fully
-  finite under FP32 yet layer 1 still enters NaN: Q8 state exonerated.
-- `mq4v2_moe_down_parity` example (uncommitted, registered in Cargo.toml) —
-  kernel-vs-CPU for gate_up + down, device + host. Replaces/augments the older
-  down-only `mq4v2_moe_parity` claim in the table above.
-- The two `--features lab` examples from the prior revision.
+- `HIPFIRE_STATE_QUANT=fp32` — FP32 DeltaNet state (TEMP-DIAG: loader
+  `carriers.rs` + CLI `main.rs` thread-through).
+- `mq4v2_moe_down_parity` example **and** `tests/gpu_moe_cpu_parity.rs`
+  (committed, `--features lab`) — kernel-vs-CPU for gate_up + down, device + host.
+  The test is the discoverable `cargo test --ignored` form.
+- **Stash-only (`stash@{0}` "TEMP-DIAG ornith probes") — NOT in the tree; do not
+  pop:** `HIPFIRE_MOE_CPU_BOTH_DECODE` / `HIPFIRE_MOE_CPU_BOTH_PREFILL`,
+  `HIPFIRE_MOE_PACK_AUDIT`, `HIPFIRE_MOE_RESIDUAL_DELTA`, `HIPFIRE_MOE_DN_STAGE`,
+  `HIPFIRE_MOE_ATTN_EXIT`, `HIPFIRE_MOE_NO_V2_FUSE`. Confirmed 0 references in
+  `crates/`.
 
-## Recommended attempt: prefill-first-NaN hunt (MoE fully exonerated)
+## (superseded) Recommended attempt: prefill-first-NaN hunt (MoE fully exonerated)
 
 The MoE chain (packer, table, gate_up, down, router-fuse, CPU transcription,
 dense qt44) is proven; the NaN predates it. Demote everything below:

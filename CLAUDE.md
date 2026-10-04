@@ -386,6 +386,17 @@ re-learned per session.
   enabled when validating the shipping route. If explicitly testing legacy
   stochastic Q8 (`HIPFIRE_DN_STATE_EF=0`), byte parity is meaningless: re-enable
   EF or pin FP32 plus `HIPFIRE_DETERMINISTIC=1`.
+- **NaN defeats a `max`-based relative-error check.** `if rel > worst { worst = rel }`
+  scores NaN↔NaN as 0, so an all-NaN comparison reads as "bit-exact agreement".
+  Compare with an explicit `is_nan()` (or fail on any non-finite element).
+- **An unwritten scratch tensor reads as zeros, not as a reference.** `|gpu-down| 0`
+  from a buffer the arm never writes carries no information; confirm a buffer is
+  written before measuring against it.
+- **A parity check that compares an implementation against itself proves nothing.**
+  When two copies of a decoder are consolidated, any cross-check that runs the
+  merged path on both sides is a tautology. Keep the independent oracle — a stored
+  expectation table generated pre-merge, or a GPU-vs-CPU kernel check — as the
+  guard, and say in the test doc which side is the reference.
 
 ## GPU Lock Protocol (Multi-Agent)
 
