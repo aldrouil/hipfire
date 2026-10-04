@@ -124,6 +124,20 @@ struct StepStats {
 static SHAPES: LazyLock<Mutex<BTreeMap<(u8, usize, usize, bool, bool, bool), StepStats>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
+/// Per-shape totals for the decode MoE expert splice: the d2h / gemv / h2d split
+/// of one `(quant, dim, mi, k)` shape's calls.
+#[derive(Clone, Copy, Default)]
+struct MoeStepStats {
+    calls: usize,
+    d2h_ns: u64,
+    gemv_ns: u64,
+    h2d_ns: u64,
+}
+
+/// `(quant, dim, mi, k)` → running per-shape totals.
+static MOE_SHAPES: LazyLock<Mutex<BTreeMap<(u8, usize, usize, usize), MoeStepStats>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
 /// `DType` → the decoder for it, for exactly the formats `hipfire_cpu` can
 /// decode. `None` means the step stays on the GPU (over PCIe): not a correctness
 /// problem, only a smaller bandwidth win, and the load-time coverage line names
@@ -397,6 +411,7 @@ pub fn moe_cpu_experts(
     if k == 0 {
         return Err(cpu_err("moe cpu expert splice: empty top-k scratch"));
     }
+    let t_d2h = Instant::now();
     let x = download_f32(gpu, x_rot, dim)?;
     let ti = download_f32(gpu, topk_indices, k)?;
     let tw = download_f32(gpu, topk_weights, k)?;
@@ -417,33 +432,99 @@ pub fn moe_cpu_experts(
         )));
     }
     let mut acc = download_f32(gpu, residual, dim)?;
-    let mut gu_out = vec![0.0f32; 2 * mi];
-    let mut hidden = vec![0.0f32; mi];
-    let mut dn_out = vec![0.0f32; dim];
-    for krank in 0..k {
+    let d2h_ns = t_d2h.elapsed().as_nanos() as u64;
+    // Two rayon regions per layer (all experts' gate_up, then all experts' down)
+    // instead of 2k small ones: the per-call region entry dominates when each
+    // expert's GEMV is only a few thousand rows. Per output element the work is
+    // the same `dot_row_simd`, and the residual is still accumulated in rank
+    // order, so the result is unchanged.
+    let mut gu_all = vec![0.0f32; k * 2 * mi];
+    let mut hidden = vec![0.0f32; k * mi];
+    let mut dn_all = vec![0.0f32; k * dim];
+    let mut slots = vec![0usize; k];
+    let t_gemv = Instant::now();
+    let mut gu_pairs: Vec<(&[u8], &[f32])> = Vec::with_capacity(k);
+    for (krank, slot_out) in slots.iter_mut().enumerate() {
         let slot = (ti[krank].to_bits() as i32) as u16 as usize;
-        let gu0 = slot.checked_mul(gate_up_stride).ok_or_else(|| cpu_err("moe cpu expert splice: gate_up offset overflows"))?;
+        *slot_out = slot;
+        let gu0 = slot
+            .checked_mul(gate_up_stride)
+            .ok_or_else(|| cpu_err("moe cpu expert splice: gate_up offset overflows"))?;
         if gu0.checked_add(gu_need).is_none_or(|end| end > gu_bytes.len()) {
             return Err(cpu_err(&format!("moe cpu expert splice: gate_up slot {slot} out of range")));
         }
-        gu_out.fill(0.0);
-        gemv(quant, &gu_bytes[gu0..gu0 + gu_need], 2 * mi, dim, &x, &mut gu_out);
-        silu_mul(&gu_out, &mut hidden);
-        rotate_x(&mut hidden);
-        let dn0 = slot.checked_mul(down_stride).ok_or_else(|| cpu_err("moe cpu expert splice: down offset overflows"))?;
+        gu_pairs.push((&gu_bytes[gu0..gu0 + gu_need], x.as_slice()));
+    }
+    hipfire_cpu::gemv::gemv_experts(quant, 2 * mi, dim, &gu_pairs, &mut gu_all, None);
+    for e in 0..k {
+        silu_mul(
+            &gu_all[e * 2 * mi..(e + 1) * 2 * mi],
+            &mut hidden[e * mi..(e + 1) * mi],
+        );
+        rotate_x(&mut hidden[e * mi..(e + 1) * mi]);
+    }
+    let mut dn_pairs: Vec<(&[u8], &[f32])> = Vec::with_capacity(k);
+    for (krank, &slot) in slots.iter().enumerate() {
+        let dn0 = slot
+            .checked_mul(down_stride)
+            .ok_or_else(|| cpu_err("moe cpu expert splice: down offset overflows"))?;
         if dn0.checked_add(dn_need).is_none_or(|end| end > dn_bytes.len()) {
             return Err(cpu_err(&format!("moe cpu expert splice: down slot {slot} out of range")));
         }
-        dn_out.fill(0.0);
-        gemv(quant, &dn_bytes[dn0..dn0 + dn_need], dim, mi, &hidden, &mut dn_out);
+        dn_pairs.push((
+            &dn_bytes[dn0..dn0 + dn_need],
+            &hidden[krank * mi..(krank + 1) * mi],
+        ));
+    }
+    hipfire_cpu::gemv::gemv_experts(quant, dim, mi, &dn_pairs, &mut dn_all, None);
+    for krank in 0..k {
         let w = tw[krank];
+        let dn_out = &dn_all[krank * dim..(krank + 1) * dim];
         for (a, v) in acc.iter_mut().zip(dn_out.iter()) {
             *a += w * v;
         }
     }
+    let gemv_ns = t_gemv.elapsed().as_nanos() as u64;
+    let t_h2d = Instant::now();
     upload_f32(gpu, residual, &acc)?;
+    let h2d_ns = t_h2d.elapsed().as_nanos() as u64;
     CPU_STEPS.fetch_add(1, Ordering::Relaxed);
+    trace_moe_step(quant, dim, mi, k, d2h_ns, gemv_ns, h2d_ns);
     Ok(())
+}
+
+/// Per-shape accounting for the decode MoE splice under
+/// `HIPFIRE_CPU_EXEC_TRACE=1`: one line per `(quant, dim, mi, k)` at its first
+/// call and at every doubling, so the `calls=1` line is the cold first step and
+/// later lines are steady state. Keyed by shape rather than summed process-wide,
+/// for the same reason [`trace_step`] is.
+fn trace_moe_step(q: CpuQuant, dim: usize, mi: usize, k: usize, d2h_ns: u64, gemv_ns: u64, h2d_ns: u64) {
+    if hipfire_config::developer_var("HIPFIRE_CPU_EXEC_TRACE").is_err() {
+        return;
+    }
+    let Ok(mut shapes) = MOE_SHAPES.lock() else {
+        return;
+    };
+    let stats = shapes.entry((q as u8, dim, mi, k)).or_default();
+    stats.calls += 1;
+    stats.d2h_ns += d2h_ns;
+    stats.gemv_ns += gemv_ns;
+    stats.h2d_ns += h2d_ns;
+    let stats = *stats;
+    if !stats.calls.is_power_of_two() {
+        return;
+    }
+    let (on_cpu, on_gpu) = cpu_exec_counters();
+    let per_ms = |ns: u64| ns as f64 / 1e6 / stats.calls as f64;
+    eprintln!(
+        "cpu exec: moe expert splice dim={dim} mi={mi} k={k} quant={q:?} | {} calls | \
+         {on_cpu} steps on CPU, {on_gpu} host-mapped steps still on GPU | mean per call: \
+         d2h={:.2}ms gemv={:.2}ms h2d={:.2}ms",
+        stats.calls,
+        per_ms(stats.d2h_ns),
+        per_ms(stats.gemv_ns),
+        per_ms(stats.h2d_ns)
+    );
 }
 
 /// Whether [`run_host_mapped_gemv`] / [`run_host_mapped_gemv_residual`] can drive
