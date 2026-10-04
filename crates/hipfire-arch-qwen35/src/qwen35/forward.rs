@@ -618,8 +618,14 @@ fn moe_params_for_decode<'a>(
         skip_shared: ep_skip_shared,
         router: ffn.router.dispatch_ref(),
         shared,
-        expert_gate_up_ptrs: &ffn.expert_gate_up_ptrs,
-        expert_down_ptrs: &ffn.expert_down_ptrs,
+        expert_gate_up_ptrs: ffn
+            .cpu_sink_gate_up_ptrs
+            .as_ref()
+            .unwrap_or(&ffn.expert_gate_up_ptrs),
+        expert_down_ptrs: ffn
+            .cpu_sink_down_ptrs
+            .as_ref()
+            .unwrap_or(&ffn.expert_down_ptrs),
         expert_ptrs_host: None,
         expert_down_awq_ptrs: ffn.expert_down_awq_ptrs.as_ref(),
         expert_dtype_tags: ffn.expert_dtype_tags.as_ref(),
@@ -703,11 +709,12 @@ fn moe_ffn_decode_impl<'a>(
         &[hipfire_dispatch::pipeline::Step::Moe(sealed)],
     )
     .map_err(HipError::from)?;
-    // CPU expert splice: the loader rewrote both expert tables to a zeroed sink,
-    // so the sealed step above contributed 0 for the routed experts. Recompute
-    // the whole expert FFN here on the CPU from the intact host blobs and
-    // accumulate into the residual. Fail closed: any unavailable input is an
-    // error, never silent zeros.
+    // CPU expert splice (single-token decode only): the decode MoE params bound
+    // the loader's zeroed sink twins, so the sealed step above contributed 0 for
+    // the routed experts. Recompute the whole expert FFN here on the CPU from the
+    // intact host blobs and accumulate into the residual. Batched forwards
+    // (prefill, MTP verify) bind the real tables and never reach this. Fail
+    // closed: any unavailable input is an error, never silent zeros.
     if let Some(sink) = ffn.cpu_expert_sink.as_ref() {
         let _ = sink;
         let owners = ffn.packed_expert_owners.as_ref().ok_or_else(|| {

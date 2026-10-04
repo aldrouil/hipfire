@@ -1134,6 +1134,15 @@ struct LiveMoeBinding {
     down_ptrs: LiveTensorIdentity,
     down_awq_ptrs: Option<LiveTensorIdentity>,
     dtype_tags: Option<LiveTensorIdentity>,
+    /// Load-time zeroed-sink twins of the two pointer tables, accepted as
+    /// alternates by [`validate_live_binding`]. The single-token decode MoE step
+    /// binds these (`memory.offload_exec=cpu`) so the GPU routed contribution is
+    /// 0 and `cpu_exec::moe_cpu_experts` supplies it from the host blobs, while
+    /// every batched forward binds the real tables and keeps the GPU grouped read.
+    /// Populated only from load-time-created sink tensors, so the provenance proof
+    /// still rejects any other table a caller might pass.
+    gate_up_ptrs_sink: Option<LiveTensorIdentity>,
+    down_ptrs_sink: Option<LiveTensorIdentity>,
     mapping_fingerprint: String,
     /// [`RoutedExpertWeights::immutable_identity`] of the bound expert set.
     source_identity: Option<u64>,
@@ -1300,6 +1309,34 @@ impl ExpertBindingCache {
         down_awq_ptrs: Option<&GpuTensor>,
         dtype_tags: Option<&GpuTensor>,
     ) -> Result<(), DispatchError> {
+        self.bind_live_with_sink(
+            table,
+            routed_experts,
+            gate_up_ptrs,
+            down_ptrs,
+            down_awq_ptrs,
+            dtype_tags,
+            None,
+            None,
+        )
+    }
+
+    /// [`Self::bind_live`] with the load-time zeroed-sink pointer-table twins
+    /// (`memory.offload_exec=cpu`): the single-token decode MoE step binds those
+    /// so the GPU routed contribution is 0, and the intercepting CPU splice
+    /// supplies it from the host blobs. See [`LiveMoeBinding::gate_up_ptrs_sink`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn bind_live_with_sink(
+        &mut self,
+        table: &ExpertTable,
+        routed_experts: &dyn RoutedExpertWeights,
+        gate_up_ptrs: &GpuTensor,
+        down_ptrs: &GpuTensor,
+        down_awq_ptrs: Option<&GpuTensor>,
+        dtype_tags: Option<&GpuTensor>,
+        gate_up_ptrs_sink: Option<&GpuTensor>,
+        down_ptrs_sink: Option<&GpuTensor>,
+    ) -> Result<(), DispatchError> {
         check_cache_table(self, table)?;
         if self.live.is_some() {
             return Err(invalid("expert live resources are already bound"));
@@ -1311,6 +1348,8 @@ impl ExpertBindingCache {
             down_ptrs,
             down_awq_ptrs,
             dtype_tags,
+            gate_up_ptrs_sink,
+            down_ptrs_sink,
         )?;
         self.live = Some(live);
         Ok(())
@@ -3603,6 +3642,27 @@ fn validate_expert_shape_and_dtype(
     Ok(())
 }
 
+/// Accept either the bound pointer table or its load-time zeroed-sink twin.
+///
+/// The Single decode path (`memory.offload_exec=cpu`) binds the sink twin so the
+/// GPU routed contribution is 0 while the CPU splice supplies it; every batched
+/// forward binds the real table. Both are load-time-created tensors named in the
+/// binding, so any other table still fails identity.
+fn matches_pointer_table_or_sink(
+    bound: &LiveTensorIdentity,
+    sink: Option<&LiveTensorIdentity>,
+    tensor: &GpuTensor,
+    name: &str,
+) -> Result<(), DispatchError> {
+    match bound.matches(tensor, name) {
+        Ok(()) => Ok(()),
+        Err(bound_error) => match sink {
+            Some(sink) => sink.matches(tensor, name),
+            None => Err(bound_error),
+        },
+    }
+}
+
 fn build_live_binding(
     table: &ExpertTable,
     routed_experts: &dyn RoutedExpertWeights,
@@ -3610,6 +3670,8 @@ fn build_live_binding(
     down_ptrs: &GpuTensor,
     down_awq_ptrs: Option<&GpuTensor>,
     dtype_tags: Option<&GpuTensor>,
+    gate_up_ptrs_sink: Option<&GpuTensor>,
+    down_ptrs_sink: Option<&GpuTensor>,
 ) -> Result<LiveMoeBinding, DispatchError> {
     let n_experts = table.n_experts();
     if routed_experts.len() != n_experts {
@@ -3624,6 +3686,12 @@ fn build_live_binding(
         validate_pointer_table(table, n_experts, "live down AWQ")?;
     }
     validate_dtype_tag_table(dtype_tags, n_experts, table_has_mixed_dtypes(table)?)?;
+    if let Some(table) = gate_up_ptrs_sink {
+        validate_pointer_table(table, n_experts, "live gate/up sink")?;
+    }
+    if let Some(table) = down_ptrs_sink {
+        validate_pointer_table(table, n_experts, "live down sink")?;
+    }
 
     let gate_up_identity = LiveTensorIdentity::capture(gate_up_ptrs, "live gate/up")?;
     let down_identity = LiveTensorIdentity::capture(down_ptrs, "live down")?;
@@ -3632,6 +3700,12 @@ fn build_live_binding(
         .transpose()?;
     let dtype_tag_identity = dtype_tags
         .map(|table| LiveTensorIdentity::capture(table, "live dtype tags"))
+        .transpose()?;
+    let gate_up_sink_identity = gate_up_ptrs_sink
+        .map(|table| LiveTensorIdentity::capture(table, "live gate/up sink table"))
+        .transpose()?;
+    let down_sink_identity = down_ptrs_sink
+        .map(|table| LiveTensorIdentity::capture(table, "live down sink table"))
         .transpose()?;
 
     let mut live_experts = Vec::with_capacity(n_experts);
@@ -3687,6 +3761,8 @@ fn build_live_binding(
         down_ptrs: down_identity,
         down_awq_ptrs: down_awq_identity,
         dtype_tags: dtype_tag_identity,
+        gate_up_ptrs_sink: gate_up_sink_identity,
+        down_ptrs_sink: down_sink_identity,
         mapping_fingerprint: fingerprint_hex(&canonical),
         source_identity: routed_experts.immutable_identity(),
         gate_up_entries,
@@ -3926,6 +4002,8 @@ fn build_compact_live_binding(
         down_ptrs: down_identity,
         down_awq_ptrs: down_awq_identity,
         dtype_tags: dtype_tag_identity,
+        gate_up_ptrs_sink: None,
+        down_ptrs_sink: None,
         mapping_fingerprint: fingerprint_hex(&canonical),
         source_identity: None,
         gate_up_entries,
@@ -4139,9 +4217,18 @@ fn validate_live_binding(
             expected_down.matches(&down, "live down")?;
         }
     }
-    live.gate_up_ptrs
-        .matches(gate_up_ptrs, "gate/up pointer table")?;
-    live.down_ptrs.matches(down_ptrs, "down pointer table")?;
+    matches_pointer_table_or_sink(
+        &live.gate_up_ptrs,
+        live.gate_up_ptrs_sink.as_ref(),
+        gate_up_ptrs,
+        "gate/up pointer table",
+    )?;
+    matches_pointer_table_or_sink(
+        &live.down_ptrs,
+        live.down_ptrs_sink.as_ref(),
+        down_ptrs,
+        "down pointer table",
+    )?;
     // Table *contents*, not just the table tensor: a replay dereferences these
     // entries without re-uploading them, so each entry must point at the live
     // expert tensor it claims to name. Mirrors the compact path's check.
@@ -4778,6 +4865,64 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    #[test]
+    fn live_validation_accepts_the_sink_twin_and_rejects_a_third_table() {
+        let table = table(2, DType::MQ4G256);
+        let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+        let fixture = live_fixture(&table, 0x88_0000);
+        let n = table.n_experts();
+        let gate_up_sink = live_tensor(0x98_0000, n * DEVICE_POINTER_BYTES, &[2 * n], DType::F32);
+        let down_sink = live_tensor(0x99_0000, n * DEVICE_POINTER_BYTES, &[2 * n], DType::F32);
+        cache
+            .bind_live_with_sink(
+                &table,
+                &fixture.routed,
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+                None,
+                None,
+                Some(&gate_up_sink),
+                Some(&down_sink),
+            )
+            .unwrap();
+        let bound = BoundMoeExperts::from_cache(&table, &cache).unwrap();
+        // The real tables still validate...
+        validate_live_binding(
+            &bound,
+            Some(&fixture.routed),
+            &fixture.gate_up_ptrs,
+            &fixture.down_ptrs,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        // ...and so do the load-time sink twins the single-token decode step binds.
+        validate_live_binding(
+            &bound,
+            Some(&fixture.routed),
+            &gate_up_sink,
+            &down_sink,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        // A third table of identical shape/dtype but a different buffer is still
+        // rejected — the relaxation is scoped to the twin named at bind time.
+        let third = live_tensor(0xA8_0000, n * DEVICE_POINTER_BYTES, &[2 * n], DType::F32);
+        assert!(validate_live_binding(
+            &bound,
+            Some(&fixture.routed),
+            &third,
+            &fixture.down_ptrs,
+            None,
+            None,
+            None,
+        )
+        .is_err());
     }
 
     fn table(n: usize, dtype: DType) -> ExpertTable {

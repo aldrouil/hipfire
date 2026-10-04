@@ -5022,117 +5022,15 @@ pub(crate) fn prefill_moe_ffn_body_batched_with_route<'a>(
 
         execute_steps(gpu, ctx, &[Step::Moe(sealed)])
             .map_err(|e| HipError::new(0, &e.to_string()))?;
-        // CPU expert splice, batched twin of the decode hook: the loader rewrote
-        // both expert tables to a zeroed sink, so the sealed step contributed 0
-        // for the routed experts. Recompute the whole FFN per (token, rank) from
-        // the intact host blobs and accumulate into `pbs.x_batch`. Fail closed:
-        // unavailable inputs are errors, never silent zeros.
-        if ffn.cpu_expert_sink.is_some() {
-            let owners = ffn.packed_expert_owners.as_ref().ok_or_else(|| {
-                HipError::new(
-                    0,
-                    "moe cpu expert splice: layer has an expert sink but no packed owners",
-                )
-            })?;
-            if ffn.expert_dtype_tags.is_some() {
-                return Err(HipError::new(
-                    0,
-                    "moe cpu expert splice: prefill refuses mixed-dtype layers (tag table present)",
-                ));
-            }
-            let gu_dtype = ffn
-                .experts
-                .first()
-                .map(|e| e.gate_up.gpu_dtype)
-                .ok_or_else(|| {
-                    HipError::new(
-                        0,
-                        "moe cpu expert splice: layer has an expert sink but no experts",
-                    )
-                })?;
-            let quant = hipfire_dispatch::cpu_exec::cpu_quant_for(gu_dtype).ok_or_else(|| {
-                HipError::new(
-                    0,
-                    &format!(
-                        "moe cpu expert splice: no CPU decoder for gate_up dtype {gu_dtype:?}"
-                    ),
-                )
-            })?;
-            // Uniform-only splice (graded refused at load); a single blob per
-            // projection is the only live shape.
-            if owners.gate_up.len() != 1 || owners.down.len() != 1 {
-                return Err(HipError::new(
-                    0,
-                    "moe cpu expert splice: graded (multi-blob) layers cannot run on the CPU",
-                ));
-            }
-            let gu_owner = owners.gate_up.first().ok_or_else(|| {
-                HipError::new(
-                    0,
-                    "moe cpu expert splice: packed owners have no gate_up blob",
-                )
-            })?;
-            let dn_owner = owners.down.first().ok_or_else(|| {
-                HipError::new(0, "moe cpu expert splice: packed owners have no down blob")
-            })?;
-            let gu_host = gpu.host_bytes(gu_owner).ok_or_else(|| {
-                HipError::new(0, "moe cpu expert splice: gate_up blob has no host bytes")
-            })?;
-            let dn_host = gpu.host_bytes(dn_owner).ok_or_else(|| {
-                HipError::new(0, "moe cpu expert splice: down blob has no host bytes")
-            })?;
-            let n_exp = config.num_experts.max(1);
-            let gu_stride = gu_owner.buf.size() / n_exp;
-            let dn_stride = dn_owner.buf.size() / n_exp;
-            let slots = n
-                .checked_mul(config.num_experts_per_tok)
-                .ok_or_else(|| HipError::new(0, "moe cpu expert splice: slot extent overflows"))?;
-            let mi = config.moe_intermediate_size;
-            let dim = config.dim;
-            let topk_indices = pbs.moe_topk_indices_batch.as_ref().expect("moe scratch");
-            let topk_weights = pbs.moe_topk_weights_batch.as_ref().expect("moe scratch");
-            let mut x_rot = vec![0.0f32; n * dim];
-            let mut ti = vec![0.0f32; slots];
-            let mut tw = vec![0.0f32; slots];
-            let mut acc = vec![0.0f32; n * dim];
-            let f32_from = |t: &rdna_compute::GpuTensor, out: &mut [f32]| -> HipResult<()> {
-                let bytes = unsafe {
-                    std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, out.len() * 4)
-                };
-                gpu.memcpy_dtoh_auto(bytes, &t.buf)?;
-                Ok(())
-            };
-            f32_from(&pbs.x_rot_batch, &mut x_rot)?;
-            f32_from(topk_indices, &mut ti)?;
-            f32_from(topk_weights, &mut tw)?;
-            f32_from(&pbs.x_batch, &mut acc)?;
-            let awq = ffn.expert_down_awq_ptrs.is_some()
-                || ffn
-                    .experts
-                    .first()
-                    .is_some_and(|e| e.gate_up.awq_scale.is_some());
-            hipfire_dispatch::cpu_exec::moe_cpu_experts_batched(
-                gpu,
-                quant,
-                dim,
-                mi,
-                n,
-                config.num_experts_per_tok,
-                gu_stride,
-                gu_host,
-                dn_stride,
-                dn_host,
-                &x_rot,
-                &ti,
-                &tw,
-                &mut acc,
-                awq,
-            )
-            .map_err(|e| HipError::new(0, &e.to_string()))?;
-            let acc_bytes =
-                unsafe { std::slice::from_raw_parts(acc.as_ptr() as *const u8, acc.len() * 4) };
-            gpu.memcpy_htod_auto(&pbs.x_batch.buf, acc_bytes)?;
-        }
+        // `memory.offload_exec=cpu` deliberately does **not** splice the routed
+        // experts here. The batched prefill params bind the real expert tables,
+        // so the sealed step above already produced the routed contribution with
+        // the GPU's grouped read over the host-mapped blobs (one weight pass per
+        // unique expert per chunk). The CPU expert FFN is compute-bound and loses
+        // to that by >10x at chunk sizes (measured 15x on ornith/gfx1201), so
+        // running it for prefill — or for the MTP verify batch, which shares this
+        // path — was the regression. Only the single-token decode step
+        // (`qwen35::forward`) binds the zeroed sink twins and splices on the CPU.
 
         #[cfg(feature = "moe-oracle")]
         {

@@ -105,6 +105,7 @@ impl hipfire_dispatch::families::moe::RoutedExpertWeights for ResidentExpertWeig
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn bind_live_expert_cache(
     cache: &mut hipfire_dispatch::pipeline::sealed_moe::ExpertBindingCache,
     table: &hipfire_dispatch::pipeline::sealed_moe::ExpertTable,
@@ -113,15 +114,19 @@ pub(crate) fn bind_live_expert_cache(
     down_ptrs: &GpuTensor,
     down_awq_ptrs: Option<&GpuTensor>,
     dtype_tags: Option<&GpuTensor>,
+    gate_up_ptrs_sink: Option<&GpuTensor>,
+    down_ptrs_sink: Option<&GpuTensor>,
 ) -> HipResult<()> {
     cache
-        .bind_live(
+        .bind_live_with_sink(
             table,
             &ResidentExpertWeights(experts),
             gate_up_ptrs,
             down_ptrs,
             down_awq_ptrs,
             dtype_tags,
+            gate_up_ptrs_sink,
+            down_ptrs_sink,
         )
         .map_err(HipError::from)
 }
@@ -1260,12 +1265,26 @@ pub struct MoeFfnWeights {
     /// kernel's output so the indexed MoE GEMV can stay capture-safe.
     pub expert_gate_up_ptrs: GpuTensor, // [num_experts * 2] f32 slots = num_experts × u64
     pub expert_down_ptrs: GpuTensor,      // [num_experts * 2] f32 slots = num_experts × u64
-    /// Diagnostic CPU-down splice (ornith qt44 spill): a zeroed device buffer of
-    /// exactly one packed down stride, rewritten into every down table entry so
-    /// the GPU down projection contributes 0 while the CPU recomputes it from
-    /// the intact host blob. `Some` only when the loader spliced it; freed as a
-    /// buffer in `free_moe_ffn_with`.
+    /// CPU expert splice zero buffer (`memory.offload_exec=cpu`): a zeroed
+    /// device buffer of exactly one packed expert stride. The decode-only sink
+    /// twins [`Self::cpu_sink_gate_up_ptrs`] / [`Self::cpu_sink_down_ptrs`] point
+    /// every entry at it, so the single-token decode MoE step contributes 0 for the
+    /// routed experts while [`hipfire_dispatch::cpu_exec::moe_cpu_experts`]
+    /// recomputes them from the intact host blobs. `Some` only when the loader
+    /// armed the splice; freed as a buffer in `free_moe_ffn_with`.
     pub(crate) cpu_expert_sink: Option<GpuTensor>,
+
+    /// Zeroed-sink twins of [`Self::expert_gate_up_ptrs`] / [`Self::expert_down_ptrs`]:
+    /// every entry points at [`Self::cpu_expert_sink`]. The **single-token decode**
+    /// MoE step binds these so the GPU routed contribution is 0 and
+    /// [`hipfire_dispatch::cpu_exec::moe_cpu_experts`] supplies it from the host
+    /// blobs. Batched forwards (prefill, MTP verify) bind the real tables and skip
+    /// the splice — the CPU expert FFN is compute-bound and loses to the GPU's
+    /// grouped PCIe read at chunk sizes (measured 15x on ornith/gfx1201), so
+    /// `memory.offload_exec=cpu` applies to decode only, matching llama.cpp's
+    /// per-op batch routing.
+    pub(crate) cpu_sink_gate_up_ptrs: Option<GpuTensor>,
+    pub(crate) cpu_sink_down_ptrs: Option<GpuTensor>,
 
     /// Route A MoE-AWQ: per-expert down `awq_scale` pointer table
     /// (`[num_experts * 2]` f32 = num_experts × u64). `Some` only when the
@@ -2415,6 +2434,13 @@ pub(crate) fn free_moe_ffn_with(ffn: MoeFfnWeights, free: &mut impl FnMut(GpuTen
     }
     // CPU-down splice sink (owns the zeroed buffer every down entry points at).
     if let Some(t) = ffn.cpu_expert_sink {
+        free(t);
+    }
+    // Decode-only zeroed-sink twins of the real expert pointer tables.
+    if let Some(t) = ffn.cpu_sink_gate_up_ptrs {
+        free(t);
+    }
+    if let Some(t) = ffn.cpu_sink_down_ptrs {
         free(t);
     }
     // Owned device buffer (built from per-expert gpu_dtype). Free it.

@@ -434,6 +434,8 @@ mod tests {
                 expert_down_ptrs: buffers.pop().expect("MoE test pointer buffer"),
                 expert_down_awq_ptrs: None,
                 cpu_expert_sink: None,
+                cpu_sink_gate_up_ptrs: None,
+                cpu_sink_down_ptrs: None,
                 expert_dtype_tags: None,
                 layer_idx: 0,
                 expert_shape: None,
