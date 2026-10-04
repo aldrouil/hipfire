@@ -48,12 +48,19 @@ Stage-1 plan §Verification arm A on `qwen3.5:35b-a3b`, prompt
 - `HIPFIRE_MOE_EXPERT_BUDGET=auto` → loads, `routed experts host on 14 layers`,
   coherent, numbers consistent with the per-layer figure (408 MiB/layer).
 
-**Residual (the class, not the instance).** `fused_gate_up_key_for`'s catch-all
-`_ => FusedGateUpHfq4G256` still silently aliases any dtype that reaches it
-without an arm to the qt13 kernel — the exact failure shape this bug was. The
-MQ6 arm closed this occurrence; making the alias *refuse* (panic like the qt=52
-arm, or narrow to the real HFQ4-G256 dtypes) is the durable fix and needs the
-valid dtype set confirmed first, so it is left as a follow-up rather than guessed.
+**Residual (the class, not the instance).** Four `_key_for` selectors shared the
+same HFQ4 catch-all and all four were missing an `MQ6G256` arm — a silent
+qt13-kernel-over-6-bit-bytes misread, the exact failure shape above:
+`fused_gate_up_key_for` and `residual_gemm_key_for` (both `hipfire-dispatch`; the
+latter is the per-decode-step residual path), and the arch-local
+`fused_qkv_key_for` / `fused_qkvza_key_for`
+(`crates/hipfire-arch-qwen35/src/forward_slots.rs`). All four now select the
+registered `*Hfq6G256` sibling. What remains is the catch-all itself: a *future*
+dtype reaching any of these without an arm is still aliased to HFQ4. Making the
+alias refuse (panic like the qt=52 arm) is the durable fix and needs the full
+valid dtype set read off `coverage_tests` first; the two arch-local selectors are
+also candidates to hoist into `hipfire-dispatch` (an arch-local selector is the
+per-arch decision the PR-793 review warns against).
 
 ## Goal and constraint
 

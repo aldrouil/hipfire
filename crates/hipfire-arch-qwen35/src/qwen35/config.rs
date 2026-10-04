@@ -7,7 +7,6 @@
 
 use hip_bridge::HipError;
 use hip_bridge::HipResult;
-use hipfire_config::memory::OffloadBudget;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::model_source::ModelSource;
 use hipfire_runtime::tp_shard::ShardConfig;
