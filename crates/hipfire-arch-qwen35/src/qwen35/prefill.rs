@@ -13991,8 +13991,7 @@ pub(crate) fn forward_batch_chunk_impl(
     let n_v_heads = config.linear_num_value_heads;
     let hd = config.linear_key_head_dim;
     let dim_row_bytes = dim * 4;
-    let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu)
-        .with_verify_tile_attend(fusion == DflashFusionCtx::ChainVerify);
+
 
     let do_embed = band.map(|b| b.is_first_band).unwrap_or(true);
     let layer_start = band.map(|b| b.layer_start).unwrap_or(0);
@@ -14165,7 +14164,8 @@ pub(crate) fn forward_batch_chunk_impl(
                 && (n % 512 == 0 || (64..512).contains(&(n % 512)))));
     let ctx = DispatchCtx::new(gpu)
         .with_workload(dispatch_workload)
-        .with_verify_tile_attend(fusion == DflashFusionCtx::ChainVerify);
+        .with_verify_tile_attend(fusion == DflashFusionCtx::ChainVerify)
+        .with_batch_size(n);
 
     for layer_idx in layer_start..layer_end {
         match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {

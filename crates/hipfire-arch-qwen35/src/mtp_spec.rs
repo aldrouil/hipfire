@@ -1996,6 +1996,11 @@ fn mtp_verify_accept_impl(
         committed = accepted.committed;
         accept_count = accepted.accept_count;
         hit_eos = accepted.hit_eos;
+        if mtp_phase_timing_enabled() {
+            eprintln!(
+                "QWEN35_MTP_ACCEPT {{\"event\":\"mtp_accept\",\"pos\":{cur_pos},\"drafts\":{drafts_generated},\"accepted\":{accept_count}}}",
+            );
+        }
     }
 
     let advance = committed.len();
