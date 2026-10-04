@@ -2754,21 +2754,11 @@ pub fn qwen35_layer_bytes(hfq: &HfqFile, config: &Qwen35Config) -> LayerBytes {
     let n = config.n_layers;
     let mut non_expert = vec![0u64; n];
     let mut expert = vec![0u64; n];
-    let mut unverified_host = vec![false; n];
     let mut always_resident = 0u64;
     for info in hfq.tensor_infos() {
         let bytes = info.data_size as u64;
         match crate::serve_engine::tensor_layer_index(&info.name) {
             Some(layer) if layer < n => {
-                // The packed MQ4-V2 (qt 44/45) host path is unverified (see
-                // `LayerBytes::unverified_host`); flag the layer so the resolver
-                // refuses to host-place it. Not a proven format defect: the
-                // kernels and the tensor-level host read both pass parity, and the
-                // evidenced failure compared two models that differ in more than
-                // the quant.
-                if matches!(info.quant_type, 44 | 45) {
-                    unverified_host[layer] = true;
-                }
                 if crate::qwen35::weights::is_routed_expert_weight(&info.name) {
                     expert[layer] += bytes;
                 } else {
@@ -2782,7 +2772,6 @@ pub fn qwen35_layer_bytes(hfq: &HfqFile, config: &Qwen35Config) -> LayerBytes {
         non_expert,
         expert,
         always_resident,
-        unverified_host,
     }
 }
 
@@ -5699,37 +5688,6 @@ pub(crate) fn load_moe_ffn(
         ));
     }
     if let Some((experts, owners)) = packed {
-        if residency.experts_host() {
-            // Host-mapped packed experts are verified for MQ4G256 (qt 13) only.
-            // On `ornith-1.5:35b-a3b` (routed experts MQ4G256V2, qt 44) the
-            // identical spill produced a wrong *first* token — invariant across
-            // KV mode, KV backend and host fraction — while the qt-13
-            // `qwen3.5:35b-a3b` control produced the right one. Refuse rather
-            // than ship silent corruption; a device-vs-host parity check over one
-            // layer's packed experts is what lifts this.
-            let dtype = experts.first().map(|expert| expert.gate_up.gpu_dtype);
-            if dtype != Some(DType::MQ4G256)
-                && hipfire_config::developer_var("HIPFIRE_MOE_V2_HOST_ALLOW").is_err()
-            {
-                return Err(pending.rollback(
-                    gpu,
-                    HipError::new(
-                        0,
-                        &format!(
-                            "qwen35: layer {layer_idx} routed experts are host-placed \
-                             (memory.moe_expert_budget) but their packed dtype is {dtype:?}, which \
-                             the host-expert path has no verified example: the one model \
-                             measured (ornith-1.5:35b-a3b) produced wrong logits under this \
-                             spill. Its tensor-level host read DOES pass parity (byte-identical, \
-                             host-located, indexed and packed-view arms) and so do the MQ4-V2 \
-                             kernels, so what is unverified is the end-to-end model under spill, \
-                             not the format. Raise memory.moe_expert_budget to keep these \
-                             experts resident"
-                        ),
-                    ),
-                ));
-            }
-        }
         if layer_idx == 0 {
             eprintln!(
                 "  routed MQ4 expert packing: {} per-expert weight buffers -> 2 layer blobs",
