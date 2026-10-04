@@ -5021,43 +5021,47 @@ pub(crate) fn prefill_moe_ffn_body_batched_with_route<'a>(
 
         execute_steps(gpu, ctx, &[Step::Moe(sealed)])
             .map_err(|e| HipError::new(0, &e.to_string()))?;
-        // Diagnostic CPU-down splice, batched twin of the decode hook: the
-        // loader rewrote every down entry to a zeroed sink, so the down above
-        // contributed 0 on every path. Recompute per (token, rank) on the CPU
-        // from the intact host blob and accumulate into `pbs.x_batch`.
-        // Fail closed: unavailable inputs are errors, never silent zeros.
-        if ffn.cpu_down_sink.is_some() {
+        // CPU expert splice, batched twin of the decode hook: the loader rewrote
+        // both expert tables to a zeroed sink, so the sealed step contributed 0
+        // for the routed experts. Recompute the whole FFN per (token, rank) from
+        // the intact host blobs and accumulate into `pbs.x_batch`. Fail closed:
+        // unavailable inputs are errors, never silent zeros.
+        if ffn.cpu_expert_sink.is_some() {
             let owners = ffn.packed_expert_owners.as_ref().ok_or_else(|| {
-                HipError::new(0, "moe cpu-down splice: layer has a down sink but no packed owners")
+                HipError::new(0, "moe cpu expert splice: layer has an expert sink but no packed owners")
             })?;
             if ffn.expert_dtype_tags.is_some() {
                 return Err(HipError::new(
                     0,
-                    "moe cpu-down splice: prefill refuses mixed-dtype layers (tag table present)",
+                    "moe cpu expert splice: prefill refuses mixed-dtype layers (tag table present)",
                 ));
             }
-            let down_dtype = ffn.experts.first().map(|e| e.down.gpu_dtype).ok_or_else(|| {
-                HipError::new(0, "moe cpu-down splice: layer has a down sink but no experts")
+            let gu_dtype = ffn.experts.first().map(|e| e.gate_up.gpu_dtype).ok_or_else(|| {
+                HipError::new(0, "moe cpu expert splice: layer has an expert sink but no experts")
             })?;
-            let quant = hipfire_dispatch::cpu_exec::cpu_quant_for(down_dtype).ok_or_else(|| {
+            let quant = hipfire_dispatch::cpu_exec::cpu_quant_for(gu_dtype).ok_or_else(|| {
                 HipError::new(
                     0,
-                    &format!("moe cpu-down splice: no CPU decoder for down dtype {down_dtype:?}"),
+                    &format!("moe cpu expert splice: no CPU decoder for gate_up dtype {gu_dtype:?}"),
                 )
             })?;
-            let down_host = gpu.host_bytes(&owners.down).ok_or_else(|| {
-                HipError::new(0, "moe cpu-down splice: down blob has no host bytes")
+            let gu_host = gpu.host_bytes(&owners.gate_up).ok_or_else(|| {
+                HipError::new(0, "moe cpu expert splice: gate_up blob has no host bytes")
             })?;
-            let down_stride = owners.down.buf.size() / config.num_experts.max(1);
+            let dn_host = gpu.host_bytes(&owners.down).ok_or_else(|| {
+                HipError::new(0, "moe cpu expert splice: down blob has no host bytes")
+            })?;
+            let n_exp = config.num_experts.max(1);
+            let gu_stride = owners.gate_up.buf.size() / n_exp;
+            let dn_stride = owners.down.buf.size() / n_exp;
             let slots = n.checked_mul(config.num_experts_per_tok).ok_or_else(|| {
-                HipError::new(0, "moe cpu-down splice: slot extent overflows")
+                HipError::new(0, "moe cpu expert splice: slot extent overflows")
             })?;
             let mi = config.moe_intermediate_size;
             let dim = config.dim;
-            let rot_batch = pbs.moe_rot_batch.as_ref().expect("moe scratch");
             let topk_indices = pbs.moe_topk_indices_batch.as_ref().expect("moe scratch");
             let topk_weights = pbs.moe_topk_weights_batch.as_ref().expect("moe scratch");
-            let mut rot = vec![0.0f32; slots * mi];
+            let mut x_rot = vec![0.0f32; n * dim];
             let mut ti = vec![0.0f32; slots];
             let mut tw = vec![0.0f32; slots];
             let mut acc = vec![0.0f32; n * dim];
@@ -5068,24 +5072,28 @@ pub(crate) fn prefill_moe_ffn_body_batched_with_route<'a>(
                 gpu.memcpy_dtoh_auto(bytes, &t.buf)?;
                 Ok(())
             };
-            f32_from(rot_batch, &mut rot)?;
+            f32_from(&pbs.x_rot_batch, &mut x_rot)?;
             f32_from(topk_indices, &mut ti)?;
             f32_from(topk_weights, &mut tw)?;
             f32_from(&pbs.x_batch, &mut acc)?;
-            hipfire_dispatch::cpu_exec::moe_cpu_down_residual_batched(
+            let awq = ffn.expert_down_awq_ptrs.is_some()
+                || ffn.experts.first().is_some_and(|e| e.gate_up.awq_scale.is_some());
+            hipfire_dispatch::cpu_exec::moe_cpu_experts_batched(
                 gpu,
                 quant,
                 dim,
                 mi,
                 n,
                 config.num_experts_per_tok,
-                down_stride,
-                down_host,
-                &rot,
+                gu_stride,
+                gu_host,
+                dn_stride,
+                dn_host,
+                &x_rot,
                 &ti,
                 &tw,
                 &mut acc,
-                ffn.expert_down_awq_ptrs.is_some(),
+                awq,
             )
             .map_err(|e| HipError::new(0, &e.to_string()))?;
             let acc_bytes =

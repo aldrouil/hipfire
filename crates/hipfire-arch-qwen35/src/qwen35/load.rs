@@ -2639,35 +2639,43 @@ pub fn report_cpu_exec_coverage(
     let mut spilled: BTreeSet<usize> = host_layers.iter().copied().collect();
     spilled.extend(expert_layers.iter().copied());
 
+    // The expert splice is the same model-level decision the loader made
+    // (`memory.offload_exec=cpu` + the `HIPFIRE_MOE_CPU_EXPERTS` kill-switch), so
+    // when it is armed a host-placed layer's routed FFN runs on the CPU too.
+    let expert_cpu = hipfire_dispatch::cpu_exec::moe_cpu_experts_enabled();
     let mut covered = 0usize;
     let mut uncovered: BTreeSet<String> = BTreeSet::new();
     for layer in &spilled {
-        // A layer whose routed experts are host-placed is not CPU-covered until
-        // stage 2 expresses their work as seam steps: MoE experts dispatch
-        // through `families::moe`, not `execute_steps`, so the CPU seam cannot
-        // see them and they stay on the PCIe path.
-        if expert_layers.contains(layer) {
-            uncovered.insert("routed-experts (PCIe)".to_string());
-            continue;
-        }
+        let own_host = host_layers.contains(layer);
+        let experts_host = expert_layers.contains(layer);
         let mut layer_covered = true;
-        for t in hfq.tensors() {
-            if crate::serve_engine::tensor_layer_index(&t.name) != Some(*layer) {
-                continue;
+        // A host-placed layer's own weights run through the generic CPU seam;
+        // check that every one of its tensors has a CPU decoder.
+        if own_host {
+            for t in hfq.tensors() {
+                if crate::serve_engine::tensor_layer_index(&t.name) != Some(*layer) {
+                    continue;
+                }
+                // Resolve through the *loader's own* map, not the passthrough table:
+                // `hfq_weight_dtype` is RAW_CODECS, which omits the `arch-loaded`
+                // formats (qt 31 per `docs/quant-formats/qt-register.txt`, the MFP4
+                // family, PARO), and a tensor skipped here would be reported as
+                // covered while nothing decodes it. F16/F32/BF16 do resolve, and are
+                // covered because the loader host-decodes them to f32 at load time.
+                let Ok(dtype) = dtype_from_quant_type(t.quant_type) else {
+                    continue;
+                };
+                if hipfire_dispatch::cpu_quant_for(dtype).is_none() {
+                    layer_covered = false;
+                    uncovered.insert(format!("{dtype:?}"));
+                }
             }
-            // Resolve through the *loader's own* map, not the passthrough table:
-            // `hfq_weight_dtype` is RAW_CODECS, which omits the `arch-loaded`
-            // formats (qt 31 per `docs/quant-formats/qt-register.txt`, the MFP4
-            // family, PARO), and a tensor skipped here would be reported as
-            // covered while nothing decodes it. F16/F32/BF16 do resolve, and are
-            // covered because the loader host-decodes them to f32 at load time.
-            let Ok(dtype) = dtype_from_quant_type(t.quant_type) else {
-                continue;
-            };
-            if hipfire_dispatch::cpu_quant_for(dtype).is_none() {
-                layer_covered = false;
-                uncovered.insert(format!("{dtype:?}"));
-            }
+        }
+        // Routed experts are covered only when the splice is armed; otherwise they
+        // stay on the GPU reading host bytes over PCIe.
+        if experts_host && !expert_cpu {
+            layer_covered = false;
+            uncovered.insert("routed-experts (PCIe)".to_string());
         }
         if layer_covered {
             covered += 1;
@@ -2678,10 +2686,15 @@ pub fn report_cpu_exec_coverage(
     } else {
         uncovered.into_iter().collect::<Vec<_>>().join(", ")
     };
-    // A dense model has no expert tier; printing "routed-expert steps of 0
-    // layers" would describe a tier that does not exist.
+    // A dense model has no expert tier; printing an expert clause would describe a
+    // tier that does not exist.
     let expert_clause = if expert_layers.is_empty() {
         String::new()
+    } else if expert_cpu {
+        format!(
+            "; routed-expert FFN of {} layers recomputed on the CPU",
+            expert_layers.len()
+        )
     } else {
         format!(
             "; routed-expert steps of {} layers stay on the PCIe path",
@@ -5186,7 +5199,7 @@ pub(crate) struct PendingMoeFfn {
     pub(crate) packed_expert_owners: Option<PackedExpertOwners>,
     pub(crate) expert_gate_up_ptrs: Option<GpuTensor>,
     pub(crate) expert_down_ptrs: Option<GpuTensor>,
-    pub(crate) cpu_down_sink: Option<GpuTensor>,
+    pub(crate) cpu_expert_sink: Option<GpuTensor>,
     pub(crate) expert_down_awq_ptrs: Option<GpuTensor>,
     pub(crate) expert_dtype_tags: Option<GpuTensor>,
     pub(crate) paro_shared: Option<MoeParoSidecars>,
@@ -5207,7 +5220,7 @@ impl PendingMoeFfn {
             packed_expert_owners: None,
             expert_gate_up_ptrs: None,
             expert_down_ptrs: None,
-            cpu_down_sink: None,
+            cpu_expert_sink: None,
             expert_down_awq_ptrs: None,
             expert_dtype_tags: None,
             paro_shared: None,
@@ -5230,7 +5243,7 @@ impl PendingMoeFfn {
         if let Some(tensor) = self.expert_down_awq_ptrs.take() {
             let _ = gpu.free_tensor(tensor);
         }
-        if let Some(tensor) = self.cpu_down_sink.take() {
+        if let Some(tensor) = self.cpu_expert_sink.take() {
             let _ = gpu.free_tensor(tensor);
         }
         if let Some(tensor) = self.expert_down_ptrs.take() {
@@ -5321,7 +5334,7 @@ impl PendingMoeFfn {
             packed_expert_owners,
             expert_gate_up_ptrs,
             expert_down_ptrs,
-            cpu_down_sink,
+            cpu_expert_sink,
             expert_down_awq_ptrs,
             expert_dtype_tags,
             paro_shared,
@@ -5349,7 +5362,7 @@ impl PendingMoeFfn {
             shared_expert_gate: shared_gate_scalar.expect("pending MoE shared gate scalar"),
             expert_gate_up_ptrs: expert_gate_up_ptrs.expect("pending MoE gate/up pointer table"),
             expert_down_ptrs: expert_down_ptrs.expect("pending MoE down pointer table"),
-            cpu_down_sink,
+            cpu_expert_sink,
             expert_down_awq_ptrs,
             expert_dtype_tags,
             layer_idx,
@@ -5433,7 +5446,7 @@ impl PendingMoeFfn {
             packed_expert_owners,
             expert_gate_up_ptrs,
             expert_down_ptrs,
-            cpu_down_sink,
+            cpu_expert_sink,
             expert_down_awq_ptrs,
             expert_dtype_tags,
             paro_shared,
@@ -5465,7 +5478,7 @@ impl PendingMoeFfn {
             shared_expert_gate: shared_gate_scalar.expect("pending EP shared gate scalar"),
             expert_gate_up_ptrs: expert_gate_up_ptrs.expect("pending EP gate/up pointer table"),
             expert_down_ptrs: expert_down_ptrs.expect("pending EP down pointer table"),
-            cpu_down_sink,
+            cpu_expert_sink,
             expert_down_awq_ptrs,
             expert_dtype_tags,
             layer_idx,
@@ -5840,24 +5853,29 @@ pub(crate) fn load_moe_ffn(
     if let Err(error) = down_copy {
         return Err(pending.rollback(gpu, error));
     }
-    // Diagnostic CPU-down splice: only on the CPU arm (`memory.offload_exec=cpu`)
-    // and only on a host-placed packed layer, so the PCIe arm is genuinely PCIe
-    // and resident loads are byte-identical. `HIPFIRE_MOE_CPU_DOWN=0` is the
-    // kill-switch. The sink owns one zeroed device buffer of exactly
-    // `down_stride` bytes and every down entry is rewritten to it; the real host
-    // blob stays intact for the CPU at forward time. AWQ layers stay refused: a
-    // bare `gemv` would ignore the per-expert scale.
-    let cpu_down_splice = hipfire_dispatch::cpu_exec_enabled()
-        && hipfire_config::developer_var("HIPFIRE_MOE_CPU_DOWN")
-            .ok()
-            .as_deref()
-            != Some("0")
+    // CPU expert splice: only on the CPU arm (`memory.offload_exec=cpu`) and only
+    // on a host-placed packed layer, so the PCIe arm is genuinely PCIe and
+    // resident loads are byte-identical. `HIPFIRE_MOE_CPU_EXPERTS=0` is the
+    // kill-switch. Both expert tables are rewritten to one zeroed sink, so the
+    // sealed step contributes 0 for the routed experts and the CPU recomputes the
+    // whole FFN (gate_up + SiLU + down) from the intact host blobs at forward
+    // time. AWQ layers stay refused: a bare `gemv` would ignore the per-expert
+    // scale, on either projection.
+    let cpu_expert_splice = hipfire_dispatch::cpu_exec::moe_cpu_experts_enabled()
         && residency.experts_host()
         && pending.packed_expert_owners.is_some()
-        && pending.experts.first().is_some_and(|e| e.down.awq_scale.is_none());
-    if cpu_down_splice {
-        let down_stride = pending.experts[0].down.buf.buf.size();
-        let sink = match gpu.zeros(&[down_stride / 4], DType::F32) {
+        && pending
+            .experts
+            .first()
+            .is_some_and(|e| e.gate_up.awq_scale.is_none() && e.down.awq_scale.is_none());
+    if cpu_expert_splice {
+        // One zero sink covers both tables: every gate_up and down entry points
+        // at it, so any kernel read (whose extent is that table's stride) stays
+        // in bounds. Sized to the larger stride.
+        let gu_stride = pending.experts[0].gate_up.buf.buf.size();
+        let dn_stride = pending.experts[0].down.buf.buf.size();
+        let sink_len = gu_stride.max(dn_stride);
+        let sink = match gpu.zeros(&[sink_len / 4], DType::F32) {
             Ok(tensor) => tensor,
             Err(error) => return Err(pending.rollback(gpu, error)),
         };
@@ -5866,23 +5884,34 @@ pub(crate) fn load_moe_ffn(
             .iter()
             .flat_map(|ptr| ptr.to_ne_bytes())
             .collect();
-        let rewrite = {
+        let gu_rewrite = {
+            let tensor = pending
+                .expert_gate_up_ptrs
+                .as_ref()
+                .expect("pending gate/up table");
+            gpu.hip.memcpy_htod(&tensor.buf, &sink_bytes)
+        };
+        if let Err(error) = gu_rewrite {
+            let _ = gpu.free_tensor(sink);
+            return Err(pending.rollback(gpu, error));
+        }
+        let dn_rewrite = {
             let tensor = pending
                 .expert_down_ptrs
                 .as_ref()
                 .expect("pending down table");
             gpu.hip.memcpy_htod(&tensor.buf, &sink_bytes)
         };
-        if let Err(error) = rewrite {
+        if let Err(error) = dn_rewrite {
             let _ = gpu.free_tensor(sink);
             return Err(pending.rollback(gpu, error));
         }
         if layer_idx == 0 {
             eprintln!(
-                "  [moe-cpu-down] layer {layer_idx}: GPU down silenced via zeroed sink ({down_stride} B/entry); CPU recomputes from host blob"
+                "  [moe-cpu-expert] layer {layer_idx}: GPU gate_up+down silenced via zeroed sink ({sink_len} B/entry); CPU recomputes the expert FFN"
             );
         }
-        pending.cpu_down_sink = Some(sink);
+        pending.cpu_expert_sink = Some(sink);
     }
 
     let moe_awq_enabled = hipfire_config::developer_var("HIPFIRE_MOE_AWQ")

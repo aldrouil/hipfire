@@ -18,7 +18,8 @@ pub mod pipeline;
 pub use cpu_exec::{
     cpu_exec_counters, cpu_exec_enabled, cpu_exec_redline_conflict, cpu_offload_active,
     cpu_quant_for, host_mapped_cpu_capable, log_capture_disabled_once,
-    moe_cpu_down_residual, moe_cpu_down_residual_batched, reject_cpu_exec_under_redline,
+    moe_cpu_experts, moe_cpu_experts_batched, moe_cpu_experts_enabled,
+    reject_cpu_exec_under_redline,
     run_host_mapped_gemv, run_host_mapped_gemv_residual,
 };
 pub mod resource;

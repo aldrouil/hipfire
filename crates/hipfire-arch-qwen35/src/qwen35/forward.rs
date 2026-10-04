@@ -684,9 +684,11 @@ fn moe_ffn_decode_impl<'a>(
     }
     let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
     let bound = ffn.bound_experts()?;
-    // The CPU-down splice needs the residual after `seal_decode` moves
-    // `moe_params`; capture the reference first (a shared borrow, no copy).
+    // The CPU expert splice needs the residual and the gate_up activation after
+    // `seal_decode` moves `moe_params`; capture the references first (shared
+    // borrows, no copy).
     let splice_residual = moe_params.x_residual;
+    let splice_x_rot = moe_params.x_rot_local;
     // Only when explicitly asked: the oracle downloads the activation and the
     // route for every MoE layer, which is a host sync point on the decode path.
     let oracle_input = hipfire_config::developer_var("HIPFIRE_MOE_CPU_ORACLE")
@@ -700,38 +702,44 @@ fn moe_ffn_decode_impl<'a>(
         &[hipfire_dispatch::pipeline::Step::Moe(sealed)],
     )
     .map_err(HipError::from)?;
-    // Diagnostic CPU-down splice: the loader rewrote every down entry to a
-    // zeroed sink, so the sealed step above contributed 0 for the routed down
-    // projection. Recompute it here on the CPU from the intact host blob and
+    // CPU expert splice: the loader rewrote both expert tables to a zeroed sink,
+    // so the sealed step above contributed 0 for the routed experts. Recompute
+    // the whole expert FFN here on the CPU from the intact host blobs and
     // accumulate into the residual. Fail closed: any unavailable input is an
     // error, never silent zeros.
-    if let Some(sink) = ffn.cpu_down_sink.as_ref() {
+    if let Some(sink) = ffn.cpu_expert_sink.as_ref() {
         let _ = sink;
         let owners = ffn.packed_expert_owners.as_ref().ok_or_else(|| {
-            HipError::new(0, "moe cpu-down splice: layer has a down sink but no packed owners")
+            HipError::new(0, "moe cpu expert splice: layer has an expert sink but no packed owners")
         })?;
-        let down_dtype = ffn.experts.first().map(|e| e.down.gpu_dtype).ok_or_else(|| {
-            HipError::new(0, "moe cpu-down splice: layer has a down sink but no experts")
+        let gu_dtype = ffn.experts.first().map(|e| e.gate_up.gpu_dtype).ok_or_else(|| {
+            HipError::new(0, "moe cpu expert splice: layer has an expert sink but no experts")
         })?;
-        let quant = hipfire_dispatch::cpu_exec::cpu_quant_for(down_dtype).ok_or_else(|| {
+        let quant = hipfire_dispatch::cpu_exec::cpu_quant_for(gu_dtype).ok_or_else(|| {
             HipError::new(
                 0,
-                &format!("moe cpu-down splice: no CPU decoder for down dtype {down_dtype:?}"),
+                &format!("moe cpu expert splice: no CPU decoder for gate_up dtype {gu_dtype:?}"),
             )
         })?;
-        let down_stride = owners.down.buf.size() / config.num_experts.max(1);
-        hipfire_dispatch::cpu_exec::moe_cpu_down_residual(
+        let n_exp = config.num_experts.max(1);
+        let gu_stride = owners.gate_up.buf.size() / n_exp;
+        let dn_stride = owners.down.buf.size() / n_exp;
+        let awq = ffn.expert_down_awq_ptrs.is_some()
+            || ffn.experts.first().is_some_and(|e| e.gate_up.awq_scale.is_some());
+        hipfire_dispatch::cpu_exec::moe_cpu_experts(
             gpu,
             quant,
             config.dim,
             config.moe_intermediate_size,
+            &owners.gate_up,
+            gu_stride,
             &owners.down,
-            down_stride,
-            s.rot_batch,
+            dn_stride,
+            splice_x_rot,
             s.topk_indices,
             s.topk_weights,
             splice_residual,
-            ffn.expert_down_awq_ptrs.is_some(),
+            awq,
         )
         .map_err(HipError::from)?;
     }

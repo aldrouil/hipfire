@@ -1262,7 +1262,7 @@ pub struct MoeFfnWeights {
     /// the GPU down projection contributes 0 while the CPU recomputes it from
     /// the intact host blob. `Some` only when the loader spliced it; freed as a
     /// buffer in `free_moe_ffn_with`.
-    pub(crate) cpu_down_sink: Option<GpuTensor>,
+    pub(crate) cpu_expert_sink: Option<GpuTensor>,
 
     /// Route A MoE-AWQ: per-expert down `awq_scale` pointer table
     /// (`[num_experts * 2]` f32 = num_experts × u64). `Some` only when the
@@ -2411,7 +2411,7 @@ pub(crate) fn free_moe_ffn_with(ffn: MoeFfnWeights, free: &mut impl FnMut(GpuTen
         free(t);
     }
     // CPU-down splice sink (owns the zeroed buffer every down entry points at).
-    if let Some(t) = ffn.cpu_down_sink {
+    if let Some(t) = ffn.cpu_expert_sink {
         free(t);
     }
     // Owned device buffer (built from per-expert gpu_dtype). Free it.
