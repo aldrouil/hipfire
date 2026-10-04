@@ -146,6 +146,61 @@ pub fn gemm_with_simd(
         });
 }
 
+/// Batched multi-expert GEMV: `out[e*m .. (e+1)*m] = W_e · x_e`, with
+/// `pairs[e] = (weight rows, activation)`.
+///
+/// One rayon region over every `(expert, row)` output element. A loop of small
+/// per-expert [`gemv`] calls pays one region entry — and one worker wake-up —
+/// per expert, which dominates when `m` is only a few thousand rows; the routed
+/// expert FFN of a decode token is exactly that shape (k experts × two
+/// projections per layer). Every element is the same [`dot_row_simd`] call
+/// [`gemv`] makes, so the result is bit-identical to calling [`gemv`] once per
+/// expert.
+pub fn gemv_experts(
+    q: CpuQuant,
+    m: usize,
+    k: usize,
+    pairs: &[(&[u8], &[f32])],
+    out: &mut [f32],
+    requested: Option<bool>,
+) {
+    if pairs.is_empty() || m == 0 || k == 0 {
+        return;
+    }
+    let rb = row_bytes(q, k);
+    assert!(
+        k % 256 == 0,
+        "gemv_experts({q:?}): k={k} is not a multiple of 256"
+    );
+    assert!(
+        out.len() >= pairs.len() * m,
+        "gemv_experts({q:?}): out has {} elements, need {} experts × {m} rows",
+        out.len(),
+        pairs.len()
+    );
+    let use_simd = simd::row_dot_enabled(q, requested);
+    out[..pairs.len() * m]
+        .par_chunks_mut(m)
+        .zip(pairs.par_iter())
+        .for_each(|(out_e, (packed, x))| {
+            assert!(
+                packed.len() >= m * rb,
+                "gemv_experts({q:?}): weight rows have {} bytes, need {}",
+                packed.len(),
+                m * rb
+            );
+            assert!(
+                x.len() >= k,
+                "gemv_experts({q:?}): activation has {} elements, need k={k}",
+                x.len()
+            );
+            let x = &x[..k];
+            out_e.par_iter_mut().enumerate().for_each(|(row, o)| {
+                *o = dot_row_simd(q, &packed[row * rb..], k, x, use_simd);
+            });
+        });
+}
+
 /// One output element: `Σ_j W[row][j] * x[j]`, accumulating one group at a time.
 ///
 /// `use_simd` is resolved once per GEMV call by the caller
@@ -222,6 +277,36 @@ mod test {
                 (v as f32 - 2048.0) * 0.001_953_125
             })
             .collect()
+    }
+
+    /// `gemv_experts` must be bit-identical to calling `gemv` once per expert —
+    /// it is the routed-expert decode path's replacement for a loop of small
+    /// per-expert GEMVs, and a rounding change there would flip greedy tokens.
+    #[test]
+    fn gemv_experts_matches_per_expert_gemv() {
+        for q in [CpuQuant::Mq4G256, CpuQuant::Mq4G256V2, CpuQuant::Mq6G256] {
+            let (m, k, experts) = (8usize, 256usize, 3usize);
+            // Byte-distinct experts and distinct activations, so a slot mix-up or
+            // a shared-x shortcut cannot pass.
+            let packed: Vec<Vec<u8>> = (0..experts)
+                .map(|e| weights(q, m, k).iter().map(|b| b ^ (e as u8)).collect())
+                .collect();
+            let xs: Vec<Vec<f32>> = (0..experts)
+                .map(|e| x_of(k).iter().map(|v| v + e as f32).collect())
+                .collect();
+            let pairs: Vec<(&[u8], &[f32])> = packed
+                .iter()
+                .zip(xs.iter())
+                .map(|(p, x)| (p.as_slice(), x.as_slice()))
+                .collect();
+            let mut batched = vec![0.0f32; experts * m];
+            gemv_experts(q, m, k, &pairs, &mut batched, None);
+            let mut per_expert = vec![0.0f32; experts * m];
+            for (e, (p, x)) in packed.iter().zip(xs.iter()).enumerate() {
+                gemv(q, p, m, k, x, &mut per_expert[e * m..(e + 1) * m]);
+            }
+            assert_eq!(batched, per_expert, "{q:?}: batched != per-expert gemv");
+        }
     }
 
     #[test]
