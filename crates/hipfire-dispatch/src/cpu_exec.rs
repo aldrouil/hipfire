@@ -351,9 +351,11 @@ pub fn run_host_mapped_gemv_residual(
 /// host blobs and accumulate the routing-weighted result into the residual.
 ///
 /// `x_rot` is the already-rotated activation the gate_up projection consumes; the
-/// post-SiLU hidden is rotated here exactly as the fused kernel would. The loader
-/// rewrote both expert pointer tables to a zeroed sink, so the sealed MoE step
+/// post-SiLU hidden is rotated here exactly as the fused kernel would. The decode
+/// MoE params bound the loader's zeroed sink twins, so the sealed MoE step
 /// contributed 0 for the routed experts; this supplies the whole contribution.
+/// Batched forwards (prefill, MTP verify) bind the real tables and keep the GPU
+/// grouped PCIe read, so this runs for single-token decode only.
 ///
 /// Fail-closed by construction: unavailable host bytes, an undecodable dtype, an
 /// AWQ sidecar (a bare `gemv` would ignore the per-expert scale), graph capture /
@@ -448,97 +450,6 @@ pub fn moe_cpu_experts(
 /// this weight: host-mapped *and* a decodable format.
 pub fn host_mapped_cpu_capable(gpu: &Gpu, w: &WeightRef) -> bool {
     cpu_exec_enabled() && gpu.host_located(w.buf) && cpu_quant_for(w.dtype).is_some()
-}
-
-/// Batched twin of [`moe_cpu_experts`] for the prefill path: `x_rot` is the
-/// `[n × dim]` rotated activation batch and `residual` is the `[n × dim]` batch
-/// the combine accumulates into (`pbs.x_batch`). Same fail-closed contract:
-/// unavailable host bytes, an undecodable dtype, AWQ sidecars, graph capture /
-/// replay, or short scratch are errors, never silent zeros.
-#[allow(clippy::too_many_arguments)]
-pub fn moe_cpu_experts_batched(
-    gpu: &Gpu,
-    quant: CpuQuant,
-    dim: usize,
-    mi: usize,
-    n: usize,
-    k_top: usize,
-    gate_up_stride: usize,
-    gate_up_bytes: &[u8],
-    down_stride: usize,
-    down_bytes: &[u8],
-    x_rot: &[f32],
-    ti: &[f32],
-    tw: &[f32],
-    residual: &mut [f32],
-    awq: bool,
-) -> Result<(), DispatchError> {
-    if gpu.graphs.capture_mode || gpu.replay.is_recording() {
-        return Err(cpu_err(
-            "moe cpu expert splice refuses graph capture / replay recording: a CPU step is a host sync point",
-        ));
-    }
-    if awq {
-        return Err(cpu_err(
-            "moe cpu expert splice refuses AWQ weights: a bare gemv would ignore the per-expert scale",
-        ));
-    }
-    let gu_need = hipfire_cpu::gemv::row_bytes(quant, dim)
-        .checked_mul(2 * mi)
-        .ok_or_else(|| cpu_err("moe cpu expert splice: gate_up extent overflows"))?;
-    let dn_need = hipfire_cpu::gemv::row_bytes(quant, mi)
-        .checked_mul(dim)
-        .ok_or_else(|| cpu_err("moe cpu expert splice: down extent overflows"))?;
-    if gate_up_stride < gu_need {
-        return Err(cpu_err(&format!(
-            "moe cpu expert splice: gate_up_stride {gate_up_stride} < expert bytes {gu_need}"
-        )));
-    }
-    if down_stride < dn_need {
-        return Err(cpu_err(&format!(
-            "moe cpu expert splice: down_stride {down_stride} < expert bytes {dn_need}"
-        )));
-    }
-    let slots = n.checked_mul(k_top).ok_or_else(|| cpu_err("moe cpu expert splice: slot extent overflows"))?;
-    if ti.len() < slots || tw.len() < slots {
-        return Err(cpu_err("moe cpu expert splice: top-k scratch short for batch"));
-    }
-    if x_rot.len() < n.checked_mul(dim).ok_or_else(|| cpu_err("moe cpu expert splice: x_rot extent overflows"))? {
-        return Err(cpu_err("moe cpu expert splice: x_rot short for batch"));
-    }
-    if residual.len() < n.checked_mul(dim).ok_or_else(|| cpu_err("moe cpu expert splice: residual extent overflows"))? {
-        return Err(cpu_err("moe cpu expert splice: residual short for batch"));
-    }
-    let mut gu_out = vec![0.0f32; 2 * mi];
-    let mut hidden = vec![0.0f32; mi];
-    let mut dn_out = vec![0.0f32; dim];
-    for tok in 0..n {
-        let x = &x_rot[tok * dim..(tok + 1) * dim];
-        for krank in 0..k_top {
-            let slot_idx = tok * k_top + krank;
-            let slot = (ti[slot_idx].to_bits() as i32) as u16 as usize;
-            let gu0 = slot.checked_mul(gate_up_stride).ok_or_else(|| cpu_err("moe cpu expert splice: gate_up offset overflows"))?;
-            if gu0.checked_add(gu_need).is_none_or(|end| end > gate_up_bytes.len()) {
-                return Err(cpu_err(&format!("moe cpu expert splice: gate_up slot {slot} out of range")));
-            }
-            gu_out.fill(0.0);
-            gemv(quant, &gate_up_bytes[gu0..gu0 + gu_need], 2 * mi, dim, x, &mut gu_out);
-            silu_mul(&gu_out, &mut hidden);
-            rotate_x(&mut hidden);
-            let dn0 = slot.checked_mul(down_stride).ok_or_else(|| cpu_err("moe cpu expert splice: down offset overflows"))?;
-            if dn0.checked_add(dn_need).is_none_or(|end| end > down_bytes.len()) {
-                return Err(cpu_err(&format!("moe cpu expert splice: down slot {slot} out of range")));
-            }
-            dn_out.fill(0.0);
-            gemv(quant, &down_bytes[dn0..dn0 + dn_need], dim, mi, &hidden, &mut dn_out);
-            let w = tw[slot_idx];
-            let acc = &mut residual[tok * dim..(tok + 1) * dim];
-            for (a, v) in acc.iter_mut().zip(dn_out.iter()) {
-                *a += w * v;
-            }
-        }
-    }
-    Ok(())
 }
 
 /// `HIPFIRE_MOE_CPU_ORACLE=1`: run the same host-mapped expert bytes that fed the
