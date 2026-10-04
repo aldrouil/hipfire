@@ -221,3 +221,97 @@ mod test {
         }
     }
 }
+
+#[cfg(test)]
+mod i8_dot_test {
+    use super::*;
+    use crate::quant::{decode_group_codes, CpuQuant};
+    use crate::simd::{int8_dot_available, mq4v2_i8_group_dot};
+    use crate::testfix;
+
+    /// The 256-element weight values of one MQ4V2 group, in element order.
+    fn group_values(g: &[u8]) -> Vec<f32> {
+        let mut out = vec![0.0f32; 256];
+        decode_group_codes(CpuQuant::Mq4G256V2, g, &mut out);
+        out
+    }
+
+    fn activation(salt: usize, f: impl Fn(f32) -> f32) -> Vec<f32> {
+        (0..256)
+            .map(|i| f(((i * 37 + salt) as f32) * 0.017) * 2.0)
+            .collect()
+    }
+
+    /// The integer dot must land exactly where the quantized activation says,
+    /// which is where a layout/pairing bug (a swapped nibble plane, a wrong
+    /// half) would show up as a large error rather than a rounding one.
+    #[test]
+    fn int8_group_dot_matches_the_quantized_reference() {
+        if !int8_dot_available() {
+            eprintln!("skipping int8_group_dot_matches_the_quantized_reference: no AVX2+F16C");
+            return;
+        }
+        for salt in [0usize, 1, 7] {
+            let g = testfix::group_bytes(CpuQuant::Mq4G256V2, salt);
+            let w = group_values(&g);
+            let x = activation(salt, f32::sin);
+            let a0 = BlockI8_128::quantize(&x[..128]);
+            let a1 = BlockI8_128::quantize(&x[128..]);
+            let got = mq4v2_i8_group_dot(&g, &[a0, a1]) as f64;
+            let q0 = a0.codes_in_element_order();
+            let q1 = a1.codes_in_element_order();
+            let mut want = 0.0f64;
+            let mut norm = 0.0f64;
+            for (i, &wi) in w.iter().enumerate() {
+                let (d, q) = if i < 128 {
+                    (a0.d, q0[i])
+                } else {
+                    (a1.d, q1[i - 128])
+                };
+                let contribution = wi as f64 * (d * q as f32) as f64;
+                want += contribution;
+                norm += contribution.abs();
+            }
+            assert!(
+                (got - want).abs() <= 1e-4 * norm.max(1e-6),
+                "salt {salt}: got {got}, quantized-reference {want} (norm {norm})"
+            );
+        }
+    }
+
+    /// And it must approximate the true f32 dot within the *provable* error of
+    /// the int8 activation: `|x_i - d·q_i| <= d/2`, so the group error is
+    /// bounded by `Σ |w_i|·d_i/2`.
+    #[test]
+    fn int8_group_dot_is_within_the_quantization_bound() {
+        if !int8_dot_available() {
+            return;
+        }
+        for salt in [0usize, 3, 5] {
+            let g = testfix::group_bytes(CpuQuant::Mq4G256V2, salt);
+            let w = group_values(&g);
+            let x = activation(salt, f32::cos);
+            let a0 = BlockI8_128::quantize(&x[..128]);
+            let a1 = BlockI8_128::quantize(&x[128..]);
+            let got = mq4v2_i8_group_dot(&g, &[a0, a1]) as f64;
+            let truth: f64 = w
+                .iter()
+                .zip(x.iter())
+                .map(|(&wi, &xi)| wi as f64 * xi as f64)
+                .sum();
+            let bound: f64 = w
+                .iter()
+                .enumerate()
+                .map(|(i, &wi)| {
+                    let d = if i < 128 { a0.d } else { a1.d };
+                    wi.abs() as f64 * d as f64 * 0.5
+                })
+                .sum();
+            assert!(
+                (got - truth).abs() <= bound * 1.0001 + 1e-6,
+                "salt {salt}: |int8 - true| = {} exceeds the quantization bound {bound}",
+                (got - truth).abs()
+            );
+        }
+    }
+}
