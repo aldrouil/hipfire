@@ -179,21 +179,24 @@ pub fn gemv_experts(
         pairs.len()
     );
     let use_simd = simd::row_dot_enabled(q, requested);
+    // Validate once, not per output element (this loop is k × m elements).
+    for (packed, x) in pairs {
+        assert!(
+            packed.len() >= m * rb,
+            "gemv_experts({q:?}): weight rows have {} bytes, need {}",
+            packed.len(),
+            m * rb
+        );
+        assert!(
+            x.len() >= k,
+            "gemv_experts({q:?}): activation has {} elements, need k={k}",
+            x.len()
+        );
+    }
     out[..pairs.len() * m]
         .par_chunks_mut(m)
         .zip(pairs.par_iter())
         .for_each(|(out_e, (packed, x))| {
-            assert!(
-                packed.len() >= m * rb,
-                "gemv_experts({q:?}): weight rows have {} bytes, need {}",
-                packed.len(),
-                m * rb
-            );
-            assert!(
-                x.len() >= k,
-                "gemv_experts({q:?}): activation has {} elements, need k={k}",
-                x.len()
-            );
             let x = &x[..k];
             out_e.par_iter_mut().enumerate().for_each(|(row, o)| {
                 *o = dot_row_simd(q, &packed[row * rb..], k, x, use_simd);
@@ -286,10 +289,24 @@ mod test {
     fn gemv_experts_matches_per_expert_gemv() {
         for q in [CpuQuant::Mq4G256, CpuQuant::Mq4G256V2, CpuQuant::Mq6G256] {
             let (m, k, experts) = (8usize, 256usize, 3usize);
-            // Byte-distinct experts and distinct activations, so a slot mix-up or
-            // a shared-x shortcut cannot pass.
+            let groups = k / q.group_elems();
+            // Byte-distinct experts: shift the *group payload* salt per expert
+            // (as `moe.rs`'s fixture does) so headers stay valid — XOR-ing the
+            // whole blob would corrupt the fp16/f32 scale and can produce NaN,
+            // which `assert_eq!` rejects even when both sides match.
             let packed: Vec<Vec<u8>> = (0..experts)
-                .map(|e| weights(q, m, k).iter().map(|b| b ^ (e as u8)).collect())
+                .map(|e| {
+                    let mut out = Vec::with_capacity(m * groups * q.group_bytes());
+                    for row in 0..m {
+                        for g in 0..groups {
+                            out.extend_from_slice(&crate::testfix::group_bytes(
+                                q,
+                                e * 1_000_000 + row * groups + g,
+                            ));
+                        }
+                    }
+                    out
+                })
                 .collect();
             let xs: Vec<Vec<f32>> = (0..experts)
                 .map(|e| x_of(k).iter().map(|v| v + e as f32).collect())

@@ -129,8 +129,15 @@ static SHAPES: LazyLock<Mutex<BTreeMap<(u8, usize, usize, bool, bool, bool), Ste
 #[derive(Clone, Copy, Default)]
 struct MoeStepStats {
     calls: usize,
-    d2h_ns: u64,
-    gemv_ns: u64,
+    /// The `x_rot` download, which starts before the sealed MoE step's writes to
+    /// it have drained — so this carries the GPU wait, not just copy cost.
+    d2h_first_ns: u64,
+    /// The other three downloads (`ti`, `tw`, `residual`), pure copy latency.
+    d2h_rest_ns: u64,
+    /// All experts' gate_up GEMV.
+    gu_ns: u64,
+    /// All experts' down GEMV.
+    dn_ns: u64,
     h2d_ns: u64,
 }
 
@@ -411,8 +418,10 @@ pub fn moe_cpu_experts(
     if k == 0 {
         return Err(cpu_err("moe cpu expert splice: empty top-k scratch"));
     }
-    let t_d2h = Instant::now();
+    let t_first = Instant::now();
     let x = download_f32(gpu, x_rot, dim)?;
+    let d2h_first_ns = t_first.elapsed().as_nanos() as u64;
+    let t_rest = Instant::now();
     let ti = download_f32(gpu, topk_indices, k)?;
     let tw = download_f32(gpu, topk_weights, k)?;
     let gu_need = hipfire_cpu::gemv::row_bytes(quant, dim)
@@ -432,7 +441,7 @@ pub fn moe_cpu_experts(
         )));
     }
     let mut acc = download_f32(gpu, residual, dim)?;
-    let d2h_ns = t_d2h.elapsed().as_nanos() as u64;
+    let d2h_rest_ns = t_rest.elapsed().as_nanos() as u64;
     // Two rayon regions per layer (all experts' gate_up, then all experts' down)
     // instead of 2k small ones: the per-call region entry dominates when each
     // expert's GEMV is only a few thousand rows. Per output element the work is
@@ -442,7 +451,6 @@ pub fn moe_cpu_experts(
     let mut hidden = vec![0.0f32; k * mi];
     let mut dn_all = vec![0.0f32; k * dim];
     let mut slots = vec![0usize; k];
-    let t_gemv = Instant::now();
     let mut gu_pairs: Vec<(&[u8], &[f32])> = Vec::with_capacity(k);
     for (krank, slot_out) in slots.iter_mut().enumerate() {
         let slot = (ti[krank].to_bits() as i32) as u16 as usize;
@@ -455,7 +463,9 @@ pub fn moe_cpu_experts(
         }
         gu_pairs.push((&gu_bytes[gu0..gu0 + gu_need], x.as_slice()));
     }
+    let t_gu = Instant::now();
     hipfire_cpu::gemv::gemv_experts(quant, 2 * mi, dim, &gu_pairs, &mut gu_all, None);
+    let gu_ns = t_gu.elapsed().as_nanos() as u64;
     for e in 0..k {
         silu_mul(
             &gu_all[e * 2 * mi..(e + 1) * 2 * mi],
@@ -476,7 +486,9 @@ pub fn moe_cpu_experts(
             &hidden[krank * mi..(krank + 1) * mi],
         ));
     }
+    let t_dn = Instant::now();
     hipfire_cpu::gemv::gemv_experts(quant, dim, mi, &dn_pairs, &mut dn_all, None);
+    let dn_ns = t_dn.elapsed().as_nanos() as u64;
     for krank in 0..k {
         let w = tw[krank];
         let dn_out = &dn_all[krank * dim..(krank + 1) * dim];
@@ -484,12 +496,23 @@ pub fn moe_cpu_experts(
             *a += w * v;
         }
     }
-    let gemv_ns = t_gemv.elapsed().as_nanos() as u64;
     let t_h2d = Instant::now();
     upload_f32(gpu, residual, &acc)?;
     let h2d_ns = t_h2d.elapsed().as_nanos() as u64;
     CPU_STEPS.fetch_add(1, Ordering::Relaxed);
-    trace_moe_step(quant, dim, mi, k, d2h_ns, gemv_ns, h2d_ns);
+    trace_moe_step(
+        quant,
+        dim,
+        mi,
+        k,
+        MoeStepTiming {
+            d2h_first_ns,
+            d2h_rest_ns,
+            gu_ns,
+            dn_ns,
+            h2d_ns,
+        },
+    );
     Ok(())
 }
 
@@ -498,7 +521,7 @@ pub fn moe_cpu_experts(
 /// call and at every doubling, so the `calls=1` line is the cold first step and
 /// later lines are steady state. Keyed by shape rather than summed process-wide,
 /// for the same reason [`trace_step`] is.
-fn trace_moe_step(q: CpuQuant, dim: usize, mi: usize, k: usize, d2h_ns: u64, gemv_ns: u64, h2d_ns: u64) {
+fn trace_moe_step(q: CpuQuant, dim: usize, mi: usize, k: usize, timing: MoeStepTiming) {
     if hipfire_config::developer_var("HIPFIRE_CPU_EXEC_TRACE").is_err() {
         return;
     }
@@ -507,9 +530,11 @@ fn trace_moe_step(q: CpuQuant, dim: usize, mi: usize, k: usize, d2h_ns: u64, gem
     };
     let stats = shapes.entry((q as u8, dim, mi, k)).or_default();
     stats.calls += 1;
-    stats.d2h_ns += d2h_ns;
-    stats.gemv_ns += gemv_ns;
-    stats.h2d_ns += h2d_ns;
+    stats.d2h_first_ns += timing.d2h_first_ns;
+    stats.d2h_rest_ns += timing.d2h_rest_ns;
+    stats.gu_ns += timing.gu_ns;
+    stats.dn_ns += timing.dn_ns;
+    stats.h2d_ns += timing.h2d_ns;
     let stats = *stats;
     if !stats.calls.is_power_of_two() {
         return;
@@ -519,12 +544,23 @@ fn trace_moe_step(q: CpuQuant, dim: usize, mi: usize, k: usize, d2h_ns: u64, gem
     eprintln!(
         "cpu exec: moe expert splice dim={dim} mi={mi} k={k} quant={q:?} | {} calls | \
          {on_cpu} steps on CPU, {on_gpu} host-mapped steps still on GPU | mean per call: \
-         d2h={:.2}ms gemv={:.2}ms h2d={:.2}ms",
+         d2h_first={:.2}ms d2h_rest={:.2}ms gu={:.2}ms dn={:.2}ms h2d={:.2}ms",
         stats.calls,
-        per_ms(stats.d2h_ns),
-        per_ms(stats.gemv_ns),
+        per_ms(stats.d2h_first_ns),
+        per_ms(stats.d2h_rest_ns),
+        per_ms(stats.gu_ns),
+        per_ms(stats.dn_ns),
         per_ms(stats.h2d_ns)
     );
+}
+
+/// One splice call's wall-time split, handed to [`trace_moe_step`].
+struct MoeStepTiming {
+    d2h_first_ns: u64,
+    d2h_rest_ns: u64,
+    gu_ns: u64,
+    dn_ns: u64,
+    h2d_ns: u64,
 }
 
 /// Whether [`run_host_mapped_gemv`] / [`run_host_mapped_gemv_residual`] can drive
