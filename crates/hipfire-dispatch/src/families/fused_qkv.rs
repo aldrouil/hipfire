@@ -10,6 +10,10 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 /// Select the fused gate/up kernel key for a packed weight container.
 pub fn fused_gate_up_key_for(dtype: DType) -> KernelKey {
     match dtype {
+        // V1 MQ6 (200 B/group 6-bit) rides the HFQ6 fused gate/up family, not
+        // the HFQ4 default below (136 B/group 4-bit) — the catch-all used to
+        // mistranslate it silently (ornith shared expert NaN).
+        DType::MQ6G256 => KernelKey::FusedGateUpHfq6G256,
         DType::MQ4G256V2 => KernelKey::FusedGateUpMq4G256V2,
         DType::MQ4CG256 => KernelKey::FusedGateUpMq4CG256,
         DType::MQ6G256V2 => KernelKey::FusedGateUpMq6G256V2,
