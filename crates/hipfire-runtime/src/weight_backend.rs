@@ -923,54 +923,13 @@ fn fwht256_inplace(group: &mut [f32], signs1: &[f32], signs2: &[f32]) {
     }
 }
 
-/// TQ2G128 ternary block → F32, GPU-free pure fn (unit-testable in isolation
-/// from `dequant_f32`, which needs a `Gpu` to upload). Block layout (34
-/// bytes / 128-elem group): `[FP16 d (2B)][qs[32]]`, codes packed 4/byte
-/// LSB-first; `value = (code - 1) * d`. Mirrors the proven Task-5/Task-8v
-/// CPU oracle for `dequant_tq2g128_to_f16`.
-fn dequant_tq2_to_f32(data: &[u8], n: usize) -> Vec<f32> {
-    const BLK: usize = 34;
-    let nblocks = n / 128;
-    let mut out = Vec::with_capacity(n);
-    for b in 0..nblocks {
-        let base = b * BLK;
-        let d = f16_to_f32(u16::from_le_bytes([data[base], data[base + 1]]));
-        for j in 0..128 {
-            let code = (data[base + 2 + j / 4] >> ((j % 4) * 2)) & 0x3;
-            out.push((code as i32 - 1) as f32 * d);
-        }
-    }
-    out
-}
-
-/// BQ1G128 binary block → F32, GPU-free pure fn (unit-testable in isolation
-/// from `dequant_f32`, which needs a `Gpu` to upload). Block layout (18
-/// bytes / 128-elem group): `[FP16 d (2B)][16 packed sign-bit bytes,
-/// LSB-first]`; element `e` reads byte `2 + e/8`, bit `e % 8`; `value =
-/// bit ? +d : -d`. Mirrors the proven Task-9 GPU/CPU oracle in
-/// `crates/rdna-compute/examples/test_dequant_bq1g128.rs` and the
-/// `dequant_bq1g128_to_f16.hip` kernel body.
-fn dequant_bq1_to_f32(data: &[u8], n: usize) -> Vec<f32> {
-    const BLK: usize = 18;
-    let nblocks = n / 128;
-    let mut out = Vec::with_capacity(n);
-    for b in 0..nblocks {
-        let base = b * BLK;
-        let d = f16_to_f32(u16::from_le_bytes([data[base], data[base + 1]]));
-        for j in 0..128 {
-            let byte = data[base + 2 + (j >> 3)];
-            let bit = (byte >> (j & 7)) & 1;
-            out.push(if bit == 1 { d } else { -d });
-        }
-    }
-    out
-}
-
-/// CPU-side dequant of HTQ weight bytes to F32 for every supported quant_type
-/// (F16/F32/BF16, Q8_0, MQ4/6/MQ3, MFP4, codebook 19/20/30, ...). Factored out of
-/// [`dequant_f32`] so this device path and its host-located counterpart decode
-/// byte-for-byte identically — a sign/normalization drift here is the "token soup"
-/// attractor failure mode, so there is exactly one copy.
+/// CPU-side dequant of HTQ weight bytes to F32 for the quant_types this path
+/// still decodes locally (F16/F32/BF16, Q8_0, the legacy qt14 group). Every
+/// block-quantized format delegates to the canonical decoder in `hipfire-cpu`
+/// (`quant::dequant_group`), whose expectation tables pin those bit-for-bit — so
+/// this device path and its host-located counterpart stay identical while there
+/// is one decoder, not two. A sign/normalization drift here is the "token soup"
+/// attractor failure mode.
 fn dequantize_to_f32(quant_type: u8, data: &[u8], n: usize) -> Vec<f32> {
     match quant_type {
         1 => data
@@ -1004,375 +963,27 @@ fn dequantize_to_f32(quant_type: u8, data: &[u8], n: usize) -> Vec<f32> {
             }
             out
         }
-        44 => {
-            // MQ4G256V2 (qt44, mq4v2): per 256-group 136B — [s0 z0 s1 z1] as
-            // fp16 (per-128 half scales/zeros) + 128B pair-packed nibbles.
-            // Decode mirrors the kernel (level*scale[h]+zero[h]) then applies
-            // the FWHT inverse, exactly like the qt13 MQ4G256 arm below.
-            let group_size: usize = 256;
-            let bytes_per_group: usize = 136;
-            let n_groups = data.len() / bytes_per_group;
-            let signs1 = KvCache::gen_fwht_signs(42, 256);
-            let signs2 = KvCache::gen_fwht_signs(1042, 256);
-            let mut out = Vec::with_capacity(n_groups * group_size);
-            for g in 0..n_groups {
-                let off = g * bytes_per_group;
-                let st = |h: usize| {
-                    f16_to_f32(u16::from_le_bytes([
-                        data[off + 4 * h],
-                        data[off + 4 * h + 1],
-                    ]))
-                };
-                let zz = |h: usize| {
-                    f16_to_f32(u16::from_le_bytes([
-                        data[off + 4 * h + 2],
-                        data[off + 4 * h + 3],
-                    ]))
-                };
-                let start = out.len();
-                for i in 0..group_size {
-                    let h = i / 128;
-                    let byte_val = data[off + 8 + i / 2];
-                    let nibble = if i % 2 == 0 {
-                        byte_val & 0xF
-                    } else {
-                        byte_val >> 4
-                    };
-                    let s = if h == 0 { st(0) } else { st(1) };
-                    let z = if h == 0 { zz(0) } else { zz(1) };
-                    out.push(s * nibble as f32 + z);
-                }
-                let group = &mut out[start..start + 256];
-                fwht256_inplace(group, &signs1, &signs2);
+        6 | 7 | 8 | 11 | 12 | 13 | 15 | 17 | 18 | 19 | 20 | 30 | 40 | 41 | 44 => {
+            // Block-quantized formats decode through the canonical CPU decoder in
+            // `hipfire-cpu` (`dequant_group`). Its expectation tables pin each of
+            // these bit-for-bit to the arithmetic this arm used to hold, so the
+            // delegation is behaviour-preserving — and there is now one decoder
+            // instead of two. Element formats stay local above: their "group" is a
+            // single element, so the block decoder's fixed chunking does not apply
+            // to sub-block norms/biases.
+            let q = hipfire_cpu::quant::CpuQuant::from_quant_type(quant_type)
+                .expect("routed quant_type has a CpuQuant");
+            let (group_bytes, group_elems) = (q.group_bytes(), q.group_elems());
+            let mut out = vec![0.0f32; (data.len() / group_bytes) * group_elems];
+            for (g, chunk) in data.chunks_exact(group_bytes).enumerate() {
+                hipfire_cpu::quant::dequant_group(
+                    q,
+                    chunk,
+                    &mut out[g * group_elems..(g + 1) * group_elems],
+                );
             }
             out
         }
-        6 | 7 | 13 | 15 => {
-            let is_6bit = quant_type == 15;
-            let group_size: usize = if quant_type == 6 || quant_type == 13 || quant_type == 15 {
-                256
-            } else {
-                128
-            };
-            let bytes_per_group = if is_6bit { 200 } else { 8 + group_size / 2 };
-            let n_groups = data.len() / bytes_per_group;
-            let is_mq = quant_type == 13 || quant_type == 15;
-            let mut out = Vec::with_capacity(n_groups * group_size);
-            let (signs1, signs2) = if is_mq {
-                (
-                    Some(KvCache::gen_fwht_signs(42, 256)),
-                    Some(KvCache::gen_fwht_signs(1042, 256)),
-                )
-            } else {
-                (None, None)
-            };
-            for g in 0..n_groups {
-                let off = g * bytes_per_group;
-                let scale =
-                    f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
-                let zero = f32::from_le_bytes([
-                    data[off + 4],
-                    data[off + 5],
-                    data[off + 6],
-                    data[off + 7],
-                ]);
-                let start = out.len();
-                if is_6bit {
-                    for i in (0..group_size).step_by(4) {
-                        let bo = off + 8 + (i / 4) * 3;
-                        let b0 = data[bo] as u32;
-                        let b1 = data[bo + 1] as u32;
-                        let b2 = data[bo + 2] as u32;
-                        out.push(scale * ((b0 & 0x3F) as f32) + zero);
-                        out.push(scale * ((((b0 >> 6) | (b1 << 2)) & 0x3F) as f32) + zero);
-                        out.push(scale * ((((b1 >> 4) | (b2 << 4)) & 0x3F) as f32) + zero);
-                        out.push(scale * (((b2 >> 2) & 0x3F) as f32) + zero);
-                    }
-                } else {
-                    for i in 0..group_size {
-                        let byte_idx = i / 2;
-                        let byte_val = data[off + 8 + byte_idx];
-                        let nibble = if i % 2 == 0 {
-                            byte_val & 0xF
-                        } else {
-                            byte_val >> 4
-                        };
-                        out.push(scale * nibble as f32 + zero);
-                    }
-                }
-                if is_mq && group_size == 256 {
-                    let s1 = signs1.as_ref().unwrap();
-                    let s2 = signs2.as_ref().unwrap();
-                    let group = &mut out[start..start + 256];
-                    fwht256_inplace(group, s1, s2);
-                }
-            }
-            out
-        }
-        8 => {
-            let group_size: usize = 256;
-            let bytes_per_group: usize = 200;
-            let n_groups = data.len() / bytes_per_group;
-            let mut out = Vec::with_capacity(n_groups * group_size);
-            for g in 0..n_groups {
-                let off = g * bytes_per_group;
-                let scale =
-                    f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
-                let zero = f32::from_le_bytes([
-                    data[off + 4],
-                    data[off + 5],
-                    data[off + 6],
-                    data[off + 7],
-                ]);
-                for i in (0..group_size).step_by(4) {
-                    let byte_off = 8 + (i / 4) * 3;
-                    let b0 = data[off + byte_off] as u32;
-                    let b1 = data[off + byte_off + 1] as u32;
-                    let b2 = data[off + byte_off + 2] as u32;
-                    let q0 = (b0 & 0x3F) as f32;
-                    let q1 = (((b0 >> 6) | (b1 << 2)) & 0x3F) as f32;
-                    let q2 = (((b1 >> 4) | (b2 << 4)) & 0x3F) as f32;
-                    let q3 = ((b2 >> 2) & 0x3F) as f32;
-                    out.push(scale * q0 + zero);
-                    out.push(scale * q1 + zero);
-                    out.push(scale * q2 + zero);
-                    out.push(scale * q3 + zero);
-                }
-            }
-            out
-        }
-        11 => {
-            let group_size: usize = 256;
-            let bytes_per_group: usize = 104;
-            let n_groups = data.len() / bytes_per_group;
-            let mut out = Vec::with_capacity(n_groups * group_size);
-            for g in 0..n_groups {
-                let off = g * bytes_per_group;
-                let scale =
-                    f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
-                let zero = f32::from_le_bytes([
-                    data[off + 4],
-                    data[off + 5],
-                    data[off + 6],
-                    data[off + 7],
-                ]);
-                for chunk in 0..32 {
-                    let bo = off + 8 + chunk * 3;
-                    let b0 = data[bo] as u32;
-                    let b1 = data[bo + 1] as u32;
-                    let b2 = data[bo + 2] as u32;
-                    let q0 = (b0 & 7) as f32;
-                    let q1 = ((b0 >> 3) & 7) as f32;
-                    let q2 = (((b0 >> 6) | (b1 << 2)) & 7) as f32;
-                    let q3 = ((b1 >> 1) & 7) as f32;
-                    let q4 = ((b1 >> 4) & 7) as f32;
-                    let q5 = (((b1 >> 7) | (b2 << 1)) & 7) as f32;
-                    let q6 = ((b2 >> 2) & 7) as f32;
-                    let q7 = ((b2 >> 5) & 7) as f32;
-                    out.push(scale * q0 + zero);
-                    out.push(scale * q1 + zero);
-                    out.push(scale * q2 + zero);
-                    out.push(scale * q3 + zero);
-                    out.push(scale * q4 + zero);
-                    out.push(scale * q5 + zero);
-                    out.push(scale * q6 + zero);
-                    out.push(scale * q7 + zero);
-                }
-            }
-            out
-        }
-        12 => {
-            let group_size: usize = 128;
-            let bytes_per_group: usize = 56;
-            let n_groups = data.len() / bytes_per_group;
-            let mut out = Vec::with_capacity(n_groups * group_size);
-            for g in 0..n_groups {
-                let off = g * bytes_per_group;
-                let scale =
-                    f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
-                let zero = f32::from_le_bytes([
-                    data[off + 4],
-                    data[off + 5],
-                    data[off + 6],
-                    data[off + 7],
-                ]);
-                for chunk in 0..16 {
-                    let bo = off + 8 + chunk * 3;
-                    let b0 = data[bo] as u32;
-                    let b1 = data[bo + 1] as u32;
-                    let b2 = data[bo + 2] as u32;
-                    let q0 = (b0 & 7) as f32;
-                    let q1 = ((b0 >> 3) & 7) as f32;
-                    let q2 = (((b0 >> 6) | (b1 << 2)) & 7) as f32;
-                    let q3 = ((b1 >> 1) & 7) as f32;
-                    let q4 = ((b1 >> 4) & 7) as f32;
-                    let q5 = (((b1 >> 7) | (b2 << 1)) & 7) as f32;
-                    let q6 = ((b2 >> 2) & 7) as f32;
-                    let q7 = ((b2 >> 5) & 7) as f32;
-                    out.push(scale * q0 + zero);
-                    out.push(scale * q1 + zero);
-                    out.push(scale * q2 + zero);
-                    out.push(scale * q3 + zero);
-                    out.push(scale * q4 + zero);
-                    out.push(scale * q5 + zero);
-                    out.push(scale * q6 + zero);
-                    out.push(scale * q7 + zero);
-                }
-            }
-            out
-        }
-        20 => {
-            let group_size: usize = 256;
-            let bytes_per_group: usize = 112;
-            let n_groups = data.len() / bytes_per_group;
-            let mut out = Vec::with_capacity(n_groups * group_size);
-            let signs1 = KvCache::gen_fwht_signs(42, 256);
-            let signs2 = KvCache::gen_fwht_signs(1042, 256);
-            for g in 0..n_groups {
-                let off = g * bytes_per_group;
-                let mut cb = [0.0f32; 8];
-                for k in 0..8 {
-                    let bits = u16::from_le_bytes([data[off + 2 * k], data[off + 2 * k + 1]]);
-                    cb[k] = f16_to_f32(bits);
-                }
-                let start = out.len();
-                for chunk in 0..32 {
-                    let bo = off + 16 + chunk * 3;
-                    let b0 = data[bo] as u32;
-                    let b1 = data[bo + 1] as u32;
-                    let b2 = data[bo + 2] as u32;
-                    let q0 = (b0 & 7) as usize;
-                    let q1 = ((b0 >> 3) & 7) as usize;
-                    let q2 = (((b0 >> 6) | (b1 << 2)) & 7) as usize;
-                    let q3 = ((b1 >> 1) & 7) as usize;
-                    let q4 = ((b1 >> 4) & 7) as usize;
-                    let q5 = (((b1 >> 7) | (b2 << 1)) & 7) as usize;
-                    let q6 = ((b2 >> 2) & 7) as usize;
-                    let q7 = ((b2 >> 5) & 7) as usize;
-                    out.push(cb[q0]);
-                    out.push(cb[q1]);
-                    out.push(cb[q2]);
-                    out.push(cb[q3]);
-                    out.push(cb[q4]);
-                    out.push(cb[q5]);
-                    out.push(cb[q6]);
-                    out.push(cb[q7]);
-                }
-                let group = &mut out[start..start + 256];
-                fwht256_inplace(group, &signs1, &signs2);
-            }
-            out
-        }
-        19 => {
-            let group_size: usize = 256;
-            let bytes_per_group: usize = 72;
-            let n_groups = data.len() / bytes_per_group;
-            let mut out = Vec::with_capacity(n_groups * group_size);
-            let signs1 = KvCache::gen_fwht_signs(42, 256);
-            let signs2 = KvCache::gen_fwht_signs(1042, 256);
-            for g in 0..n_groups {
-                let off = g * bytes_per_group;
-                let mut cb = [0.0f32; 4];
-                for k in 0..4 {
-                    let bits = u16::from_le_bytes([data[off + 2 * k], data[off + 2 * k + 1]]);
-                    cb[k] = f16_to_f32(bits);
-                }
-                let start = out.len();
-                for i in 0..64 {
-                    let byte_val = data[off + 8 + i] as usize;
-                    out.push(cb[byte_val & 3]);
-                    out.push(cb[(byte_val >> 2) & 3]);
-                    out.push(cb[(byte_val >> 4) & 3]);
-                    out.push(cb[(byte_val >> 6) & 3]);
-                }
-                let group = &mut out[start..start + 256];
-                fwht256_inplace(group, &signs1, &signs2);
-            }
-            out
-        }
-        30 => {
-            let group_size: usize = 256;
-            let bytes_per_group: usize = 160;
-            let n_groups = data.len() / bytes_per_group;
-            let mut out = Vec::with_capacity(n_groups * group_size);
-            let signs1 = KvCache::gen_fwht_signs(42, 256);
-            let signs2 = KvCache::gen_fwht_signs(1042, 256);
-            for g in 0..n_groups {
-                let off = g * bytes_per_group;
-                let mut cb = [0.0f32; 16];
-                for k in 0..16 {
-                    let bits = u16::from_le_bytes([data[off + 2 * k], data[off + 2 * k + 1]]);
-                    cb[k] = f16_to_f32(bits);
-                }
-                let start = out.len();
-                for i in 0..128 {
-                    let byte_val = data[off + 32 + i] as usize;
-                    out.push(cb[byte_val & 0xF]);
-                    out.push(cb[(byte_val >> 4) & 0xF]);
-                }
-                let group = &mut out[start..start + 256];
-                fwht256_inplace(group, &signs1, &signs2);
-            }
-            out
-        }
-        17 | 18 => {
-            let is_mq3 = quant_type == 17;
-            let group_size: usize = 256;
-            let bytes_per_group: usize = if is_mq3 { 104 } else { 72 };
-            let n_groups = data.len() / bytes_per_group;
-            let mut out = Vec::with_capacity(n_groups * group_size);
-            let signs1 = KvCache::gen_fwht_signs(42, 256);
-            let signs2 = KvCache::gen_fwht_signs(1042, 256);
-            for g in 0..n_groups {
-                let off = g * bytes_per_group;
-                let scale =
-                    f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
-                let zero = f32::from_le_bytes([
-                    data[off + 4],
-                    data[off + 5],
-                    data[off + 6],
-                    data[off + 7],
-                ]);
-                let start = out.len();
-                if is_mq3 {
-                    for chunk in 0..32 {
-                        let bo = off + 8 + chunk * 3;
-                        let b0 = data[bo] as u32;
-                        let b1 = data[bo + 1] as u32;
-                        let b2 = data[bo + 2] as u32;
-                        let q0 = (b0 & 7) as f32;
-                        let q1 = ((b0 >> 3) & 7) as f32;
-                        let q2 = (((b0 >> 6) | (b1 << 2)) & 7) as f32;
-                        let q3 = ((b1 >> 1) & 7) as f32;
-                        let q4 = ((b1 >> 4) & 7) as f32;
-                        let q5 = (((b1 >> 7) | (b2 << 1)) & 7) as f32;
-                        let q6 = ((b2 >> 2) & 7) as f32;
-                        let q7 = ((b2 >> 5) & 7) as f32;
-                        out.push(scale * q0 + zero);
-                        out.push(scale * q1 + zero);
-                        out.push(scale * q2 + zero);
-                        out.push(scale * q3 + zero);
-                        out.push(scale * q4 + zero);
-                        out.push(scale * q5 + zero);
-                        out.push(scale * q6 + zero);
-                        out.push(scale * q7 + zero);
-                    }
-                } else {
-                    for i in 0..64 {
-                        let byte_val = data[off + 8 + i] as u32;
-                        out.push(scale * ((byte_val & 3) as f32) + zero);
-                        out.push(scale * (((byte_val >> 2) & 3) as f32) + zero);
-                        out.push(scale * (((byte_val >> 4) & 3) as f32) + zero);
-                        out.push(scale * (((byte_val >> 6) & 3) as f32) + zero);
-                    }
-                }
-                let group = &mut out[start..start + 256];
-                fwht256_inplace(group, &signs1, &signs2);
-            }
-            out
-        }
-        40 => dequant_tq2_to_f32(data, n),
-        41 => dequant_bq1_to_f32(data, n),
         53 => panic!("MQ4G128V2 (qt=53) is typed-Qwen4-only; generic dequant_f32 refuses it"),
         _ => panic!("unsupported quant_type {quant_type} for dequant_f32"),
     }
@@ -1799,7 +1410,7 @@ mod tests {
         data[1] = 0x40; // FP16 2.0
         data[2] = 0xE4; // codes [0,1,2,3] LSB-first (0b11_10_01_00)
                         // data[3..34] already zero => codes 0 for elements 4..127
-        let out = dequant_tq2_to_f32(&data, 128);
+        let out = dequantize_to_f32(40, &data, 128);
         assert_eq!(out.len(), 128);
         assert_eq!(&out[0..4], &[-2.0, 0.0, 2.0, 4.0]);
         for (i, &v) in out.iter().enumerate().skip(4) {
@@ -1821,14 +1432,14 @@ mod tests {
         for b in data[2..18].iter_mut() {
             *b = 0xFF; // all 128 sign bits set => all +d
         }
-        let out = dequant_bq1_to_f32(&data, 128);
+        let out = dequantize_to_f32(41, &data, 128);
         assert_eq!(out.len(), 128);
         for (i, &v) in out.iter().enumerate() {
             assert!((v - 0.5).abs() < 1e-3, "expected +d at index {i}, got {v}");
         }
 
         data[2] &= !1; // clear bit 0 of qs[0] => element 0 flips to -d
-        let out = dequant_bq1_to_f32(&data, 128);
+        let out = dequantize_to_f32(41, &data, 128);
         assert!(
             (out[0] - (-0.5)).abs() < 1e-3,
             "expected -d at index 0, got {}",
