@@ -576,9 +576,10 @@ fn moe_params_for_decode<'a>(
         moe_dtypes.routed_gate_up,
         moe_dtypes.routed_down,
         moe_dtypes.experts_all_gate_up_mq4,
-        ffn.packed_expert_owners
-            .as_ref()
-            .is_some_and(|owners| owners.gate_up.buf.is_host_mapped()),
+        ffn.packed_expert_owners.as_ref().is_some_and(|owners| {
+            owners.gate_up.iter().all(|b| b.buf.is_host_mapped())
+                && owners.down.iter().all(|b| b.buf.is_host_mapped())
+        }),
         per_expert_gate_up.is_some() || per_expert_down.is_some(),
     );
     let shared = Some(hipfire_dispatch::families::moe::MoeSharedDecode {
@@ -710,30 +711,60 @@ fn moe_ffn_decode_impl<'a>(
     if let Some(sink) = ffn.cpu_expert_sink.as_ref() {
         let _ = sink;
         let owners = ffn.packed_expert_owners.as_ref().ok_or_else(|| {
-            HipError::new(0, "moe cpu expert splice: layer has an expert sink but no packed owners")
+            HipError::new(
+                0,
+                "moe cpu expert splice: layer has an expert sink but no packed owners",
+            )
         })?;
-        let gu_dtype = ffn.experts.first().map(|e| e.gate_up.gpu_dtype).ok_or_else(|| {
-            HipError::new(0, "moe cpu expert splice: layer has an expert sink but no experts")
-        })?;
+        let gu_dtype = ffn
+            .experts
+            .first()
+            .map(|e| e.gate_up.gpu_dtype)
+            .ok_or_else(|| {
+                HipError::new(
+                    0,
+                    "moe cpu expert splice: layer has an expert sink but no experts",
+                )
+            })?;
         let quant = hipfire_dispatch::cpu_exec::cpu_quant_for(gu_dtype).ok_or_else(|| {
             HipError::new(
                 0,
                 &format!("moe cpu expert splice: no CPU decoder for gate_up dtype {gu_dtype:?}"),
             )
         })?;
+        // Uniform layers pack one blob per projection; graded layers are refused
+        // at load for the CPU arm, so a single bucket is the only live shape.
+        if owners.gate_up.len() != 1 || owners.down.len() != 1 {
+            return Err(HipError::new(
+                0,
+                "moe cpu expert splice: graded (multi-blob) layers cannot run on the CPU",
+            ));
+        }
+        let gu_owner = owners.gate_up.first().ok_or_else(|| {
+            HipError::new(
+                0,
+                "moe cpu expert splice: packed owners have no gate_up blob",
+            )
+        })?;
+        let dn_owner = owners.down.first().ok_or_else(|| {
+            HipError::new(0, "moe cpu expert splice: packed owners have no down blob")
+        })?;
         let n_exp = config.num_experts.max(1);
-        let gu_stride = owners.gate_up.buf.size() / n_exp;
-        let dn_stride = owners.down.buf.size() / n_exp;
+        let gu_stride = gu_owner.buf.size() / n_exp;
+        let dn_stride = dn_owner.buf.size() / n_exp;
         let awq = ffn.expert_down_awq_ptrs.is_some()
-            || ffn.experts.first().is_some_and(|e| e.gate_up.awq_scale.is_some());
+            || ffn
+                .experts
+                .first()
+                .is_some_and(|e| e.gate_up.awq_scale.is_some());
         hipfire_dispatch::cpu_exec::moe_cpu_experts(
             gpu,
             quant,
             config.dim,
             config.moe_intermediate_size,
-            &owners.gate_up,
+            gu_owner,
             gu_stride,
-            &owners.down,
+            dn_owner,
             dn_stride,
             splice_x_rot,
             s.topk_indices,
@@ -748,21 +779,27 @@ fn moe_ffn_decode_impl<'a>(
             hipfire_dispatch::cpu_exec::cpu_quant_for(routed_gate_up),
             ffn.packed_expert_owners.as_ref(),
         ) {
-            hipfire_dispatch::cpu_exec::moe_cpu_oracle_report(
-                gpu,
-                q,
-                config.dim,
-                config.moe_intermediate_size,
-                config.num_experts_per_tok,
-                &owners.gate_up,
-                &owners.down,
-                x_norm,
-                s.topk_indices,
-                s.topk_weights,
-                s.down_expanded,
-                ffn.layer_idx,
-                ffn.expert_down_awq_ptrs.is_some(),
-            );
+            // Uniform-only diagnostic: skip graded layers rather than report
+            // one tier's bytes as the whole layer.
+            if owners.gate_up.len() == 1 && owners.down.len() == 1 {
+                if let (Some(gu), Some(dn)) = (owners.gate_up.first(), owners.down.first()) {
+                    hipfire_dispatch::cpu_exec::moe_cpu_oracle_report(
+                        gpu,
+                        q,
+                        config.dim,
+                        config.moe_intermediate_size,
+                        config.num_experts_per_tok,
+                        gu,
+                        dn,
+                        x_norm,
+                        s.topk_indices,
+                        s.topk_weights,
+                        s.down_expanded,
+                        ffn.layer_idx,
+                        ffn.expert_down_awq_ptrs.is_some(),
+                    );
+                }
+            }
         }
     }
     #[cfg(feature = "moe-oracle")]

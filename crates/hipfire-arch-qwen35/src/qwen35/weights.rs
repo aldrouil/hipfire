@@ -126,15 +126,18 @@ pub(crate) fn bind_live_expert_cache(
         .map_err(HipError::from)
 }
 
-/// Owning storage for a layer's packed uniform-MQ4 routed experts.
+/// Owning storage for a layer's packed routed experts.
 ///
-/// `experts` still carries one [`WeightTensor`] view per routed expert so the
-/// CPU fallback and every existing indexed dispatch keep their exact metadata
-/// and pointer-table ABI. Those views are non-owning subranges of these two
-/// buffers; only this owner pair may be returned to the GPU pool.
+/// Uniform MQ4 layers pack into exactly one bucket per projection
+/// (`gate_up.len() == down.len() == 1`); graded (mixed-dtype) host layers
+/// pack one blob per distinct `(gate_up, down)` tag bucket. `experts` still
+/// carries one [`WeightTensor`] view per routed expert so the CPU fallback
+/// and every existing indexed dispatch keep their exact metadata and
+/// pointer-table ABI. Those views are non-owning subranges of these buffers;
+/// only these owner vecs may be returned to the GPU pool.
 pub(crate) struct PackedExpertOwners {
-    pub(crate) gate_up: GpuTensor,
-    pub(crate) down: GpuTensor,
+    pub(crate) gate_up: Vec<GpuTensor>,
+    pub(crate) down: Vec<GpuTensor>,
 }
 
 /// SP2: build the per-expert (gate_up, down) quant-tier tables that
@@ -2427,8 +2430,9 @@ pub(crate) fn free_moe_ffn_with(ffn: MoeFfnWeights, free: &mut impl FnMut(GpuTen
             free_weight_metadata_with(e.gate_up, free);
             free_weight_metadata_with(e.down, free);
         }
-        free(owners.gate_up);
-        free(owners.down);
+        for owner in owners.gate_up.into_iter().chain(owners.down) {
+            free(owner);
+        }
     } else {
         for e in ffn.experts {
             free_weight_with(e.gate_up, free);

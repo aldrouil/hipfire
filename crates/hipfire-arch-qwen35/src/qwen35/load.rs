@@ -2731,8 +2731,9 @@ fn host_mapped_expert_accounting(layers: &[LayerWeights]) -> (usize, u64) {
             _ => continue,
         };
         if let Some(owners) = &ffn.packed_expert_owners {
-            tally(&owners.gate_up);
-            tally(&owners.down);
+            for owner in owners.gate_up.iter().chain(owners.down.iter()) {
+                tally(owner);
+            }
         } else {
             for expert in &ffn.experts {
                 tally(&expert.gate_up.buf);
@@ -4940,15 +4941,18 @@ fn try_load_packed_mq4_experts(
         else {
             return Ok(None);
         };
-        let Some(gu_dt) = packable_mq4_dtype(gate_up_qt) else {
-            return Ok(None);
-        };
-        let Some(dn_dt) = packable_mq4_dtype(down_qt) else {
-            return Ok(None);
-        };
-        if gu_dt != dn_dt {
-            return Ok(None);
+        // Uniform fast-path gate: every expert must share the packable MQ4
+        // dtype and stride. Anything else falls through to the graded host
+        // packer below (host-only) or `None` (device keeps literal tensors).
+        let uniform_ok = packable_mq4_dtype(gate_up_qt)
+            .zip(packable_mq4_dtype(down_qt))
+            .is_some_and(|(gu_dt, dn_dt)| gu_dt == dn_dt);
+        if !uniform_ok {
+            return try_load_graded_host_experts(hfq, gpu, p, expert_ids, mi, dim, target);
         }
+        let gu_dt = packable_mq4_dtype(gate_up_qt).expect("graded fallback checked packable");
+        let dn_dt = packable_mq4_dtype(down_qt).expect("graded fallback checked packable");
+        debug_assert_eq!(gu_dt, dn_dt, "uniform gate must equal uniform down dtype");
         match expert_dtype {
             None => expert_dtype = Some(gu_dt),
             Some(dt) if dt == gu_dt => {}
@@ -5134,8 +5138,276 @@ fn try_load_packed_mq4_experts(
     Ok(Some((
         experts,
         PackedExpertOwners {
-            gate_up: gate_up_owner,
-            down: down_owner,
+            gate_up: vec![gate_up_owner],
+            down: vec![down_owner],
+        },
+    )))
+}
+
+/// Graded (mixed-dtype) host packer: one blob per distinct `(gate_up, down)`
+/// tag bucket, host-only (`target` must be `HostMapped`; the device path
+/// keeps literal per-expert tensors and the merged tag kernel).
+///
+/// Partitioning key is [`mixed_expert_tag`]: the same authority the resident
+/// path uses, so an unmapped pair (GL, qt52 LUTs, unknown V2 mixes) returns
+/// `None` here exactly as it fails device-side — never a silent collapse.
+/// AWQ sidecars are NOT packed: graded files carry none, and a sidecar here
+/// would ride the wrong kernel path, so any sidecar returns `None`.
+///
+/// Layout: per bucket, gate_up experts concatenated in slot order, then the
+/// same for down; one owner blob per bucket per projection. Expert views are
+/// `sub_offset` slices of their bucket owner, and the pointer tables are
+/// built from the views exactly as the uniform path does — the merged
+/// tag-branched kernels dereference `expert_ptrs[expert_id]` plus
+/// `dtype_tags[expert_id]`, so no new kernel shape is needed.
+fn try_load_graded_host_experts(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    p: &str,
+    expert_ids: &[usize],
+    mi: usize,
+    dim: usize,
+    target: MemoryTarget,
+) -> HipResult<Option<(Vec<ExpertWeights>, PackedExpertOwners)>> {
+    use std::collections::BTreeMap;
+    if target != MemoryTarget::HostMapped || expert_ids.is_empty() {
+        return Ok(None);
+    }
+    struct GradedSpec {
+        gate_up_name: String,
+        down_name: String,
+        gate_dt: DType,
+        down_dt: DType,
+        tag: u8,
+        gate_bytes: usize,
+        down_bytes: usize,
+    }
+    let mut specs: Vec<(usize, GradedSpec)> = Vec::with_capacity(expert_ids.len());
+    for (slot, &expert_id) in expert_ids.iter().enumerate() {
+        let gate_up_bare = format!("{p}.mlp.experts.{expert_id}.gate_up_proj.weight");
+        let down_bare = format!("{p}.mlp.experts.{expert_id}.down_proj.weight");
+        let Some((gate_up_name, gate_up_qt, gate_up_bytes)) =
+            qwen35_tensor_name_candidates(&gate_up_bare)
+                .into_iter()
+                .find_map(|name| {
+                    hfq.find_tensor_info(&name)
+                        .map(|info| (name, info.quant_type, info.data_size))
+                })
+        else {
+            return Ok(None);
+        };
+        let Some((down_name, down_qt, down_bytes)) = qwen35_tensor_name_candidates(&down_bare)
+            .into_iter()
+            .find_map(|name| {
+                hfq.find_tensor_info(&name)
+                    .map(|info| (name, info.quant_type, info.data_size))
+            })
+        else {
+            return Ok(None);
+        };
+        let (Ok(gate_dt), Ok(down_dt)) = (
+            super::weights::dtype_from_quant_type(gate_up_qt),
+            super::weights::dtype_from_quant_type(down_qt),
+        ) else {
+            return Ok(None);
+        };
+        if matches!(
+            gate_dt,
+            DType::MQ4G256V2Lloyd | DType::MQ2G256GL | DType::MQ3G256GL
+        ) || matches!(
+            down_dt,
+            DType::MQ4G256V2Lloyd | DType::MQ2G256GL | DType::MQ3G256GL
+        ) {
+            return Ok(None);
+        }
+        let Ok(tag) = super::weights::mixed_expert_tag(gate_dt, down_dt) else {
+            return Ok(None);
+        };
+        specs.push((
+            slot,
+            GradedSpec {
+                gate_up_name,
+                down_name,
+                gate_dt,
+                down_dt,
+                tag,
+                gate_bytes: gate_up_bytes,
+                down_bytes: down_bytes,
+            },
+        ));
+    }
+    let uniform = specs.iter().all(|(_, s)| {
+        s.gate_dt == specs[0].1.gate_dt
+            && s.down_dt == specs[0].1.down_dt
+            && s.gate_bytes == specs[0].1.gate_bytes
+            && s.down_bytes == specs[0].1.down_bytes
+    });
+    if uniform {
+        return Ok(None);
+    }
+    let mut buckets: BTreeMap<u8, Vec<usize>> = BTreeMap::new();
+    for (idx, (_, spec)) in specs.iter().enumerate() {
+        buckets.entry(spec.tag).or_default().push(idx);
+    }
+    let gate_up_names: Vec<&str> = specs.iter().map(|(_, s)| s.gate_up_name.as_str()).collect();
+    let down_names: Vec<&str> = specs.iter().map(|(_, s)| s.down_name.as_str()).collect();
+    let read_all = |names: &[&str], label: &str| -> HipResult<Vec<u8>> {
+        if hfq.has_overlay() {
+            let mut out = Vec::new();
+            for name in names {
+                let Some((_, bytes)) = hfq.tensor_data_pread(name) else {
+                    return Err(HipError::new(
+                        0,
+                        &format!("qwen35: graded host tensor gone: {name}"),
+                    ));
+                };
+                out.extend_from_slice(&bytes);
+            }
+            return Ok(out);
+        }
+        let job = HfqReadJob::packed(hfq, format!("{p}.{label}"), names.iter().copied())
+            .map_err(|e| HipError::new(0, &format!("qwen35: plan graded {label}: {e}")))?;
+        let mut results = read_hfq_jobs_ordered(hfq, &[job])
+            .map_err(|e| HipError::new(0, &format!("qwen35: graded {label} read: {e}")))?
+            .into_iter();
+        Ok(results.next().expect("one graded job").data)
+    };
+    let gate_flat = read_all(&gate_up_names, "graded_host_gate_up")?;
+    let down_flat = read_all(&down_names, "graded_host_down")?;
+    let mut gate_off = Vec::with_capacity(specs.len());
+    let mut down_off = Vec::with_capacity(specs.len());
+    let mut cursor = 0usize;
+    for (_, spec) in &specs {
+        gate_off.push(cursor);
+        cursor += spec.gate_bytes;
+    }
+    if gate_flat.len() != cursor {
+        return Err(HipError::new(
+            0,
+            &format!(
+                "qwen35: graded gate_up bytes {} != sum of strides {cursor}",
+                gate_flat.len()
+            ),
+        ));
+    }
+    cursor = 0;
+    for (_, spec) in &specs {
+        down_off.push(cursor);
+        cursor += spec.down_bytes;
+    }
+    if down_flat.len() != cursor {
+        return Err(HipError::new(
+            0,
+            &format!(
+                "qwen35: graded down bytes {} != sum of strides {cursor}",
+                down_flat.len()
+            ),
+        ));
+    }
+    let mut gate_owners: Vec<GpuTensor> = Vec::with_capacity(buckets.len());
+    let mut down_owners: Vec<GpuTensor> = Vec::with_capacity(buckets.len());
+    let mut gate_view: Vec<GpuTensor> = Vec::with_capacity(specs.len());
+    let mut down_view: Vec<GpuTensor> = Vec::with_capacity(specs.len());
+    for _ in 0..specs.len() {
+        gate_view.push(GpuTensor::null_for_test());
+        down_view.push(GpuTensor::null_for_test());
+    }
+    let mut experts_meta: Vec<(DType, DType)> = vec![(DType::F32, DType::F32); specs.len()];
+    for bucket in buckets.values() {
+        let first = &specs[bucket[0]].1;
+        let gu_stride = first.gate_bytes;
+        let dn_stride = first.down_bytes;
+        for &idx in bucket {
+            let spec = &specs[idx].1;
+            if spec.gate_bytes != gu_stride || spec.down_bytes != dn_stride {
+                for owner in gate_owners.drain(..).chain(down_owners.drain(..)) {
+                    let _ = gpu.free_tensor(owner);
+                }
+                return Err(HipError::new(
+                    0,
+                    "qwen35: graded host bucket has mixed strides for one tag; refusing",
+                ));
+            }
+        }
+        let mut gu_blob = Vec::with_capacity(gu_stride * bucket.len());
+        for &idx in bucket {
+            gu_blob.extend_from_slice(&gate_flat[gate_off[idx]..gate_off[idx] + gu_stride]);
+        }
+        let mut dn_blob = Vec::with_capacity(dn_stride * bucket.len());
+        for &idx in bucket {
+            dn_blob.extend_from_slice(&down_flat[down_off[idx]..down_off[idx] + dn_stride]);
+        }
+        let gu_owner = gpu.upload_raw_host_mapped(&gu_blob, &[bucket.len(), gu_stride])?;
+        let dn_owner = match gpu.upload_raw_host_mapped(&dn_blob, &[bucket.len(), dn_stride]) {
+            Ok(owner) => owner,
+            Err(error) => {
+                let _ = gpu.free_tensor(gu_owner);
+                for owner in gate_owners.drain(..).chain(down_owners.drain(..)) {
+                    let _ = gpu.free_tensor(owner);
+                }
+                return Err(error);
+            }
+        };
+        let gu_base = gate_owners.len();
+        let dn_base = down_owners.len();
+        gate_owners.push(gu_owner);
+        down_owners.push(dn_owner);
+        for (pos, &idx) in bucket.iter().enumerate() {
+            let slot = specs[idx].0;
+            gate_view[slot] = gate_owners[gu_base].sub_offset(pos * gu_stride, gu_stride);
+            down_view[slot] = down_owners[dn_base].sub_offset(pos * dn_stride, dn_stride);
+            experts_meta[slot] = (specs[idx].1.gate_dt, specs[idx].1.down_dt);
+        }
+    }
+    drop(gate_flat);
+    drop(down_flat);
+    let mut experts = Vec::with_capacity(specs.len());
+    for slot in 0..specs.len() {
+        let (gate_dt, down_dt) = experts_meta[slot];
+        if load_awq_scale_for(hfq, gpu, &specs[slot].1.gate_up_name, dim).is_some() {
+            for owner in gate_owners.drain(..).chain(down_owners.drain(..)) {
+                let _ = gpu.free_tensor(owner);
+            }
+            return Ok(None);
+        }
+        if load_awq_scale_for(hfq, gpu, &specs[slot].1.down_name, mi).is_some() {
+            for owner in gate_owners.drain(..).chain(down_owners.drain(..)) {
+                let _ = gpu.free_tensor(owner);
+            }
+            return Ok(None);
+        }
+        experts.push(ExpertWeights {
+            gate_up: WeightTensor {
+                buf: std::mem::replace(&mut gate_view[slot], GpuTensor::null_for_test()),
+                gpu_dtype: gate_dt,
+                m: 2 * mi,
+                k: dim,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
+            },
+            down: WeightTensor {
+                buf: std::mem::replace(&mut down_view[slot], GpuTensor::null_for_test()),
+                gpu_dtype: down_dt,
+                m: dim,
+                k: mi,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
+            },
+        });
+    }
+    Ok(Some((
+        experts,
+        PackedExpertOwners {
+            gate_up: gate_owners,
+            down: down_owners,
         },
     )))
 }
@@ -5247,8 +5519,9 @@ impl PendingMoeFfn {
                 expert.gate_up.free_metadata_only(gpu);
                 expert.down.free_metadata_only(gpu);
             }
-            let _ = gpu.free_tensor(owners.gate_up);
-            let _ = gpu.free_tensor(owners.down);
+            for owner in owners.gate_up.into_iter().chain(owners.down) {
+                let _ = gpu.free_tensor(owner);
+            }
         } else {
             for expert in self.experts.drain(..) {
                 expert.gate_up.free_all(gpu);
@@ -5670,8 +5943,10 @@ pub(crate) fn load_moe_ffn(
         Err(error) => return Err(pending.rollback(gpu, error)),
     };
     if packed.is_none() && residency.experts_host() {
-        // The packed blob is the only host expert path. Per-expert host tensors
-        // would each pay `HOST_TAIL_PAD_BYTES` (1 MiB) of tail pad — ~512 MiB per
+        // No packer covered this layer (uniform packer needs one MQ4/MQ4V2/MQ4C
+        // dtype+stride; graded host packer needs one tag-mapped pair per
+        // expert with no AWQ/LUT/GL sidecars). Per-expert host tensors would
+        // each pay `HOST_TAIL_PAD_BYTES` (1 MiB) of tail pad — ~512 MiB per
         // layer against a ~430 MB payload — so fail closed and name the layer.
         return Err(pending.rollback(
             gpu,
@@ -5679,9 +5954,10 @@ pub(crate) fn load_moe_ffn(
                 0,
                 &format!(
                     "qwen35: layer {layer_idx} routed experts are host-placed \
-                     (memory.moe_expert_budget) but expert packing does not apply: every routed \
-                     expert must share one dtype and stride, and only MQ4/MQ4V2/MQ4C are \
-                     packable. Refusing a per-expert host fallback, which would cost ~512 MiB \
+                     (memory.moe_expert_budget) but expert packing does not apply: uniform packing needs \
+                     one shared MQ4/MQ4V2/MQ4C dtype and stride, and graded host packing needs every \
+                     expert on a tag-mapped (gate, down) pair with no AWQ/LUT/GL sidecars. Refusing a \
+                     per-expert host fallback, which would cost ~512 MiB \
                      of tail pad per layer; re-quantize the experts to a packable MQ4 format"
                 ),
             ),
@@ -5689,8 +5965,9 @@ pub(crate) fn load_moe_ffn(
     }
     if let Some((experts, owners)) = packed {
         if layer_idx == 0 {
+            let n_blobs = owners.gate_up.len() + owners.down.len();
             eprintln!(
-                "  routed MQ4 expert packing: {} per-expert weight buffers -> 2 layer blobs",
+                "  routed MQ4 expert packing: {} per-expert weight buffers -> {n_blobs} layer blobs",
                 table_len
             );
         }
@@ -5819,25 +6096,36 @@ pub(crate) fn load_moe_ffn(
     // whole FFN (gate_up + SiLU + down) from the intact host blobs at forward
     // time. AWQ layers stay refused: a bare `gemv` would ignore the per-expert
     // scale, on either projection.
+    // Splice arming, computed before the tag table exists (it is built below):
+    // only on the CPU arm over a host-placed packed layer with no AWQ sidecar
+    // and no dtype mix. Both expert tables are rewritten to one zeroed sink,
+    // so the sealed step contributes 0 for the routed experts and the CPU
+    // recomputes the whole FFN (gate_up + SiLU + down) from the intact host
+    // blobs at forward time. AWQ layers stay refused: a bare `gemv` would
+    // ignore the per-expert scale, on either projection. Graded (mixed-dtype)
+    // layers stay refused for the same fail-closed reason: the splice decodes
+    // the whole blob at `experts[0]`'s dtype and a uniform stride, which
+    // silently mis-decodes every cold-tier expert — the decode-side twin of
+    // the prefill `tag table present` refusal.
+    let graded_mixed = match pending.experts.split_first() {
+        Some((first, rest)) => rest.iter().any(|e| {
+            e.gate_up.gpu_dtype != first.gate_up.gpu_dtype
+                || e.down.gpu_dtype != first.down.gpu_dtype
+        }),
+        None => false,
+    };
+    let packed_host = residency.experts_host() && pending.packed_expert_owners.is_some();
     let cpu_expert_splice = hipfire_dispatch::cpu_exec::moe_cpu_experts_enabled()
-        && residency.experts_host()
-        && pending.packed_expert_owners.is_some()
-        && pending
-            .experts
-            .first()
-            .is_some_and(|e| e.gate_up.awq_scale.is_none() && e.down.awq_scale.is_none());
-    // Fail closed rather than silently leave host-placed AWQ experts on the PCIe
-    // read while the coverage line claims the CPU. A bare `gemv` would ignore the
-    // per-expert scale, so the CPU expert splice cannot handle AWQ on either
-    // projection — and MoE-AWQ is on by default, so this combination is reachable.
-    if hipfire_dispatch::cpu_exec_enabled()
-        && residency.experts_host()
-        && pending.packed_expert_owners.is_some()
-        && pending
-            .experts
-            .first()
-            .is_some_and(|e| e.gate_up.awq_scale.is_some() || e.down.awq_scale.is_some())
-    {
+        && packed_host
+        && !graded_mixed
+        && matches!(pending.experts.first(), Some(e) if e.gate_up.awq_scale.is_none() && e.down.awq_scale.is_none());
+    // Fail closed rather than silently leave host-placed AWQ experts on the
+    // PCIe read while the coverage line claims the CPU. A bare `gemv` would
+    // ignore the per-expert scale, so the CPU expert splice cannot handle
+    // AWQ on either projection — and MoE-AWQ is on by default, so this
+    // combination is reachable.
+    let awq_sidecar = matches!(pending.experts.first(), Some(e) if e.gate_up.awq_scale.is_some() || e.down.awq_scale.is_some());
+    if hipfire_dispatch::cpu_exec_enabled() && packed_host && awq_sidecar {
         return Err(pending.rollback(
             gpu,
             HipError::new(
@@ -5845,6 +6133,20 @@ pub(crate) fn load_moe_ffn(
                 "qwen35: memory.offload_exec=cpu with host-placed packed AWQ experts is refused — \
                  the CPU expert splice cannot apply the per-expert AWQ scale, so the experts would \
                  silently run on the GPU over PCIe. Keep them resident (raise \
+                 memory.moe_expert_budget) or set memory.offload_exec=pcie",
+            ),
+        ));
+    }
+    // Fail closed rather than silently leave host-placed graded experts on the
+    // PCIe read while the coverage line claims the CPU.
+    if hipfire_dispatch::cpu_exec_enabled() && residency.experts_host() && graded_mixed {
+        return Err(pending.rollback(
+            gpu,
+            HipError::new(
+                0,
+                "qwen35: memory.offload_exec=cpu with host-placed graded (mixed-dtype) experts is refused — \
+                 the CPU expert splice decodes at one dtype and stride, so cold-tier experts would \
+                 silently mis-decode. Keep them resident (raise \
                  memory.moe_expert_budget) or set memory.offload_exec=pcie",
             ),
         ));
