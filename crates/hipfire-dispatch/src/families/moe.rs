@@ -1453,8 +1453,23 @@ impl MoePrefillResolution {
         arch: &rdna_compute::arch_caps::ArchCaps,
         flags: &rdna_compute::feature_flags::FeatureFlags,
     ) -> Self {
+        Self::resolve_with_batch_ctx(d, arch, flags, 0, false)
+    }
+
+    /// Batch- and workload-aware resolution. Narrow *verify* batches (MTP
+    /// verify, n <= 4) take the indexed Path 1. Prompt chunks keep the
+    /// legacy route regardless of width — only `SpeculativeVerify` moves.
+    /// `batch == 0` (unknown) preserves the legacy shape-blind behavior.
+    pub fn resolve_with_batch_ctx(
+        d: &MoeDtypes<'_>,
+        arch: &rdna_compute::arch_caps::ArchCaps,
+        flags: &rdna_compute::feature_flags::FeatureFlags,
+        batch: usize,
+        is_verify: bool,
+    ) -> Self {
         let paro_mode = d.routed_gate_up == DType::ParoQ4G128 && d.has_paro_shared;
-        let use_path2 = flags.moe_grouped_gemm && arch.has_wmma();
+        let narrow_verify = is_verify && batch != 0 && batch <= 4;
+        let use_path2 = flags.moe_grouped_gemm && arch.has_wmma() && !narrow_verify;
         // MQ6 / MQ6V2 grouped-WMMA: gfx11 `_k2` kernel now exists (alongside the
         // gfx12 `_gfx12` / `mq6g256v2` sisters). Only suppress Path 2 on archs
         // that have NEITHER (gfx9*, gfx1010/1030, CDNA) — i.e. no wmma_w32 and

@@ -26,6 +26,10 @@ pub struct DispatchCtx {
     pub flags: Arc<FeatureFlags>,
     pub resources: ResourceManager,
     pub workload: DispatchWorkload,
+    /// Token-row count of the current batch (0 = unknown / not a batch).
+    /// Lets shape-driven route choices (e.g. MoE grouped vs indexed) see
+    /// the batch width without a signature change at every call site.
+    pub batch_size: usize,
     device_id: i32,
 }
 
@@ -42,6 +46,7 @@ impl DispatchCtx {
             flags,
             resources: ResourceManager::new(gpu),
             workload: DispatchWorkload::Standard,
+            batch_size: 0,
             device_id: gpu.device_id,
         }
     }
@@ -57,6 +62,13 @@ impl DispatchCtx {
         self
     }
 
+    /// Attach the token-row count of the current batch. 0 (default) means
+    /// unknown — route choices must not depend on it then.
+    pub fn with_batch_size(mut self, batch_size: usize) -> Self {
+        self.batch_size = batch_size;
+        self
+    }
+
     /// Construct a `DispatchCtx` for the given arch string and device without
     /// a live GPU. Only for use in tests.
     #[cfg(any(test, feature = "test-utils"))]
@@ -69,6 +81,7 @@ impl DispatchCtx {
             flags,
             resources: crate::resource::ResourceManager::for_test(),
             workload: DispatchWorkload::Standard,
+            batch_size: 0,
             device_id,
         }
     }

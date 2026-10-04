@@ -1597,7 +1597,7 @@ pub(super) fn select_prefill(
     if route.is_none() {
         super::reject_mq4g128v2_moe(&params.dtypes)?;
     }
-    let resolution = MoePrefillResolution::resolve(&params.dtypes, &ctx.arch, &ctx.flags);
+    let resolution = MoePrefillResolution::resolve_with_batch_ctx(&params.dtypes, &ctx.arch, &ctx.flags, ctx.batch_size, ctx.workload == crate::context::DispatchWorkload::SpeculativeVerify);
     let _total_slots = params
         .batch_size
         .checked_mul(params.k_top)
