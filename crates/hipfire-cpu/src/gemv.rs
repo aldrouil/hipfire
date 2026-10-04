@@ -21,6 +21,7 @@
 
 use rayon::prelude::*;
 
+use crate::block_i8::BlockI8_128;
 use crate::quant::{decode_group_codes, CpuQuant};
 use crate::simd;
 
@@ -204,6 +205,77 @@ pub fn gemv_experts(
         });
 }
 
+/// Batched multi-expert MQ4V2 GEMV over int8 activations — the A8 image of
+/// [`gemv_experts`] for the V2 format.
+///
+/// `packed[e]` is expert `e`'s `m` rows, each `(k/256)*136` bytes; `acts[e]`
+/// holds expert `e`'s `k/128` [`BlockI8_128`] activation blocks (the same slice
+/// repeated for a projection whose activation is shared by every expert).
+/// `out[e*m + row]` is the result. Parallel over `(expert, row)`, so a loop of
+/// per-expert calls does not pay one rayon region entry per expert.
+///
+/// Numerically this is the same integral as `Σ (scale·code + zero)·x` with `x`
+/// replaced by its per-128 int8 approximation `d·q`; the zero term is taken from
+/// the activation block's exact `s`, so no `Σx` accumulator is needed.
+pub fn gemv_experts_i8_mq4v2(
+    packed: &[&[u8]],
+    m: usize,
+    k: usize,
+    acts: &[&[BlockI8_128]],
+    out: &mut [f32],
+) {
+    if packed.is_empty() || m == 0 || k == 0 {
+        return;
+    }
+    assert!(
+        k % 256 == 0,
+        "gemv_experts_i8_mq4v2: k={k} is not a multiple of 256"
+    );
+    assert!(
+        acts.len() >= packed.len(),
+        "gemv_experts_i8_mq4v2: {} activation slices, need {}",
+        acts.len(),
+        packed.len()
+    );
+    assert!(
+        out.len() >= packed.len() * m,
+        "gemv_experts_i8_mq4v2: out has {} elements, need {}",
+        out.len(),
+        packed.len() * m
+    );
+    let groups = k / 256;
+    let rb = groups * 136;
+    let per_expert_blocks = k / 128;
+    for (e, block) in packed.iter().enumerate() {
+        assert!(
+            block.len() >= m * rb,
+            "gemv_experts_i8_mq4v2: expert {e} has {} bytes, need {}",
+            block.len(),
+            m * rb
+        );
+        assert!(
+            acts[e].len() >= per_expert_blocks,
+            "gemv_experts_i8_mq4v2: expert {e} has {} activation blocks, need {}",
+            acts[e].len(),
+            per_expert_blocks
+        );
+    }
+    out[..packed.len() * m]
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(flat, o)| {
+            let (expert, row) = (flat / m, flat % m);
+            let base = row * rb;
+            let act = acts[expert];
+            let mut acc = 0.0f32;
+            for g in 0..groups {
+                let gp = &packed[expert][base + g * 136..base + g * 136 + 136];
+                acc += crate::simd::mq4v2_i8_group_dot(gp, &[act[2 * g], act[2 * g + 1]]);
+            }
+            *o = acc;
+        });
+}
+
 /// One output element: `Σ_j W[row][j] * x[j]`, accumulating one group at a time.
 ///
 /// `use_simd` is resolved once per GEMV call by the caller
@@ -323,6 +395,54 @@ mod test {
                 gemv(q, p, m, k, x, &mut per_expert[e * m..(e + 1) * m]);
             }
             assert_eq!(batched, per_expert, "{q:?}: batched != per-expert gemv");
+        }
+    }
+
+    /// The batched int8 GEMV must index `(expert, row)` the same way the
+    /// per-group call does — the row stride and expert stride are exactly where
+    /// a silent cross-expert read would hide.
+    #[test]
+    fn gemv_experts_i8_matches_the_per_group_sum() {
+        if !crate::simd::int8_dot_available() {
+            eprintln!("skipping gemv_experts_i8_matches_the_per_group_sum: no AVX2+F16C");
+            return;
+        }
+        let (k, m, experts) = (512usize, 3usize, 2usize);
+        let groups = k / 256;
+        let rb = groups * 136;
+        // Byte-distinct experts via the group payload salt (headers stay valid).
+        let packed: Vec<Vec<u8>> = (0..experts)
+            .map(|e| {
+                let mut out = Vec::with_capacity(m * groups * 136);
+                for row in 0..m {
+                    for g in 0..groups {
+                        out.extend_from_slice(&crate::testfix::group_bytes(
+                            CpuQuant::Mq4G256V2,
+                            e * 1000 + row * groups + g,
+                        ));
+                    }
+                }
+                out
+            })
+            .collect();
+        let x = x_of(k);
+        let act: Vec<BlockI8_128> = (0..k / 128)
+            .map(|b| BlockI8_128::quantize(&x[b * 128..]))
+            .collect();
+        let refs: Vec<&[u8]> = packed.iter().map(|p| p.as_slice()).collect();
+        let acts_refs: Vec<&[BlockI8_128]> = vec![act.as_slice(); experts];
+        let mut out = vec![0.0f32; experts * m];
+        gemv_experts_i8_mq4v2(&refs, m, k, &acts_refs, &mut out);
+        for (e, p) in packed.iter().enumerate() {
+            for row in 0..m {
+                let base = row * rb;
+                let mut want = 0.0f32;
+                for g in 0..groups {
+                    let gp = &p[base + g * 136..base + g * 136 + 136];
+                    want += crate::simd::mq4v2_i8_group_dot(gp, &[act[2 * g], act[2 * g + 1]]);
+                }
+                assert_eq!(out[e * m + row], want, "expert {e} row {row}");
+            }
         }
     }
 
