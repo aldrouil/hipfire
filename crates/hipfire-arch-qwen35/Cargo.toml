@@ -170,3 +170,8 @@ required-features = ["deltanet"]
 name = "mq4v2_moe_down_parity"
 path = "examples/mq4v2_moe_down_parity.rs"
 required-features = ["lab"]
+
+[[test]]
+name = "gpu_moe_cpu_parity"
+path = "tests/gpu_moe_cpu_parity.rs"
+required-features = ["lab"]
