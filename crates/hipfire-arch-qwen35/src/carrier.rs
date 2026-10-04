@@ -84,13 +84,15 @@ fn draft_device_reserve_bytes(hfq: &HfqFile, ctx: &LoadCtx) -> u64 {
     bytes
 }
 
-/// The default MTP sidecar the loader resolves when the CLI named none:
-/// `<trunk>.mtp`.
+/// The default MTP sidecar the loader resolves when the CLI named none: the
+/// first existing `sidecar_candidates(trunk, "mtp")` spelling (last-extension
+/// replacement, then the stem spelling `model.mtp`). A single
+/// `path + ".mtp"` concatenation misses the stem spelling and charges 0 for a
+/// head that then loads, under-reserving the placement.
 fn trunk_mtp_sidecar(hfq: &HfqFile) -> Option<std::path::PathBuf> {
-    let mut path = hfq.path().to_path_buf().into_os_string();
-    path.push(".mtp");
-    let path = std::path::PathBuf::from(path);
-    path.is_file().then_some(path)
+    crate::mtp_head::mtp_sidecar_candidates(hfq.path())
+        .into_iter()
+        .find(|p| p.is_file())
 }
 
 /// Resolve partial GPU offload before the first allocation.

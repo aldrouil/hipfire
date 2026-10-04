@@ -2226,40 +2226,33 @@ fn finish_qwen35_load(
     } else {
         None
     };
-    // MTP with host-mapped experts: off by default (one line), kept only on an
-    // explicit request — the same shape as Qwen4's
-    // `qwen4_mtp_with_host_mapped_experts`. The head itself stays on the GPU and
-    // is charged to the placement's capacity; what is not ready is the MTP
-    // verify/prefill path over a spill, which takes a GPU memory access fault
-    // (`Memory access fault ... address 0xac000`, SIGABRT, on
-    // `ornith-1.5:35b-a3b` + `moe_expert_budget=auto`; the same spill with
-    // `--spec off` loads and decodes). An explicit request is refused with that
-    // evidence; an implicit one degrades.
-    // Conservative: any MoE now auto-fits, so MTP is off by default until the
-    // MTP path is spill-aware — including for a MoE that resolves fully resident,
-    // where MTP is a measured win (Strix Halo).
-    // TODO(moe-offload): key this on the resolved placement (host-mapped expert
-    // count) instead of `partial_offload_requested(is_moe)` so a fitting MoE
-    // keeps MTP.
-    let offload_spill = crate::admission::partial_offload_requested(config.num_experts != 0);
-    if offload_spill && matches!(arch_id, 5 | 6) {
-        if ctx.spec.mtp == Some(true) {
-            return Err(
-                "load refused: partial GPU offload cannot yet be combined with an explicitly \
-                 requested MTP draft (speculation.mtp / --spec mtp). The MTP verify/prefill path is \
-                 not host-expert aware and faults the GPU during prefill (measured on \
-                 ornith-1.5:35b-a3b with memory.moe_expert_budget=auto). The draft itself stays on \
-                 the GPU; use --spec off with the spill, or keep every expert resident (an explicit \
-                 memory.moe_expert_budget that fits)"
-                    .to_string(),
-            );
-        }
-        if ctx.spec.mtp != Some(false) {
-            eprintln!(
-                "  qwen35 MTP: off by default with host-mapped experts; opt in with --spec mtp \
-                 (currently refused: the MTP path is not spill-aware)"
-            );
-        }
+    // MTP over a host spill: the `0xac000` SIGABRT recorded in `6273965e7`
+    // (ornith-1.5:35b-a3b + moe_expert_budget=auto) no longer reproduces —
+    // expert-spill (graph on/off) and layer-spill arms load the head and decode.
+    // Upstream candidates in between (unbisected): `3b3d2ab45` MQ6 shared
+    // gate/up alias, graded host-expert offload. So the hard refusal is gone:
+    // explicit `speculation.mtp = "on"` (`--spec mtp`) attaches the head over a
+    // spill. But `auto` still degrades to AR when routed experts are
+    // host-mapped — measured on ornith/gfx1201 (serve_harness battery, greedy,
+    // `--thinking off --sampling greedy --seed 7`): single merge_sort prompt
+    // (md5 `253c7ac50857fe6d0e10fb0d2c5e35c0`, daemon md5 `32c2495e`): MTP
+    // decode 10.7 vs AR 44.6 tok/s, prefill 147.2 vs 170.2 tok/s at tau=1.33;
+    // 9-prompt genre battery `benchmarks/prompts/mtp_genre_battery.json`
+    // (md5 `c6311934e3426ad0b64c7adf9e2c56be`, derived from `~/mtp-bench.py`
+    // PROMPTS, daemon md5 `0339b7c1`): avg decode 34.9 vs 45.1 tok/s, avg
+    // prefill 186.4 vs 262.3 tok/s. The verify re-reads
+    // host-mapped experts over PCIe, so each extra pass costs more than the
+    // accepted tokens return. Keyed on the *resolved*
+    // placement (host-mapped count from the loaded weights), not on MoE-ness,
+    // so a MoE that resolves fully resident keeps MTP under `auto`.
+    let mtp_spill_degrade = matches!(arch_id, 5 | 6)
+        && ctx.spec.mtp.is_none()
+        && hipfire_arch_qwen35::qwen35::host_mapped_expert_accounting(&bundle.weights.layers).0
+            > 0;
+    if mtp_spill_degrade {
+        eprintln!(
+            "  qwen35 MTP: off by default with host-mapped experts; opt in with --spec mtp"
+        );
     }
     // ── qwen35 MTP head (single resolver: bundled .mq4-mtp trailer then .mtp sidecar) ──
     // Precedence: DSpark > DFlash > MTP > n-gram. Gate: only arch 5/6, no adaptive/eviction,
@@ -2270,8 +2263,8 @@ fn finish_qwen35_load(
     let mtp: Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead> = if adaptive_blocks_generic_spec
         || eviction.is_some()
         || !matches!(arch_id, 5 | 6)
-        || offload_spill
         || ctx.spec.mtp == Some(false)
+        || mtp_spill_degrade
         || dflash.is_some()
         || dspark_speculator.is_some()
     {

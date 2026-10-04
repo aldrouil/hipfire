@@ -42,7 +42,7 @@ pub use forward::{
     Qwen35ScratchSet,
 };
 pub use load::{
-    load_weights, load_weights_dense_tp_rank, load_weights_ep_rank,
+    host_mapped_expert_accounting, load_weights, load_weights_dense_tp_rank, load_weights_ep_rank,
     load_weights_ep_rank_with_fault, load_weights_with_fault, preflight_weights_dense_tp, EpFault,
     EpLoadStage, HfqSource, Layout, ParoSource, StagedLoadFault,
 };

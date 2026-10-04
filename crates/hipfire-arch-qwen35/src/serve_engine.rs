@@ -634,13 +634,27 @@ impl Rig {
         }
         let pbs = crate::qwen35::prefill::minimum_prefill_reservation_bytes(config, &gpu.arch)
             .unwrap_or(0) as u64;
-        // The MTP head the slots path resolves for itself is the `<trunk>.mtp`
-        // sidecar, so that is the draft it must reserve for (the bundled trailer
-        // is already part of the trunk file the placement charges).
+        // The slots MTP loader probes the bundled trailer first, then every
+        // `sidecar_candidates(trunk, "mtp")` spelling (stem-based
+        // `ornith-1.5-35b-a3b.mtp` included). The reserve must probe the same
+        // list — string-appending `.mtp` to the full filename misses the stem
+        // spelling, charges 0 for a head that then loads, and under-reserves
+        // the placement. A bundled trailer needs no reserve (already charged
+        // as part of the trunk file).
         let draft = if cfg.mtp_k > 0 {
-            let mut sidecar = cfg.model_path.clone().into_os_string();
-            sidecar.push(".mtp");
-            crate::carrier::draft_file_reserve_bytes(std::path::Path::new(&sidecar))
+            let bundled = crate::mtp_head::detect_bundled_mtp_offset(&cfg.model_path)
+                .ok()
+                .flatten()
+                .is_some();
+            if bundled {
+                0
+            } else {
+                crate::mtp_head::mtp_sidecar_candidates(&cfg.model_path)
+                    .into_iter()
+                    .find(|p| p.is_file())
+                    .map(|p| crate::carrier::draft_file_reserve_bytes(&p))
+                    .unwrap_or(0)
+            }
         } else {
             0
         };
