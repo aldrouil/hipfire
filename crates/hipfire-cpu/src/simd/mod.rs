@@ -24,41 +24,7 @@
 #[cfg(target_arch = "x86_64")]
 mod x86;
 
-use crate::block_i8::BlockI8_128;
 use crate::quant::CpuQuant;
-
-/// Whether the int8-activation V2 group dot can run here. Same feature set as
-/// [`row_dot_avx2`]'s V2 arm: AVX2 + F16C.
-pub fn int8_dot_available() -> bool {
-    avx2_f16c_available()
-}
-
-/// One MQ4V2 256-element group scored against int8 activation blocks
-/// ([`crate::block_i8::BlockI8_128`], one per 128-element half) — the
-/// int8-activation image of the V2 row dot. `gptr` is the 136-byte group.
-///
-/// # Panics
-///
-/// If AVX2 + F16C are unavailable; gate through [`int8_dot_available`].
-#[cfg(target_arch = "x86_64")]
-pub fn mq4v2_i8_group_dot(gptr: &[u8], act: &[BlockI8_128; 2]) -> f32 {
-    assert!(
-        int8_dot_available(),
-        "mq4v2_i8_group_dot needs AVX2 + F16C"
-    );
-    assert!(
-        gptr.len() >= 136,
-        "mq4v2_i8_group_dot: group has {} bytes, need 136",
-        gptr.len()
-    );
-    // SAFETY: AVX2+F16C checked above; the group length is checked above.
-    unsafe { x86::mq4v2_i8_group_dot(gptr.as_ptr(), act) }
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-pub fn mq4v2_i8_group_dot(_gptr: &[u8], _act: &[BlockI8_128; 2]) -> f32 {
-    unreachable!("mq4v2_i8_group_dot is reachable only where AVX2 + F16C were detected")
-}
 
 /// Whether the CPU reports AVX2 + FMA.
 #[cfg(target_arch = "x86_64")]
