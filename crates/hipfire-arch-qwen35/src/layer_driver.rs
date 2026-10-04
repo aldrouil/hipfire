@@ -433,7 +433,7 @@ mod tests {
                 expert_gate_up_ptrs: buffers.pop().expect("MoE test pointer buffer"),
                 expert_down_ptrs: buffers.pop().expect("MoE test pointer buffer"),
                 expert_down_awq_ptrs: None,
-                cpu_down_sink: None,
+                cpu_expert_sink: None,
                 expert_dtype_tags: None,
                 layer_idx: 0,
                 expert_shape: None,

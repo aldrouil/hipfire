@@ -54,7 +54,7 @@ use std::time::Instant;
 
 use rdna_compute::{DType, Gpu, GpuTensor};
 
-use hipfire_cpu::epilogue::residual_add;
+use hipfire_cpu::epilogue::{residual_add, silu_mul};
 use hipfire_cpu::gemv::gemv;
 use hipfire_cpu::quant::{divide_by_awq_scale, rotate_x, CpuQuant};
 
@@ -67,6 +67,21 @@ use crate::types::{dtype_rotation_plan, DispatchError, RotationPlan};
 pub fn cpu_exec_enabled() -> bool {
     static ENABLED: LazyLock<bool> = LazyLock::new(|| {
         hipfire_config::memory::offload_exec() == hipfire_config::memory::OffloadExec::Cpu
+    });
+    *ENABLED
+}
+
+/// Whether the CPU expert splice is armed: `memory.offload_exec=cpu` and the
+/// `HIPFIRE_MOE_CPU_EXPERTS=0` kill-switch unset. This is the *model-level*
+/// decision; the loader additionally requires a host-placed packed layer with no
+/// AWQ sidecar, and records the armed sink on the layer weights.
+pub fn moe_cpu_experts_enabled() -> bool {
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        cpu_exec_enabled()
+            && hipfire_config::developer_var("HIPFIRE_MOE_CPU_EXPERTS")
+                .ok()
+                .as_deref()
+                != Some("0")
     });
     *ENABLED
 }
@@ -331,69 +346,96 @@ pub fn run_host_mapped_gemv_residual(
     Ok(())
 }
 
-/// Diagnostic CPU-down splice: recompute one decode token's routed down
-/// projection on the CPU from the intact host blob and accumulate into the
-/// residual. `rot_batch` is the already-rotated post-SiLU hidden (`[k × mi]`);
-/// no rotation convention is needed. `down_owner` is the packed host-mapped
-/// down blob; `down_stride` is the file's per-expert `data_size`.
+/// CPU FFN for one decode token's routed experts: recompute the full expert
+/// (gate_up GEMV + SiLU + hidden-rotate + down GEMV) on the CPU from the intact
+/// host blobs and accumulate the routing-weighted result into the residual.
 ///
-/// Fail-closed by construction: unavailable host bytes, an undecodable dtype,
-/// an AWQ sidecar (a bare `gemv` would ignore the scale), or short scratch
-/// downloads are all errors, never silent zeros.
+/// `x_rot` is the already-rotated activation the gate_up projection consumes; the
+/// post-SiLU hidden is rotated here exactly as the fused kernel would. The loader
+/// rewrote both expert pointer tables to a zeroed sink, so the sealed MoE step
+/// contributed 0 for the routed experts; this supplies the whole contribution.
+///
+/// Fail-closed by construction: unavailable host bytes, an undecodable dtype, an
+/// AWQ sidecar (a bare `gemv` would ignore the per-expert scale), graph capture /
+/// replay recording (a CPU step is a host sync point), or short scratch are all
+/// errors, never silent zeros.
 #[allow(clippy::too_many_arguments)]
-pub fn moe_cpu_down_residual(
+pub fn moe_cpu_experts(
     gpu: &Gpu,
     quant: CpuQuant,
     dim: usize,
     mi: usize,
+    gate_up_owner: &GpuTensor,
+    gate_up_stride: usize,
     down_owner: &GpuTensor,
     down_stride: usize,
-    rot_batch: &GpuTensor,
+    x_rot: &GpuTensor,
     topk_indices: &GpuTensor,
     topk_weights: &GpuTensor,
     residual: &GpuTensor,
-    down_awq: bool,
+    awq: bool,
 ) -> Result<(), DispatchError> {
     if gpu.graphs.capture_mode || gpu.replay.is_recording() {
         return Err(cpu_err(
-            "moe cpu-down splice refuses graph capture / replay recording: a CPU step is a host sync point",
+            "moe cpu expert splice refuses graph capture / replay recording: a CPU step is a host sync point",
         ));
     }
-    if down_awq {
+    if awq {
         return Err(cpu_err(
-            "moe cpu-down splice refuses AWQ down weights: a bare gemv would ignore the per-expert scale",
+            "moe cpu expert splice refuses AWQ weights: a bare gemv would ignore the per-expert scale",
         ));
     }
-    let down_bytes = gpu
+    let gu_bytes = gpu
+        .host_bytes(gate_up_owner)
+        .ok_or_else(|| cpu_err("moe cpu expert splice: gate_up blob has no host bytes"))?;
+    let dn_bytes = gpu
         .host_bytes(down_owner)
-        .ok_or_else(|| cpu_err("moe cpu-down splice: down blob has no host bytes"))?;
+        .ok_or_else(|| cpu_err("moe cpu expert splice: down blob has no host bytes"))?;
     let k = topk_indices.numel().min(topk_weights.numel());
     if k == 0 {
-        return Err(cpu_err("moe cpu-down splice: empty top-k scratch"));
+        return Err(cpu_err("moe cpu expert splice: empty top-k scratch"));
     }
-    let rot = download_f32(gpu, rot_batch, k.checked_mul(mi).ok_or_else(|| cpu_err("moe cpu-down splice: rot extent overflows"))?)?;
+    let x = download_f32(gpu, x_rot, dim)?;
     let ti = download_f32(gpu, topk_indices, k)?;
     let tw = download_f32(gpu, topk_weights, k)?;
-    let row_bytes = hipfire_cpu::gemv::row_bytes(quant, mi);
-    let need = row_bytes.checked_mul(dim).ok_or_else(|| cpu_err("moe cpu-down splice: down extent overflows"))?;
-    if down_stride < need {
+    let gu_need = hipfire_cpu::gemv::row_bytes(quant, dim)
+        .checked_mul(2 * mi)
+        .ok_or_else(|| cpu_err("moe cpu expert splice: gate_up extent overflows"))?;
+    let dn_need = hipfire_cpu::gemv::row_bytes(quant, mi)
+        .checked_mul(dim)
+        .ok_or_else(|| cpu_err("moe cpu expert splice: down extent overflows"))?;
+    if gate_up_stride < gu_need {
         return Err(cpu_err(&format!(
-            "moe cpu-down splice: down_stride {down_stride} < expert bytes {need}"
+            "moe cpu expert splice: gate_up_stride {gate_up_stride} < expert bytes {gu_need}"
+        )));
+    }
+    if down_stride < dn_need {
+        return Err(cpu_err(&format!(
+            "moe cpu expert splice: down_stride {down_stride} < expert bytes {dn_need}"
         )));
     }
     let mut acc = download_f32(gpu, residual, dim)?;
-    let mut down_out = vec![0.0f32; dim];
+    let mut gu_out = vec![0.0f32; 2 * mi];
+    let mut hidden = vec![0.0f32; mi];
+    let mut dn_out = vec![0.0f32; dim];
     for krank in 0..k {
         let slot = (ti[krank].to_bits() as i32) as u16 as usize;
-        let d0 = slot.checked_mul(down_stride).ok_or_else(|| cpu_err("moe cpu-down splice: down offset overflows"))?;
-        if d0.checked_add(need).is_none_or(|end| end > down_bytes.len()) {
-            return Err(cpu_err(&format!("moe cpu-down splice: down slot {slot} out of range")));
+        let gu0 = slot.checked_mul(gate_up_stride).ok_or_else(|| cpu_err("moe cpu expert splice: gate_up offset overflows"))?;
+        if gu0.checked_add(gu_need).is_none_or(|end| end > gu_bytes.len()) {
+            return Err(cpu_err(&format!("moe cpu expert splice: gate_up slot {slot} out of range")));
         }
-        let x = rot.get(krank * mi..(krank + 1) * mi).ok_or_else(|| cpu_err("moe cpu-down splice: rot_batch short"))?;
-        down_out.fill(0.0);
-        gemv(quant, &down_bytes[d0..d0 + need], dim, mi, x, &mut down_out);
+        gu_out.fill(0.0);
+        gemv(quant, &gu_bytes[gu0..gu0 + gu_need], 2 * mi, dim, &x, &mut gu_out);
+        silu_mul(&gu_out, &mut hidden);
+        rotate_x(&mut hidden);
+        let dn0 = slot.checked_mul(down_stride).ok_or_else(|| cpu_err("moe cpu expert splice: down offset overflows"))?;
+        if dn0.checked_add(dn_need).is_none_or(|end| end > dn_bytes.len()) {
+            return Err(cpu_err(&format!("moe cpu expert splice: down slot {slot} out of range")));
+        }
+        dn_out.fill(0.0);
+        gemv(quant, &dn_bytes[dn0..dn0 + dn_need], dim, mi, &hidden, &mut dn_out);
         let w = tw[krank];
-        for (a, v) in acc.iter_mut().zip(down_out.iter()) {
+        for (a, v) in acc.iter_mut().zip(dn_out.iter()) {
             *a += w * v;
         }
     }
@@ -408,69 +450,90 @@ pub fn host_mapped_cpu_capable(gpu: &Gpu, w: &WeightRef) -> bool {
     cpu_exec_enabled() && gpu.host_located(w.buf) && cpu_quant_for(w.dtype).is_some()
 }
 
-/// Batched twin of [`moe_cpu_down_residual`] for the prefill path: `rot_batch`
-/// holds `n * k_top * mi` already-rotated post-SiLU rows and `residual` is the
-/// `[n × dim]` batch the combine accumulates into (`pbs.x_batch`). Same
-/// fail-closed contract: unavailable host bytes, an undecodable dtype, AWQ
-/// sidecars, or short scratch downloads are errors, never silent zeros.
+/// Batched twin of [`moe_cpu_experts`] for the prefill path: `x_rot` is the
+/// `[n × dim]` rotated activation batch and `residual` is the `[n × dim]` batch
+/// the combine accumulates into (`pbs.x_batch`). Same fail-closed contract:
+/// unavailable host bytes, an undecodable dtype, AWQ sidecars, graph capture /
+/// replay, or short scratch are errors, never silent zeros.
 #[allow(clippy::too_many_arguments)]
-pub fn moe_cpu_down_residual_batched(
+pub fn moe_cpu_experts_batched(
     gpu: &Gpu,
     quant: CpuQuant,
     dim: usize,
     mi: usize,
     n: usize,
     k_top: usize,
+    gate_up_stride: usize,
+    gate_up_bytes: &[u8],
     down_stride: usize,
     down_bytes: &[u8],
-    rot: &[f32],
+    x_rot: &[f32],
     ti: &[f32],
     tw: &[f32],
     residual: &mut [f32],
-    down_awq: bool,
+    awq: bool,
 ) -> Result<(), DispatchError> {
     if gpu.graphs.capture_mode || gpu.replay.is_recording() {
         return Err(cpu_err(
-            "moe cpu-down splice refuses graph capture / replay recording: a CPU step is a host sync point",
+            "moe cpu expert splice refuses graph capture / replay recording: a CPU step is a host sync point",
         ));
     }
-    if down_awq {
+    if awq {
         return Err(cpu_err(
-            "moe cpu-down splice refuses AWQ down weights: a bare gemv would ignore the per-expert scale",
+            "moe cpu expert splice refuses AWQ weights: a bare gemv would ignore the per-expert scale",
         ));
     }
-    let row_bytes = hipfire_cpu::gemv::row_bytes(quant, mi);
-    let need = row_bytes.checked_mul(dim).ok_or_else(|| cpu_err("moe cpu-down splice: down extent overflows"))?;
-    if down_stride < need {
+    let gu_need = hipfire_cpu::gemv::row_bytes(quant, dim)
+        .checked_mul(2 * mi)
+        .ok_or_else(|| cpu_err("moe cpu expert splice: gate_up extent overflows"))?;
+    let dn_need = hipfire_cpu::gemv::row_bytes(quant, mi)
+        .checked_mul(dim)
+        .ok_or_else(|| cpu_err("moe cpu expert splice: down extent overflows"))?;
+    if gate_up_stride < gu_need {
         return Err(cpu_err(&format!(
-            "moe cpu-down splice: down_stride {down_stride} < expert bytes {need}"
+            "moe cpu expert splice: gate_up_stride {gate_up_stride} < expert bytes {gu_need}"
         )));
     }
-    let slots = n.checked_mul(k_top).ok_or_else(|| cpu_err("moe cpu-down splice: slot extent overflows"))?;
+    if down_stride < dn_need {
+        return Err(cpu_err(&format!(
+            "moe cpu expert splice: down_stride {down_stride} < expert bytes {dn_need}"
+        )));
+    }
+    let slots = n.checked_mul(k_top).ok_or_else(|| cpu_err("moe cpu expert splice: slot extent overflows"))?;
     if ti.len() < slots || tw.len() < slots {
-        return Err(cpu_err("moe cpu-down splice: top-k scratch short for batch"));
+        return Err(cpu_err("moe cpu expert splice: top-k scratch short for batch"));
     }
-    if rot.len() < slots.checked_mul(mi).ok_or_else(|| cpu_err("moe cpu-down splice: rot extent overflows"))? {
-        return Err(cpu_err("moe cpu-down splice: rot_batch short for batch"));
+    if x_rot.len() < n.checked_mul(dim).ok_or_else(|| cpu_err("moe cpu expert splice: x_rot extent overflows"))? {
+        return Err(cpu_err("moe cpu expert splice: x_rot short for batch"));
     }
-    if residual.len() < n.checked_mul(dim).ok_or_else(|| cpu_err("moe cpu-down splice: residual extent overflows"))? {
-        return Err(cpu_err("moe cpu-down splice: residual short for batch"));
+    if residual.len() < n.checked_mul(dim).ok_or_else(|| cpu_err("moe cpu expert splice: residual extent overflows"))? {
+        return Err(cpu_err("moe cpu expert splice: residual short for batch"));
     }
-    let mut down_out = vec![0.0f32; dim];
+    let mut gu_out = vec![0.0f32; 2 * mi];
+    let mut hidden = vec![0.0f32; mi];
+    let mut dn_out = vec![0.0f32; dim];
     for tok in 0..n {
+        let x = &x_rot[tok * dim..(tok + 1) * dim];
         for krank in 0..k_top {
             let slot_idx = tok * k_top + krank;
             let slot = (ti[slot_idx].to_bits() as i32) as u16 as usize;
-            let d0 = slot.checked_mul(down_stride).ok_or_else(|| cpu_err("moe cpu-down splice: down offset overflows"))?;
-            if d0.checked_add(need).is_none_or(|end| end > down_bytes.len()) {
-                return Err(cpu_err(&format!("moe cpu-down splice: down slot {slot} out of range")));
+            let gu0 = slot.checked_mul(gate_up_stride).ok_or_else(|| cpu_err("moe cpu expert splice: gate_up offset overflows"))?;
+            if gu0.checked_add(gu_need).is_none_or(|end| end > gate_up_bytes.len()) {
+                return Err(cpu_err(&format!("moe cpu expert splice: gate_up slot {slot} out of range")));
             }
-            let x = &rot[slot_idx * mi..(slot_idx + 1) * mi];
-            down_out.fill(0.0);
-            gemv(quant, &down_bytes[d0..d0 + need], dim, mi, x, &mut down_out);
+            gu_out.fill(0.0);
+            gemv(quant, &gate_up_bytes[gu0..gu0 + gu_need], 2 * mi, dim, x, &mut gu_out);
+            silu_mul(&gu_out, &mut hidden);
+            rotate_x(&mut hidden);
+            let dn0 = slot.checked_mul(down_stride).ok_or_else(|| cpu_err("moe cpu expert splice: down offset overflows"))?;
+            if dn0.checked_add(dn_need).is_none_or(|end| end > down_bytes.len()) {
+                return Err(cpu_err(&format!("moe cpu expert splice: down slot {slot} out of range")));
+            }
+            dn_out.fill(0.0);
+            gemv(quant, &down_bytes[dn0..dn0 + dn_need], dim, mi, &hidden, &mut dn_out);
             let w = tw[slot_idx];
             let acc = &mut residual[tok * dim..(tok + 1) * dim];
-            for (a, v) in acc.iter_mut().zip(down_out.iter()) {
+            for (a, v) in acc.iter_mut().zip(dn_out.iter()) {
                 *a += w * v;
             }
         }
