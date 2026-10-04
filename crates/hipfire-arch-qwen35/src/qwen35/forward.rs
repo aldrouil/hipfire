@@ -1720,7 +1720,7 @@ pub fn forward_scratch(
     // host sync point — a D2H and an H2D around the multiplication — so it can
     // neither be recorded into a hipGraph nor replayed out of one. Take the
     // non-captured path for the model's whole lifetime instead.
-    let cpu_blocks_capture = hipfire_dispatch::cpu_offload_active(config.i_gpu_start);
+    let cpu_blocks_capture = gpu.owns_host_cpu_weights();
     if graph_would_be_used && cpu_blocks_capture {
         hipfire_dispatch::log_capture_disabled_once();
     }

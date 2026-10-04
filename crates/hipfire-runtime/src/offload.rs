@@ -584,6 +584,10 @@ pub fn report(placement: &Placement, layers: &LayerBytes, host_bytes: u64) -> St
     } else {
         layers.expert_total() / n as u64
     };
+    // The total must be the *spilled* subset, not the model's whole expert
+    // stack: "pinned host" beside it is the spilled bytes, and reporting the
+    // whole model there reads as an operator error.
+    let spilled_experts = layers.host_expert_bytes(placement);
     format!(
         "moe offload: {} of {n} layers host-placed, routed experts host on {} layers \
          ({} MiB of routed experts per layer, {} MiB total); pinned host {} MiB; \
@@ -591,7 +595,7 @@ pub fn report(placement: &Placement, layers: &LayerBytes, host_bytes: u64) -> St
         placement.host_layers(),
         placement.host_expert_layers(),
         per_layer / MIB,
-        layers.expert_total() / MIB,
+        spilled_experts / MIB,
         host_bytes / MIB,
         layers.device_bytes(placement) / MIB,
     )

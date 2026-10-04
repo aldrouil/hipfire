@@ -152,17 +152,19 @@ pub fn cpu_quant_for(dtype: DType) -> Option<CpuQuant> {
     }
 }
 
-/// Whether a model with this resolved offload split has CPU-executed steps at
-/// all: CPU execution selected *and* a non-empty spilled prefix
-/// (`Qwen35Config::i_gpu_start`). With no spill every weight stays
-/// device-resident, [`Gpu::host_located`] is false everywhere, and not a single
-/// step can move to the CPU — `memory.offload_exec=cpu` must not change a number
-/// there.
+/// Whether a model with this many host-placed weight layers has CPU-executed
+/// steps at all: CPU execution selected *and* a non-empty host placement. With
+/// no spill every weight stays device-resident, [`Gpu::host_located`] is false
+/// everywhere, and not a single step can move to the CPU — `memory.offload_exec=cpu`
+/// must not change a number there.
 ///
-/// Conservative by construction: a spill whose every weight is an unsupported
-/// format also reports `true`, which costs a hipGraph but never correctness.
-pub fn cpu_offload_active(i_gpu_start: usize) -> bool {
-    cpu_exec_enabled() && i_gpu_start > 0
+/// `host_weight_layers` counts every layer with a host-mapped weight the CPU may
+/// multiply: whole-layer spills (the step seam) *and* routed-expert layers (the
+/// MoE CPU-down splice). Conservative by construction: a spill whose every weight
+/// is an unsupported format also reports `true`, which costs a hipGraph but never
+/// correctness.
+pub fn cpu_offload_active(host_weight_layers: usize) -> bool {
+    cpu_exec_enabled() && host_weight_layers > 0
 }
 
 /// Whether `memory.offload_exec=cpu` conflicts with a retained-replay backend.

@@ -41,10 +41,19 @@ HIPFIRE_MOE_EXPERT_BUDGET=20 \
 Stage-1 plan §Verification arm A on `qwen3.5:35b-a3b`, prompt
 `benchmarks/prompts/moe_offload_probe.txt` (md5 `1b1a4e91d31f6eefb7514352e0063a0f`):
 
-- resident (no knobs) → refused, `hipMalloc: out of memory` at layer 34;
+- resident (no knobs) → cannot load: `hipMalloc: out of memory` at layer 34 (no
+  preflight when both budgets are `Full` — the resident path keeps its
+  byte-identical contract rather than refusing with numbers);
 - `HIPFIRE_GPU_LAYER_BUDGET=26` → loads, `14 of 40 layers host-placed`, coherent;
 - `HIPFIRE_MOE_EXPERT_BUDGET=auto` → loads, `routed experts host on 14 layers`,
   coherent, numbers consistent with the per-layer figure (408 MiB/layer).
+
+**Residual (the class, not the instance).** `fused_gate_up_key_for`'s catch-all
+`_ => FusedGateUpHfq4G256` still silently aliases any dtype that reaches it
+without an arm to the qt13 kernel — the exact failure shape this bug was. The
+MQ6 arm closed this occurrence; making the alias *refuse* (panic like the qt=52
+arm, or narrow to the real HFQ4-G256 dtypes) is the durable fix and needs the
+valid dtype set confirmed first, so it is left as a follow-up rather than guessed.
 
 ## Goal and constraint
 
@@ -119,7 +128,7 @@ Each was killed by running something, not by argument.
 | dense qt44 codec + dense host read | `qwen3.8-27b.mq4` resident AND spilled-PCIe coherent (`Paris`). |
 | `run_experts` missing hidden rotation (found live this session) | `hipfire-cpu/src/moe.rs`: no `rotate_x` between silu and down GEMV. Fixed + unit test (FWHT formats rotate, `Mq2G256LloydU` does not). 32 lib tests green. This was a real stage-2 executor defect. |
 
-## Current lead (2026-10-04): layer-1 static inputs (ring reading corrected)
+## Retired lead: layer-1 static inputs (explained by the MQ6 fix)
 
 CORRECTION to the prefill-ring claim: `[moe-dn-prefill-ring] ring=0.000e0` is
 read *before* that layer's batch conv writes the ring — "not yet written",
@@ -153,8 +162,10 @@ finite inputs, on the first body. The routed chain (all qt44, all proven)
 never runs before the poison. Related real gap (not today's bug):
 `prefill_shared_gemm_key` returns `None` for `MQ6G256` (mod.rs:2469), so the
 non-fused GEMM path would refuse it outright — only the fused path
-mistranslates silently. Fix: key V1 MQ6 to a real MQ6 fused kernel if one
-exists, else refuse loudly like the GEMM path does.
+mistranslates silently. **Fixed in `3b3d2ab45`**: the MQ6 fused key exists, so
+`fused_gate_up_key_for` now selects it instead of the HFQ4 default. (The HFQ4
+catch-all remains for future formats — see the residual-class note in the
+Verification section.)
 
 ## Prior lead: prefill batched MoE body layer 0 (confirmed, narrowed above)
 

@@ -110,7 +110,7 @@ fn resolve_partial_offload(
     ctx: &LoadCtx,
     plan: &Qwen35KvPlan,
 ) -> Result<Option<offload::Placement>, String> {
-    use hipfire_config::memory::{moe_expert_budget, offload_exec, OffloadBudget, OffloadExec};
+    use hipfire_config::memory::{moe_expert_budget, OffloadBudget};
     let budgets = (
         hipfire_config::memory::gpu_layer_budget(),
         moe_expert_budget(),
@@ -118,22 +118,10 @@ fn resolve_partial_offload(
     if budgets == (OffloadBudget::Full, OffloadBudget::Full) {
         return Ok(None);
     }
-    // A CPU-executed step is a host sync point, so hipGraph capture must be off
-    // for the model's lifetime — but the arch's capture gate reads the
-    // config-level split (`i_gpu_start`), which `auto` leaves at zero. Refuse the
-    // combination until the gate reads the loaded placement instead of the config.
-    if offload_exec() == OffloadExec::Cpu
-        && (matches!(budgets.0, OffloadBudget::Auto) || matches!(budgets.1, OffloadBudget::Auto))
-    {
-        return Err(
-            "memory.offload_exec=cpu cannot be combined with an `auto` offload budget: the \
-             placement search would spill layers while the capture gate still reads the \
-             config-level split (which `auto` leaves at zero), leaving hipGraph capture enabled \
-             over CPU-executed steps. Pin an explicit layer count (memory.gpu_layer_budget / \
-             memory.moe_expert_budget), or set memory.offload_exec=pcie"
-                .to_string(),
-        );
-    }
+    // `memory.offload_exec=cpu` with an `auto` budget is allowed: the capture
+    // gate now reads the model-level host-weights flag the loader sets from the
+    // resolved placement (`Gpu::set_host_cpu_weights`), so `auto` can no longer
+    // leave hipGraph capture enabled over CPU-executed steps.
 
     let free_vram = ctx
         .gpu

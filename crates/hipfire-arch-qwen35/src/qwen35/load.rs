@@ -2679,11 +2679,20 @@ pub fn report_cpu_exec_coverage(
     } else {
         uncovered.into_iter().collect::<Vec<_>>().join(", ")
     };
+    // A dense model has no expert tier; printing "routed-expert steps of 0
+    // layers" would describe a tier that does not exist.
+    let expert_clause = if expert_layers.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; routed-expert steps of {} layers stay on the PCIe path",
+            expert_layers.len()
+        )
+    };
     eprintln!(
-        "cpu exec: {covered}/{} spilled layers fully covered by the CPU seam; routed-expert steps \
-         of {} layers stay on the PCIe path; uncovered quants: {list}",
+        "cpu exec: {covered}/{} spilled layers fully covered by the CPU seam{expert_clause}; \
+         uncovered quants: {list}",
         spilled.len(),
-        expert_layers.len(),
     );
 }
 
@@ -5832,17 +5841,18 @@ pub(crate) fn load_moe_ffn(
     if let Err(error) = down_copy {
         return Err(pending.rollback(gpu, error));
     }
-    // Diagnostic CPU-down splice: only under explicit `HIPFIRE_MOE_CPU_DOWN=1`
-    // (any other value, including `0`/unset, leaves the load untouched) on a
-    // host-placed packed layer, so resident loads are byte-identical. The sink
-    // owns one zeroed device buffer of exactly `down_stride` bytes and every
-    // down entry is rewritten to it; the real host blob stays intact for the
-    // CPU at forward time. AWQ layers stay refused: a bare `gemv` would ignore
-    // the per-expert scale.
-    let cpu_down_splice = hipfire_config::developer_var("HIPFIRE_MOE_CPU_DOWN")
-        .ok()
-        .as_deref()
-        != Some("0")
+    // Diagnostic CPU-down splice: only on the CPU arm (`memory.offload_exec=cpu`)
+    // and only on a host-placed packed layer, so the PCIe arm is genuinely PCIe
+    // and resident loads are byte-identical. `HIPFIRE_MOE_CPU_DOWN=0` is the
+    // kill-switch. The sink owns one zeroed device buffer of exactly
+    // `down_stride` bytes and every down entry is rewritten to it; the real host
+    // blob stays intact for the CPU at forward time. AWQ layers stay refused: a
+    // bare `gemv` would ignore the per-expert scale.
+    let cpu_down_splice = hipfire_dispatch::cpu_exec_enabled()
+        && hipfire_config::developer_var("HIPFIRE_MOE_CPU_DOWN")
+            .ok()
+            .as_deref()
+            != Some("0")
         && residency.experts_host()
         && pending.packed_expert_owners.is_some()
         && pending.experts.first().is_some_and(|e| e.down.awq_scale.is_none());

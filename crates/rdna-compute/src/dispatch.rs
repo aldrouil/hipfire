@@ -1907,6 +1907,7 @@ impl Gpu {
             },
             graphs: crate::graph::GraphState {
                 capture_mode: false,
+                host_cpu_weights: false,
                 capture_blobs: Vec::new(),
                 graph_exec: None,
                 captured_graph: None,
@@ -5234,6 +5235,22 @@ impl Gpu {
     pub fn host_located(&self, tensor: &GpuTensor) -> bool {
         // bind_thread: skip — pure read of the tensor's own ownership tag; no device call.
         tensor.buf.is_host_mapped()
+    }
+
+    /// Whether the loaded model owns host-mapped weights the CPU multiplies
+    /// (`memory.offload_exec=cpu` over a spilled prefix). A CPU step is a host
+    /// sync point, so hipGraph capture and retained replay are refused while
+    /// this is set — the one central gate, read by the arch forward paths and
+    /// the graph/replay controllers instead of a config-level mirror.
+    pub fn owns_host_cpu_weights(&self) -> bool {
+        self.graphs.host_cpu_weights
+    }
+
+    /// Record whether the model now being loaded owns CPU-executed (host)
+    /// weights. Set once per load from the resolved placement; cleared on unload.
+    pub fn set_host_cpu_weights(&mut self, on: bool) {
+        self.graphs.host_cpu_weights = on;
+        self.replay.set_host_cpu_weights(on);
     }
 
     /// The primary physical allocation handle backing a tensor's VMM arena, if any.

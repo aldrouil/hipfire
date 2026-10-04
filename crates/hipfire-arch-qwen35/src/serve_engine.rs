@@ -940,6 +940,16 @@ impl Rig {
                 .map(|v| v != "0")
                 .unwrap_or_else(|| gpu.is_uma()),
         );
+        // The capture gate and the CPU-exec coverage line are model-scoped: this
+        // slots path loads weights directly (not through
+        // `Architecture::load_weights_with_placement`), so it must set the flag,
+        // refuse an incompatible retained-replay backend, and report coverage here
+        // too — otherwise none of the three run on the serve route.
+        let host_weights = placement.host_layers() + placement.host_expert_layers();
+        gpu.set_host_cpu_weights(hipfire_dispatch::cpu_offload_active(host_weights));
+        hipfire_dispatch::reject_cpu_exec_under_redline(host_weights, gpu.replay.is_enabled())
+            .map_err(|e| format!("qwen35: {e}"))?;
+        crate::qwen35::load::report_cpu_exec_coverage(&hfq, &config, Some(&placement));
         let (weights, pinned_host_bytes): (Qwen35Weights, u64) = {
             let mut src = qwen35::HfqSource::new(&mut hfq, &config);
             let layout = qwen35::Layout::single(config.n_layers).with_placement(placement.clone());
