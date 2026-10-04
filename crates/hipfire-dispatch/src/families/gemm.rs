@@ -71,6 +71,10 @@ pub fn residual_gemm_key_for(dtype: DType) -> KernelKey {
         DType::MQ6G256 | DType::HFQ6G256 => KernelKey::GemmHfq6G256Residual,
         DType::MQ4G256V2 => KernelKey::GemmMq4G256V2Residual,
         DType::MQ4CG256 => KernelKey::GemmMq4CG256Residual,
+        // V1 MQ6 (200 B/group 6-bit) rides the HFQ6 residual family; the
+        // catch-all below is HFQ4 (136 B/group) and would misread it — the same
+        // silent-mistranslation class as the shared-expert NaN.
+        DType::MQ6G256 => KernelKey::GemmHfq6G256Residual,
         DType::MQ6G256V2 => KernelKey::GemmMq6G256V2Residual,
         DType::MQ5G256V2 => KernelKey::GemmMq5G256V2Residual,
         DType::MQ3G256V2 => KernelKey::GemmMq3G256V2Residual,
