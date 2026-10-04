@@ -21,11 +21,12 @@ Repro as written, fresh build (23.6 s), `HIPFIRE_GRAPH=0`, `--kv-mode fwht3
 --spec off`, greedy, `memory.max_seq = 2048`:
 
 ```
-HIPFIRE_MOE_V2_HOST_ALLOW=1 HIPFIRE_MOE_EXPERT_BUDGET=20 \
+HIPFIRE_MOE_EXPERT_BUDGET=20 \
   ./target/release/hipfire run ornith-1.5:35b-a3b -t 0 -n 32 --no-stream \
     --kv-mode fwht3 --spec off 'The capital of France is located in'
 # → The capital of France is Paris, which is located in the northern central
 #   part of the country, along the Seine River.      (~23 s, was `!!!!`)
+# No `HIPFIRE_MOE_V2_HOST_ALLOW` flag: the guard was removed (see below).
 ```
 
 Guard rail — the previously-passing qt13 control under the same spill, no allow:
@@ -88,10 +89,15 @@ HIPFIRE_MOE_V2_HOST_ALLOW=1 HIPFIRE_MOE_EXPERT_BUDGET=20 \
 host sync point and refuses capture. The splice refuses capture/replay loudly;
 do not "fix" that refusal.)
 
-Without `HIPFIRE_MOE_V2_HOST_ALLOW=1` the load **refuses by name**
-(`offload::unverified_host_refusal`). That refusal is correct and must stay.
-It also fires for dense qt44 spill (`qwen3.8-27b.mq4` + `GPU_LAYER_BUDGET=3`);
-that is the guard working, not a regression — add the allow flag for diagnosis.
+**The `HIPFIRE_MOE_V2_HOST_ALLOW` guard is gone** (`a7a60ed09`). It refused any
+host placement of the packed MQ4-V2 family (qt 44/45) because the wrong-first-
+token cause was not isolated; that cause is the MQ6 shared-expert fused-key bug
+above, and with it fixed the premise is false. `offload::unverified_host_refusal`,
+the `LayerBytes::unverified_host` census, the qwen35 packed-expert refusal, the
+pinned test, and the env var are all removed. Ornith's qt44 experts now host-place
+unflagged, and the qt44 kernel host path is pinned by `tests/gpu_moe_cpu_parity.rs`
+(host ≡ device, rel 4.59e-7 / 1.66e-7). Dense qt44 spill
+(`qwen3.8-27b.mq4` + `GPU_LAYER_BUDGET=3`) likewise loads without a flag.
 
 - **Symptom**: `!!!!` on every run. The NaN enters in **layer 1's DeltaNet
   attention block, pre-MoE**: layer-0 MoE exit finite (`|delta| 4.1`,
@@ -256,15 +262,14 @@ block earlier (that layer's MoE combine / `wo` / norms).
 
 - `HIPFIRE_MOE_CPU_ORACLE=1` — per layer: `|x|`, `|gpu-down|` (=0 always here,
   see traps), `|cpu-down|`, zero counts, `down_awq`.
-- `HIPFIRE_MOE_V2_HOST_ALLOW=1` — the only way to reach the unverified path;
-  warns once, diagnostic-only.
 - `HIPFIRE_LOAD_TRACE=1` — load timing / zero-copy lines.
-- `HIPFIRE_MOE_CPU_DOWN=1` (committed `4d2cde5`) — zeroed down sink + CPU down
-  recompute (decode + prefill), fail-closed on AWQ/tags/capture.
-- `HIPFIRE_MOE_CPU_BOTH_DECODE=1` / `HIPFIRE_MOE_CPU_BOTH_PREFILL=1`
-  (uncommitted) — gate_up sink + full expert FFN on CPU. Bisect halves
-  independently. Control: decode-only was broken (fixed via x_rot_local),
-  prefill-only always coherent.
+- `HIPFIRE_MOE_CPU_EXPERTS` (renamed from `HIPFIRE_MOE_CPU_DOWN`, `b066ce4b3`) —
+  the CPU expert splice: both expert tables sink to one zeroed buffer and the
+  whole FFN (gate_up + SiLU + down) is recomputed on the CPU for decode and
+  prefill, fail-closed on AWQ/tags/capture; `=0` is the kill-switch. The old
+  `HIPFIRE_MOE_CPU_BOTH_*` bisect halves are subsumed by it.
+- `HIPFIRE_MOE_V2_HOST_ALLOW` — **removed** (`a7a60ed09`); the unverified-host
+  guard it gated is gone.
 - `HIPFIRE_MOE_PACK_AUDIT=1` (uncommitted) — pack bytes vs file bytes (all
   slots) + pointer-table audit per layer.
 - `HIPFIRE_MOE_RESIDUAL_DELTA=1` (uncommitted) — residual before/after the
