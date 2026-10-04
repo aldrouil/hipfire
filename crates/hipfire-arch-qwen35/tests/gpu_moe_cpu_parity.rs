@@ -16,6 +16,14 @@
 //! loader builds it: the one combination nothing else in the tree performs
 //! (independent reference AND real host placement).
 //!
+//! The graded extension (`graded_moe_tag_parity`, same ignore gate) covers the
+//! mixed-dtype host layout: one real expert per tag bucket of the graded
+//! fixture (MQ6 hot / MQ4 mid / MQ3L cold), driven through the merged
+//! tag-branched kernels against `hipfire_cpu` over the same bytes, on both
+//! placements. That is the per-expert evidence the spill decode needs — the
+//! full-model resident baseline cannot load on a 16 GB card (19.7 GB of
+//! weights), so device-parity at model scale is not runnable here.
+//!
 //! Contract is llama.cpp-level, not bit-identity: tolerance against
 //! `max|reference|`, recorded per half and placement.
 //!
@@ -71,7 +79,9 @@ fn gpu_moe_cpu_parity() -> Result<(), Box<dyn std::error::Error>> {
             })
             .or_else(|| {
                 hfq.tensor_infos().iter().find(|t| {
-                    t.quant_type == 44 && t.name.contains(".mlp.experts.0.") && t.name.contains(frag)
+                    t.quant_type == 44
+                        && t.name.contains(".mlp.experts.0.")
+                        && t.name.contains(frag)
                 })
             })
             .unwrap_or_else(|| panic!("no qt44 {frag} tensor matching {want}"))
@@ -141,7 +151,9 @@ fn gpu_moe_cpu_parity() -> Result<(), Box<dyn std::error::Error>> {
                 gpu.download_raw_bytes(&dn.buf)?,
             ),
             MemoryTarget::HostMapped => (
-                gpu.host_bytes(&gu.buf).expect("host gate_up bytes").to_vec(),
+                gpu.host_bytes(&gu.buf)
+                    .expect("host gate_up bytes")
+                    .to_vec(),
                 gpu.host_bytes(&dn.buf).expect("host down bytes").to_vec(),
             ),
         };
@@ -230,6 +242,217 @@ fn gpu_moe_cpu_parity() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!(
             "MQ4V2_MOE_KERNEL_PARITY PASS (qt44 [{label}], gate_up {gu_m}x{m} + down {m}x{k})"
         );
+    }
+    Ok(())
+}
+
+const GRADED_FIXTURE_ENV: &str = "HIPFIRE_MOE_GRADED_PARITY_FIXTURE";
+const GRADED_DEFAULT_FIXTURE: &str = "qwen3.6-35b-a3b.mq4p";
+
+/// Per-tag parity for the graded host layout: one real expert per tag bucket
+/// (MQ6 hot / MQ4 mid / MQ3L cold on the default fixture), driven through the
+/// merged tag-branched kernels against `hipfire_cpu` over the same bytes, on
+/// both placements. Same ignore gate as the qt44 test above.
+#[test]
+#[ignore = "needs a real graded MoE fixture and a GPU; run with --ignored --features lab"]
+fn graded_moe_tag_parity() -> Result<(), Box<dyn std::error::Error>> {
+    let _guard = GPU_ORACLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = std::env::var(GRADED_FIXTURE_ENV).unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_default();
+        format!("{home}/.hipfire/models/{GRADED_DEFAULT_FIXTURE}")
+    });
+    if !Path::new(&path).is_file() {
+        eprintln!("skip: graded MoE fixture absent ({path}); set {GRADED_FIXTURE_ENV}");
+        return Ok(());
+    }
+    let hfq = HfqFile::open(Path::new(&path))?;
+    let mut gpu = Gpu::init()?;
+    // One expert per tag bucket, by quant-type pair: (15,15)=MQ6 tag 0,
+    // (13,13)=MQ4 tag 2, (20,20)=MQ3L tag 3. Expert 0's pair is whatever the
+    // fixture holds there; the scan below finds the first expert id carrying
+    // each pair so the test does not hard-code the tier map.
+    let mut bucket_expert: std::collections::BTreeMap<(u8, u8), usize> =
+        std::collections::BTreeMap::new();
+    for t in hfq.tensor_infos() {
+        if !t.name.contains(".mlp.experts.") || !t.name.contains("gate_up_proj.weight") {
+            continue;
+        }
+        let Some(eid) = t
+            .name
+            .split(".mlp.experts.")
+            .nth(1)
+            .and_then(|s| s.split('.').next()?.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        let down_bare = t.name.replace("gate_up_proj.weight", "down_proj.weight");
+        let down_name = qwen35_tensor_name_candidates(&down_bare)
+            .into_iter()
+            .find(|n| hfq.find_tensor_info(n).is_some());
+        let (Some(down_name), Some(gu_info)) = (down_name, hfq.find_tensor_info(&t.name)) else {
+            continue;
+        };
+        let dn_info = hfq.find_tensor_info(&down_name).expect("down info");
+        bucket_expert
+            .entry((gu_info.quant_type, dn_info.quant_type))
+            .or_insert(eid);
+    }
+    eprintln!("graded buckets (gate_qt, down_qt) -> expert: {bucket_expert:?}");
+    assert!(
+        !bucket_expert.is_empty(),
+        "no graded expert pairs found in {path}"
+    );
+    let load = |gpu: &mut Gpu, name: &str, m: usize, k: usize, target: MemoryTarget| {
+        load_weight_tensor(&hfq, gpu, name, m, k, qwen35_tensor_name_candidates, target)
+    };
+    let mut rng: u32 = 0x1234_5678;
+    let next_f32 = |rng: &mut u32| {
+        *rng ^= *rng << 13;
+        *rng ^= *rng >> 17;
+        *rng ^= *rng << 5;
+        (*rng as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+    for ((gate_qt, down_qt), eid) in &bucket_expert {
+        let gu_bare = format!(".mlp.experts.{eid}.gate_up_proj.weight");
+        let dn_bare = format!(".mlp.experts.{eid}.down_proj.weight");
+        let gu_name = hfq
+            .tensor_infos()
+            .iter()
+            .find(|t| t.name.contains(&gu_bare))
+            .expect("gate_up tensor")
+            .name
+            .clone();
+        let dn_name = hfq
+            .tensor_infos()
+            .iter()
+            .find(|t| t.name.contains(&dn_bare))
+            .expect("down tensor")
+            .name
+            .clone();
+        let gu_info = hfq.find_tensor_info(&gu_name).expect("gate_up info");
+        let dn_info = hfq.find_tensor_info(&dn_name).expect("down info");
+        let (gu_m, gu_k) = (gu_info.shape[0] as usize, gu_info.shape[1] as usize);
+        let (m, k) = (dn_info.shape[0] as usize, dn_info.shape[1] as usize);
+        assert_eq!(gu_m, 2 * k, "fused gate_up rows must be 2*mi");
+        assert_eq!(gu_k, m, "gate_up k (dim) must equal down m (dim)");
+        let x_raw: Vec<f32> = (0..m).map(|_| next_f32(&mut rng)).collect();
+        let mut x_rot = x_raw.clone();
+        hipfire_cpu::quant::rotate_x(&mut x_rot);
+        // CPU decoder per gate dtype; skip the bucket when hipfire-cpu has no
+        // decoder rather than failing a coverage gap as a parity failure.
+        let cpu_quant = |qt: u8| -> Option<hipfire_cpu::quant::CpuQuant> {
+            match qt {
+                13 => Some(hipfire_cpu::quant::CpuQuant::Mq4G256),
+                15 => Some(hipfire_cpu::quant::CpuQuant::Mq6G256),
+                20 => Some(hipfire_cpu::quant::CpuQuant::Mq3G256Lloyd),
+                _ => None,
+            }
+        };
+        let (Some(gu_q), Some(dn_q)) = (cpu_quant(*gate_qt), cpu_quant(*down_qt)) else {
+            eprintln!("skip bucket ({gate_qt},{down_qt}) expert {eid}: no hipfire-cpu decoder");
+            continue;
+        };
+        let cpu_expert = |gu_bytes: &[u8], dn_bytes: &[u8]| -> Vec<f32> {
+            let mi = k;
+            let mut gate_up_out = vec![0.0f32; 2 * mi];
+            let mut hidden = vec![0.0f32; mi];
+            let mut down_out = vec![0.0f32; m];
+            hipfire_cpu::gemv::gemv(gu_q, gu_bytes, 2 * mi, m, &x_rot, &mut gate_up_out);
+            hipfire_cpu::epilogue::silu_mul(&gate_up_out, &mut hidden);
+            hipfire_cpu::quant::rotate_x(&mut hidden);
+            hipfire_cpu::gemv::gemv(dn_q, dn_bytes, m, mi, &hidden, &mut down_out);
+            down_out
+        };
+        for target in [MemoryTarget::Device, MemoryTarget::HostMapped] {
+            let label = match target {
+                MemoryTarget::Device => "device",
+                MemoryTarget::HostMapped => "host",
+            };
+            let gu = load(&mut gpu, &gu_name, gu_m, gu_k, target)?;
+            let dn = load(&mut gpu, &dn_name, m, k, target)?;
+            assert_eq!(
+                gpu.host_located(&gu.buf),
+                matches!(target, MemoryTarget::HostMapped),
+                "[{label}] gate_up locality wrong"
+            );
+            let (gu_bytes, dn_bytes) = match target {
+                MemoryTarget::Device => (
+                    gpu.download_raw_bytes(&gu.buf)?,
+                    gpu.download_raw_bytes(&dn.buf)?,
+                ),
+                MemoryTarget::HostMapped => (
+                    gpu.host_bytes(&gu.buf)
+                        .expect("host gate_up bytes")
+                        .to_vec(),
+                    gpu.host_bytes(&dn.buf).expect("host down bytes").to_vec(),
+                ),
+            };
+            // Drive the merged tag-branched kernels with a one-entry tag table.
+            // topk=expert id 0 (single expert), grid.y is k8-specialized so the
+            // table holds 8 ranks with rank 0 live.
+            let tag = hipfire_arch_qwen35::qwen35::mixed_expert_tag(gu.gpu_dtype, dn.gpu_dtype)
+                .map_err(|e| format!("bucket ({gate_qt},{down_qt}): {}", e.message))?;
+            let tags = gpu.upload_raw(&[tag], &[1])?;
+            let gu_view = gu.buf.sub_offset(0, gu.buf.byte_size());
+            let dn_view = dn.buf.sub_offset(0, dn.buf.byte_size());
+            let gu_ptrs = gpu.upload_raw(&(gu_view.buf.as_ptr() as u64).to_ne_bytes(), &[8])?;
+            let dn_ptrs = gpu.upload_raw(&(dn_view.buf.as_ptr() as u64).to_ne_bytes(), &[8])?;
+            let topk = gpu.upload_raw(&[0u8; 32], &[32])?;
+            let x = gpu.upload_f32(&x_rot, &[m])?;
+            let mut cpu_gu = vec![0.0f32; gu_m];
+            hipfire_cpu::gemv::gemv(gu_q, &gu_bytes, gu_m, m, &x_rot, &mut cpu_gu);
+            let yg = gpu.zeros(&[8 * k], DType::F32)?;
+            let yu = gpu.zeros(&[8 * k], DType::F32)?;
+            gpu.gemv_mixed_moe_gate_up_k8_indexed_batched(
+                &gu_ptrs, &tags, &topk, &x, &yg, &yu, gu_m, m, 8, 1,
+            )?;
+            let (g_full, u_full) = (gpu.download_f32(&yg)?, gpu.download_f32(&yu)?);
+            let (g, u) = (g_full[..k].to_vec(), u_full[..k].to_vec());
+            let (cpu_g, cpu_u) = cpu_gu.split_at(k);
+            let gs = cpu_gu.iter().fold(0.0f32, |a, v| a.max(v.abs())).max(1e-6);
+            let wgg = g
+                .iter()
+                .zip(cpu_g.iter())
+                .fold(0.0f32, |a, (p, q)| a.max((p - q).abs()));
+            let wuu = u
+                .iter()
+                .zip(cpu_u.iter())
+                .fold(0.0f32, |a, (p, q)| a.max((p - q).abs()));
+            let wg = wgg.max(wuu);
+            let mut cpu_hidden = vec![0.0f32; k];
+            hipfire_cpu::epilogue::silu_mul(&cpu_gu, &mut cpu_hidden);
+            hipfire_cpu::quant::rotate_x(&mut cpu_hidden);
+            let rot = gpu.upload_f32(&cpu_hidden, &[k])?;
+            let out = gpu.zeros(&[m], DType::F32)?;
+            gpu.gemv_mixed_moe_down_k8_indexed_batched_expanded(
+                &dn_ptrs, &tags, &topk, &rot, &out, m, k, 1, 1,
+            )?;
+            let kernel = gpu.download_f32(&out)?;
+            let expect = cpu_expert(&gu_bytes, &dn_bytes);
+            let scale = expect.iter().fold(0.0f32, |a, v| a.max(v.abs())).max(1e-6);
+            let worst = kernel
+                .iter()
+                .zip(&expect)
+                .fold(0.0f32, |a, (p, q)| a.max((p - q).abs()));
+            eprintln!(
+                "graded ({gate_qt},{down_qt}) tag {tag} expert {eid} [{label}]: gate_up rel {:.3e}, down rel {:.3e}",
+                wg / gs,
+                worst / scale
+            );
+            assert!(
+                wg <= gs * REL_TOL,
+                "graded gate_up kernel ({gate_qt},{down_qt}) [{label}] disagrees: rel {:.3e}",
+                wg / gs
+            );
+            assert!(
+                worst <= scale * REL_TOL,
+                "graded down kernel ({gate_qt},{down_qt}) [{label}] disagrees: rel {:.3e}",
+                worst / scale
+            );
+            eprintln!(
+                "GRADED_TAG_PARITY PASS (qt{gate_qt}/qt{down_qt} tag {tag} [{label}], gate_up {gu_m}x{m} + down {m}x{k})"
+            );
+        }
     }
     Ok(())
 }
