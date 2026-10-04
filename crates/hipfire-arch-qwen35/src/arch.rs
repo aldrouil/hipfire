@@ -87,8 +87,10 @@ impl Architecture for Qwen35 {
     ) -> Result<Self::Weights, String> {
         // One line when `memory.offload_exec=cpu`, naming which spilled formats
         // the CPU can actually execute (silent otherwise; see the fn's docs).
+        // Reads the resolved placement, not the config-level `i_gpu_start` mirror,
+        // so an experts-only spill is reported instead of "nothing is spilled".
         // Before the source takes its mutable borrow of `hfq`.
-        crate::qwen35::load::report_cpu_exec_coverage(hfq, cfg);
+        crate::qwen35::load::report_cpu_exec_coverage(hfq, cfg, placement);
         // A retained-replay backend and CPU-executed steps are mutually
         // exclusive: the tape cannot express a step the CPU owns. Refuse the
         // load rather than replay a route with stale activations.
