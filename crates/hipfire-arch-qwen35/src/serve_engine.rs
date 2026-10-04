@@ -625,9 +625,10 @@ impl Rig {
         free_vram: u64,
         kv_bytes: u64,
     ) -> Result<hipfire_runtime::offload::Placement, String> {
-        use hipfire_config::memory::{gpu_layer_budget, moe_expert_budget, OffloadBudget};
+        use hipfire_config::memory::{effective_offload_budgets, OffloadBudget};
         use hipfire_runtime::offload;
-        let budgets = (gpu_layer_budget(), moe_expert_budget());
+        // A Qwen MoE defaults to auto-fit; dense stays opt-in (all-resident).
+        let budgets = effective_offload_budgets(config.num_experts != 0);
         if budgets == (OffloadBudget::Full, OffloadBudget::Full) {
             return Ok(offload::Placement::all_device(config.n_layers));
         }

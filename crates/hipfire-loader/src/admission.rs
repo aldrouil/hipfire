@@ -196,12 +196,13 @@ pub(crate) fn qwen4_mtp_with_host_mapped_experts(
     host_mapped_experts == 0 || spec.mtp == Some(true) || gpu_arch == "gfx1201"
 }
 
-/// True when either partial-offload budget is configured. The loader asks this
-/// before it resolves a placement, so it is a *request*, not a resolved spill.
-pub(crate) fn partial_offload_requested() -> bool {
-    use hipfire_config::memory::{gpu_layer_budget, moe_expert_budget, OffloadBudget};
-    let full = OffloadBudget::Full;
-    gpu_layer_budget() != full || moe_expert_budget() != full
+/// True when a placement search will run for this load: either budget is
+/// configured, or the model is a MoE (where auto-fit is the default). The loader
+/// asks this before it resolves a placement, so it is a *request*, not a
+/// resolved spill — a fitting MoE reports `true` here and still loads resident.
+pub(crate) fn partial_offload_requested(is_moe: bool) -> bool {
+    use hipfire_config::memory::{effective_offload_budgets, OffloadBudget};
+    effective_offload_budgets(is_moe) != (OffloadBudget::Full, OffloadBudget::Full)
 }
 
 /// Fail-closed list for partial GPU offload, raised where the arch is dispatched.

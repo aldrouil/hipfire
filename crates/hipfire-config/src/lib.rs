@@ -718,7 +718,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         Some("HIPFIRE_GPU_LAYER_BUDGET"),
-        "Resident-layer budget for partial GPU offload: N keeps the last N layers on the GPU and spills the rest to system RAM; unset keeps every layer on the GPU. The number counts layers ON the GPU, not layers offloaded — 3 on a 64-layer model spills 61. 'auto' (-1) places by fit: the smallest spill that loads, routed experts first, and a model that already fits is left fully resident."
+        "Resident-layer budget for partial GPU offload: N keeps the last N layers on the GPU and spills the rest to system RAM; unset keeps every layer on the GPU for a dense model (a Qwen MoE defaults to auto-fit when both budget keys are unset). The number counts layers ON the GPU, not layers offloaded — 3 on a 64-layer model spills 61. 'auto' (-1) places by fit: the smallest spill that loads, routed experts first, and a model that already fits is left fully resident."
     ),
     field!(
         "memory.moe_expert_budget",
@@ -730,7 +730,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         Some("HIPFIRE_MOE_EXPERT_BUDGET"),
-        "Resident routed-expert budget for a Mixture-of-Experts model whose experts exceed VRAM: N keeps the last N layers' routed experts on the GPU and spills the rest to system RAM; unset keeps every routed expert on the GPU. The number counts layers whose expert weights stay ON the GPU — llama.cpp's `--n-cpu-moe K` is this value written as `n_layers - K`. Only routed experts move: attention, router, shared expert and KV stay on the card. 'auto' (-1) places by fit, spilling routed experts before whole layers. No effect on a dense model, and none on an architecture that cannot spill experts (a configured spill fails that arch's load rather than being ignored)."
+        "Resident routed-expert budget for a Mixture-of-Experts model whose experts exceed VRAM: N keeps the last N layers' routed experts on the GPU and spills the rest to system RAM; unset resolves to auto-fit on a Qwen MoE (an over-fit MoE spills instead of OOMing mid-load) and keeps every routed expert on the GPU for a dense model. The number counts layers whose expert weights stay ON the GPU — llama.cpp's `--n-cpu-moe K` is this value written as `n_layers - K`. Only routed experts move: attention, router, shared expert and KV stay on the card. 'auto' (-1) places by fit, spilling routed experts before whole layers. No effect on a dense model, and none on an architecture that cannot spill experts (a configured spill fails that arch's load rather than being ignored)."
     ),
     field!(
         "memory.offload_exec",
@@ -6505,10 +6505,11 @@ pub mod memory {
     ///   layers before them spill to host RAM.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum OffloadBudget {
-        /// Fully resident — never offload (the zero-diff default).
+        /// Fully resident — never offload (the zero-diff default for dense).
         Full,
-        /// Defers placement to the engine, as `auto` does everywhere else in the
-        /// config. The engine currently keeps every layer on the GPU.
+        /// Places by fit: the minimum spill that loads, routed experts first,
+        /// whole layers only when the expert tier cannot free enough. A model
+        /// that already fits stays fully resident.
         Auto,
         /// Pin exactly this many resident layers; spill everything before them.
         Layers(usize),
@@ -6543,9 +6544,11 @@ pub mod memory {
     }
 
     /// The configured [`OffloadBudget`] from the process snapshot. Reads exactly
-    /// one resolved value: unset or `"auto"`/`"-1"` selects auto-fit; a non-negative
-    /// integer pins that many resident layers; anything else fails closed to full
-    /// residency (the zero-diff baseline).
+    /// one resolved value: `"auto"`/`"-1"` selects auto-fit; a non-negative integer
+    /// pins that many resident layers; unset/empty/unparseable fails closed to full
+    /// residency (the zero-diff baseline). For placement, use
+    /// [`effective_offload_budgets`] — a Qwen MoE defaults to auto-fit when both
+    /// keys are unset.
     pub fn gpu_layer_budget() -> OffloadBudget {
         parse_gpu_layer_budget(process_value("HIPFIRE_GPU_LAYER_BUDGET").as_deref())
     }
@@ -6563,9 +6566,39 @@ pub mod memory {
     /// [`gpu_layer_budget`]: unset/empty/unparseable is [`OffloadBudget::Full`]
     /// (never spill an expert), `"auto"`/`"-1"` is [`OffloadBudget::Auto`], and a
     /// non-negative integer pins that many layers whose routed experts stay on
-    /// the device.
+    /// the device. This is the raw key; [`effective_offload_budgets`] resolves a
+    /// Qwen MoE to auto-fit when both keys are unset.
     pub fn moe_expert_budget() -> OffloadBudget {
         parse_gpu_layer_budget(process_value("HIPFIRE_MOE_EXPERT_BUDGET").as_deref())
+    }
+
+    /// The budgets a placement search actually runs with, given whether the
+    /// model is a Mixture-of-Experts.
+    ///
+    /// MoE is the one case where auto-fit is the default rather than opt-in. A
+    /// Qwen3.5/3.6 MoE has a third placement axis (the routed-expert tier) and
+    /// routinely does not fit VRAM; leaving it fully resident is an
+    /// `hipMalloc: out of memory` mid-load, not a refusal. So unset (the `Full`
+    /// sentinel) means `Auto` on both tiers for a MoE — a model that already
+    /// fits still resolves to all-resident and stays byte-identical. Dense keeps
+    /// the opt-in contract: unset is `Full` and never spills. An explicit
+    /// `Layers(n)` or `auto` on either key still overrides the default.
+    pub fn effective_offload_budgets(is_moe: bool) -> (OffloadBudget, OffloadBudget) {
+        resolve_effective_budgets(is_moe, gpu_layer_budget(), moe_expert_budget())
+    }
+
+    /// Pure form of [`effective_offload_budgets`], testable without the
+    /// process-global snapshot.
+    pub(crate) fn resolve_effective_budgets(
+        is_moe: bool,
+        layer: OffloadBudget,
+        expert: OffloadBudget,
+    ) -> (OffloadBudget, OffloadBudget) {
+        if is_moe && layer == OffloadBudget::Full && expert == OffloadBudget::Full {
+            (OffloadBudget::Auto, OffloadBudget::Auto)
+        } else {
+            (layer, expert)
+        }
     }
 
     /// Which engine executes the ops that read a spilled layer's weights
@@ -6658,6 +6691,24 @@ pub mod memory {
             // closed to full residency rather than forcing an offload.
             assert_eq!(parse_gpu_layer_budget(Some("banana")), OffloadBudget::Full);
             assert_eq!(parse_gpu_layer_budget(Some("-2")), OffloadBudget::Full);
+        }
+
+        #[test]
+        fn moe_defaults_to_auto_fit_dense_stays_opted_in() {
+            use OffloadBudget::{Auto, Full, Layers};
+            // Unset MoE -> auto-fit on both tiers: an over-fit MoE spills instead
+            // of OOMing mid-load, and a fitting one still resolves all-resident.
+            assert_eq!(resolve_effective_budgets(true, Full, Full), (Auto, Auto));
+            // Unset dense -> all resident (the opt-in contract, unchanged).
+            assert_eq!(resolve_effective_budgets(false, Full, Full), (Full, Full));
+            // An explicit value on either key overrides the MoE default.
+            assert_eq!(
+                resolve_effective_budgets(true, Layers(26), Full),
+                (Layers(26), Full)
+            );
+            assert_eq!(resolve_effective_budgets(true, Full, Layers(20)), (Full, Layers(20)));
+            assert_eq!(resolve_effective_budgets(true, Full, Auto), (Full, Auto));
+            assert_eq!(resolve_effective_budgets(true, Auto, Full), (Auto, Full));
         }
 
         #[test]

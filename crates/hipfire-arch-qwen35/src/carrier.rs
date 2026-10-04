@@ -95,11 +95,12 @@ fn trunk_mtp_sidecar(hfq: &HfqFile) -> Option<std::path::PathBuf> {
 
 /// Resolve partial GPU offload before the first allocation.
 ///
-/// Returns `None` when neither knob is set, which is the *only* case that must
-/// stay byte-identical to the pre-offload loader: no measured capacity, no
-/// admission, no refusal — exactly as before. A model that does not fit still
-/// fails where it always did (the KV allocation), and the post-weight `card_cap`
-/// reduction is untouched.
+/// Returns `None` only when the resolved budgets are `Full`/`Full` — an unset
+/// **dense** load, which stays byte-identical to the pre-offload loader: no
+/// measured capacity, no admission, no refusal. A **MoE** resolves to `Auto`
+/// regardless of the knobs ([`effective_offload_budgets`]), so an over-fit MoE
+/// spills instead of OOMing mid-upload; a MoE that already fits is untouched
+/// (every layer resident).
 ///
 /// With a knob set, the capacity is `free VRAM − KV reservation − prefill floor −
 /// 128 MiB`, the same KV footprint the post-weight path computes, so the
@@ -110,11 +111,10 @@ fn resolve_partial_offload(
     ctx: &LoadCtx,
     plan: &Qwen35KvPlan,
 ) -> Result<Option<offload::Placement>, String> {
-    use hipfire_config::memory::{moe_expert_budget, OffloadBudget};
-    let budgets = (
-        hipfire_config::memory::gpu_layer_budget(),
-        moe_expert_budget(),
-    );
+    use hipfire_config::memory::{effective_offload_budgets, OffloadBudget};
+    // A Qwen MoE defaults to auto-fit (its experts usually do not fit); dense
+    // stays opt-in, where unset means all-resident.
+    let budgets = effective_offload_budgets(config.num_experts != 0);
     if budgets == (OffloadBudget::Full, OffloadBudget::Full) {
         return Ok(None);
     }

@@ -2235,7 +2235,13 @@ fn finish_qwen35_load(
     // `ornith-1.5:35b-a3b` + `moe_expert_budget=auto`; the same spill with
     // `--spec off` loads and decodes). An explicit request is refused with that
     // evidence; an implicit one degrades.
-    let offload_spill = crate::admission::partial_offload_requested();
+    // Conservative: any MoE now auto-fits, so MTP is off by default until the
+    // MTP path is spill-aware — including for a MoE that resolves fully resident,
+    // where MTP is a measured win (Strix Halo).
+    // TODO(moe-offload): key this on the resolved placement (host-mapped expert
+    // count) instead of `partial_offload_requested(is_moe)` so a fitting MoE
+    // keeps MTP.
+    let offload_spill = crate::admission::partial_offload_requested(config.num_experts != 0);
     if offload_spill && matches!(arch_id, 5 | 6) {
         if ctx.spec.mtp == Some(true) {
             return Err(
@@ -2243,8 +2249,8 @@ fn finish_qwen35_load(
                  requested MTP draft (speculation.mtp / --spec mtp). The MTP verify/prefill path is \
                  not host-expert aware and faults the GPU during prefill (measured on \
                  ornith-1.5:35b-a3b with memory.moe_expert_budget=auto). The draft itself stays on \
-                 the GPU; use --spec off with the spill, or unset memory.gpu_layer_budget / \
-                 memory.moe_expert_budget to keep MTP"
+                 the GPU; use --spec off with the spill, or keep every expert resident (an explicit \
+                 memory.moe_expert_budget that fits)"
                     .to_string(),
             );
         }
