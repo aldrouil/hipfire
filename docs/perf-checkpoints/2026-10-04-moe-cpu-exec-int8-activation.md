@@ -57,11 +57,13 @@ Net: neither the arithmetic (int8) nor the allocation class moved it. The
 remaining ~2× between 26 GB/s and the ~46–55 GB/s the box sustains is the open
 question; it is a property of the read path/pattern, not of the dot.
 
-## Disposition
+## Disposition — reverted
 
-The int8 path is **kept behind `HIPFIRE_MOE_CPU_I8`** (default on, `0` = f32):
-it is the llama.cpp arithmetic, it is bit-tested against the f32 kernel and the
-`block_i8_128` contract, and it is not slower — but it is perf-neutral on this
-fixture and costs an activation-quantization quality step, so it is a candidate
-to drop if the read-path investigation does not revive it. Raw logs:
+The int8 path was landed behind `HIPFIRE_MOE_CPU_I8` and then **reverted**: it
+is the llama.cpp arithmetic and is bit-tested against the f32 kernel and the
+`block_i8_128` contract, but it is perf-neutral on this fixture and costs an
+activation-quantization quality step for no gain, so it does not meet the bar to
+land. The three commits (`3d077947f` `block_i8_128`, `98adeb58f` the AVX2 group
+dot, `8d84c5854` the wiring) are undone; this record is kept as the evidence of
+the null and of *why* the arithmetic was not the lever. Raw logs:
 `results-offload/i8*-moe-cpu.*`.

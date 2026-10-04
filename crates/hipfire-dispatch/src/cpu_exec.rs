@@ -54,7 +54,6 @@ use std::time::Instant;
 
 use rdna_compute::{DType, Gpu, GpuTensor};
 
-use hipfire_cpu::block_i8::BlockI8_128;
 use hipfire_cpu::epilogue::{residual_add, silu_mul};
 use hipfire_cpu::gemv::gemv;
 use hipfire_cpu::quant::{divide_by_awq_scale, rotate_x, CpuQuant};
@@ -143,7 +142,7 @@ struct MoeStepStats {
 }
 
 /// `(quant, dim, mi, k)` → running per-shape totals.
-static MOE_SHAPES: LazyLock<Mutex<BTreeMap<(u8, usize, usize, usize, bool), MoeStepStats>>> =
+static MOE_SHAPES: LazyLock<Mutex<BTreeMap<(u8, usize, usize, usize), MoeStepStats>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
 /// `DType` → the decoder for it, for exactly the formats `hipfire_cpu` can
@@ -452,6 +451,7 @@ pub fn moe_cpu_experts(
     let mut hidden = vec![0.0f32; k * mi];
     let mut dn_all = vec![0.0f32; k * dim];
     let mut slots = vec![0usize; k];
+    let mut gu_pairs: Vec<(&[u8], &[f32])> = Vec::with_capacity(k);
     for (krank, slot_out) in slots.iter_mut().enumerate() {
         let slot = (ti[krank].to_bits() as i32) as u16 as usize;
         *slot_out = slot;
@@ -461,47 +461,10 @@ pub fn moe_cpu_experts(
         if gu0.checked_add(gu_need).is_none_or(|end| end > gu_bytes.len()) {
             return Err(cpu_err(&format!("moe cpu expert splice: gate_up slot {slot} out of range")));
         }
-        let dn0 = slot
-            .checked_mul(down_stride)
-            .ok_or_else(|| cpu_err("moe cpu expert splice: down offset overflows"))?;
-        if dn0.checked_add(dn_need).is_none_or(|end| end > dn_bytes.len()) {
-            return Err(cpu_err(&format!("moe cpu expert splice: down slot {slot} out of range")));
-        }
+        gu_pairs.push((&gu_bytes[gu0..gu0 + gu_need], x.as_slice()));
     }
-    // The int8-activation path (llama.cpp's arithmetic: maddubs over int8
-    // activations instead of decoding every code to f32) when the format and the
-    // CPU both allow it; the f32 path is the fallback and the reference.
-    // `HIPFIRE_MOE_CPU_I8=0` forces the f32 path (A/B).
-    let i8_kill = hipfire_config::developer_var("HIPFIRE_MOE_CPU_I8").ok().as_deref() == Some("0");
-    let use_i8 = !i8_kill
-        && matches!(quant, CpuQuant::Mq4G256V2)
-        && hipfire_cpu::simd::int8_dot_available()
-        && dim % 128 == 0
-        && mi % 128 == 0;
     let t_gu = Instant::now();
-    if use_i8 {
-        let act_dim: Vec<BlockI8_128> = (0..dim / 128)
-            .map(|b| BlockI8_128::quantize(&x[b * 128..]))
-            .collect();
-        let gu_blocks: Vec<&[u8]> = slots
-            .iter()
-            .map(|&s| {
-                let gu0 = s * gate_up_stride;
-                &gu_bytes[gu0..gu0 + gu_need]
-            })
-            .collect();
-        let acts: Vec<&[BlockI8_128]> = vec![act_dim.as_slice(); k];
-        hipfire_cpu::gemv::gemv_experts_i8_mq4v2(&gu_blocks, 2 * mi, dim, &acts, &mut gu_all);
-    } else {
-        let gu_pairs: Vec<(&[u8], &[f32])> = slots
-            .iter()
-            .map(|&s| {
-                let gu0 = s * gate_up_stride;
-                (&gu_bytes[gu0..gu0 + gu_need], x.as_slice())
-            })
-            .collect();
-        hipfire_cpu::gemv::gemv_experts(quant, 2 * mi, dim, &gu_pairs, &mut gu_all, None);
-    }
+    hipfire_cpu::gemv::gemv_experts(quant, 2 * mi, dim, &gu_pairs, &mut gu_all, None);
     let gu_ns = t_gu.elapsed().as_nanos() as u64;
     for e in 0..k {
         silu_mul(
@@ -510,40 +473,21 @@ pub fn moe_cpu_experts(
         );
         rotate_x(&mut hidden[e * mi..(e + 1) * mi]);
     }
-    let t_dn = Instant::now();
-    if use_i8 {
-        // Each expert's down projection has its own activation (its post-SiLU
-        // hidden), so it needs its own int8 blocks.
-        let per = mi / 128;
-        let mut act_hid: Vec<BlockI8_128> = Vec::with_capacity(k * per);
-        for e in 0..k {
-            for b in 0..per {
-                act_hid.push(BlockI8_128::quantize(&hidden[e * mi + b * 128..]));
-            }
+    let mut dn_pairs: Vec<(&[u8], &[f32])> = Vec::with_capacity(k);
+    for (krank, &slot) in slots.iter().enumerate() {
+        let dn0 = slot
+            .checked_mul(down_stride)
+            .ok_or_else(|| cpu_err("moe cpu expert splice: down offset overflows"))?;
+        if dn0.checked_add(dn_need).is_none_or(|end| end > dn_bytes.len()) {
+            return Err(cpu_err(&format!("moe cpu expert splice: down slot {slot} out of range")));
         }
-        let acts: Vec<&[BlockI8_128]> = (0..k).map(|e| &act_hid[e * per..(e + 1) * per]).collect();
-        let dn_blocks: Vec<&[u8]> = slots
-            .iter()
-            .map(|&s| {
-                let dn0 = s * down_stride;
-                &dn_bytes[dn0..dn0 + dn_need]
-            })
-            .collect();
-        hipfire_cpu::gemv::gemv_experts_i8_mq4v2(&dn_blocks, dim, mi, &acts, &mut dn_all);
-    } else {
-        let dn_pairs: Vec<(&[u8], &[f32])> = slots
-            .iter()
-            .enumerate()
-            .map(|(krank, &s)| {
-                let dn0 = s * down_stride;
-                (
-                    &dn_bytes[dn0..dn0 + dn_need],
-                    &hidden[krank * mi..(krank + 1) * mi],
-                )
-            })
-            .collect();
-        hipfire_cpu::gemv::gemv_experts(quant, dim, mi, &dn_pairs, &mut dn_all, None);
+        dn_pairs.push((
+            &dn_bytes[dn0..dn0 + dn_need],
+            &hidden[krank * mi..(krank + 1) * mi],
+        ));
     }
+    let t_dn = Instant::now();
+    hipfire_cpu::gemv::gemv_experts(quant, dim, mi, &dn_pairs, &mut dn_all, None);
     let dn_ns = t_dn.elapsed().as_nanos() as u64;
     for krank in 0..k {
         let w = tw[krank];
@@ -561,7 +505,6 @@ pub fn moe_cpu_experts(
         dim,
         mi,
         k,
-        use_i8,
         MoeStepTiming {
             d2h_first_ns,
             d2h_rest_ns,
@@ -578,14 +521,14 @@ pub fn moe_cpu_experts(
 /// call and at every doubling, so the `calls=1` line is the cold first step and
 /// later lines are steady state. Keyed by shape rather than summed process-wide,
 /// for the same reason [`trace_step`] is.
-fn trace_moe_step(q: CpuQuant, dim: usize, mi: usize, k: usize, i8: bool, timing: MoeStepTiming) {
+fn trace_moe_step(q: CpuQuant, dim: usize, mi: usize, k: usize, timing: MoeStepTiming) {
     if hipfire_config::developer_var("HIPFIRE_CPU_EXEC_TRACE").is_err() {
         return;
     }
     let Ok(mut shapes) = MOE_SHAPES.lock() else {
         return;
     };
-    let stats = shapes.entry((q as u8, dim, mi, k, i8)).or_default();
+    let stats = shapes.entry((q as u8, dim, mi, k)).or_default();
     stats.calls += 1;
     stats.d2h_first_ns += timing.d2h_first_ns;
     stats.d2h_rest_ns += timing.d2h_rest_ns;
@@ -599,7 +542,7 @@ fn trace_moe_step(q: CpuQuant, dim: usize, mi: usize, k: usize, i8: bool, timing
     let (on_cpu, on_gpu) = cpu_exec_counters();
     let per_ms = |ns: u64| ns as f64 / 1e6 / stats.calls as f64;
     eprintln!(
-        "cpu exec: moe expert splice dim={dim} mi={mi} k={k} quant={q:?} i8={i8} | {} calls | \
+        "cpu exec: moe expert splice dim={dim} mi={mi} k={k} quant={q:?} | {} calls | \
          {on_cpu} steps on CPU, {on_gpu} host-mapped steps still on GPU | mean per call: \
          d2h_first={:.2}ms d2h_rest={:.2}ms gu={:.2}ms dn={:.2}ms h2d={:.2}ms",
         stats.calls,

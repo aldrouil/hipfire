@@ -27,7 +27,6 @@
 //! together by asserting bit-for-bit equality over the real tensors of the
 //! on-disk fixtures.
 
-pub mod block_i8;
 pub mod epilogue;
 pub mod gemv;
 pub mod moe;

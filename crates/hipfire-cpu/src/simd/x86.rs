@@ -35,8 +35,6 @@
 
 use core::arch::x86_64::*;
 
-use crate::block_i8::BlockI8_128;
-
 /// Horizontal sum of eight `f32` lanes.
 #[inline]
 #[target_feature(enable = "avx2,fma")]
@@ -166,63 +164,6 @@ unsafe fn v2_group_dot<const BITS: usize>(gptr: *const u8, xg: *const f32) -> f3
     let (d0, s0) = codes_dot_sum::<BITS, 8>(gptr, xg, 0, 16);
     let (d1, s1) = codes_dot_sum::<BITS, 8>(gptr, xg, 16, 32);
     (h[0] * d0 + h[1] * s0) + (h[2] * d1 + h[3] * s1)
-}
-
-/// `Σ code_i · q_i` over one 128-element MQ4V2 half, in exact `int32`.
-///
-/// `payload` is the half's 64 packed bytes (byte `j` carries element `2j` in
-/// its low nibble and `2j+1` in its high nibble). `qs` is one
-/// [`crate::block_i8::BlockI8_128`]'s 128 codes in nibble-pair order — the
-/// per-8-group order `[even elements, odd elements]`. Masking the payload gives
-/// the two nibble planes, which *are* the even/odd element planes at the same
-/// byte positions; interleaving them at dword granularity reproduces exactly the
-/// `qs` byte order, so one `maddubs` + `madd` scores 32 elements with no
-/// per-nibble expansion.
-#[inline]
-#[target_feature(enable = "avx2")]
-unsafe fn mq4v2_i8_half_codot(payload: *const u8, qs: *const i8) -> i32 {
-    let mask = _mm_set1_epi8(0x0F);
-    let ones = _mm256_set1_epi16(1);
-    let mut acc = _mm256_setzero_si256();
-    for chunk in 0..4 {
-        let p = _mm_loadu_si128(payload.add(chunk * 16) as *const __m128i);
-        let lo = _mm_and_si128(p, mask);
-        let hi = _mm_and_si128(_mm_srli_epi16(p, 4), mask);
-        // [g0e, g0o, g1e, g1o | g2e, g2o, g3e, g3o] — the `qs` order for 4 groups.
-        let w = _mm256_inserti128_si256(
-            _mm256_castsi128_si256(_mm_unpacklo_epi32(lo, hi)),
-            _mm_unpackhi_epi32(lo, hi),
-            1,
-        );
-        let q = _mm256_loadu_si256(qs.add(chunk * 32) as *const __m256i);
-        // w is unsigned (codes 0..=15), q is signed: `maddubs` is exactly the
-        // (unsigned code × signed activation) product, pairwise-summed to
-        // int16, then `madd` folds the pairs into int32.
-        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(ones, _mm256_maddubs_epi16(w, q)));
-    }
-    let lo = _mm256_castsi256_si128(acc);
-    let hi = _mm256_extracti128_si256(acc, 1);
-    let s = _mm_add_epi32(lo, hi);
-    let s = _mm_hadd_epi32(s, s);
-    let s = _mm_hadd_epi32(s, s);
-    _mm_cvtsi128_si32(s)
-}
-
-/// One MQ4V2 256-element group against the matching int8 activation blocks:
-/// `d_act·(scale·Σ(code·q) + zero·s)` per 128-element half, summed.
-///
-/// This is the int8-activation image of [`uniform_group_dot`] for the V2
-/// format: the activation is a [`crate::block_i8::BlockI8_128`] per half
-/// (`d`, `s`, `qs`), so the per-element decode and the whole float `Σx`
-/// accumulator both disappear.
-#[inline]
-#[target_feature(enable = "avx2,f16c")]
-pub(crate) unsafe fn mq4v2_i8_group_dot(gptr: *const u8, act: &[BlockI8_128; 2]) -> f32 {
-    let h = f16_quad(gptr);
-    let c0 = mq4v2_i8_half_codot(gptr.add(8), act[0].qs.as_ptr());
-    let c1 = mq4v2_i8_half_codot(gptr.add(72), act[1].qs.as_ptr());
-    act[0].d * (h[0] * c0 as f32 + h[1] * act[0].s as f32)
-        + act[1].d * (h[2] * c1 as f32 + h[3] * act[1].s as f32)
 }
 
 /// The `CB`-entry `fp16` codebook at the group's start, indexed per lane by
