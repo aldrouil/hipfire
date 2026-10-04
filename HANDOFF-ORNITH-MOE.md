@@ -311,3 +311,13 @@ Goal was AR baseline, then DFlash and MTP arms. None reached speculation:
 Net: DFlash/MTP unreachable on this box (no placement loads). Per AGENTS.md
 §6, 3.6-A3B DFlash is a documented ~50% loss vs AR anyway (draft trained on
 3.5 traces), so AR is the recommendation there regardless.
+
+## Stash warning (do not pop)
+
+`stash@{0}` ("TEMP-DIAG ornith probes") is archaeology, not pending work. It
+contains the default-on `HIPFIRE_MOE_CPU_DOWN` splice gate (`!= Some("0")`,
+unset enables) that silently regressed the qt13 control from `Paris` to
+`open think span`, plus the `Box::leak` TEMP-DIAG thread-through in
+`carriers.rs`. A bare `git stash pop` reintroduces both onto a working
+branch. Recover single files with `git checkout stash@{0} -- <path>` only,
+never pop.
