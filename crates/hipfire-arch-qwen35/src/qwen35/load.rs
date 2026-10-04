@@ -2715,7 +2715,10 @@ pub fn report_cpu_exec_coverage(
 /// Counted from the *packed owners*, whose `GpuTensor`s carry the host-mapped
 /// ownership tag; the per-expert views are `sub_offset` slices and always report
 /// `Borrowed`, never `HostMapped`, so counting views would report zero.
-fn host_mapped_expert_accounting(layers: &[LayerWeights]) -> (usize, u64) {
+///
+/// Public so the loader can key its MTP-over-spill policy on the resolved
+/// placement (host-mapped count) instead of on MoE-ness.
+pub fn host_mapped_expert_accounting(layers: &[LayerWeights]) -> (usize, u64) {
     let mut tensors = 0usize;
     let mut bytes = 0u64;
     let mut tally = |owner: &GpuTensor| {
