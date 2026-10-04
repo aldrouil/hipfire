@@ -5868,6 +5868,29 @@ pub(crate) fn load_moe_ffn(
             .experts
             .first()
             .is_some_and(|e| e.gate_up.awq_scale.is_none() && e.down.awq_scale.is_none());
+    // Fail closed rather than silently leave host-placed AWQ experts on the PCIe
+    // read while the coverage line claims the CPU. A bare `gemv` would ignore the
+    // per-expert scale, so the CPU expert splice cannot handle AWQ on either
+    // projection — and MoE-AWQ is on by default, so this combination is reachable.
+    if hipfire_dispatch::cpu_exec_enabled()
+        && residency.experts_host()
+        && pending.packed_expert_owners.is_some()
+        && pending
+            .experts
+            .first()
+            .is_some_and(|e| e.gate_up.awq_scale.is_some() || e.down.awq_scale.is_some())
+    {
+        return Err(pending.rollback(
+            gpu,
+            HipError::new(
+                0,
+                "qwen35: memory.offload_exec=cpu with host-placed packed AWQ experts is refused — \
+                 the CPU expert splice cannot apply the per-expert AWQ scale, so the experts would \
+                 silently run on the GPU over PCIe. Keep them resident (raise \
+                 memory.moe_expert_budget) or set memory.offload_exec=pcie",
+            ),
+        ));
+    }
     if cpu_expert_splice {
         // One zero sink covers both tables: every gate_up and down entry points
         // at it, so any kernel read (whose extent is that table's stride) stays
