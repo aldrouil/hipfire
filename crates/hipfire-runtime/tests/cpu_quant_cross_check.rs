@@ -2,18 +2,16 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Live cross-check of `hipfire_cpu`'s transcription of the canonical weight
-//! decoder, over the **real** tensors of the on-disk fixtures.
+//! Live cross-check of the host-side weight decoder over the **real** tensors of
+//! the on-disk fixtures.
 //!
-//! `hipfire-cpu` is a dependency leaf (its tests run in the GPU-free gate with
-//! no GPU stack linked) so it cannot call
-//! `hipfire_runtime::weight_backend::dequantize_to_f32` — it reimplements the
-//! byte layouts instead. This test is what holds the two copies together: for
-//! every tensor of every fixture whose `quant_type` maps to a
-//! [`CpuQuant`], `hipfire_cpu::quant::dequant_group` must reproduce the
-//! canonical decoder **bit for bit**. A sign or normalization drift in the FWHT
-//! un-rotation is the "token soup" attractor failure mode, so equality here is
-//! exact, not approximate.
+//! `weight_backend::dequantize_to_f32` now delegates every block-quantized
+//! format to `hipfire_cpu::quant::dequant_group`, so for those formats this test
+//! compares the canonical decoder to itself. Its remaining two-sided value is
+//! the formats `dequantize_to_f32` still decodes locally (qt 1/2/3/14/16). The
+//! independent bit-exact oracle for the delegated formats is `hipfire-cpu`'s own
+//! `EXPECTED_*` table test (`quant.rs`), whose tables were generated from the
+//! canonical decoder before the cutover — keep both green.
 //!
 //! Not part of `scripts/no-gpu-ci.sh`'s curated list (it needs model files), and
 //! it decodes real tensors, so run it optimized:
