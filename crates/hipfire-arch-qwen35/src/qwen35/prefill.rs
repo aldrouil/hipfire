@@ -15919,7 +15919,6 @@ mod tests {
         Qwen35Config {
             dim: 5120,
             n_layers: 64,
-            i_gpu_start: 0,
             vocab_size: 152064,
             norm_eps: 1e-6,
             eos_token: 2,

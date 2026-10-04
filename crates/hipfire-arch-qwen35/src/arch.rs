@@ -94,10 +94,9 @@ impl Architecture for Qwen35 {
         // A retained-replay backend and CPU-executed steps are mutually
         // exclusive: the tape cannot express a step the CPU owns. Refuse the
         // load rather than replay a route with stale activations.
-        // The `None` route is the pre-placement one, where `i_gpu_start` is the
-        // only statement of what spilled — so keep today's dense refusal there
-        // rather than reporting nothing spilled.
-        let host_weights = placement.map_or(cfg.i_gpu_start, |p| {
+        // The `None` route is the pre-placement one — no placement was resolved,
+        // so nothing is spilled and the gate starts off.
+        let host_weights = placement.map_or(0, |p| {
             p.host_layers() + p.host_expert_layers()
         });
         // Any host-mapped weight the CPU may multiply is a host sync point: a

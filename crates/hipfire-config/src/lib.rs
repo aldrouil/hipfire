@@ -6497,11 +6497,10 @@ pub mod memory {
     ///   resident, never offload — byte-identical to a pure-VRAM run and the
     ///   regression guard for the whole feature.
     /// * [`OffloadBudget::Auto`] (`-1`) defers placement to the engine, as `auto`
-    ///   does for every other key. The engine currently keeps every layer on the
-    ///   GPU, because a real placement needs a measured device and per-layer
-    ///   weight bytes (see [`largest_fitting_tail`]) and this is resolved where
-    ///   neither exists. `auto` will mean the same thing once that measurement is
-    ///   in hand — it will just decide a split instead of nothing.
+    ///   does for every other key: the loader measures free VRAM, the per-layer
+    ///   weight bytes and the KV reservation, then places by fit — routed experts
+    ///   first, whole layers only when the expert tier cannot free enough. A model
+    ///   that already fits is left fully resident.
     /// * [`OffloadBudget::Layers`] pins exactly this many resident layers; the
     ///   layers before them spill to host RAM.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
