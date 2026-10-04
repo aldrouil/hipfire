@@ -118,3 +118,8 @@ required-features = ["deltanet", "moe-oracle"]
 name = "host_offload_smoke"
 path = "examples/host_offload_smoke.rs"
 required-features = ["lab"]
+
+[[example]]
+name = "mq4v2_moe_down_parity"
+path = "examples/mq4v2_moe_down_parity.rs"
+required-features = ["lab"]
