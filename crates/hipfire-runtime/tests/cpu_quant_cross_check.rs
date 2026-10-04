@@ -43,12 +43,14 @@ use hipfire_runtime::weight_backend::dequantize_weight_to_f32;
 
 /// Registry fixtures, smallest first. The 2B variants are the per-format
 /// fixtures (`mq3` = qt 17, `mq6` = qt 15, `hf6` = qt 8, `mq4` = qt 13).
-const FIXTURES: [&str; 5] = [
+const FIXTURES: [&str; 7] = [
     "qwen3.5-2b.mq4",
     "qwen3.5-2b.mq3",
     "qwen3.5-2b.mq6",
     "qwen3.5-2b.hf6",
     "qwen3.5-9b.mq4",
+    "qwen3.8-27b.mq4",
+    "ornith-1.5-35b-a3b.mq4",
 ];
 
 fn models_dir() -> PathBuf {

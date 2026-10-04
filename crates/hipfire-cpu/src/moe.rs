@@ -21,7 +21,7 @@
 
 use crate::epilogue::silu_mul;
 use crate::gemv::{gemv, row_bytes};
-use crate::quant::CpuQuant;
+use crate::quant::{rotate_x, CpuQuant};
 
 /// The packed expert weight blobs of one MoE layer, laid out as the on-disk
 /// tensor is: every routed expert's rows end to end.
@@ -110,6 +110,16 @@ pub fn run_experts(
             &mut gate_up_out,
         );
         silu_mul(&gate_up_out, &mut hidden);
+        // The device path fuses this rotation into the silu step
+        // (`fused_silu_mul_rotate_mq_batched`): the down weights are stored
+        // post-rotation, so the post-SiLU hidden must be forward-rotated
+        // before the down GEMV — for every FWHT-basis format. Skip it for the
+        // unrotated dtypes (e.g. `Mq2G256LloydU`), whose down weights live in
+        // the natural basis. (CPU-down never caught this: it consumed the
+        // GPU's already-rotated `rot_batch`.)
+        if blobs.quant.is_fwht_g256() {
+            rotate_x(&mut hidden);
+        }
         gemv(
             blobs.quant,
             &blobs.down[d0..d0 + down_bytes],
@@ -232,6 +242,76 @@ mod test {
         let mut got = vec![0.0f32; DIM];
         run_experts(&padded, &x, &[(0, 1.0), (1, 0.0)], &mut got).unwrap();
         assert_eq!(got, want);
+    }
+
+    #[test]
+    fn post_silu_hidden_is_rotated_before_down_on_fwht_formats() {
+        // Asymmetric gate/up bytes: the hidden is non-uniform, so skipping the
+        // post-SiLU rotation changes the down GEMV observably. A single-group
+        // swap (first two groups exchange their codes) is enough.
+        let gu0 = blob(2 * MI, DIM, 0);
+        let dn = blob(DIM, MI, 7_000_000);
+        let b = blobs(&gu0, &dn);
+        let x = activation();
+        let mut rotated = vec![0.0f32; DIM];
+        run_experts(&b, &x, &[(0, 1.0)], &mut rotated).unwrap();
+        // Recompute the same expert with the hidden rotation skipped: decode
+        // gate_up, silu, then down WITHOUT rotate_x. Must differ — otherwise
+        // the rotation under test is a no-op on this fixture and the test is
+        // vacuous.
+        {
+            use crate::epilogue::silu_mul;
+            use crate::gemv::{gemv, row_bytes};
+            let gu_bytes = row_bytes(Q, DIM) * 2 * MI;
+            let down_bytes = row_bytes(Q, MI) * DIM;
+            let mut gate_up_out = vec![0.0f32; 2 * MI];
+            let mut hidden = vec![0.0f32; MI];
+            let mut down_out = vec![0.0f32; DIM];
+            let mut xr = x.clone();
+            crate::quant::rotate_x(&mut xr);
+            gemv(Q, &gu0[..gu_bytes], 2 * MI, DIM, &xr, &mut gate_up_out);
+            silu_mul(&gate_up_out, &mut hidden);
+            // NOTE: no rotate_x here — the pre-fix behavior.
+            gemv(Q, &dn[..down_bytes], DIM, MI, &hidden, &mut down_out);
+            assert_ne!(
+                rotated, down_out,
+                "post-SiLU rotation must change the down output on FWHT formats"
+            );
+        }
+        // Unrotated sibling: rotation must NOT apply — same construction with
+        // Mq2G256LloydU must equal the manual no-rotate recompute exactly.
+        {
+            use crate::epilogue::silu_mul;
+            use crate::gemv::{gemv, row_bytes};
+            use crate::quant::CpuQuant;
+            let qu = CpuQuant::Mq2G256LloydU;
+            assert!(!qu.is_fwht_g256());
+            let gu_bytes = row_bytes(qu, DIM) * 2 * MI;
+            let down_bytes = row_bytes(qu, MI) * DIM;
+            let gu = crate::testfix::weight_bytes(qu, 2 * MI, DIM);
+            let dn = crate::testfix::weight_bytes(qu, DIM, MI);
+            let bu = ExpertBlobs {
+                gate_up: &gu,
+                down: &dn,
+                gate_up_stride: gu_bytes,
+                down_stride: down_bytes,
+                quant: qu,
+                dim: DIM,
+                mi: MI,
+            };
+            let mut got = vec![0.0f32; DIM];
+            run_experts(&bu, &x, &[(0, 1.0)], &mut got).unwrap();
+            // Manual reference: no input rotation (natural basis), no hidden
+            // rotation — must match bit-for-bit since the code path is
+            // straight-line GEMV+silu+GEMV with no RNG.
+            let mut gate_up_out = vec![0.0f32; 2 * MI];
+            let mut hidden = vec![0.0f32; MI];
+            let mut down_out = vec![0.0f32; DIM];
+            gemv(qu, &gu[..gu_bytes], 2 * MI, DIM, &x, &mut gate_up_out);
+            silu_mul(&gate_up_out, &mut hidden);
+            gemv(qu, &dn[..down_bytes], DIM, MI, &hidden, &mut down_out);
+            assert_eq!(got, down_out, "unrotated dtype must skip both rotations");
+        }
     }
 
     #[test]
