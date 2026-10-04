@@ -203,24 +203,9 @@ pub struct LayerBytes {
     pub non_expert: Vec<u64>,
     pub expert: Vec<u64>,
     pub always_resident: u64,
-    /// Layers that own a weight whose *host read* is not verified — the packed
-    /// MQ4-V2 family (MQ4G256V2 / MQ4CG256). Empty (the default) means every
-    /// layer is verified, so an arch that has not characterised its dtypes is
-    /// unaffected. The arch fills this from its own tensor index; the placement
-    /// resolver refuses a host-placed unverified layer, because a host read that
-    /// is wrong is worse than a load that refuses.
-    pub unverified_host: Vec<bool>,
 }
 
 impl LayerBytes {
-    /// The first host-placed layer whose host read is unverified, if any.
-    pub fn first_unverified_host(&self, placement: &Placement) -> Option<usize> {
-        (0..self.n_layers()).find(|layer| {
-            self.unverified_host.get(*layer).copied().unwrap_or(false)
-                && (placement.layer(*layer) == WeightResidency::HostMapped
-                    || placement.experts(*layer) == ExpertResidency::HostMapped)
-        })
-    }
     pub fn n_layers(&self) -> usize {
         self.non_expert.len()
     }
@@ -306,39 +291,6 @@ impl LayerBytes {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Capacity {
     pub weight_bytes: u64,
-}
-
-/// Refuse a placement that host-places a layer whose host read is unverified.
-///
-/// An arch marks such layers in [`LayerBytes::unverified_host`]; the refusal is
-/// raised here so both loaders and every arch share one message.
-pub fn unverified_host_refusal(layers: &LayerBytes, placement: &Placement) -> Option<String> {
-    let layer = layers.first_unverified_host(placement)?;
-    // Dev escape hatch, loud and explicit: the only way to exercise the MQ4-V2
-    // host path at all (and therefore the only way to revalidate or debug it),
-    // since no fixture on hand can run that model without a spill. Warn once per
-    // process so a run that took this path is never mistaken for a verified one.
-    if hipfire_config::developer_var("HIPFIRE_MOE_V2_HOST_ALLOW").is_ok() {
-        static WARNED: std::sync::Once = std::sync::Once::new();
-        WARNED.call_once(|| {
-            eprintln!(
-                "[offload] HIPFIRE_MOE_V2_HOST_ALLOW=1: host-placing an MQ4-V2 layer whose host \
-                 path is unverified. Output from this run is diagnostic only -- do not treat it \
-                 as a supported configuration."
-            );
-        });
-        return None;
-    }
-    Some(format!(
-        "load refused: layer {layer} carries weights in the packed MQ4-V2 family \
-         (MQ4G256V2 / MQ4CG256), whose host-mapped path is not verified — under this style of \
-         spill that model produced a wrong *first* token (ornith-1.5:35b-a3b), while the qt-13 \
-         (MQ4G256) control produced the right one. The cause is not isolated: those two \
-         differ in model as well as quant, the MQ4-V2 kernels and the tensor-level host read \
-         both pass their parity checks, and no fixture on hand separates the variables. Keep \
-         these layers resident by raising memory.moe_expert_budget / memory.gpu_layer_budget, \
-         or set HIPFIRE_MOE_V2_HOST_ALLOW=1 to run the unverified path for diagnosis"
-    ))
 }
 
 /// Device room a placement may spend, from the measured free VRAM and every
@@ -867,45 +819,7 @@ mod tests {
             non_expert: non_expert.to_vec(),
             expert: expert.to_vec(),
             always_resident: always,
-            unverified_host: Vec::new(),
         }
-    }
-
-    /// The fail-closed rule the packed MQ4-V2 arm depends on, pinned so it cannot
-    /// be dropped again on the premise that the qt-44 host read is exact — that
-    /// premise was an artifact (a comparison against a scratch tensor that is
-    /// never written, scored through a `rel > worst` test that NaN defeats).
-    #[test]
-    fn an_unverified_host_layer_refuses_by_name_and_a_verified_one_does_not() {
-        let mut layers = bytes(&[100, 100], &[400, 400], 50);
-        layers.unverified_host = vec![true, false];
-        let host_experts = Placement {
-            layer_residency: vec![WeightResidency::Resident; 2],
-            expert_residency: vec![ExpertResidency::HostMapped, ExpertResidency::Device],
-        };
-
-        let refusal = unverified_host_refusal(&layers, &host_experts)
-            .expect("host-placing an unverified layer's experts must refuse");
-        assert!(refusal.contains("layer 0"), "{refusal}");
-        assert!(refusal.contains("MQ4G256V2"), "{refusal}");
-        assert!(refusal.contains("moe_expert_budget"), "{refusal}");
-
-        // A whole-layer spill of the same layer takes its experts with it, so it
-        // is refused on the same rule rather than a second one.
-        let host_layer = Placement {
-            layer_residency: vec![WeightResidency::HostMapped, WeightResidency::Resident],
-            expert_residency: vec![ExpertResidency::Device, ExpertResidency::Device],
-        };
-        assert!(unverified_host_refusal(&layers, &host_layer).is_some());
-
-        // The qt-13 shape: verified layers host-place freely.
-        let verified = bytes(&[100, 100], &[400, 400], 50);
-        assert!(unverified_host_refusal(&verified, &host_experts).is_none());
-
-        // A resident placement never refuses, and an arch that has not
-        // characterised its dtypes (empty vector) is unaffected.
-        assert!(unverified_host_refusal(&layers, &Placement::all_device(2)).is_none());
-        assert!(unverified_host_refusal(&verified, &Placement::all_device(2)).is_none());
     }
 
     #[test]
