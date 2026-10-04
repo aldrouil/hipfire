@@ -590,27 +590,6 @@ fn dn_buffers(dn: &DeltaNetState) -> Vec<&GpuTensor> {
     v
 }
 
-/// Device-resident weight bytes for the placement described by `i_gpu_start`.
-///
-/// Sums the on-disk size of every tensor the loader will place on the device: all
-/// tensors of layers `[i_gpu_start .. n_layers)`, plus every non-layer tensor.
-/// `token_embd` / `output_norm` / `lm_head` are always resident because the host
-/// path is reachable only from the per-layer `HfqBackend`. Layers
-/// `[0 .. i_gpu_start)` are excluded: they live in host RAM, and charging them to
-/// the device is what stopped offload from affording the context it frees.
-///
-/// Conservative in one direction only. The AWQ sidecar of an *offloaded* layer
-/// stays device-resident and is not counted here, but it is a 1-D f16 vector of
-/// length K per tensor — tens of KB against the MiB of weight blob it accompanies
-/// — which the caller's fixed headroom absorbs.
-fn resident_weight_bytes(hfq: &hipfire_runtime::hfq::HfqFile, i_gpu_start: usize) -> u64 {
-    hfq.tensors()
-        .iter()
-        .filter(|t| tensor_layer_index(&t.name).map_or(true, |i| i >= i_gpu_start))
-        .map(|t| t.data_size as u64)
-        .sum()
-}
-
 /// Layer ordinal in an HFQ tensor name (`layers.<n>.…`, optionally behind a
 /// text-tower prefix such as `model.language_model.`). `None` for non-layer
 /// tensors.

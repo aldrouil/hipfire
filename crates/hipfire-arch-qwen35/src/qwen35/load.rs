@@ -2603,11 +2603,10 @@ pub fn report_cpu_exec_coverage(
     if offload_exec() != OffloadExec::Cpu {
         return;
     }
-    // The loaded placement is the only honest statement of what spilled: the
-    // config-level `i_gpu_start` mirror is 0 for an experts-only spill, so it
-    // would report "nothing is spilled" while every routed expert sits in host
-    // RAM. The `None` route is the pre-placement one; fall back to `i_gpu_start`
-    // there (the dense prefix it mirrors).
+    // The loaded placement is the only honest statement of what spilled: a
+    // config-level mirror would be 0 for an experts-only spill and report
+    // "nothing is spilled" while every routed expert sits in host RAM. The `None`
+    // route is the pre-placement one, where nothing is spilled.
     let (host_layers, expert_layers): (Vec<usize>, Vec<usize>) = match placement {
         Some(p) => (
             (0..config.n_layers)
@@ -2617,7 +2616,7 @@ pub fn report_cpu_exec_coverage(
                 .filter(|l| p.experts(*l) == ExpertResidency::HostMapped)
                 .collect(),
         ),
-        None => ((0..config.i_gpu_start).collect(), Vec::new()),
+        None => (Vec::new(), Vec::new()),
     };
     // The layer knob dominates: a host-placed layer's expert axis reads
     // `HostMapped` even when the model has no routed experts (a dense layer's

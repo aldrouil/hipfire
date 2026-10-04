@@ -121,10 +121,6 @@ pub struct TreeVerifyCtx<'a> {
 pub struct Qwen35Config {
     pub dim: usize,
     pub n_layers: usize,
-    /// Resident-tail split point for partial GPU offload. Layers `[0 .. i_gpu_start)`
-    /// spill to host-mapped system RAM; `[i_gpu_start .. n_layers)` stay device-resident. Set by the
-    /// Step 3 loader from the placement policy; `0` = fully resident (zero-diff default).
-    pub i_gpu_start: usize,
     pub vocab_size: usize,
     pub norm_eps: f32,
     pub eos_token: u32,
@@ -916,7 +912,6 @@ fn from_config_value(config: &serde_json::Value) -> Result<Qwen35Config, String>
     let mut config = Qwen35Config {
         dim,
         n_layers: raw.num_hidden_layers,
-        i_gpu_start: 0,
         vocab_size: raw.vocab_size,
         norm_eps: raw.rms_norm_eps,
         eos_token: first_token_or(raw.eos_token_id.as_ref(), 248044),
@@ -961,57 +956,7 @@ fn from_config_value(config: &serde_json::Value) -> Result<Qwen35Config, String>
     // of getting collapsed into a generic "bad metadata" fallback.
     apply_reap_plan(&mut config)?;
 
-    apply_offload_policy(&mut config);
-
     Ok(config)
-}
-
-/// Resident-tail split point for a configured budget.
-///
-/// Returns `i_gpu_start`, where layers `[0 .. i_gpu_start)` spill to host RAM and
-/// `[i_gpu_start .. n_layers)` stay on the GPU.
-///
-/// A resident count above the model's layer count keeps everything on the GPU
-/// (`saturating_sub` saturates). The loader's placement search is what reports a
-/// budget that could not do anything; this split is the config-level mirror.
-fn offload_split(n_layers: usize, budget: OffloadBudget) -> usize {
-    match budget {
-        OffloadBudget::Full => 0,
-        OffloadBudget::Layers(resident) => n_layers.saturating_sub(resident),
-        // `auto` means "the engine decides", exactly as it does for every other
-        // config key. The engine currently decides to offload nothing: a placement
-        // decision needs measured device capacity and per-layer weight bytes, and
-        // at config construction there is no `Gpu` (the arch trait hands us
-        // `&Config`). Once that measurement is in hand it feeds
-        // `hipfire_config::memory::largest_fitting_tail` and the engine decides a
-        // real split — `auto`'s meaning does not change, only what it decides.
-        //
-        // It deliberately does not fail the load: a config value that breaks a
-        // model reads to a user as "the model is broken", and the whole point of
-        // `auto` is that it is always a safe choice.
-        OffloadBudget::Auto => 0,
-    }
-}
-
-/// Resolve partial-GPU-offload placement for this config, in place.
-///
-/// Placement is fixed for the model's lifetime, so it is decided here — once, at
-/// config construction — rather than per request. The split keeps a contiguous
-/// resident TAIL `[i_gpu_start .. n_layers)` and spills the prefix `[0 ..
-/// i_gpu_start)` to host-mapped system RAM; `load_layer_into` turns that into a
-/// per-layer `host_local` flag.
-///
-/// `Full` (the default, and the zero-diff regression guard) and `Auto` leave
-/// `i_gpu_start = 0`, so every layer stays device-resident and the load is
-/// byte-identical to stock. `Layers(n)` is pure arithmetic on `n_layers` and
-/// needs no device measurement, which is why it can be resolved here.
-///
-/// Infallible, and silent. Placement *reporting* belongs to the loader, which
-/// resolves the full placement (both tiers, against measured capacity) and prints
-/// it once; this function only keeps `i_gpu_start` a truthful mirror of the dense
-/// layer knob for the config-level capture/CPU-exec gates, which still read it.
-fn apply_offload_policy(config: &mut Qwen35Config) {
-    config.i_gpu_start = offload_split(config.n_layers, hipfire_config::memory::gpu_layer_budget());
 }
 
 /// Apply an optional REAP keep-map to a freshly parsed `Qwen35Config`.
@@ -1695,50 +1640,6 @@ mod tests {
         });
         let cfg4 = from_config_value(&inner4).unwrap();
         assert!(dense_tp_rank_layouts(&cfg4, &shard).is_err());
-    }
-
-    /// The placement arithmetic, which had no test at all. `resident` counts
-    /// layers LEFT ON the GPU; `i_gpu_start` is where the spilled prefix ends, so
-    /// `offload_split(64, Layers(3)) == 61` is the contract the help text states.
-    #[test]
-    fn offload_split_maps_resident_count_to_spill_point() {
-        use hipfire_config::memory::OffloadBudget as B;
-        assert_eq!(
-            offload_split(64, B::Full),
-            0,
-            "unset keeps every layer resident"
-        );
-        assert_eq!(
-            offload_split(64, B::Auto),
-            0,
-            "auto is a placeholder = all resident"
-        );
-        assert_eq!(
-            offload_split(64, B::Layers(64)),
-            0,
-            "asking for all of them"
-        );
-        assert_eq!(offload_split(64, B::Layers(62)), 2, "2 spilled");
-        assert_eq!(offload_split(64, B::Layers(32)), 32, "32 spilled");
-        assert_eq!(offload_split(64, B::Layers(3)), 61, "3 on GPU, 61 spilled");
-        assert_eq!(
-            offload_split(64, B::Layers(0)),
-            64,
-            "0 resident spills everything"
-        );
-        // Overshoot saturates to fully resident instead of indexing out of range.
-        assert_eq!(
-            offload_split(64, B::Layers(200)),
-            0,
-            "more layers than the model has"
-        );
-        assert_eq!(
-            offload_split(1, B::Layers(999)),
-            0,
-            "single-layer model, large request"
-        );
-        // A model with no layers must not underflow either.
-        assert_eq!(offload_split(0, B::Layers(0)), 0, "degenerate model");
     }
 
     #[test]
