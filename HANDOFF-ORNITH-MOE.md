@@ -1,14 +1,50 @@
 # HANDOFF — get `ornith-1.5:35b-a3b` decoding coherently
 
-**Point-in-time document.** Updated 2026-10-04 at commit `4d2cde536` on branch
-`feature/qwen35-moe-offload` plus a large uncommitted tree (see State).
-Re-verify anything line-numbered before acting on it. Read `AGENTS.md`,
-`CLAUDE.md`, and `docs/QUANTIZATION.md` first.
-Supersedes the `bc85744da` revision: the MoE chain is FULLY exonerated and the
-fault has moved to the DeltaNet/conv path (see Current lead).
+**Point-in-time document.** Updated 2026-10-03 at commit `3b3d2ab45` on branch
+`feature/qwen35-moe-offload`. The uncommitted tree the prior revision described
+is committed; `git status --short` is clean, and `stash@{0}` remains archaeology
+(see Stash warning). Re-verify anything line-numbered before acting on it. Read
+`AGENTS.md`, `CLAUDE.md`, and `docs/QUANTIZATION.md` first.
 
-`ornith` currently emits a constant `!`. This document is what is known, what has
-been ruled out **by measurement**, and the shortest path from here.
+**RESOLVED 2026-10-03 — ornith decodes coherently.** The constant `!` was the
+V1 `MQ6G256` shared-expert path fogging `fused_gate_up_key_for`, whose catch-all
+aliased it to the qt13 `FusedGateUpHfq4G256` kernel (136 B/group) over 200
+B/group 6-bit bytes — a silent misread, NaN from finite inputs. Fixed in
+`3b3d2ab45` (one arm: `DType::MQ6G256 => KernelKey::FusedGateUpHfq6G256`,
+`crates/hipfire-dispatch/src/families/fused_qkv.rs`); verified end-to-end below.
+The "Already exonerated" table and the retired leads are the measurement record
+of how it was narrowed, not open work.
+
+## Verification (2026-10-03)
+
+Repro as written, fresh build (23.6 s), `HIPFIRE_GRAPH=0`, `--kv-mode fwht3
+--spec off`, greedy, `memory.max_seq = 2048`:
+
+```
+HIPFIRE_MOE_V2_HOST_ALLOW=1 HIPFIRE_MOE_EXPERT_BUDGET=20 \
+  ./target/release/hipfire run ornith-1.5:35b-a3b -t 0 -n 32 --no-stream \
+    --kv-mode fwht3 --spec off 'The capital of France is located in'
+# → The capital of France is Paris, which is located in the northern central
+#   part of the country, along the Seine River.      (~23 s, was `!!!!`)
+```
+
+Guard rail — the previously-passing qt13 control under the same spill, no allow:
+
+```
+HIPFIRE_MOE_EXPERT_BUDGET=20 \
+  ./target/release/hipfire run qwen3.5:35b-a3b -t 0 -n 32 --no-stream \
+    --kv-mode fwht3 --spec off 'The capital of France is located in'
+# → The capital of France is **Paris**. Paris is located in the **north-central
+#   part of France**, situated along the banks of the **Seine River**.
+```
+
+Stage-1 plan §Verification arm A on `qwen3.5:35b-a3b`, prompt
+`benchmarks/prompts/moe_offload_probe.txt` (md5 `1b1a4e91d31f6eefb7514352e0063a0f`):
+
+- resident (no knobs) → refused, `hipMalloc: out of memory` at layer 34;
+- `HIPFIRE_GPU_LAYER_BUDGET=26` → loads, `14 of 40 layers host-placed`, coherent;
+- `HIPFIRE_MOE_EXPERT_BUDGET=auto` → loads, `routed experts host on 14 layers`,
+  coherent, numbers consistent with the per-layer figure (408 MiB/layer).
 
 ## Goal and constraint
 
@@ -103,7 +139,7 @@ conv. Next: when is dl1's ring written — prefill batch conv, decode conv on
 a prior token, or never (init gap)? Bracket with the same ring read right
 after load/reset (before prefill) and right after the prefill chunk.
 
-## Current lead (2026-10-04, confirmed + narrowed): prefill shared-expert gate/up
+## RESOLVED: prefill shared-expert gate/up (fixed in `3b3d2ab45`)
 
 `[moe-prefill-dtypes]` (measured, layer 0, uncommitted probe): router=Q8_0,
 selector=Q8_0, shared gate/up/down=MQ6G256, routed gate_up/down=MQ4G256V2.
