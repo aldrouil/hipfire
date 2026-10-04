@@ -22,7 +22,7 @@
 //! Run explicitly (needs `--features lab` for `Gpu::init`):
 //!
 //!   HIPFIRE_MOE_PARITY_FIXTURE=$HOME/.hipfire/models/ornith-1.5-35b-a3b.mq4 \
-//!     cargo test -p hipfire-arch-qwen35 --features lab --locked \
+//!     cargo test --release -p hipfire-arch-qwen35 --features lab --locked \
 //!         --test gpu_moe_cpu_parity -- --ignored --test-threads=1 --nocapture
 
 use hipfire_arch_qwen35::qwen35::load::{load_weight_tensor, qwen35_tensor_name_candidates};
