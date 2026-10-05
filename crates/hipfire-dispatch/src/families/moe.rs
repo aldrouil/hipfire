@@ -1493,6 +1493,15 @@ impl MoePrefillResolution {
         // tags on any WMMA arch (gfx11 _k2 or gfx12 .gfx12). The routed
         // representative dtype may be MQ6/MQ5 and trip the suppression above,
         // so re-admit Path 2 when the file is graded-mixed (tag table present).
+        //
+        // Load-bearing for CORRECTNESS, not just perf. Measured 2026-10-04 on
+        // qwen3.6-35b-a3b.mq4p: forcing a graded narrow verify onto
+        // both-indexed projections (mixed indexed gate_up AND down together)
+        // drives MTP tau 2.34 -> 0.00 and degenerates the plain AR prompt
+        // prefill (`hipfire run --spec off`) to a repeated-token attractor;
+        // either indexed kernel alone is fine, so this is an all-indexed
+        // interaction, not a single-kernel defect. The narrow-verify gate must
+        // NOT override this re-admit.
         let use_path2 =
             use_path2 || (d.routed_has_mixed_experts && flags.moe_grouped_gemm && arch.has_wmma());
         // mfp4-E8 routed experts: use Path 2 (grouped-WMMA) on gfx1151 and gfx12
