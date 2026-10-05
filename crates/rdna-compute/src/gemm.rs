@@ -18151,7 +18151,56 @@ impl Gpu {
         m_total: usize,
         x_src_rows: usize,
     ) -> HipResult<()> {
+        self.gemm_mixed_moe_grouped_wmma_impl(
+            expert_weight_ptrs, expert_dtype_tags, expert_tile_ids, sorted_slot_index,
+            x_src, y_grouped, m, k, x_row_div, m_total, x_src_rows, false,
+        )
+    }
+
+    /// gfx1201 coalesced packed-weight variant, with the same grouped ABI.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_mixed_moe_grouped_wmma_coalesced(
+        &mut self,
+        expert_weight_ptrs: &GpuTensor,
+        expert_dtype_tags: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_src: &GpuTensor,
+        y_grouped: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        m_total: usize,
+        x_src_rows: usize,
+    ) -> HipResult<()> {
+        self.gemm_mixed_moe_grouped_wmma_impl(
+            expert_weight_ptrs, expert_dtype_tags, expert_tile_ids, sorted_slot_index,
+            x_src, y_grouped, m, k, x_row_div, m_total, x_src_rows, true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_mixed_moe_grouped_wmma_impl(
+        &mut self,
+        expert_weight_ptrs: &GpuTensor,
+        expert_dtype_tags: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_src: &GpuTensor,
+        y_grouped: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        m_total: usize,
+        x_src_rows: usize,
+        coalesced: bool,
+    ) -> HipResult<()> {
         self.bind_thread()?;
+        if coalesced && !self.arch_caps.is_gfx1201() {
+            return Err(hip_bridge::HipError::new(
+                0, "coalesced grouped WMMA requires gfx1201",
+            ));
+        }
         let is_gfx12 = self.arch_caps.is_rdna4();
         if !is_gfx12 && !self.arch_caps.has_wmma_w32() {
             return Err(hip_bridge::HipError::new(
@@ -18165,7 +18214,12 @@ impl Gpu {
         }
         // 4-warp LDS-tiled variant (gfx11/RDNA3 only). Env-gated; default OFF.
         let use_4w = !is_gfx12 && self.flags.moe_grouped_4w;
-        let (kernel_name, kernel_src) = if is_gfx12 {
+        let (kernel_name, kernel_src) = if coalesced {
+            (
+                "gemm_mixed_moe_grouped_wmma_coalesced_gfx1201",
+                kernels::GEMM_MIXED_MOE_GROUPED_WMMA_COALESCED_GFX1201_SRC,
+            )
+        } else if is_gfx12 {
             (
                 "gemm_mixed_moe_grouped_wmma_gfx12",
                 kernels::GEMM_MIXED_MOE_GROUPED_WMMA_GFX12_SRC,

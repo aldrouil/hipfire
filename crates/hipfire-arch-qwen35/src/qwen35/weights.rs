@@ -145,6 +145,23 @@ pub(crate) struct PackedExpertOwners {
     pub(crate) down: Vec<GpuTensor>,
 }
 
+impl PackedExpertOwners {
+    /// Uniform packing has one owner per projection; graded packing creates
+    /// only host-mapped buckets. Residency is therefore uniform within each
+    /// projection, and its first owner is authoritative even when every expert
+    /// tensor is a non-owning subrange.
+    pub(crate) fn host_mapped_projections(&self) -> (bool, bool) {
+        (
+            self.gate_up
+                .first()
+                .is_some_and(|owner| owner.buf.is_host_mapped()),
+            self.down
+                .first()
+                .is_some_and(|owner| owner.buf.is_host_mapped()),
+        )
+    }
+}
+
 /// SP2: build the per-expert (gate_up, down) quant-tier tables that
 /// [`hipfire_dispatch::families::moe::MoeDtypes`] uses to detect an
 /// intra-layer mixed-tier layer.
@@ -2899,6 +2916,155 @@ impl DeltaNetState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn metadata_weight(buf: GpuTensor) -> WeightTensor {
+        WeightTensor {
+            buf,
+            gpu_dtype: DType::F32,
+            m: 1,
+            k: 1,
+            row_stride: 0,
+            paro: None,
+            awq_scale: None,
+            lloyd_lut_e4m3: None,
+            lloyd_lut_f16: None,
+            lloyd_lut_c16: None,
+        }
+    }
+
+    fn metadata_owner(storage: &mut [u8], host_mapped: bool) -> GpuTensor {
+        // Metadata-only ownership descriptors, following hip-bridge's owner-tag
+        // tests. The live backing storage permits sub_offset pointer arithmetic.
+        // Neither descriptor nor its views is dereferenced by HIP or freed.
+        let ptr = storage.as_mut_ptr().cast();
+        let buf = unsafe {
+            if host_mapped {
+                hip_bridge::DeviceBuffer::from_host_mapped(ptr, storage.len())
+            } else {
+                hip_bridge::DeviceBuffer::from_vmm_owner(ptr, storage.len())
+            }
+        };
+        GpuTensor {
+            buf,
+            shape: vec![storage.len()],
+            dtype: DType::Raw,
+        }
+    }
+
+    fn metadata_moe(
+        experts: Vec<ExpertWeights>,
+        packed_expert_owners: Option<PackedExpertOwners>,
+    ) -> MoeFfnWeights {
+        let (expert_execution_plan, expert_table, expert_binding) =
+            test_expert_binding().expect("test expert metadata");
+        MoeFfnWeights {
+            router: metadata_weight(GpuTensor::null_for_test()),
+            experts,
+            packed_expert_owners,
+            shared_expert: SharedExpertWeights {
+                gate: metadata_weight(GpuTensor::null_for_test()),
+                up: metadata_weight(GpuTensor::null_for_test()),
+                down: metadata_weight(GpuTensor::null_for_test()),
+            },
+            shared_expert_gate: metadata_weight(GpuTensor::null_for_test()),
+            expert_gate_up_ptrs: GpuTensor::null_for_test(),
+            expert_down_ptrs: GpuTensor::null_for_test(),
+            expert_down_awq_ptrs: None,
+            cpu_expert_sink: None,
+            cpu_sink_gate_up_ptrs: None,
+            cpu_sink_down_ptrs: None,
+            expert_dtype_tags: None,
+            layer_idx: 0,
+            expert_shape: None,
+            paro_shared: None,
+            global_expert_dtypes: None,
+            ep_dummy_buffers: Vec::new(),
+            ep_dummy_experts: Vec::new(),
+            retired_expert_weights: Vec::new(),
+            mixed_expert_gate_up_tiers: None,
+            mixed_expert_down_tiers: None,
+            expert_execution_plan,
+            expert_table,
+            expert_binding,
+        }
+    }
+
+    #[test]
+    fn packed_projection_residency_comes_from_owners_not_borrowed_views() {
+        use hipfire_dispatch::families::moe::RoutedExpertWeights;
+
+        for gate_host in [false, true] {
+            for down_host in [false, true] {
+                let mut gate_storage = [0u8; 16];
+                let mut down_storage = [0u8; 16];
+                let gate_owner = metadata_owner(&mut gate_storage, gate_host);
+                let down_owner = metadata_owner(&mut down_storage, down_host);
+                let expert = ExpertWeights {
+                    gate_up: metadata_weight(gate_owner.sub_offset(4, 4)),
+                    down: metadata_weight(down_owner.sub_offset(8, 4)),
+                };
+                let ffn = metadata_moe(
+                    vec![expert],
+                    Some(PackedExpertOwners {
+                        gate_up: vec![gate_owner],
+                        down: vec![down_owner],
+                    }),
+                );
+                let (gate, down) = ffn.get(0).expect("packed expert views");
+                assert!(gate.buf.buf.is_borrowed());
+                assert!(down.buf.buf.is_borrowed());
+                assert!(!gate.buf.buf.is_host_mapped());
+                assert!(!down.buf.buf.is_host_mapped());
+                assert_eq!(ffn.host_mapped_projections(), (gate_host, down_host));
+
+                // Without owner metadata, the generic adapter must not infer
+                // host residency merely because these same views are borrowed.
+                assert_eq!(
+                    ResidentExpertWeights(&ffn.experts).host_mapped_projections(),
+                    (false, false)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unpacked_projection_residency_uses_direct_owners_and_empty_fails_closed() {
+        use hipfire_dispatch::families::moe::RoutedExpertWeights;
+
+        for gate_host in [false, true] {
+            for down_host in [false, true] {
+                let mut gate_storage = [0u8; 16];
+                let mut down_storage = [0u8; 16];
+                let ffn = metadata_moe(
+                    vec![ExpertWeights {
+                        gate_up: metadata_weight(metadata_owner(&mut gate_storage, gate_host)),
+                        down: metadata_weight(metadata_owner(&mut down_storage, down_host)),
+                    }],
+                    None,
+                );
+                assert_eq!(ffn.host_mapped_projections(), (gate_host, down_host));
+                assert_eq!(
+                    ResidentExpertWeights(&ffn.experts).host_mapped_projections(),
+                    (gate_host, down_host)
+                );
+            }
+        }
+        assert_eq!(
+            metadata_moe(Vec::new(), None).host_mapped_projections(),
+            (false, false)
+        );
+        assert_eq!(
+            metadata_moe(
+                Vec::new(),
+                Some(PackedExpertOwners {
+                    gate_up: Vec::new(),
+                    down: Vec::new(),
+                }),
+            )
+            .host_mapped_projections(),
+            (false, false)
+        );
+    }
 
     /// The classifier decides which tensors `memory.moe_expert_budget` may move,
     /// so its accept/reject sets are the contract. Every spelling below is one

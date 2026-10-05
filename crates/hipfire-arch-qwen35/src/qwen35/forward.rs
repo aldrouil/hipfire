@@ -471,6 +471,19 @@ impl hipfire_dispatch::families::moe::RoutedExpertWeights for MoeFfnWeights {
         }
     }
 
+    fn host_mapped_projections(&self) -> (bool, bool) {
+        if let Some(owners) = &self.packed_expert_owners {
+            owners.host_mapped_projections()
+        } else {
+            self.get(0).map_or((false, false), |(gate_up, down)| {
+                (
+                    gate_up.buf.buf.is_host_mapped(),
+                    down.buf.buf.is_host_mapped(),
+                )
+            })
+        }
+    }
+
     fn get(
         &self,
         expert_idx: usize,

@@ -4065,6 +4065,12 @@ pub const GEMM_MIXED_MOE_GROUPED_WMMA_4W_K2_SRC: &str =
 pub const GEMM_MIXED_MOE_GROUPED_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_mixed_moe_grouped_wmma.gfx12.hip");
 
+/// gfx1201 coalesced packed-weight reads; unchanged mixed grouped ABI and math.
+pub const GEMM_MIXED_MOE_GROUPED_WMMA_COALESCED_GFX1201_SRC: &str = concat!(
+    "#define HIPFIRE_MOE_COALESCED_WEIGHTS 1\n",
+    include_str!("../../../kernels/src/gemm_mixed_moe_grouped_wmma.gfx12.hip")
+);
+
 /// gfx12 (RDNA4) HFQ3/MQ3 sister of GEMM_HFQ4G256_MOE_GROUPED_WMMA_GFX12_SRC.
 /// Same WMMA tile geometry + expert_tile_ids sentinel pattern + kernarg
 /// layout; differs in dequant (HFQ3-G256 = 104 B/group, 8 × 3-bit chunks
