@@ -456,3 +456,253 @@ fn graded_moe_tag_parity() -> Result<(), Box<dyn std::error::Error>> {
     }
     Ok(())
 }
+
+/// Chained multi-expert batch-4 parity for the graded Path-1 route: gate_up
+/// (mixed indexed, k_top=8, batch=4) -> GPU fused silu+rotate -> mixed down,
+/// over 8 real host-mapped experts with mixed tags, against a per-slot CPU
+/// reference. The single-expert tests above cannot see index, layout, or
+/// chaining faults (batch=1, expert 0, CPU-fed rot); this is the
+/// pointer/staging discriminator. Missing fixture is a hard error, never a
+/// silent skip.
+#[test]
+#[ignore = "needs a real graded MoE fixture and a GPU; run with --ignored --features lab"]
+fn chained_graded_moe_batch4_parity() -> Result<(), Box<dyn std::error::Error>> {
+    let _guard = GPU_ORACLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = std::env::var(GRADED_FIXTURE_ENV).unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_default();
+        format!("{home}/.hipfire/models/{GRADED_DEFAULT_FIXTURE}")
+    });
+    if !Path::new(&path).is_file() {
+        return Err(format!("graded fixture absent ({path}); refusing silent skip").into());
+    }
+    let hfq = HfqFile::open(Path::new(&path))?;
+    let mut gpu = Gpu::init()?;
+    const N: usize = 4;
+    const KTOP: usize = 8;
+    // Prefer layer 3 (the handoff's divergence layer), fall back to layer 0.
+    // Need >=8 decodable experts spanning >=2 (gate_qt, down_qt) buckets.
+    let mut picked_layer: Option<usize> = None;
+    let mut buckets: std::collections::BTreeMap<(u8, u8), Vec<(usize, String, String)>> =
+        std::collections::BTreeMap::new();
+    for l in [3usize, 0] {
+        let needle = format!(".layers.{l}.mlp.experts.");
+        let mut b: std::collections::BTreeMap<(u8, u8), Vec<(usize, String, String)>> =
+            std::collections::BTreeMap::new();
+        for t in hfq.tensor_infos() {
+            if !t.name.contains(&needle) || !t.name.contains("gate_up_proj.weight") {
+                continue;
+            }
+            let Some(eid) = t
+                .name
+                .split(".mlp.experts.")
+                .nth(1)
+                .and_then(|s| s.split('.').next()?.parse::<usize>().ok())
+            else {
+                continue;
+            };
+            let down_bare = t.name.replace("gate_up_proj.weight", "down_proj.weight");
+            let down_name = qwen35_tensor_name_candidates(&down_bare)
+                .into_iter()
+                .find(|n| hfq.find_tensor_info(n).is_some());
+            let (Some(down_name), Some(gu_info)) =
+                (down_name, hfq.find_tensor_info(&t.name))
+            else {
+                continue;
+            };
+            let dn_info = hfq.find_tensor_info(&down_name).expect("down info");
+            if ![13u8, 15, 20].contains(&gu_info.quant_type)
+                || ![13u8, 15, 20].contains(&dn_info.quant_type)
+            {
+                continue;
+            }
+            b.entry((gu_info.quant_type, dn_info.quant_type))
+                .or_default()
+                .push((eid, t.name.clone(), down_name));
+        }
+        let total: usize = b.values().map(|v| v.len()).sum();
+        if total >= KTOP && b.len() >= 2 {
+            picked_layer = Some(l);
+            buckets = b;
+            break;
+        }
+    }
+    let l = picked_layer.ok_or("no layer with >=8 decodable experts across >=2 buckets")?;
+    eprintln!("chained parity layer {l} buckets: {buckets:?}");
+    // Round-robin across buckets so the 8 slots span distinct tags.
+    let key_list: Vec<(u8, u8)> = buckets.keys().cloned().collect();
+    let mut per_key_idx = vec![0usize; key_list.len()];
+    let mut chosen: Vec<(usize, String, String)> = Vec::new();
+    while chosen.len() < KTOP {
+        let mut moved = false;
+        for (ki, kk) in key_list.iter().enumerate() {
+            let v = &buckets[kk];
+            if per_key_idx[ki] < v.len() && chosen.len() < KTOP {
+                chosen.push(v[per_key_idx[ki]].clone());
+                per_key_idx[ki] += 1;
+                moved = true;
+            }
+        }
+        if !moved {
+            break;
+        }
+    }
+    assert_eq!(chosen.len(), KTOP, "bucket round-robin underfilled");
+    let cpu_quant = |qt: u8| -> Option<hipfire_cpu::quant::CpuQuant> {
+        match qt {
+            13 => Some(hipfire_cpu::quant::CpuQuant::Mq4G256),
+            15 => Some(hipfire_cpu::quant::CpuQuant::Mq6G256),
+            20 => Some(hipfire_cpu::quant::CpuQuant::Mq3G256Lloyd),
+            _ => None,
+        }
+    };
+    struct Loaded {
+        gu_bytes: Vec<u8>,
+        dn_bytes: Vec<u8>,
+        gu_q: hipfire_cpu::quant::CpuQuant,
+        dn_q: hipfire_cpu::quant::CpuQuant,
+        tag: u8,
+        gu_ptr: u64,
+        dn_ptr: u64,
+    }
+    let mut loaded: Vec<Loaded> = Vec::new();
+    let (mut dim, mut mi) = (0usize, 0usize);
+    // Keep owners alive: pointer tables point into these buffers.
+    let mut owners: Vec<(hipfire_runtime::llama::WeightTensor, hipfire_runtime::llama::WeightTensor)> =
+        Vec::new();
+    for (eid, gu_name, dn_name) in &chosen {
+        let gu_info = hfq.find_tensor_info(gu_name).expect("gate_up info");
+        let dn_info = hfq.find_tensor_info(dn_name).expect("down info");
+        let (gu_m, gu_k) = (gu_info.shape[0] as usize, gu_info.shape[1] as usize);
+        let (m, k) = (dn_info.shape[0] as usize, dn_info.shape[1] as usize);
+        assert_eq!(gu_m, 2 * k, "fused gate_up rows must be 2*mi");
+        assert_eq!(gu_k, m, "gate_up k (dim) must equal down m (dim)");
+        if dim == 0 {
+            dim = m;
+            mi = k;
+        }
+        assert_eq!((m, k), (dim, mi), "expert {eid}: geometry must match");
+        let gu = load_weight_tensor(
+            &hfq,
+            &mut gpu,
+            gu_name,
+            gu_m,
+            gu_k,
+            qwen35_tensor_name_candidates,
+            MemoryTarget::HostMapped,
+        )?;
+        let dn = load_weight_tensor(
+            &hfq,
+            &mut gpu,
+            dn_name,
+            m,
+            k,
+            qwen35_tensor_name_candidates,
+            MemoryTarget::HostMapped,
+        )?;
+        assert!(gpu.host_located(&gu.buf), "expert {eid} gate_up not host-mapped");
+        let gu_bytes = gpu.host_bytes(&gu.buf).expect("host gate_up bytes").to_vec();
+        let dn_bytes = gpu.host_bytes(&dn.buf).expect("host down bytes").to_vec();
+        let tag = hipfire_arch_qwen35::qwen35::mixed_expert_tag(gu.gpu_dtype, dn.gpu_dtype)
+            .map_err(|e| format!("expert {eid}: {}", e.message))?;
+        let gu_view = gu.buf.sub_offset(0, gu.buf.byte_size());
+        let dn_view = dn.buf.sub_offset(0, dn.buf.byte_size());
+        loaded.push(Loaded {
+            gu_bytes,
+            dn_bytes,
+            gu_q: cpu_quant(gu_info.quant_type).expect("gate decoder"),
+            dn_q: cpu_quant(dn_info.quant_type).expect("down decoder"),
+            tag,
+            gu_ptr: gu_view.buf.as_ptr() as u64,
+            dn_ptr: dn_view.buf.as_ptr() as u64,
+        });
+        owners.push((gu, dn));
+    }
+    let tags_seen: std::collections::BTreeSet<u8> = loaded.iter().map(|e| e.tag).collect();
+    assert!(tags_seen.len() >= 2, "need >=2 distinct tags, got {tags_seen:?}");
+    eprintln!("chained parity tags: {:?}", loaded.iter().map(|e| e.tag).collect::<Vec<_>>());
+    let gu_ptr_bytes: Vec<u8> = loaded.iter().flat_map(|e| e.gu_ptr.to_ne_bytes()).collect();
+    let dn_ptr_bytes: Vec<u8> = loaded.iter().flat_map(|e| e.dn_ptr.to_ne_bytes()).collect();
+    let tag_bytes: Vec<u8> = loaded.iter().map(|e| e.tag).collect();
+    let gu_ptrs = gpu.upload_raw(&gu_ptr_bytes, &[gu_ptr_bytes.len()])?;
+    let dn_ptrs = gpu.upload_raw(&dn_ptr_bytes, &[dn_ptr_bytes.len()])?;
+    let tags = gpu.upload_raw(&tag_bytes, &[tag_bytes.len()])?;
+    // topk covers all 8 local experts (row 0 alone is a permutation: 5r mod 8).
+    let mut topk_ids: Vec<i32> = Vec::with_capacity(N * KTOP);
+    for b in 0..N {
+        for r in 0..KTOP {
+            topk_ids.push(((b * 3 + r * 5 + b * r) % loaded.len()) as i32);
+        }
+    }
+    assert!(topk_ids.iter().all(|&id| id >= 0 && (id as usize) < loaded.len()));
+    let topk_bytes: Vec<u8> = topk_ids.iter().flat_map(|v| v.to_ne_bytes()).collect();
+    let topk = gpu.upload_raw(&topk_bytes, &[topk_bytes.len()])?;
+    let mut rng: u32 = 0x9e37_79b9;
+    let mut next_f32 = || {
+        rng ^= rng << 13;
+        rng ^= rng >> 17;
+        rng ^= rng << 5;
+        (rng as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+    let x_host: Vec<f32> = (0..N * dim).map(|_| next_f32()).collect();
+    let x = gpu.upload_f32(&x_host, &[N * dim])?;
+    let gate = gpu.zeros(&[N * KTOP * mi], DType::F32)?;
+    let up = gpu.zeros(&[N * KTOP * mi], DType::F32)?;
+    gpu.gemv_mixed_moe_gate_up_k8_indexed_batched(
+        &gu_ptrs, &tags, &topk, &x, &gate, &up, 2 * mi, dim, KTOP, N,
+    )?;
+    let rot = gpu.zeros(&[N * KTOP * mi], DType::F32)?;
+    gpu.fused_silu_mul_rotate_mq_batched(&gate, &up, &rot, mi, N * KTOP)?;
+    let expanded = gpu.zeros(&[N * KTOP * dim], DType::F32)?;
+    gpu.gemv_mixed_moe_down_k8_indexed_batched_expanded(
+        &dn_ptrs, &tags, &topk, &rot, &expanded, dim, mi, KTOP, N,
+    )?;
+    let (g_all, u_all, rot_all, exp_all) = (
+        gpu.download_f32(&gate)?,
+        gpu.download_f32(&up)?,
+        gpu.download_f32(&rot)?,
+        gpu.download_f32(&expanded)?,
+    );
+    let (mut w_gate, mut w_rot, mut w_down) = (0.0f32, 0.0f32, 0.0f32);
+    let (mut s_gate, mut s_rot, mut s_down) = (1e-6f32, 1e-6f32, 1e-6f32);
+    for b in 0..N {
+        let x_row = &x_host[b * dim..(b + 1) * dim];
+        for r in 0..KTOP {
+            let e = topk_ids[b * KTOP + r] as usize;
+            let le = &loaded[e];
+            let mut gu_out = vec![0.0f32; 2 * mi];
+            hipfire_cpu::gemv::gemv(le.gu_q, &le.gu_bytes, 2 * mi, dim, x_row, &mut gu_out);
+            let (cpu_g, cpu_u) = gu_out.split_at(mi);
+            let goff = (b * KTOP + r) * mi;
+            for i in 0..mi {
+                w_gate = w_gate.max((g_all[goff + i] - cpu_g[i]).abs());
+                w_gate = w_gate.max((u_all[goff + i] - cpu_u[i]).abs());
+                s_gate = s_gate.max(cpu_g[i].abs()).max(cpu_u[i].abs());
+            }
+            let mut hidden = vec![0.0f32; mi];
+            hipfire_cpu::epilogue::silu_mul(&gu_out, &mut hidden);
+            hipfire_cpu::quant::rotate_x(&mut hidden);
+            for i in 0..mi {
+                w_rot = w_rot.max((rot_all[goff + i] - hidden[i]).abs());
+                s_rot = s_rot.max(hidden[i].abs());
+            }
+            let mut d = vec![0.0f32; dim];
+            hipfire_cpu::gemv::gemv(le.dn_q, &le.dn_bytes, dim, mi, &hidden, &mut d);
+            let eoff = (b * KTOP + r) * dim;
+            for i in 0..dim {
+                w_down = w_down.max((exp_all[eoff + i] - d[i]).abs());
+                s_down = s_down.max(d[i].abs());
+            }
+        }
+    }
+    eprintln!(
+        "chained batch{N} k{KTOP} layer {l}: gate rel {:.3e}, gpu-rot rel {:.3e}, down rel {:.3e}",
+        w_gate / s_gate,
+        w_rot / s_rot,
+        w_down / s_down
+    );
+    assert!(w_gate <= s_gate * REL_TOL, "chained gate_up disagrees: rel {:.3e}", w_gate / s_gate);
+    assert!(w_rot <= s_rot * REL_TOL, "gpu silu+rotate disagrees: rel {:.3e}", w_rot / s_rot);
+    assert!(w_down <= s_down * REL_TOL, "chained down disagrees: rel {:.3e}", w_down / s_down);
+    eprintln!("CHAINED_BATCH4_PARITY PASS (layer {l}, tags {tags_seen:?})");
+    Ok(())
+}
