@@ -97,6 +97,7 @@ pub(super) struct MoePrefillSelection {
     pub(super) resolution: MoePrefillResolution,
     pub(super) path2_m_total: usize,
     pub(super) force_mq4_grouped_fp16: bool,
+    pub(super) coalesced_verify: bool,
     /// Exact architecture-selected route, or the generic grouped path.
     pub(super) route: Option<crate::families::moe::MoeRouteCapability>,
 }
@@ -885,6 +886,7 @@ impl<'a> SealedMoeOp<'a> {
             &selection.resolution,
             selection.path2_m_total,
             selection.force_mq4_grouped_fp16,
+            selection.coalesced_verify,
         )
     }
 
@@ -1010,6 +1012,7 @@ impl<'a> SealedMoeOp<'a> {
             selection.path2_m_total,
             total_slots,
             selection.force_mq4_grouped_fp16,
+            selection.coalesced_verify,
         )?;
         let compact_ep = matches!(
             &params.prelude.route,
@@ -1824,6 +1827,12 @@ pub(super) fn select_prefill(
         0
     };
     let force_mq4_grouped_fp16 = resolution.force_mq4_grouped_fp16 || params.force_mq4_grouped_fp16;
+    let coalesced_verify = ctx.arch.is_gfx1201()
+        && ctx.workload == crate::context::DispatchWorkload::SpeculativeVerify
+        && (2..=4).contains(&ctx.batch_size)
+        && (2..=4).contains(&params.batch_size)
+        && route.is_none()
+        && resolution.use_path2;
     let compact_ep = matches!(
         params.prelude.route,
         super::sealed_moe::PrefillRouteMode::ProduceRoot { .. }
@@ -1838,6 +1847,7 @@ pub(super) fn select_prefill(
         resolution,
         path2_m_total,
         force_mq4_grouped_fp16,
+        coalesced_verify,
         route,
     })
 }

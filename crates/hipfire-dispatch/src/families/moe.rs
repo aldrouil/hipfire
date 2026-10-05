@@ -699,7 +699,7 @@ pub fn moe_down_writes_expanded(routed_down: DType, has_dtype_tags: bool) -> boo
 
 // ── Dispatch parameters ────────────────────────────────
 
-/// Host-resident routed weights used only by the generic CPU-top-K fallback.
+/// Host-side routed weight views for generic CPU-top-K fallback and dispatch metadata.
 ///
 /// Implementations return borrowed dispatch views on demand so model hot paths
 /// do not rebuild an expert-reference vector for every token.
@@ -707,6 +707,21 @@ pub trait RoutedExpertWeights {
     fn len(&self) -> usize;
 
     fn get(&self, expert_idx: usize) -> Option<(WeightRef<'_>, WeightRef<'_>)>;
+
+    /// Representative `(gate_up, down)` host-mapped residency, read from the
+    /// owning allocations without querying HIP or traversing the expert table.
+    ///
+    /// The default supports owner-backed `get(0)` tensors and fails closed for
+    /// empty sets and borrowed views. Packed adapters must override this using
+    /// their allocation owners: a borrowed buffer is not residency metadata.
+    fn host_mapped_projections(&self) -> (bool, bool) {
+        self.get(0).map_or((false, false), |(gate_up, down)| {
+            (
+                gate_up.buf.buf.is_host_mapped(),
+                down.buf.buf.is_host_mapped(),
+            )
+        })
+    }
 
     fn is_empty(&self) -> bool {
         self.len() == 0

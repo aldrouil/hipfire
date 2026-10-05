@@ -921,6 +921,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         kernel,
         "gemm_mixed_moe_grouped_wmma_k2"
             | "gemm_mixed_moe_grouped_wmma_gfx12"
+            | "gemm_mixed_moe_grouped_wmma_coalesced_gfx1201"
             | "gemm_mixed_moe_grouped_wmma_4w_k2"
     ) {
         // expert_weight_ptrs, dtype_tags, tile_ids, sorted_slot_index, X_src (read); Y_grouped (write)
@@ -1631,6 +1632,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
             | "gemv_mixed_moe_down_k8_indexed_batched_expanded"
             | "gemm_mixed_moe_grouped_wmma_k2"
             | "gemm_mixed_moe_grouped_wmma_gfx12"
+            | "gemm_mixed_moe_grouped_wmma_coalesced_gfx1201"
             | "gemm_mixed_moe_grouped_wmma_4w_k2"
     ) {
         return Some(64);
@@ -9504,6 +9506,7 @@ mod tests {
         for symbol in [
             "gemm_mixed_moe_grouped_wmma_k2",
             "gemm_mixed_moe_grouped_wmma_gfx12",
+            "gemm_mixed_moe_grouped_wmma_coalesced_gfx1201",
             "gemm_mixed_moe_grouped_wmma_4w_k2",
         ] {
             let mut blob = hip_bridge::KernargBlob::new();
