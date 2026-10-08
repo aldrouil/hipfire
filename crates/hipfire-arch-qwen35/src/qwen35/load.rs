@@ -2692,8 +2692,8 @@ pub fn report_cpu_exec_coverage(
         String::new()
     } else if expert_cpu {
         format!(
-            "; routed-expert FFN of {} layers recomputed on the CPU for single-token decode \
-             (prefill and MTP verify keep the GPU grouped PCIe read)",
+            "; routed-expert FFN of {} layers recomputed on the CPU for single-token decode and \
+             narrow verify/rollback batches (wide prompt prefill keeps the GPU grouped PCIe read)",
             expert_layers.len()
         )
     } else {
@@ -6117,31 +6117,27 @@ pub(crate) fn load_moe_ffn(
     // resident loads are byte-identical. `HIPFIRE_MOE_CPU_EXPERTS=0` is the
     // kill-switch. Splice arming is computed before the tag table exists (it is
     // built below): the CPU arm over a host-placed packed layer with no AWQ
-    // sidecar and no dtype mix. The loader writes the **real** expert tables
-    // (every forward path reads them) and adds one zeroed sink buffer plus its
-    // two pointer-table twins, which the live-binding proof accepts by name.
-    // Only the single-token decode step binds the twins, so its GPU routed
-    // contribution is 0 and the CPU recomputes the whole FFN (gate_up + SiLU +
-    // down) from the intact host blobs. Prefill and the MTP verify batch keep
-    // the real tables and the GPU grouped PCIe read — the CPU expert FFN is
-    // compute-bound and loses to it by >10x at chunk sizes. AWQ
-    // layers stay refused: a bare `gemv` would ignore the per-expert scale, on
-    // either projection. Graded (mixed-dtype)
-    // layers stay refused for the same fail-closed reason: the splice decodes
-    // the whole blob at `experts[0]`'s dtype and a uniform stride, which
-    // silently mis-decodes every cold-tier expert — the decode-side twin of
-    // the prefill `tag table present` refusal.
-    let graded_mixed = match pending.experts.split_first() {
-        Some((first, rest)) => rest.iter().any(|e| {
-            e.gate_up.gpu_dtype != first.gate_up.gpu_dtype
-                || e.down.gpu_dtype != first.down.gpu_dtype
-        }),
-        None => false,
-    };
+    // sidecar. The loader writes the **real** expert tables (every forward path
+    // reads them) and adds one zeroed sink buffer plus its two pointer-table
+    // twins, which the live-binding proof accepts by name.
+    //
+    // Single-token decode and the narrow batched forwards that share the CPU
+    // target arithmetic (the `<=4`-row speculative verify and its accepted-prefix
+    // rollback replay) bind the twins, so their GPU routed contribution is 0 and
+    // the CPU recomputes the whole FFN (gate_up + SiLU + down) from the intact
+    // host blobs per (token, rank). Ordinary prompt prefill keeps the real tables
+    // and the GPU grouped PCIe read — the CPU expert FFN is compute-bound and
+    // loses to it by >10x at chunk sizes.
+    //
+    // Graded (mixed-dtype) layers are spliced too: the executor resolves each
+    // selected expert's own `(quant, bucket owner, byte offset)` from the packed
+    // buckets and decodes at its own dtype/stride, so cold-tier experts are no
+    // longer mis-decoded. The tag table and real tables are still written for
+    // the GPU arms (ordinary wide prefill). AWQ layers stay refused: a bare
+    // `gemv` would ignore the per-expert scale on either projection.
     let packed_host = residency.experts_host() && pending.packed_expert_owners.is_some();
     let cpu_expert_splice = hipfire_dispatch::cpu_exec::moe_cpu_experts_enabled()
         && packed_host
-        && !graded_mixed
         && matches!(pending.experts.first(), Some(e) if e.gate_up.awq_scale.is_none() && e.down.awq_scale.is_none());
     // Fail closed rather than silently leave host-placed AWQ experts on the
     // PCIe read while the coverage line claims the CPU. A bare `gemv` would
@@ -6161,28 +6157,16 @@ pub(crate) fn load_moe_ffn(
             ),
         ));
     }
-    // Fail closed rather than silently leave host-placed graded experts on the
-    // PCIe read while the coverage line claims the CPU.
-    if hipfire_dispatch::cpu_exec_enabled() && residency.experts_host() && graded_mixed {
-        return Err(pending.rollback(
-            gpu,
-            HipError::new(
-                0,
-                "qwen35: memory.offload_exec=cpu with host-placed graded (mixed-dtype) experts is refused — \
-                 the CPU expert splice decodes at one dtype and stride, so cold-tier experts would \
-                 silently mis-decode. Keep them resident (raise \
-                 memory.moe_expert_budget) or set memory.offload_exec=pcie",
-            ),
-        ));
-    }
     if cpu_expert_splice {
         // One zero sink backs both twins: every gate_up and down entry points
         // at it, so any kernel read (whose extent is that table's stride) stays
-        // in bounds. Sized to the larger stride.
-        let gu_stride = pending.experts[0].gate_up.buf.buf.size();
-        let dn_stride = pending.experts[0].down.buf.buf.size();
-        let sink_len = gu_stride.max(dn_stride);
-        let sink = match gpu.zeros(&[sink_len / 4], DType::F32) {
+        // in bounds. Sized to the largest expert extent across **every** tier:
+        // a graded layer has one stride per bucket, so sizing to `experts[0]`
+        // would leave a wider-tier read past the buffer.
+        let sink_len = pending.experts.iter().fold(0usize, |acc, e| {
+            acc.max(e.gate_up.buf.buf.size()).max(e.down.buf.buf.size())
+        });
+        let sink = match gpu.zeros(&[sink_len.div_ceil(4)], DType::F32) {
             Ok(tensor) => tensor,
             Err(error) => return Err(pending.rollback(gpu, error)),
         };
@@ -6191,13 +6175,14 @@ pub(crate) fn load_moe_ffn(
             .iter()
             .flat_map(|ptr| ptr.to_ne_bytes())
             .collect();
-        // Decode-only twins. The **real** tables stay intact, so every batched
-        // forward (prompt prefill, MTP verify) keeps the GPU grouped PCIe read:
-        // the CPU expert FFN is compute-bound and loses to it by >10x at chunk
-        // sizes (measured 15x on ornith/gfx1201). Only the single-token decode
-        // step binds these twins, so its GPU routed contribution is 0 and the
-        // CPU splice supplies it. The live-binding proof accepts the twins
-        // because they are named here at load time.
+        // CPU-splice twins. The **real** tables stay intact, so ordinary prompt
+        // prefill keeps the GPU grouped PCIe read (the CPU expert FFN is
+        // compute-bound and loses to it by >10x at chunk sizes, measured 15x on
+        // ornith/gfx1201). Single-token decode and the narrow batched forwards
+        // that must match its arithmetic (MTP/DFlash verify, accepted-prefix
+        // rollback replay) bind these twins instead, so their GPU routed
+        // contribution is 0 and the CPU splice supplies it. The live-binding
+        // proof accepts the twins because they are named here at load time.
         let gu_sink = match gpu.alloc_tensor(&[table_len], DType::F32) {
             Ok(tensor) => tensor,
             Err(error) => {
@@ -6226,7 +6211,7 @@ pub(crate) fn load_moe_ffn(
         pending.cpu_sink_down_ptrs = Some(dn_sink);
         if layer_idx == 0 {
             eprintln!(
-                "  [moe-cpu-expert] layer {layer_idx}: decode-only zeroed sink twins bound ({sink_len} B/entry); prefill keeps the PCIe grouped read"
+                "  [moe-cpu-expert] layer {layer_idx}: zeroed sink twins bound ({sink_len} B/entry); wide prefill keeps the PCIe grouped read"
             );
         }
         pending.cpu_expert_sink = Some(sink);

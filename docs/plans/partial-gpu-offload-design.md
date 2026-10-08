@@ -345,6 +345,7 @@ PCIe link (27.1 GB/s measured, §7) instead of device DRAM: this is llama.cpp's
   `execute_steps`, so their spilled weights are still read over PCIe; the seam
   covers their per-slot lm_head `Step::Gemv` only. The lm_head itself can never
   be host-mapped — it is part of `largest_fitting_tail`'s always-resident base.
+  **One path that used to fall in this gap is now covered:** on a `memory.moe_expert_budget` spill the AR single-token decode and any armed batched forward of `<=4` rows route their routed experts through the CPU splice (`crates/hipfire-cpu`) instead of the GPU grouped PCIe read, while wider prompt prefill and wider (>4-row) verify keep the real expert tables on the card. The gate is width-only — the armed sink plus `n <= 4`, irrespective of dispatch workload — so the `SpeculativeVerify` narrow verify and the `Standard` tape-disabled accepted-prefix rollback replay both take it, and so does an ordinary very short `<=4`-row prompt prefill. Graded (mixed-dtype) packed host experts are supported here — no-AWQ only, per tier, each expert's gate and down decoded in its own dtype with a checked bucket-owner offset and a zero sink sized to the largest tier extent; AWQ and unpackable/unsupported host formats stay refused.
 - **Numerical contract.** llama.cpp-level, not bit-identity (the same record's
   "Correctness gate"): the two engines are independent implementations with
   different accumulation orders. Acceptance is coherence plus task-correct output
