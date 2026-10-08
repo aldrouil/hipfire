@@ -1283,23 +1283,26 @@ pub struct MoeFfnWeights {
     pub expert_gate_up_ptrs: GpuTensor, // [num_experts * 2] f32 slots = num_experts × u64
     pub expert_down_ptrs: GpuTensor,      // [num_experts * 2] f32 slots = num_experts × u64
     /// CPU expert splice zero buffer (`memory.offload_exec=cpu`): a zeroed
-    /// device buffer of exactly one packed expert stride. The decode-only sink
-    /// twins [`Self::cpu_sink_gate_up_ptrs`] / [`Self::cpu_sink_down_ptrs`] point
-    /// every entry at it, so the single-token decode MoE step contributes 0 for the
-    /// routed experts while [`hipfire_dispatch::cpu_exec::moe_cpu_experts`]
-    /// recomputes them from the intact host blobs. `Some` only when the loader
-    /// armed the splice; freed as a buffer in `free_moe_ffn_with`.
+    /// device buffer covering the largest expert extent across every tier. The
+    /// splice sink twins [`Self::cpu_sink_gate_up_ptrs`] /
+    /// [`Self::cpu_sink_down_ptrs`] point every entry at it, so the CPU-spliced
+    /// forwards contribute 0 for the routed experts on the GPU while
+    /// [`hipfire_dispatch::cpu_exec::moe_cpu_experts`] recomputes them from the
+    /// intact host blobs. `Some` only when the loader armed the splice; freed as
+    /// a buffer in `free_moe_ffn_with`.
     pub(crate) cpu_expert_sink: Option<GpuTensor>,
 
     /// Zeroed-sink twins of [`Self::expert_gate_up_ptrs`] / [`Self::expert_down_ptrs`]:
-    /// every entry points at [`Self::cpu_expert_sink`]. The **single-token decode**
-    /// MoE step binds these so the GPU routed contribution is 0 and
+    /// every entry points at [`Self::cpu_expert_sink`]. The single-token decode
+    /// MoE step and the narrow batched forwards that share its target arithmetic
+    /// (narrow (<=4-row) speculative verify and rollback replay) bind these so the GPU
+    /// routed contribution is 0 and
     /// [`hipfire_dispatch::cpu_exec::moe_cpu_experts`] supplies it from the host
-    /// blobs. Batched forwards (prefill, MTP verify) bind the real tables and skip
-    /// the splice — the CPU expert FFN is compute-bound and loses to the GPU's
+    /// blobs. Ordinary wide prompt prefill binds the real tables and skips the
+    /// splice — the CPU expert FFN is compute-bound and loses to the GPU's
     /// grouped PCIe read at chunk sizes (measured 15x on ornith/gfx1201), so
-    /// `memory.offload_exec=cpu` applies to decode only, matching llama.cpp's
-    /// per-op batch routing.
+    /// `memory.offload_exec=cpu` applies to decode and narrow verify only,
+    /// matching llama.cpp's per-op batch routing.
     pub(crate) cpu_sink_gate_up_ptrs: Option<GpuTensor>,
     pub(crate) cpu_sink_down_ptrs: Option<GpuTensor>,
 

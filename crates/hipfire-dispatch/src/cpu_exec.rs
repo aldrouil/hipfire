@@ -124,8 +124,10 @@ struct StepStats {
 static SHAPES: LazyLock<Mutex<BTreeMap<(u8, usize, usize, bool, bool, bool), StepStats>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
-/// Per-shape totals for the decode MoE expert splice: the d2h / gemv / h2d split
-/// of one `(quant, dim, mi, k)` shape's calls.
+/// Per-shape totals for the MoE expert splice: the d2h / gemv / h2d split of one
+/// `(quant, dim, mi, top_k, rows, graded)` shape's calls. `quant` is the first
+/// selected expert's gate_up format (a representative); `graded` says the call's
+/// experts were not all one tier.
 #[derive(Clone, Copy, Default)]
 struct MoeStepStats {
     calls: usize,
@@ -141,8 +143,8 @@ struct MoeStepStats {
     h2d_ns: u64,
 }
 
-/// `(quant, dim, mi, k)` → running per-shape totals.
-static MOE_SHAPES: LazyLock<Mutex<BTreeMap<(u8, usize, usize, usize), MoeStepStats>>> =
+/// `(quant, dim, mi, top_k, rows, graded)` → running per-shape totals.
+static MOE_SHAPES: LazyLock<Mutex<BTreeMap<(u8, usize, usize, usize, usize, bool), MoeStepStats>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
 /// `DType` → the decoder for it, for exactly the formats `hipfire_cpu` can
@@ -367,36 +369,148 @@ pub fn run_host_mapped_gemv_residual(
     Ok(())
 }
 
-/// CPU FFN for one decode token's routed experts: recompute the full expert
-/// (gate_up GEMV + SiLU + hidden-rotate + down GEMV) on the CPU from the intact
-/// host blobs and accumulate the routing-weighted result into the residual.
+/// One selected expert's host-resident weight bytes for the CPU splice.
+///
+/// Each projection carries its own format, so a graded layer's experts (MQ6 hot
+/// / MQ4 mid / MQ3-Lloyd cold) resolve per expert, and an expert whose two
+/// projections differ is expressible too. The slices are the expert's *own*
+/// extents — no stride padding: `gate_up` is exactly
+/// `row_bytes(gate_up_quant, dim) * 2 * mi` bytes and `down` exactly
+/// `row_bytes(down_quant, mi) * dim`. The engine validates and refuses a short
+/// slice rather than reading past it.
+///
+/// Owns nothing, so the splice can hold a whole window's resolved slots in a
+/// fixed-capacity stack array instead of a heap `Vec` (`Copy` is what makes
+/// `[CpuMoeExpert; N]` initializable without an allocation).
+#[derive(Clone, Copy)]
+pub struct CpuMoeExpert<'a> {
+    pub gate_up_quant: CpuQuant,
+    pub gate_up: &'a [u8],
+    pub down_quant: CpuQuant,
+    pub down: &'a [u8],
+}
+
+/// Reusable host workspaces for the MoE CPU splice, kept in a thread-local so a
+/// per-token decode does not re-allocate them every layer. Resized on demand,
+/// never shrunk — the buffers are the splice's, not the caller's.
+///
+/// The first eight are the `f32` workspaces. The rest is plain index metadata
+/// (counts and offsets, no borrows), rebuilt each call in reusable storage so
+/// the warm path makes no heap allocation: the selected slots are grouped by
+/// expert id by a counting sort, which needs no per-group `Vec`. The
+/// borrow-carrying job descriptors cannot live here at all — they borrow these
+/// very buffers — so they are answered on demand through
+/// [`MoeJobSource`] instead.
+#[derive(Default)]
+struct MoeScratch {
+    x: Vec<f32>,
+    ti: Vec<f32>,
+    tw: Vec<f32>,
+    acc: Vec<f32>,
+    gu: Vec<f32>,
+    hidden: Vec<f32>,
+    dn: Vec<f32>,
+    gather: Vec<f32>,
+    /// Slots in first-seen group order: group `g` owns
+    /// `order[group_start[g]..group_start[g+1]]`.
+    order: Vec<u32>,
+    /// `groups + 1` start offsets into [`Self::order`].
+    group_start: Vec<u32>,
+    /// The global expert id of each group.
+    group_id: Vec<u16>,
+    /// Group index of each slot.
+    slot_group: Vec<u32>,
+    /// Position of each slot within its group (its column in the group's
+    /// row-major output run).
+    slot_si: Vec<u32>,
+    /// Element offset of each group's output run, plus a trailing total
+    /// (`groups + 1`); refilled per projection with that projection's row count.
+    group_off: Vec<usize>,
+}
+
+thread_local! {
+    static MOE_SCRATCH: std::cell::RefCell<MoeScratch> =
+        const { std::cell::RefCell::new(MoeScratch {
+            x: Vec::new(),
+            ti: Vec::new(),
+            tw: Vec::new(),
+            acc: Vec::new(),
+            gu: Vec::new(),
+            hidden: Vec::new(),
+            dn: Vec::new(),
+            gather: Vec::new(),
+            order: Vec::new(),
+            group_start: Vec::new(),
+            group_id: Vec::new(),
+            slot_group: Vec::new(),
+            slot_si: Vec::new(),
+            group_off: Vec::new(),
+        }) };
+}
+
+/// The top-k scratch's expert id, decoded exactly as the loader packed it: the
+/// router writes a `u16` id as the low bits of an `f32` bit pattern.
+fn expert_id(raw: f32) -> usize {
+    (raw.to_bits() as i32) as u16 as usize
+}
+
+/// `gate_up` extent of one expert: `row_bytes * 2 * mi`, checked.
+fn expert_gu_bytes(q: CpuQuant, dim: usize, mi: usize) -> Result<usize, DispatchError> {
+    hipfire_cpu::gemv::row_bytes(q, dim)
+        .checked_mul(2 * mi)
+        .ok_or_else(|| cpu_err("moe cpu expert splice: gate_up extent overflows"))
+}
+
+/// `down` extent of one expert: `row_bytes * dim`, checked.
+fn expert_down_bytes(q: CpuQuant, dim: usize, mi: usize) -> Result<usize, DispatchError> {
+    hipfire_cpu::gemv::row_bytes(q, mi)
+        .checked_mul(dim)
+        .ok_or_else(|| cpu_err("moe cpu expert splice: down extent overflows"))
+}
+
+/// Cap on the slots (`rows × top_k`) [`moe_cpu_experts`] resolves into a stack
+/// array instead of a heap `Vec`. Decode (1 row) and the ≤4-row verify window
+/// keep `rows × top_k` far below this for every real `num_experts_per_tok`; a
+/// wider window still works through the `Vec` fallback.
+const MOE_STACK_SLOTS: usize = 256;
+
+/// CPU FFN for a window of `rows` tokens' routed experts: recompute every
+/// selected expert (gate_up GEMV + SiLU + hidden-rotate + down GEMV) on the CPU
+/// from the intact host blobs and accumulate the routing-weighted result into
+/// the residual, one row at a time.
 ///
 /// `x_rot` is the already-rotated activation the gate_up projection consumes; the
-/// post-SiLU hidden is rotated here exactly as the fused kernel would. The decode
-/// MoE params bound the loader's zeroed sink twins, so the sealed MoE step
-/// contributed 0 for the routed experts; this supplies the whole contribution.
-/// Batched forwards (prefill, MTP verify) bind the real tables and keep the GPU
-/// grouped PCIe read, so this runs for single-token decode only.
+/// post-SiLU hidden is rotated here exactly as the fused kernel would (per the
+/// *down* projection's format). The decode MoE params bound the loader's zeroed
+/// sink twins, so the sealed MoE step contributed 0 for the routed experts; this
+/// supplies the whole contribution. `rows` is the window width (1 for decode, up
+/// to the narrow MTP verify width) and `top_k` is `num_experts_per_tok`; both are
+/// explicit so a tensor's spare capacity can never silently become the batch
+/// size.
 ///
-/// Fail-closed by construction: unavailable host bytes, an undecodable dtype, an
-/// AWQ sidecar (a bare `gemv` would ignore the per-expert scale), graph capture /
-/// replay recording (a CPU step is a host sync point), or short scratch are all
-/// errors, never silent zeros.
+/// `resolve` maps a selected expert's global id to its host bytes. It is called
+/// once per selected slot (`rows * top_k` calls, row-major then rank order) up
+/// front, may be asked for the same id more than once, and must be a pure
+/// function of the id.
+///
+/// Fail-closed by construction: an unknown expert id, unavailable host bytes, an
+/// undecodable dtype, an AWQ sidecar (a bare `gemv` would ignore the per-expert
+/// scale), graph capture / replay recording (a CPU step is a host sync point), a
+/// `dim`/`mi` that is not a multiple of 256, or short scratch are all errors,
+/// never silent zeros.
 #[allow(clippy::too_many_arguments)]
-pub fn moe_cpu_experts(
+pub fn moe_cpu_experts<'a>(
     gpu: &Gpu,
-    quant: CpuQuant,
     dim: usize,
     mi: usize,
-    gate_up_owner: &GpuTensor,
-    gate_up_stride: usize,
-    down_owner: &GpuTensor,
-    down_stride: usize,
+    rows: usize,
+    top_k: usize,
     x_rot: &GpuTensor,
     topk_indices: &GpuTensor,
     topk_weights: &GpuTensor,
     residual: &GpuTensor,
     awq: bool,
+    resolve: impl Fn(usize) -> Result<CpuMoeExpert<'a>, DispatchError>,
 ) -> Result<(), DispatchError> {
     if gpu.graphs.capture_mode || gpu.replay.is_recording() {
         return Err(cpu_err(
@@ -408,127 +522,389 @@ pub fn moe_cpu_experts(
             "moe cpu expert splice refuses AWQ weights: a bare gemv would ignore the per-expert scale",
         ));
     }
-    let gu_bytes = gpu
-        .host_bytes(gate_up_owner)
-        .ok_or_else(|| cpu_err("moe cpu expert splice: gate_up blob has no host bytes"))?;
-    let dn_bytes = gpu
-        .host_bytes(down_owner)
-        .ok_or_else(|| cpu_err("moe cpu expert splice: down blob has no host bytes"))?;
-    let k = topk_indices.numel().min(topk_weights.numel());
-    if k == 0 {
-        return Err(cpu_err("moe cpu expert splice: empty top-k scratch"));
-    }
-    let t_first = Instant::now();
-    let x = download_f32(gpu, x_rot, dim)?;
-    let d2h_first_ns = t_first.elapsed().as_nanos() as u64;
-    let t_rest = Instant::now();
-    let ti = download_f32(gpu, topk_indices, k)?;
-    let tw = download_f32(gpu, topk_weights, k)?;
-    let gu_need = hipfire_cpu::gemv::row_bytes(quant, dim)
-        .checked_mul(2 * mi)
-        .ok_or_else(|| cpu_err("moe cpu expert splice: gate_up extent overflows"))?;
-    let dn_need = hipfire_cpu::gemv::row_bytes(quant, mi)
-        .checked_mul(dim)
-        .ok_or_else(|| cpu_err("moe cpu expert splice: down extent overflows"))?;
-    if gate_up_stride < gu_need {
-        return Err(cpu_err(&format!(
-            "moe cpu expert splice: gate_up_stride {gate_up_stride} < expert bytes {gu_need}"
-        )));
-    }
-    if down_stride < dn_need {
-        return Err(cpu_err(&format!(
-            "moe cpu expert splice: down_stride {down_stride} < expert bytes {dn_need}"
-        )));
-    }
-    let mut acc = download_f32(gpu, residual, dim)?;
-    let d2h_rest_ns = t_rest.elapsed().as_nanos() as u64;
-    // Two rayon regions per layer (all experts' gate_up, then all experts' down)
-    // instead of 2k small ones: the per-call region entry dominates when each
-    // expert's GEMV is only a few thousand rows. Per output element the work is
-    // the same `dot_row_simd`, and the residual is still accumulated in rank
-    // order, so the result is unchanged.
-    let mut gu_all = vec![0.0f32; k * 2 * mi];
-    let mut hidden = vec![0.0f32; k * mi];
-    let mut dn_all = vec![0.0f32; k * dim];
-    let mut slots = vec![0usize; k];
-    let mut gu_pairs: Vec<(&[u8], &[f32])> = Vec::with_capacity(k);
-    for (krank, slot_out) in slots.iter_mut().enumerate() {
-        let slot = (ti[krank].to_bits() as i32) as u16 as usize;
-        *slot_out = slot;
-        let gu0 = slot
-            .checked_mul(gate_up_stride)
-            .ok_or_else(|| cpu_err("moe cpu expert splice: gate_up offset overflows"))?;
-        if gu0.checked_add(gu_need).is_none_or(|end| end > gu_bytes.len()) {
-            return Err(cpu_err(&format!("moe cpu expert splice: gate_up slot {slot} out of range")));
-        }
-        gu_pairs.push((&gu_bytes[gu0..gu0 + gu_need], x.as_slice()));
-    }
-    let t_gu = Instant::now();
-    hipfire_cpu::gemv::gemv_experts(quant, 2 * mi, dim, &gu_pairs, &mut gu_all, None);
-    let gu_ns = t_gu.elapsed().as_nanos() as u64;
-    for e in 0..k {
-        silu_mul(
-            &gu_all[e * 2 * mi..(e + 1) * 2 * mi],
-            &mut hidden[e * mi..(e + 1) * mi],
-        );
-        rotate_x(&mut hidden[e * mi..(e + 1) * mi]);
-    }
-    let mut dn_pairs: Vec<(&[u8], &[f32])> = Vec::with_capacity(k);
-    for (krank, &slot) in slots.iter().enumerate() {
-        let dn0 = slot
-            .checked_mul(down_stride)
-            .ok_or_else(|| cpu_err("moe cpu expert splice: down offset overflows"))?;
-        if dn0.checked_add(dn_need).is_none_or(|end| end > dn_bytes.len()) {
-            return Err(cpu_err(&format!("moe cpu expert splice: down slot {slot} out of range")));
-        }
-        dn_pairs.push((
-            &dn_bytes[dn0..dn0 + dn_need],
-            &hidden[krank * mi..(krank + 1) * mi],
+    if rows == 0 || top_k == 0 {
+        return Err(cpu_err(
+            "moe cpu expert splice: rows and top_k must be non-zero",
         ));
     }
-    let t_dn = Instant::now();
-    hipfire_cpu::gemv::gemv_experts(quant, dim, mi, &dn_pairs, &mut dn_all, None);
-    let dn_ns = t_dn.elapsed().as_nanos() as u64;
-    for krank in 0..k {
-        let w = tw[krank];
-        let dn_out = &dn_all[krank * dim..(krank + 1) * dim];
-        for (a, v) in acc.iter_mut().zip(dn_out.iter()) {
-            *a += w * v;
-        }
+    if dim % 256 != 0 || mi % 256 != 0 {
+        return Err(cpu_err(&format!(
+            "moe cpu expert splice: dim={dim} mi={mi} must be multiples of 256"
+        )));
     }
-    let t_h2d = Instant::now();
-    upload_f32(gpu, residual, &acc)?;
-    let h2d_ns = t_h2d.elapsed().as_nanos() as u64;
-    CPU_STEPS.fetch_add(1, Ordering::Relaxed);
-    trace_moe_step(
-        quant,
-        dim,
-        mi,
-        k,
-        MoeStepTiming {
-            d2h_first_ns,
-            d2h_rest_ns,
-            gu_ns,
-            dn_ns,
-            h2d_ns,
-        },
-    );
-    Ok(())
+    let slots = rows
+        .checked_mul(top_k)
+        .ok_or_else(|| cpu_err("moe cpu expert splice: rows × top_k overflows"))?;
+    let n_x = rows
+        .checked_mul(dim)
+        .ok_or_else(|| cpu_err("moe cpu expert splice: rows × dim overflows"))?;
+    if x_rot.numel() < n_x || residual.numel() < n_x {
+        return Err(cpu_err(&format!(
+            "moe cpu expert splice: activation/residual need {n_x} elements"
+        )));
+    }
+    if topk_indices.numel() < slots || topk_weights.numel() < slots {
+        return Err(cpu_err(&format!(
+            "moe cpu expert splice: top-k scratch needs {slots} elements"
+        )));
+    }
+    MOE_SCRATCH.with(|cell| {
+        let mut scratch = cell.borrow_mut();
+        scratch.x.resize(n_x, 0.0);
+        scratch.acc.resize(n_x, 0.0);
+        scratch.ti.resize(slots, 0.0);
+        scratch.tw.resize(slots, 0.0);
+        let t_first = Instant::now();
+        download_into_f32(gpu, x_rot, n_x, &mut scratch.x)?;
+        let d2h_first_ns = t_first.elapsed().as_nanos() as u64;
+        let t_rest = Instant::now();
+        download_into_f32(gpu, topk_indices, slots, &mut scratch.ti)?;
+        download_into_f32(gpu, topk_weights, slots, &mut scratch.tw)?;
+        download_into_f32(gpu, residual, n_x, &mut scratch.acc)?;
+        let d2h_rest_ns = t_rest.elapsed().as_nanos() as u64;
+        // Resolve every selected slot up front: a bad id or a short span is then
+        // an error before any arithmetic, and the compute never re-enters the
+        // resolver. On the warm path the resolved experts live in a
+        // fixed-capacity stack array (no per-layer heap allocation); a window
+        // wider than `MOE_STACK_SLOTS` slots falls back to a heap `Vec`.
+        let dummy: CpuMoeExpert<'a> = CpuMoeExpert {
+            gate_up_quant: CpuQuant::F32,
+            gate_up: &[],
+            down_quant: CpuQuant::F32,
+            down: &[],
+        };
+        let mut stack = [dummy; MOE_STACK_SLOTS];
+        let heap: Vec<CpuMoeExpert<'a>>;
+        let experts: &[CpuMoeExpert<'a>] = if slots <= MOE_STACK_SLOTS {
+            for s in 0..slots {
+                stack[s] = resolve(expert_id(scratch.ti[s]))?;
+            }
+            &stack[..slots]
+        } else {
+            heap = (0..slots)
+                .map(|s| resolve(expert_id(scratch.ti[s])))
+                .collect::<Result<Vec<_>, _>>()?;
+            &heap
+        };
+        let (gu_ns, dn_ns) = moe_cpu_experts_host(dim, mi, rows, top_k, experts, &mut scratch)?;
+        let t_h2d = Instant::now();
+        upload_f32(gpu, residual, &scratch.acc[..n_x])?;
+        let h2d_ns = t_h2d.elapsed().as_nanos() as u64;
+        CPU_STEPS.fetch_add(1, Ordering::Relaxed);
+        let mixed = experts.iter().any(|e| {
+            e.gate_up_quant != experts[0].gate_up_quant || e.down_quant != experts[0].down_quant
+        });
+        trace_moe_step(
+            experts[0].gate_up_quant,
+            dim,
+            mi,
+            top_k,
+            rows,
+            mixed,
+            MoeStepTiming {
+                d2h_first_ns,
+                d2h_rest_ns,
+                gu_ns,
+                dn_ns,
+                h2d_ns,
+            },
+        );
+        Ok(())
+    })
 }
 
-/// Per-shape accounting for the decode MoE splice under
-/// `HIPFIRE_CPU_EXEC_TRACE=1`: one line per `(quant, dim, mi, k)` at its first
-/// call and at every doubling, so the `calls=1` line is the cold first step and
-/// later lines are steady state. Keyed by shape rather than summed process-wide,
-/// for the same reason [`trace_step`] is.
-fn trace_moe_step(q: CpuQuant, dim: usize, mi: usize, k: usize, timing: MoeStepTiming) {
+/// The splice's arithmetic over already-resolved host slices — split out from
+/// [`moe_cpu_experts`] so it is testable without a device. It accumulates into
+/// `scratch.acc` and returns the gate_up and down region timings.
+///
+/// Slots are grouped by expert id: one weight, one shared-weight projection,
+/// every token that selected it. A weight row's bytes are therefore read once
+/// for all of that expert's tokens (row-major, see
+/// [`hipfire_cpu::gemv::gemv_shared_sourced`]), and all groups of a projection go
+/// to the CPU in one rayon region.
+///
+/// Every working set is a reusable field of `scratch` — the `f32` buffers and the
+/// index metadata — and the grouped window is described to the kernel through
+/// [`MoeJobSource`] instead of a materialized job slice, so a warm call performs
+/// no heap allocation.
+#[allow(clippy::too_many_arguments)]
+fn moe_cpu_experts_host(
+    dim: usize,
+    mi: usize,
+    rows: usize,
+    top_k: usize,
+    experts: &[CpuMoeExpert<'_>],
+    scratch: &mut MoeScratch,
+) -> Result<(u64, u64), DispatchError> {
+    let slots = rows * top_k;
+    if experts.len() != slots {
+        return Err(cpu_err(
+            "moe cpu expert splice: expert count != rows × top_k",
+        ));
+    }
+    let n_x = rows * dim;
+    if scratch.x.len() < n_x
+        || scratch.acc.len() < n_x
+        || scratch.ti.len() < slots
+        || scratch.tw.len() < slots
+    {
+        return Err(cpu_err("moe cpu expert splice: scratch too small"));
+    }
+    let x = &scratch.x[..n_x];
+    let ti = &scratch.ti[..slots];
+    let tw = &scratch.tw[..slots];
+
+    // Group the selected slots by expert id, in first-seen order, validating each
+    // expert's spans as we go. A counting sort into the reusable index vectors
+    // keeps each group's members contiguous in `order` without a per-group `Vec`:
+    // assign every slot its group index and collect the group ids, then
+    // prefix-sum the sizes into `group_start` and place the slots. (`group_off`
+    // doubles as the fill cursor here, before it holds output offsets.)
+    scratch.group_id.clear();
+    scratch.slot_group.resize(slots, 0);
+    for s in 0..slots {
+        let e = &experts[s];
+        let gu_need = expert_gu_bytes(e.gate_up_quant, dim, mi)?;
+        let dn_need = expert_down_bytes(e.down_quant, dim, mi)?;
+        if e.gate_up.len() < gu_need {
+            return Err(cpu_err(&format!(
+                "moe cpu expert splice: expert gate_up span {} < {gu_need} bytes",
+                e.gate_up.len()
+            )));
+        }
+        if e.down.len() < dn_need {
+            return Err(cpu_err(&format!(
+                "moe cpu expert splice: expert down span {} < {dn_need} bytes",
+                e.down.len()
+            )));
+        }
+        let eid = expert_id(ti[s]) as u16;
+        let gi = match scratch.group_id.iter().position(|&g| g == eid) {
+            Some(gi) => gi,
+            None => {
+                scratch.group_id.push(eid);
+                scratch.group_id.len() - 1
+            }
+        };
+        scratch.slot_group[s] = gi as u32;
+    }
+    let groups = scratch.group_id.len();
+    scratch.group_off.clear();
+    scratch.group_off.resize(groups, 0);
+    for s in 0..slots {
+        scratch.group_off[scratch.slot_group[s] as usize] += 1;
+    }
+    scratch.group_start.clear();
+    scratch.group_start.resize(groups + 1, 0);
+    let mut acc = 0u32;
+    for gi in 0..groups {
+        scratch.group_start[gi] = acc;
+        acc += scratch.group_off[gi] as u32;
+    }
+    scratch.group_start[groups] = acc;
+    for gi in 0..groups {
+        scratch.group_off[gi] = scratch.group_start[gi] as usize;
+    }
+    scratch.order.resize(slots, 0);
+    scratch.slot_si.resize(slots, 0);
+    for s in 0..slots {
+        let gi = scratch.slot_group[s] as usize;
+        let at = scratch.group_off[gi];
+        scratch.order[at] = s as u32;
+        scratch.slot_si[s] = at as u32 - scratch.group_start[gi];
+        scratch.group_off[gi] += 1;
+    }
+
+    // gate_up: one shared-weight projection per group, every group in one rayon
+    // region. Output is row-major per group (`out[r * n + t]`), so a weight row's
+    // bytes are read once for all of that expert's tokens.
+    scratch.gu.resize(2 * mi * slots, 0.0);
+    scratch.hidden.resize(mi * slots, 0.0);
+    scratch.gather.resize(2 * mi, 0.0);
+    scratch.dn.resize(dim * slots, 0.0);
+    scratch.group_off.resize(groups + 1, 0);
+    fill_group_off(&scratch.group_start, &mut scratch.group_off, 2 * mi);
+    let gu_ns = {
+        let src = MoeJobSource {
+            experts,
+            order: &scratch.order,
+            group_start: &scratch.group_start,
+            act: x,
+            row_len: dim,
+            top_k,
+            proj: MoeProj::GateUp,
+        };
+        let t = Instant::now();
+        hipfire_cpu::gemv::gemv_shared_sourced(2 * mi, dim, &mut scratch.gu, &src, None);
+        t.elapsed().as_nanos() as u64
+    };
+    // SwiGLU + hidden rotation, per token. The gate/up pair sits at strided
+    // indices in the row-major output, so gather it; the rotation is the *down*
+    // projection's contract (its weights are stored post-rotation).
+    {
+        let gu = &scratch.gu[..2 * mi * slots];
+        let hidden = &mut scratch.hidden[..mi * slots];
+        let gather = &mut scratch.gather[..2 * mi];
+        for gi in 0..groups {
+            let n = group_n(&scratch.group_start, gi);
+            let base = scratch.group_off[gi];
+            let first = scratch.order[scratch.group_start[gi] as usize] as usize;
+            let rotate = experts[first].down_quant.is_fwht_g256();
+            for si in 0..n {
+                let s = scratch.order[scratch.group_start[gi] as usize + si] as usize;
+                for (r, g) in gather.iter_mut().enumerate() {
+                    *g = gu[base + r * n + si];
+                }
+                let hid = &mut hidden[s * mi..(s + 1) * mi];
+                silu_mul(gather, hid);
+                if rotate {
+                    rotate_x(hid);
+                }
+            }
+        }
+    }
+    scratch.group_off.resize(groups + 1, 0);
+    fill_group_off(&scratch.group_start, &mut scratch.group_off, dim);
+    let dn_ns = {
+        let src = MoeJobSource {
+            experts,
+            order: &scratch.order,
+            group_start: &scratch.group_start,
+            act: &scratch.hidden[..mi * slots],
+            row_len: mi,
+            top_k,
+            proj: MoeProj::Down,
+        };
+        let t = Instant::now();
+        hipfire_cpu::gemv::gemv_shared_sourced(dim, mi, &mut scratch.dn, &src, None);
+        t.elapsed().as_nanos() as u64
+    };
+    // The down outputs are row-major per group, so a token's vector is strided:
+    // `slot_group`/`slot_si` place each slot in its group's run, and the residual
+    // accumulates in the original row-major, rank-minor order.
+    {
+        let dn = &scratch.dn[..dim * slots];
+        for s in 0..slots {
+            let t = s / top_k;
+            let gi = scratch.slot_group[s] as usize;
+            let si = scratch.slot_si[s] as usize;
+            let n = group_n(&scratch.group_start, gi);
+            let base = scratch.group_off[gi];
+            let w = tw[s];
+            let accrow = &mut scratch.acc[t * dim..(t + 1) * dim];
+            for (r, a) in accrow.iter_mut().enumerate() {
+                *a += w * dn[base + r * n + si];
+            }
+        }
+    }
+    Ok((gu_ns, dn_ns))
+}
+
+/// Which projection of a selected expert a [`MoeJobSource`] job reads.
+#[derive(Clone, Copy)]
+enum MoeProj {
+    GateUp,
+    Down,
+}
+
+/// Group `gi`'s member count from the prefix-summed `group_start`.
+fn group_n(group_start: &[u32], gi: usize) -> usize {
+    (group_start[gi + 1] - group_start[gi]) as usize
+}
+
+/// Fill `group_off` (length `groups + 1`) with each group's element offset into a
+/// projection buffer whose per-group run is `per_row * n(g)` elements — `2 * mi`
+/// for gate_up, `dim` for down — plus a trailing total.
+fn fill_group_off(group_start: &[u32], group_off: &mut [usize], per_row: usize) {
+    let groups = group_start.len() - 1;
+    let mut acc = 0usize;
+    for gi in 0..groups {
+        group_off[gi] = acc;
+        acc += per_row * group_n(group_start, gi);
+    }
+    group_off[groups] = acc;
+}
+
+/// The splice's grouped window presented to
+/// [`hipfire_cpu::gemv::gemv_shared_sourced`] without materializing a job slice:
+/// every read is answered from the reusable index metadata (`order`,
+/// `group_start`) plus the activation buffer and the resolved experts, so no
+/// per-call descriptor allocation is needed and nothing borrows out of the
+/// thread-local scratch after the call.
+struct MoeJobSource<'a, 's> {
+    experts: &'s [CpuMoeExpert<'a>],
+    order: &'s [u32],
+    group_start: &'s [u32],
+    act: &'s [f32],
+    /// Row width of `act`: `dim` for gate_up, `mi` for down.
+    row_len: usize,
+    top_k: usize,
+    proj: MoeProj,
+}
+
+impl<'a, 's> MoeJobSource<'a, 's> {
+    /// A group's expert — its first-seen slot; every slot in the group resolved to
+    /// the same expert id, hence the same bytes.
+    fn first_expert(&self, j: usize) -> &'s CpuMoeExpert<'a> {
+        &self.experts[self.order[self.group_start[j] as usize] as usize]
+    }
+}
+
+impl<'a, 's> hipfire_cpu::gemv::SharedJobSource for MoeJobSource<'a, 's> {
+    fn jobs(&self) -> usize {
+        self.group_start.len() - 1
+    }
+    fn n(&self, j: usize) -> usize {
+        group_n(self.group_start, j)
+    }
+    fn quant(&self, j: usize) -> CpuQuant {
+        let e = self.first_expert(j);
+        match self.proj {
+            MoeProj::GateUp => e.gate_up_quant,
+            MoeProj::Down => e.down_quant,
+        }
+    }
+    fn packed(&self, j: usize) -> &[u8] {
+        let e = self.first_expert(j);
+        match self.proj {
+            MoeProj::GateUp => e.gate_up,
+            MoeProj::Down => e.down,
+        }
+    }
+    fn xs_row(&self, j: usize, t: usize) -> &[f32] {
+        let slot = self.order[self.group_start[j] as usize + t] as usize;
+        // gate_up consumes token `slot / top_k`'s activation row; down consumes
+        // the slot's own post-SiLU hidden row.
+        let row = match self.proj {
+            MoeProj::GateUp => slot / self.top_k,
+            MoeProj::Down => slot,
+        };
+        &self.act[row * self.row_len..(row + 1) * self.row_len]
+    }
+}
+
+/// Per-shape accounting for the MoE splice under
+/// `HIPFIRE_CPU_EXEC_TRACE=1`: one line per `(quant, dim, mi, top_k, rows,
+/// graded)` at its first call and at every doubling, so the `calls=1` line is
+/// the cold first step and later lines are steady state. Keyed by shape rather
+/// than summed process-wide, for the same reason [`trace_step`] is.
+#[allow(clippy::too_many_arguments)]
+fn trace_moe_step(
+    q: CpuQuant,
+    dim: usize,
+    mi: usize,
+    k: usize,
+    rows: usize,
+    graded: bool,
+    timing: MoeStepTiming,
+) {
     if hipfire_config::developer_var("HIPFIRE_CPU_EXEC_TRACE").is_err() {
         return;
     }
     let Ok(mut shapes) = MOE_SHAPES.lock() else {
         return;
     };
-    let stats = shapes.entry((q as u8, dim, mi, k)).or_default();
+    let stats = shapes.entry((q as u8, dim, mi, k, rows, graded)).or_default();
     stats.calls += 1;
     stats.d2h_first_ns += timing.d2h_first_ns;
     stats.d2h_rest_ns += timing.d2h_rest_ns;
@@ -542,9 +918,10 @@ fn trace_moe_step(q: CpuQuant, dim: usize, mi: usize, k: usize, timing: MoeStepT
     let (on_cpu, on_gpu) = cpu_exec_counters();
     let per_ms = |ns: u64| ns as f64 / 1e6 / stats.calls as f64;
     eprintln!(
-        "cpu exec: moe expert splice dim={dim} mi={mi} k={k} quant={q:?} | {} calls | \
-         {on_cpu} steps on CPU, {on_gpu} host-mapped steps still on GPU | mean per call: \
-         d2h_first={:.2}ms d2h_rest={:.2}ms gu={:.2}ms dn={:.2}ms h2d={:.2}ms",
+        "cpu exec: moe expert splice dim={dim} mi={mi} k={k} rows={rows} quant={q:?} \
+         graded={graded} | {} calls | {on_cpu} steps on CPU, {on_gpu} host-mapped steps still \
+         on GPU | mean per call: d2h_first={:.2}ms d2h_rest={:.2}ms gu={:.2}ms dn={:.2}ms \
+         h2d={:.2}ms",
         stats.calls,
         per_ms(stats.d2h_first_ns),
         per_ms(stats.d2h_rest_ns),
@@ -822,18 +1199,35 @@ fn cpu_err(msg: &str) -> DispatchError {
 }
 
 fn download_f32(gpu: &Gpu, t: &GpuTensor, n: usize) -> Result<Vec<f32>, DispatchError> {
+    let mut out = vec![0.0f32; n];
+    download_into_f32(gpu, t, n, &mut out)?;
+    Ok(out)
+}
+
+/// [`download_f32`] into a caller-owned buffer, so the MoE splice's thread-local
+/// workspaces are reused instead of re-allocated every layer.
+fn download_into_f32(
+    gpu: &Gpu,
+    t: &GpuTensor,
+    n: usize,
+    out: &mut [f32],
+) -> Result<(), DispatchError> {
     assert!(
         t.numel() >= n,
         "cpu exec: tensor has {} elements, need {n}",
         t.numel()
     );
-    let mut out = vec![0.0f32; n];
-    // Safety: `out` is a live `n`-element f32 buffer; the slice covers exactly
-    // those bytes and does not outlive the call.
-    let bytes = unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, n * 4) };
+    assert!(
+        out.len() >= n,
+        "cpu exec: buffer has {} elements, need {n}",
+        out.len()
+    );
+    // Safety: `out[..n]` is a live `n`-element f32 buffer; the slice covers
+    // exactly those bytes and does not outlive the call.
+    let bytes =
+        unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, n * 4) };
     gpu.memcpy_dtoh_auto(bytes, &t.buf)
-        .map_err(|e| cpu_err(&format!("D2H: {e}")))?;
-    Ok(out)
+        .map_err(|e| cpu_err(&format!("D2H: {e}")))
 }
 
 fn upload_f32(gpu: &Gpu, t: &GpuTensor, v: &[f32]) -> Result<(), DispatchError> {
@@ -900,4 +1294,255 @@ fn trace_step(q: CpuQuant, w: &WeightRef, rotated: bool, residual: bool, timing:
         per_ms(stats.gemv_ns),
         per_ms(stats.h2d_ns)
     );
+}
+
+#[cfg(test)]
+mod moe_splice_tests {
+    use super::*;
+
+    /// One packed group of weights for `q`, mirroring `hipfire_cpu`'s own test
+    /// fixture: a valid, finite header plus a bijective payload, so a wrong
+    /// offset or format fails rather than matching by symmetry.
+    fn group_bytes(q: CpuQuant, salt: usize) -> Vec<u8> {
+        let mut b: Vec<u8> = (0..q.group_bytes())
+            .map(|i| (((i + salt) * 37 + 11) & 0xFF) as u8)
+            .collect();
+        let f32x2 = |a: f32, c: f32| {
+            let mut o = [0u8; 8];
+            o[..4].copy_from_slice(&a.to_le_bytes());
+            o[4..].copy_from_slice(&c.to_le_bytes());
+            o
+        };
+        match q {
+            CpuQuant::Mq4G256 => b[..8].copy_from_slice(&f32x2(0.03125, -0.5)),
+            CpuQuant::Mq6G256 => b[..8].copy_from_slice(&f32x2(0.0078125, -0.125)),
+            CpuQuant::Mq3G256Lloyd => {
+                const CB: [u16; 8] =
+                    [0xbc00, 0xb800, 0xb400, 0xb000, 0x3000, 0x3400, 0x3800, 0x3c00];
+                for (k, v) in CB.iter().enumerate() {
+                    b[2 * k..2 * k + 2].copy_from_slice(&v.to_le_bytes());
+                }
+            }
+            _ => {}
+        }
+        b
+    }
+
+    /// A `[m, k]` weight tensor's bytes, group by group.
+    fn weight_bytes(q: CpuQuant, m: usize, k: usize, salt: usize) -> Vec<u8> {
+        let groups = k / q.group_elems();
+        let mut out = Vec::with_capacity(m * groups * q.group_bytes());
+        for row in 0..m {
+            for g in 0..groups {
+                out.extend_from_slice(&group_bytes(q, salt + row * groups + g));
+            }
+        }
+        out
+    }
+
+    /// The top-k scratch stores an id as the low bits of an `f32` bit pattern
+    /// (`expert_id` inverts this).
+    fn id_bits(e: usize) -> f32 {
+        f32::from_bits(e as u32)
+    }
+
+    fn x_of(n: usize) -> Vec<f32> {
+        (0..n).map(|i| ((i as f32) * 0.017).sin() * 0.5).collect()
+    }
+
+    /// A uniform layer: the multirow engine must reproduce repeated single-row
+    /// CPU expert evaluation, measured against the existing per-expert reference
+    /// ([`hipfire_cpu::moe::run_experts`]) over the same packed blobs.
+    #[test]
+    fn uniform_multirow_matches_run_experts() {
+        let (dim, mi) = (256usize, 256usize);
+        let (rows, top_k, n_exp) = (4usize, 3usize, 4usize);
+        let q = CpuQuant::Mq4G256;
+        let gu_stride = hipfire_cpu::gemv::row_bytes(q, dim) * 2 * mi;
+        let dn_stride = hipfire_cpu::gemv::row_bytes(q, mi) * dim;
+        let mut gu_all = Vec::with_capacity(n_exp * gu_stride);
+        let mut dn_all = Vec::with_capacity(n_exp * dn_stride);
+        for e in 0..n_exp {
+            gu_all.extend_from_slice(&weight_bytes(q, 2 * mi, dim, 100 + e));
+            dn_all.extend_from_slice(&weight_bytes(q, dim, mi, 200 + e));
+        }
+        // Repeated experts across rows, and the higher-id experts selected too.
+        let idx: [usize; 12] = [0, 2, 3, 2, 2, 0, 3, 0, 1, 1, 3, 3];
+        let wts: [f32; 12] = [0.5, 0.3, 0.2, 0.4, 0.4, 0.2, 0.25, 0.35, 0.4, 0.6, 0.2, 0.2];
+        let x = x_of(rows * dim);
+        let seed: Vec<f32> = (0..rows * dim).map(|i| 0.1 * (i % 7) as f32).collect();
+        let ti: Vec<f32> = idx.iter().map(|&e| id_bits(e)).collect();
+
+        let experts: Vec<CpuMoeExpert> = (0..rows * top_k)
+            .map(|s| {
+                let e = idx[s];
+                CpuMoeExpert {
+                    gate_up_quant: q,
+                    gate_up: &gu_all[e * gu_stride..(e + 1) * gu_stride],
+                    down_quant: q,
+                    down: &dn_all[e * dn_stride..(e + 1) * dn_stride],
+                }
+            })
+            .collect();
+        let mut scratch = MoeScratch {
+            x: x.clone(),
+            ti,
+            tw: wts.to_vec(),
+            acc: seed.clone(),
+            ..Default::default()
+        };
+        moe_cpu_experts_host(dim, mi, rows, top_k, &experts, &mut scratch).unwrap();
+
+        let blobs = hipfire_cpu::moe::ExpertBlobs {
+            gate_up: &gu_all,
+            down: &dn_all,
+            gate_up_stride: gu_stride,
+            down_stride: dn_stride,
+            quant: q,
+            dim,
+            mi,
+        };
+        let mut reference = seed.clone();
+        for t in 0..rows {
+            let routing: Vec<(usize, f32)> = (0..top_k)
+                .map(|j| (idx[t * top_k + j], wts[t * top_k + j]))
+                .collect();
+            hipfire_cpu::moe::run_experts(
+                &blobs,
+                &x[t * dim..(t + 1) * dim],
+                &routing,
+                &mut reference[t * dim..(t + 1) * dim],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            scratch.acc, reference,
+            "multirow CPU output != repeated single-row run_experts"
+        );
+    }
+
+    /// A graded layer: experts of different tiers, including one whose gate_up
+    /// and down formats differ, and a higher-id cold (MQ3-Lloyd) expert. The
+    /// reference is the per-(row, rank) single-expert evaluation built from the
+    /// crate's own `gemv` primitive.
+    #[test]
+    fn graded_multirow_matches_per_expert_gemv() {
+        let (dim, mi) = (256usize, 256usize);
+        let (rows, top_k, n_exp) = (3usize, 4usize, 4usize);
+        let gu_q = [
+            CpuQuant::Mq6G256,
+            CpuQuant::Mq4G256,
+            CpuQuant::Mq3G256Lloyd,
+            CpuQuant::Mq6G256,
+        ];
+        let dn_q = [
+            CpuQuant::Mq6G256,
+            CpuQuant::Mq4G256,
+            CpuQuant::Mq3G256Lloyd,
+            CpuQuant::Mq3G256Lloyd,
+        ];
+        let gu: Vec<Vec<u8>> = (0..n_exp)
+            .map(|e| weight_bytes(gu_q[e], 2 * mi, dim, 300 + e))
+            .collect();
+        let dn: Vec<Vec<u8>> = (0..n_exp)
+            .map(|e| weight_bytes(dn_q[e], dim, mi, 400 + e))
+            .collect();
+        let idx: [usize; 12] = [0, 1, 2, 3, 2, 2, 3, 0, 3, 1, 1, 2];
+        let wts: [f32; 12] = [0.4, 0.3, 0.2, 0.1, 0.5, 0.3, 0.2, 0.4, 0.6, 0.25, 0.35, 0.4];
+        let x = x_of(rows * dim);
+        let seed: Vec<f32> = (0..rows * dim).map(|i| 0.05 * (i % 5) as f32).collect();
+        let ti: Vec<f32> = idx.iter().map(|&e| id_bits(e)).collect();
+
+        let experts: Vec<CpuMoeExpert> = (0..rows * top_k)
+            .map(|s| {
+                let e = idx[s];
+                CpuMoeExpert {
+                    gate_up_quant: gu_q[e],
+                    gate_up: &gu[e],
+                    down_quant: dn_q[e],
+                    down: &dn[e],
+                }
+            })
+            .collect();
+        let mut scratch = MoeScratch {
+            x: x.clone(),
+            ti,
+            tw: wts.to_vec(),
+            acc: seed.clone(),
+            ..Default::default()
+        };
+        moe_cpu_experts_host(dim, mi, rows, top_k, &experts, &mut scratch).unwrap();
+
+        let mut reference = seed.clone();
+        for t in 0..rows {
+            for j in 0..top_k {
+                let s = t * top_k + j;
+                let e = idx[s];
+                let mut gv = vec![0.0f32; 2 * mi];
+                gemv(gu_q[e], &gu[e], 2 * mi, dim, &x[t * dim..(t + 1) * dim], &mut gv);
+                let mut hid = vec![0.0f32; mi];
+                silu_mul(&gv, &mut hid);
+                if dn_q[e].is_fwht_g256() {
+                    rotate_x(&mut hid);
+                }
+                let mut dout = vec![0.0f32; dim];
+                gemv(dn_q[e], &dn[e], dim, mi, &hid, &mut dout);
+                for (a, v) in reference[t * dim..(t + 1) * dim].iter_mut().zip(dout) {
+                    *a += wts[s] * v;
+                }
+            }
+        }
+        assert_eq!(
+            scratch.acc, reference,
+            "graded multirow CPU output != per-expert gemv reference"
+        );
+    }
+
+    /// A short expert span is an error, never a silent read past it.
+    #[test]
+    fn short_expert_span_is_an_error() {
+        let (dim, mi) = (256usize, 256usize);
+        let q = CpuQuant::Mq4G256;
+        let short = vec![0u8; 8];
+        let experts = vec![CpuMoeExpert {
+            gate_up_quant: q,
+            gate_up: &short,
+            down_quant: q,
+            down: &short,
+        }];
+        let mut scratch = MoeScratch {
+            x: vec![0.0f32; dim],
+            ti: vec![id_bits(0)],
+            tw: vec![1.0],
+            acc: vec![0.0f32; dim],
+            ..Default::default()
+        };
+        let err = moe_cpu_experts_host(dim, mi, 1, 1, &experts, &mut scratch)
+            .expect_err("a short expert span must fail");
+        assert!(format!("{err}").contains("span"), "unexpected error: {err}");
+    }
+
+    /// An expert count that disagrees with `rows × top_k` is an error.
+    #[test]
+    fn expert_count_mismatch_is_an_error() {
+        let (dim, mi) = (256usize, 256usize);
+        let q = CpuQuant::Mq4G256;
+        let gu = weight_bytes(q, 2 * mi, dim, 1);
+        let dn = weight_bytes(q, dim, mi, 2);
+        let experts = vec![CpuMoeExpert {
+            gate_up_quant: q,
+            gate_up: &gu,
+            down_quant: q,
+            down: &dn,
+        }];
+        let mut scratch = MoeScratch {
+            x: vec![0.0f32; 2 * dim],
+            ti: vec![id_bits(0), id_bits(0)],
+            tw: vec![1.0, 1.0],
+            acc: vec![0.0f32; 2 * dim],
+            ..Default::default()
+        };
+        // rows=2, top_k=1 needs 2 experts; only 1 supplied.
+        assert!(moe_cpu_experts_host(dim, mi, 2, 1, &experts, &mut scratch).is_err());
+    }
 }

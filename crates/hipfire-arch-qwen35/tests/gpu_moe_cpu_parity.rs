@@ -34,6 +34,7 @@
 //!         --test gpu_moe_cpu_parity -- --ignored --test-threads=1 --nocapture
 
 use hipfire_arch_qwen35::qwen35::load::{load_weight_tensor, qwen35_tensor_name_candidates};
+use hipfire_dispatch::cpu_exec::{moe_cpu_experts, CpuMoeExpert};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::weight_backend::MemoryTarget;
 use rdna_compute::{DType, Gpu};
@@ -704,5 +705,313 @@ fn chained_graded_moe_batch4_parity() -> Result<(), Box<dyn std::error::Error>> 
     assert!(w_rot <= s_rot * REL_TOL, "gpu silu+rotate disagrees: rel {:.3e}", w_rot / s_rot);
     assert!(w_down <= s_down * REL_TOL, "chained down disagrees: rel {:.3e}", w_down / s_down);
     eprintln!("CHAINED_BATCH4_PARITY PASS (layer {l}, tags {tags_seen:?})");
+    Ok(())
+}
+
+/// Multi-row CPU splice oracle for the graded host layout: the graded /
+/// multi-row executor (`hipfire_dispatch::cpu_exec::moe_cpu_experts`) driven over
+/// real host-mapped **bucket owners** — one owner per `(gate_up, down)` tag,
+/// holding the experts' concatenated bytes at `sub_offset(pos*stride, stride)`,
+/// exactly the layout the graded packer builds — with `N = 3` rows and top-k 4,
+/// accumulating the routing-weighted down into a seeded residual. Compared
+/// elementwise against a per-(token, rank) `hipfire_cpu` reference.
+///
+/// This is the narrow-verify shape the MTP verify and the accepted-prefix
+/// rollback replay reuse: it pins that the multi-row path selects each expert's
+/// own tier quant/stride, preserves per-token rank order and accumulates into the
+/// residual — none of which the batch-1/single-expert tests can see.
+#[test]
+#[ignore = "needs a real graded MoE fixture and a GPU; run with --ignored --features lab"]
+fn graded_cpu_moe_experts_multirow_parity() -> Result<(), Box<dyn std::error::Error>> {
+    use hipfire_dispatch::types::DispatchError;
+    use std::collections::BTreeMap;
+
+    let _guard = GPU_ORACLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = std::env::var(GRADED_FIXTURE_ENV).unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_default();
+        format!("{home}/.hipfire/models/{GRADED_DEFAULT_FIXTURE}")
+    });
+    if !Path::new(&path).is_file() {
+        return Err(format!("graded fixture absent ({path}); refusing silent skip").into());
+    }
+    let hfq = HfqFile::open(Path::new(&path))?;
+    let mut gpu = Gpu::init()?;
+    const N: usize = 3;
+    const KTOP: usize = 4;
+    let cpu_quant = |qt: u8| -> Option<hipfire_cpu::quant::CpuQuant> {
+        match qt {
+            13 => Some(hipfire_cpu::quant::CpuQuant::Mq4G256),
+            15 => Some(hipfire_cpu::quant::CpuQuant::Mq6G256),
+            20 => Some(hipfire_cpu::quant::CpuQuant::Mq3G256Lloyd),
+            _ => None,
+        }
+    };
+    // Collect decodable experts on layer 3 (else 0), grouped by tag bucket.
+    let mut picked_layer: Option<usize> = None;
+    let mut buckets: BTreeMap<(u8, u8), Vec<(usize, String, String)>> = BTreeMap::new();
+    for l in [3usize, 0] {
+        let needle = format!(".layers.{l}.mlp.experts.");
+        let mut b: BTreeMap<(u8, u8), Vec<(usize, String, String)>> = BTreeMap::new();
+        for t in hfq.tensor_infos() {
+            if !t.name.contains(&needle) || !t.name.contains("gate_up_proj.weight") {
+                continue;
+            }
+            let Some(eid) = t
+                .name
+                .split(".mlp.experts.")
+                .nth(1)
+                .and_then(|s| s.split('.').next()?.parse::<usize>().ok())
+            else {
+                continue;
+            };
+            let down_bare = t.name.replace("gate_up_proj.weight", "down_proj.weight");
+            let down_name = qwen35_tensor_name_candidates(&down_bare)
+                .into_iter()
+                .find(|n| hfq.find_tensor_info(n).is_some());
+            let (Some(down_name), Some(gu_info)) = (down_name, hfq.find_tensor_info(&t.name)) else {
+                continue;
+            };
+            let dn_info = hfq.find_tensor_info(&down_name).expect("down info");
+            if cpu_quant(gu_info.quant_type).is_none() || cpu_quant(dn_info.quant_type).is_none() {
+                continue;
+            }
+            b.entry((gu_info.quant_type, dn_info.quant_type))
+                .or_default()
+                .push((eid, t.name.clone(), down_name));
+        }
+        let total: usize = b.values().map(|v| v.len()).sum();
+        if total >= KTOP && b.len() >= 2 {
+            picked_layer = Some(l);
+            buckets = b;
+            break;
+        }
+    }
+    let l = picked_layer.ok_or("no layer with >=4 decodable experts across >=2 buckets")?;
+    // Round-robin across buckets so the 4 slots span distinct tags.
+    let key_list: Vec<(u8, u8)> = buckets.keys().cloned().collect();
+    let mut per_key_idx = vec![0usize; key_list.len()];
+    let mut chosen: Vec<((u8, u8), usize, String, String)> = Vec::new();
+    while chosen.len() < KTOP {
+        let mut moved = false;
+        for (ki, kk) in key_list.iter().enumerate() {
+            let v = &buckets[kk];
+            if per_key_idx[ki] < v.len() && chosen.len() < KTOP {
+                let (eid, gu, dn) = v[per_key_idx[ki]].clone();
+                per_key_idx[ki] += 1;
+                chosen.push((*kk, eid, gu, dn));
+                moved = true;
+            }
+        }
+        if !moved {
+            break;
+        }
+    }
+    assert_eq!(chosen.len(), KTOP, "bucket round-robin underfilled");
+    eprintln!("cpu multirow layer {l} buckets: {:?}", chosen.iter().map(|c| c.0).collect::<Vec<_>>());
+
+    // Load each chosen expert host-mapped; keep the raw bytes + tier quant.
+    let mut gu_bytes: Vec<Vec<u8>> = Vec::new();
+    let mut dn_bytes: Vec<Vec<u8>> = Vec::new();
+    let mut gu_q: Vec<hipfire_cpu::quant::CpuQuant> = Vec::new();
+    let mut dn_q: Vec<hipfire_cpu::quant::CpuQuant> = Vec::new();
+    let (mut dim, mut mi) = (0usize, 0usize);
+    // Keep the loaded hosts alive too (sanity: host_bytes matches them).
+    let mut kept: Vec<(hipfire_runtime::llama::WeightTensor, hipfire_runtime::llama::WeightTensor)> =
+        Vec::new();
+    for (_, eid, gu_name, dn_name) in &chosen {
+        let gu_info = hfq.find_tensor_info(gu_name).expect("gate_up info");
+        let dn_info = hfq.find_tensor_info(dn_name).expect("down info");
+        let (gu_m, gu_k) = (gu_info.shape[0] as usize, gu_info.shape[1] as usize);
+        let (m, k) = (dn_info.shape[0] as usize, dn_info.shape[1] as usize);
+        assert_eq!(gu_m, 2 * k, "fused gate_up rows must be 2*mi");
+        assert_eq!(gu_k, m, "gate_up k (dim) must equal down m (dim)");
+        if dim == 0 {
+            dim = m;
+            mi = k;
+        }
+        assert_eq!((m, k), (dim, mi), "expert {eid}: geometry must match");
+        let gu = load_weight_tensor(
+            &hfq,
+            &mut gpu,
+            gu_name,
+            gu_m,
+            gu_k,
+            qwen35_tensor_name_candidates,
+            MemoryTarget::HostMapped,
+        )?;
+        let dn = load_weight_tensor(
+            &hfq,
+            &mut gpu,
+            dn_name,
+            m,
+            k,
+            qwen35_tensor_name_candidates,
+            MemoryTarget::HostMapped,
+        )?;
+        assert!(
+            gpu.host_located(&gu.buf) && gpu.host_located(&dn.buf),
+            "expert {eid} not host-mapped"
+        );
+        gu_bytes.push(gpu.host_bytes(&gu.buf).expect("host gu bytes").to_vec());
+        dn_bytes.push(gpu.host_bytes(&dn.buf).expect("host dn bytes").to_vec());
+        gu_q.push(cpu_quant(gu_info.quant_type).expect("gu decoder"));
+        dn_q.push(cpu_quant(dn_info.quant_type).expect("dn decoder"));
+        kept.push((gu, dn));
+    }
+    assert!(dim % 256 == 0 && mi % 256 == 0, "engine needs 256-multiple dim/mi");
+
+    // Build the graded packing: one host-mapped owner per tag per projection,
+    // expert bytes concatenated; record each expert's (tag, offset, len).
+    let mut gu_bucket_bytes: BTreeMap<(u8, u8), Vec<u8>> = BTreeMap::new();
+    let mut dn_bucket_bytes: BTreeMap<(u8, u8), Vec<u8>> = BTreeMap::new();
+    let mut gu_pos: Vec<((u8, u8), usize, usize)> = vec![((0, 0), 0, 0); KTOP];
+    let mut dn_pos: Vec<((u8, u8), usize, usize)> = vec![((0, 0), 0, 0); KTOP];
+    for (slot, (tag, _, _, _)) in chosen.iter().enumerate() {
+        let gb = gu_bucket_bytes.entry(*tag).or_default();
+        gu_pos[slot] = (*tag, gb.len(), gu_bytes[slot].len());
+        gb.extend_from_slice(&gu_bytes[slot]);
+        let db = dn_bucket_bytes.entry(*tag).or_default();
+        dn_pos[slot] = (*tag, db.len(), dn_bytes[slot].len());
+        db.extend_from_slice(&dn_bytes[slot]);
+    }
+    let mut gu_owner_idx: BTreeMap<(u8, u8), usize> = BTreeMap::new();
+    let mut gu_owners: Vec<rdna_compute::GpuTensor> = Vec::new();
+    for (tag, blob) in &gu_bucket_bytes {
+        gu_owner_idx.insert(*tag, gu_owners.len());
+        gu_owners.push(gpu.upload_raw_host_mapped(blob, &[blob.len()])?);
+    }
+    let mut dn_owner_idx: BTreeMap<(u8, u8), usize> = BTreeMap::new();
+    let mut dn_owners: Vec<rdna_compute::GpuTensor> = Vec::new();
+    for (tag, blob) in &dn_bucket_bytes {
+        dn_owner_idx.insert(*tag, dn_owners.len());
+        dn_owners.push(gpu.upload_raw_host_mapped(blob, &[blob.len()])?);
+    }
+
+
+    let mut rng: u32 = 0x51ed_2701;
+    let mut next_f32 = || {
+        rng ^= rng << 13;
+        rng ^= rng >> 17;
+        rng ^= rng << 5;
+        (rng as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+    // Per-token top-k over the 4 loaded experts (a distinct permutation per row).
+    let mut idx_host: Vec<i32> = Vec::with_capacity(N * KTOP);
+    for b in 0..N {
+        for r in 0..KTOP {
+            idx_host.push(((b + r * (b + 1) + b * b) % KTOP) as i32);
+        }
+    }
+    assert!(idx_host.iter().all(|&id| id >= 0 && (id as usize) < KTOP));
+    let w_host: Vec<f32> = (0..N * KTOP).map(|_| next_f32()).collect();
+    let seed: Vec<f32> = (0..N * dim).map(|_| next_f32()).collect();
+    let mut x_rot: Vec<f32> = (0..N * dim).map(|_| next_f32()).collect();
+    for row in 0..N {
+        hipfire_cpu::quant::rotate_x(&mut x_rot[row * dim..(row + 1) * dim]);
+    }
+
+    // Reference: per (token, rank) gemv -> silu -> rotate -> gemv, weighted into
+    // the residual in rank order.
+    let mut want = seed.clone();
+    for b in 0..N {
+        let xr = &x_rot[b * dim..(b + 1) * dim];
+        for r in 0..KTOP {
+            let e = idx_host[b * KTOP + r] as usize;
+            let w = w_host[b * KTOP + r];
+            let mut gu_out = vec![0.0f32; 2 * mi];
+            hipfire_cpu::gemv::gemv(gu_q[e], &gu_bytes[e], 2 * mi, dim, xr, &mut gu_out);
+            let mut hidden = vec![0.0f32; mi];
+            hipfire_cpu::epilogue::silu_mul(&gu_out, &mut hidden);
+            // Rotation is the *down* projection's contract (weights stored
+            // post-rotation); the engine applies it only for FWHT-G256 downs.
+            if dn_q[e].is_fwht_g256() {
+                hipfire_cpu::quant::rotate_x(&mut hidden);
+            }
+            let mut d = vec![0.0f32; dim];
+            hipfire_cpu::gemv::gemv(dn_q[e], &dn_bytes[e], dim, mi, &hidden, &mut d);
+            for i in 0..dim {
+                want[b * dim + i] += w * d[i];
+            }
+        }
+    }
+
+    let x = gpu.upload_f32(&x_rot, &[N * dim])?;
+    // The executor reads the index tensor as f32 and reinterprets the bits as
+    // i32, exactly as the decode scratch does; store the bits in an F32 tensor.
+    let idx_bits: Vec<f32> = idx_host.iter().map(|&v| f32::from_bits(v as u32)).collect();
+    let indices = gpu.upload_f32(&idx_bits, &[N * KTOP])?;
+    let weights = gpu.upload_f32(&w_host, &[N * KTOP])?;
+    let residual = gpu.upload_f32(&seed, &[N * dim])?;
+    const ADVANCE: usize = 2;
+    let prefix_residual = gpu.upload_f32(&seed[..ADVANCE * dim], &[ADVANCE * dim])?;
+    let prefix_x = gpu.upload_f32(&x_rot[..ADVANCE * dim], &[ADVANCE * dim])?;
+    let prefix_idx = gpu.upload_f32(&idx_bits[..ADVANCE * KTOP], &[ADVANCE * KTOP])?;
+    let prefix_w = gpu.upload_f32(&w_host[..ADVANCE * KTOP], &[ADVANCE * KTOP])?;
+    // Resolver: slice each expert's own bytes out of its bucket owner, exactly as
+    // `qwen35::forward::run_cpu_moe_experts` does through the view pointer walk.
+    let resolve = |e: usize| {
+        let (gtag, goff, glen) = gu_pos[e];
+        let (dtag, doff, dlen) = dn_pos[e];
+        let gb = gpu
+            .host_bytes(&gu_owners[gu_owner_idx[&gtag]])
+            .ok_or_else(|| DispatchError::Hip("test: gate_up owner lost host bytes".into()))?;
+        let db = gpu
+            .host_bytes(&dn_owners[dn_owner_idx[&dtag]])
+            .ok_or_else(|| DispatchError::Hip("test: down owner lost host bytes".into()))?;
+        Ok::<_, DispatchError>(CpuMoeExpert {
+            gate_up_quant: gu_q[e],
+            gate_up: &gb[goff..goff + glen],
+            down_quant: dn_q[e],
+            down: &db[doff..doff + dlen],
+        })
+    };
+    moe_cpu_experts(
+        &gpu, dim, mi, N, KTOP, &x, &indices, &weights, &residual, false, &resolve,
+    )?;
+    let got = gpu.download_f32(&residual)?;
+    let scale = want.iter().fold(1e-6f32, |a, v| a.max(v.abs()));
+    let worst = got
+        .iter()
+        .zip(&want)
+        .fold(0.0f32, |a, (p, q)| a.max((p - q).abs()));
+    eprintln!(
+        "cpu multirow N={N} k={KTOP} layer {l}: residual rel {:.3e} (scale {scale:.3e})",
+        worst / scale
+    );
+    assert!(
+        worst <= scale * REL_TOL,
+        "graded multi-row CPU splice disagrees: rel {:.3e}",
+        worst / scale
+    );
+
+    // Accepted-prefix rollback replay recomputes only the committed prefix
+    // (`advance` rows) after restoring the pre-verify state. The routed
+    // contribution must be row-independent, so re-running the executor for the
+    // first `ADVANCE` rows must reproduce exactly those rows of the full-width
+    // run — the target arithmetic the rollback replay must land on.
+    moe_cpu_experts(
+        &gpu,
+        dim,
+        mi,
+        ADVANCE,
+        KTOP,
+        &prefix_x,
+        &prefix_idx,
+        &prefix_w,
+        &prefix_residual,
+        false,
+        &resolve,
+    )?;
+    let prefix_got = gpu.download_f32(&prefix_residual)?;
+    let prefix_worst = prefix_got
+        .iter()
+        .zip(&got[..ADVANCE * dim])
+        .fold(0.0f32, |a, (p, q)| a.max((p - q).abs()));
+    assert!(
+        prefix_worst <= scale * REL_TOL,
+        "rollback-prefix replay disagrees with the full-width verify: rel {:.3e}",
+        prefix_worst / scale
+    );
+    eprintln!("GRADED_CPU_MULTIROW_PARITY PASS (layer {l})");
     Ok(())
 }

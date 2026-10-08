@@ -146,62 +146,149 @@ pub fn gemm_with_simd(
         });
 }
 
-/// Batched multi-expert GEMV: `out[e*m .. (e+1)*m] = W_e · x_e`, with
-/// `pairs[e] = (weight rows, activation)`.
+/// Random-access view of a batch of shared-weight jobs sharing one `(m, k)`.
 ///
-/// One rayon region over every `(expert, row)` output element. A loop of small
-/// per-expert [`gemv`] calls pays one region entry — and one worker wake-up —
-/// per expert, which dominates when `m` is only a few thousand rows; the routed
-/// expert FFN of a decode token is exactly that shape (k experts × two
-/// projections per layer). Every element is the same [`dot_row_simd`] call
-/// [`gemv`] makes, so the result is bit-identical to calling [`gemv`] once per
-/// expert.
-pub fn gemv_experts(
-    q: CpuQuant,
+/// A layer's routed-expert CPU FFN issues exactly two such batches — every
+/// selected expert's gate/up projection, then every expert's down projection —
+/// and [`gemv_shared_sourced`] runs one batch's jobs in a single rayon region.
+/// It is a trait rather than a materialized `&[Job]` slice because a job's
+/// inputs borrow the caller's buffers (`packed` from the weight owner, the
+/// activation rows from its scratch) and its output is a disjoint mutable
+/// sub-range of one caller buffer: building that as a slice would force a
+/// per-call heap allocation, and holding it in a thread-local is not expressible
+/// with safe lifetimes. The caller keeps its *index* metadata (job boundaries,
+/// slot→expert and slot→activation maps) in reusable storage and answers these
+/// reads instead.
+///
+/// Each method must be pure and cheap: `n`/`quant`/`packed`/`xs_row` are called
+/// once per job (plus once per activation row for the up-front validation).
+pub trait SharedJobSource {
+    /// Number of jobs in the batch.
+    fn jobs(&self) -> usize;
+    /// Activation rows for job `j` (`m * n(j)` outputs are written for it).
+    fn n(&self, j: usize) -> usize;
+    /// Weight format of job `j`. Jobs may differ — a graded layer's MQ6 / MQ4 /
+    /// MQ3-Lloyd experts carry different tiers.
+    fn quant(&self, j: usize) -> CpuQuant;
+    /// Job `j`'s `m` weight rows of `k` in `quant(j)`'s packed layout.
+    fn packed(&self, j: usize) -> &[u8];
+    /// Job `j`'s activation row `t` (at least `k` long, already carrying the
+    /// format's rotation — see the module docs).
+    fn xs_row(&self, j: usize, t: usize) -> &[f32];
+}
+
+/// Upper bound on the jobs [`gemv_shared_sourced`] splits into a stack array of
+/// output chunks before falling back to a heap `Vec`. Decode (1 row) and the
+/// ≤4-row verify window keep a layer's job count (one per distinct selected
+/// expert) far below this; a wider batch keeps working through the fallback.
+const MAX_STACK_JOBS: usize = 256;
+
+/// Batched shared-weight projection: job `j` is `m` weight rows of `k` applied
+/// to each of its `n(j)` activation rows, writing `m * n(j)` outputs
+/// **row-major** (`out[r * n + t]`), the jobs concatenated in order in `out`.
+///
+/// The row-major layout is the point of the job. A routed expert selected by
+/// several tokens is one weight row read from memory and applied to `n`
+/// activations, so the row's bytes stay hot across the job's tokens: the row
+/// loop is outer, the token loop inner — the same work split this had when the
+/// jobs were a materialized slice. (The *decode* is still per output element,
+/// exactly as [`gemv`] does it — the win is a single memory read of the weight
+/// row, not a shared decode; `use_simd` is resolved once per job, not per
+/// element.) Each element is the same [`dot_row_simd`] call [`gemv`] makes, so a
+/// job with one activation row is bit-identical to [`gemv`], and a job with
+/// several is bit-identical to calling [`gemv`] once per activation row — the
+/// per-element accumulation order does not depend on `n`.
+///
+/// Parallel over jobs, and within a job over its weight rows; the nesting is
+/// deliberate, so a layer whose selected experts are all distinct still fills
+/// the pool per job, while a single expert shared by every token parallelizes
+/// over that expert's rows instead.
+pub fn gemv_shared_sourced<S: SharedJobSource + Sync>(
     m: usize,
     k: usize,
-    pairs: &[(&[u8], &[f32])],
     out: &mut [f32],
+    src: &S,
     requested: Option<bool>,
 ) {
-    if pairs.is_empty() || m == 0 || k == 0 {
+    let jobs = src.jobs();
+    if m == 0 || k == 0 || jobs == 0 {
         return;
     }
-    let rb = row_bytes(q, k);
     assert!(
         k % 256 == 0,
-        "gemv_experts({q:?}): k={k} is not a multiple of 256"
+        "gemv_shared_sourced: k={k} is not a multiple of 256"
     );
-    assert!(
-        out.len() >= pairs.len() * m,
-        "gemv_experts({q:?}): out has {} elements, need {} experts × {m} rows",
-        out.len(),
-        pairs.len()
-    );
-    let use_simd = simd::row_dot_enabled(q, requested);
-    // Validate once, not per output element (this loop is k × m elements).
-    for (packed, x) in pairs {
+    // Validate once per job, not per output element (the inner loop is m × n).
+    let mut total = 0usize;
+    for j in 0..jobs {
+        let n = src.n(j);
+        let q = src.quant(j);
+        let rb = row_bytes(q, k);
+        let packed = src.packed(j);
         assert!(
             packed.len() >= m * rb,
-            "gemv_experts({q:?}): weight rows have {} bytes, need {}",
-            packed.len(),
-            m * rb
+            "gemv_shared_sourced({q:?}): weight has {} bytes, need {m} rows of {rb}",
+            packed.len()
         );
-        assert!(
-            x.len() >= k,
-            "gemv_experts({q:?}): activation has {} elements, need k={k}",
-            x.len()
-        );
+        for t in 0..n {
+            let x = src.xs_row(j, t);
+            assert!(
+                x.len() >= k,
+                "gemv_shared_sourced({q:?}): activation has {} elements, need k={k}",
+                x.len()
+            );
+        }
+        total += m * n;
     }
-    out[..pairs.len() * m]
-        .par_chunks_mut(m)
-        .zip(pairs.par_iter())
-        .for_each(|(out_e, (packed, x))| {
-            let x = &x[..k];
-            out_e.par_iter_mut().enumerate().for_each(|(row, o)| {
-                *o = dot_row_simd(q, &packed[row * rb..], k, x, use_simd);
+    assert!(
+        out.len() >= total,
+        "gemv_shared_sourced: out has {} elements, need {total}",
+        out.len()
+    );
+    // Split `out` into one row-major chunk per job without a heap allocation:
+    // the chunks live in a fixed-capacity stack array, with the `Vec` fallback
+    // reached only by a batch wider than MAX_STACK_JOBS.
+    let mut stack: [Option<&mut [f32]>; MAX_STACK_JOBS] = [const { None }; MAX_STACK_JOBS];
+    let mut heap: Vec<Option<&mut [f32]>>;
+    let chunks: &mut [Option<&mut [f32]>] = if jobs <= MAX_STACK_JOBS {
+        let mut rest: &mut [f32] = out;
+        for j in 0..jobs {
+            let (chunk, tail) = rest.split_at_mut(m * src.n(j));
+            stack[j] = Some(chunk);
+            rest = tail;
+        }
+        &mut stack[..jobs]
+    } else {
+        heap = Vec::with_capacity(jobs);
+        let mut rest: &mut [f32] = out;
+        for j in 0..jobs {
+            let (chunk, tail) = rest.split_at_mut(m * src.n(j));
+            heap.push(Some(chunk));
+            rest = tail;
+        }
+        &mut heap
+    };
+    chunks.par_iter_mut().enumerate().for_each(|(j, slot)| {
+        let Some(o) = slot.as_deref_mut() else {
+            return;
+        };
+        let n = src.n(j);
+        if n == 0 {
+            return;
+        }
+        let q = src.quant(j);
+        let rb = row_bytes(q, k);
+        let use_simd = simd::row_dot_enabled(q, requested);
+        o[..m * n]
+            .par_chunks_mut(n)
+            .enumerate()
+            .for_each(|(r, chunk)| {
+                let row = &src.packed(j)[r * rb..];
+                for (t, v) in chunk.iter_mut().enumerate() {
+                    *v = dot_row_simd(q, row, k, &src.xs_row(j, t)[..k], use_simd);
+                }
             });
-        });
+    });
 }
 
 /// One output element: `Σ_j W[row][j] * x[j]`, accumulating one group at a time.
@@ -282,48 +369,100 @@ mod test {
             .collect()
     }
 
-    /// `gemv_experts` must be bit-identical to calling `gemv` once per expert —
-    /// it is the routed-expert decode path's replacement for a loop of small
-    /// per-expert GEMVs, and a rounding change there would flip greedy tokens.
+    /// `gemv_shared_sourced` must be bit-identical to calling `gemv` once per
+    /// activation row, for every job — including jobs of different formats in
+    /// one call (a graded layer's MQ6 / MQ4 / MQ3-Lloyd experts) and several
+    /// activation rows against one weight (an expert selected by several
+    /// verification rows). It is the routed-expert CPU path's replacement for a
+    /// loop of per-expert GEMVs, and a rounding change there would flip greedy
+    /// tokens.
     #[test]
-    fn gemv_experts_matches_per_expert_gemv() {
-        for q in [CpuQuant::Mq4G256, CpuQuant::Mq4G256V2, CpuQuant::Mq6G256] {
-            let (m, k, experts) = (8usize, 256usize, 3usize);
-            let groups = k / q.group_elems();
-            // Byte-distinct experts: shift the *group payload* salt per expert
-            // (as `moe.rs`'s fixture does) so headers stay valid — XOR-ing the
-            // whole blob would corrupt the fp16/f32 scale and can produce NaN,
-            // which `assert_eq!` rejects even when both sides match.
-            let packed: Vec<Vec<u8>> = (0..experts)
-                .map(|e| {
-                    let mut out = Vec::with_capacity(m * groups * q.group_bytes());
-                    for row in 0..m {
-                        for g in 0..groups {
-                            out.extend_from_slice(&crate::testfix::group_bytes(
-                                q,
-                                e * 1_000_000 + row * groups + g,
-                            ));
-                        }
-                    }
-                    out
-                })
-                .collect();
-            let xs: Vec<Vec<f32>> = (0..experts)
-                .map(|e| x_of(k).iter().map(|v| v + e as f32).collect())
-                .collect();
-            let pairs: Vec<(&[u8], &[f32])> = packed
-                .iter()
-                .zip(xs.iter())
-                .map(|(p, x)| (p.as_slice(), x.as_slice()))
-                .collect();
-            let mut batched = vec![0.0f32; experts * m];
-            gemv_experts(q, m, k, &pairs, &mut batched, None);
-            let mut per_expert = vec![0.0f32; experts * m];
-            for (e, (p, x)) in packed.iter().zip(xs.iter()).enumerate() {
-                gemv(q, p, m, k, x, &mut per_expert[e * m..(e + 1) * m]);
-            }
-            assert_eq!(batched, per_expert, "{q:?}: batched != per-expert gemv");
+    fn gemv_shared_matches_per_row_gemv() {
+        /// A batched source over plain slices — the same index/slice shape the
+        /// CPU MoE splice builds from its reusable metadata.
+        struct Batch<'a> {
+            quants: &'a [CpuQuant],
+            packs: &'a [&'a [u8]],
+            xs: &'a [&'a [&'a [f32]]],
         }
+        impl SharedJobSource for Batch<'_> {
+            fn jobs(&self) -> usize {
+                self.quants.len()
+            }
+            fn n(&self, j: usize) -> usize {
+                self.xs[j].len()
+            }
+            fn quant(&self, j: usize) -> CpuQuant {
+                self.quants[j]
+            }
+            fn packed(&self, j: usize) -> &[u8] {
+                self.packs[j]
+            }
+            fn xs_row(&self, j: usize, t: usize) -> &[f32] {
+                self.xs[j][t]
+            }
+        }
+
+        let (m, k) = (8usize, 512usize);
+        // A graded set: three tiers plus a repeated uniform format, with one,
+        // two, three and four activation rows so both the mixed-format and the
+        // shared-weight (expert across rows) shapes run in one call.
+        let quants = [
+            CpuQuant::Mq6G256,
+            CpuQuant::Mq4G256,
+            CpuQuant::Mq3G256Lloyd,
+            CpuQuant::Mq4G256,
+        ];
+        let ns = [3usize, 1, 4, 2];
+        let packed: Vec<Vec<u8>> = quants.iter().map(|&q| weights(q, m, k)).collect();
+        let xs: Vec<Vec<Vec<f32>>> = ns
+            .iter()
+            .enumerate()
+            .map(|(j, &n)| {
+                (0..n)
+                    .map(|t| x_of(k).iter().map(|v| v + (j * 10 + t) as f32).collect())
+                    .collect()
+            })
+            .collect();
+        let xs_refs: Vec<Vec<&[f32]>> = xs
+            .iter()
+            .map(|rows| rows.iter().map(|v| v.as_slice()).collect())
+            .collect();
+        let packs: Vec<&[u8]> = packed.iter().map(|p| p.as_slice()).collect();
+        let xs_nested: Vec<&[&[f32]]> = xs_refs.iter().map(|r| r.as_slice()).collect();
+        let total: usize = ns.iter().map(|n| n * m).sum();
+        let src = Batch {
+            quants: &quants,
+            packs: &packs,
+            xs: &xs_nested,
+        };
+        let mut out = vec![0.0f32; total];
+        gemv_shared_sourced(m, k, &mut out, &src, None);
+        let mut reference = vec![0.0f32; total];
+        let mut off = 0usize;
+        for (j, &q) in quants.iter().enumerate() {
+            let n = ns[j];
+            // `gemv` produces one activation row at a time (token-major); the
+            // batched output is row-major (`out[r * n + t]`), so transpose.
+            let mut token_major = vec![0.0f32; n * m];
+            for t in 0..n {
+                gemv(
+                    q,
+                    &packed[j],
+                    m,
+                    k,
+                    &xs[j][t],
+                    &mut token_major[t * m..(t + 1) * m],
+                );
+            }
+            for r in 0..m {
+                for t in 0..n {
+                    reference[off + r * n + t] = token_major[t * m + r];
+                }
+            }
+            off += n * m;
+        }
+        assert_eq!(out, reference, "gemv_shared_sourced != per-row gemv");
     }
 
     #[test]
