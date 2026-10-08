@@ -36,7 +36,7 @@ not a baseline, not an admission, and not a
 models share one axis: 2B and 9B at 25 / 50 / 75 % of layers spilled, 27B at
 12.5 / 25 % (the "smaller spread"). **Arm order rotates by round** (`round % 3`)
 so no arm owns the post-kill cold slot; 5 rounds per point for 2B and 9B, 3 for
-27B. Rows are committed with the figure under
+27B. Rows are committed under
 `data-2026-10-02-offload-passback-model-spread/`.
 
 ## Result (measured) — median decode tok/s
@@ -61,7 +61,10 @@ Per-model load (1-min, start → end): 2B 7.31 → 5.24; 9B 2.40 → 7.31; 27B 4
 6.58. Absolutes are contended-host numbers; the interleaved **relative** deltas
 are the readable part.
 
-![pass-back gain vs spill fraction](data-2026-10-02-offload-passback-model-spread/passback-gain-vs-spill.png)
+Figure: `data-2026-10-02-offload-passback-model-spread/spread-chart.py` renders
+`passback-gain-vs-spill.{svg,png}` (and `scatter-chart.py` the paired scatter)
+from the committed `sp_*.jsonl` in that directory. The renders are not carried
+in the ledger.
 
 ## Reading
 

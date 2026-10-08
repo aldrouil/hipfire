@@ -290,8 +290,11 @@ one fresh daemon per arm, arms interleaved, `--spec off --backend noslots
 --workload stateless`, 128 tokens, greedy, the same committed prompt), sweeping the
 resident-layer budget so the spilled prefix changes. Two rounds per point.
 
-Bars: [`data-2026-10-01-offload-passback-split/mode-sweep-vs-spilled-layers.png`](data-2026-10-01-offload-passback-split/mode-sweep-vs-spilled-layers.png)
-(+ `.svg`).
+Bars: `data-2026-10-01-offload-passback-split/mode-sweep-chart.py` renders
+`mode-sweep-vs-spilled-layers.{svg,png}` from the sweep's bench JSONs
+(`sw_<model>_<spilled>_<mode>_<round>.json`, read from `SW_DIR`) — those JSONs
+are not committed; the per-round values are in the tables below. The renders are
+not carried in the ledger.
 
 ### 8.1 Qwen3.5-9B mq4 (32 layers)
 

@@ -6,15 +6,13 @@
 [`2026-10-02-offload-passback-quant-spread-gfx1201.md`](2026-10-02-offload-passback-quant-spread-gfx1201.md),
 per [`README.md`](README.md).
 
-## Adds the figure
+## Adds the chart script
 
-The record's numbers are plotted (no measured number changes):
-
-![quant vs engine](data-2026-10-02-offload-passback-quant-spread/quant-vs-engine.png)
-
-`data-2026-10-02-offload-passback-quant-spread/quant-chart.py` renders it from
-the committed jsonl — `9b_mq3.jsonl` here and `sp_9b.jsonl` from the sibling
-model-spread data dir (mq4).
+No measured number changes. `data-2026-10-02-offload-passback-quant-spread/quant-chart.py`
+renders `quant-vs-engine.{svg,png}` from the committed jsonl — `9b_mq3.jsonl`
+here and `sp_9b.jsonl` from the sibling model-spread data dir (mq4) — and the
+renders are not carried in the ledger; run the script to reproduce them. The
+panels it draws:
 
 - **Panel (a)** — decode tok/s by engine for mq3 vs mq4 at 8/32 and 16/32 spilled.
 - **Panel (b)** — pass-back's gain over `cpu` and over `pcie`. It shows the two
