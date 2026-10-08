@@ -1552,6 +1552,13 @@ pub(super) fn select_decode(
 }
 
 /// Resolve all grouped-prefill choices without a GPU or an instruction list.
+///
+/// The prefill [`MoePrefillResolution`] reads owner-derived residency via
+/// `routed_experts.host_mapped_projections()`: on narrow gfx1201 MTP verify
+/// with a host-mapped uniform MQ4 gate_up+down, Path 2 (grouped-WMMA) is
+/// re-admitted. Residency comes from the packed weight owners — never inferred
+/// from borrowed tensor kinds — so resident-only weights or any other
+/// format/arch keep the indexed Path 1 policy unchanged.
 pub(super) fn select_prefill(
     ctx: &DispatchCtx,
     params: &MoePrefillParams<'_>,
@@ -1600,7 +1607,8 @@ pub(super) fn select_prefill(
     if route.is_none() {
         super::reject_mq4g128v2_moe(&params.dtypes)?;
     }
-    let resolution = MoePrefillResolution::resolve_with_batch_ctx(&params.dtypes, &ctx.arch, &ctx.flags, ctx.batch_size, ctx.workload == crate::context::DispatchWorkload::SpeculativeVerify);
+    let (host_gate_up, host_down) = params.routed_experts.host_mapped_projections();
+    let resolution = MoePrefillResolution::resolve_with_batch_ctx(&params.dtypes, &ctx.arch, &ctx.flags, ctx.batch_size, ctx.workload == crate::context::DispatchWorkload::SpeculativeVerify, host_gate_up || host_down);
     let _total_slots = params
         .batch_size
         .checked_mul(params.k_top)

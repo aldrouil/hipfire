@@ -1468,23 +1468,44 @@ impl MoePrefillResolution {
         arch: &rdna_compute::arch_caps::ArchCaps,
         flags: &rdna_compute::feature_flags::FeatureFlags,
     ) -> Self {
-        Self::resolve_with_batch_ctx(d, arch, flags, 0, false)
+        Self::resolve_with_batch_ctx(d, arch, flags, 0, false, false)
     }
 
     /// Batch- and workload-aware resolution. Narrow *verify* batches (MTP
     /// verify, n <= 4) take the indexed Path 1. Prompt chunks keep the
     /// legacy route regardless of width — only `SpeculativeVerify` moves.
     /// `batch == 0` (unknown) preserves the legacy shape-blind behavior.
+    ///
+    /// `has_host_projection` opts into one narrow-verify exception: with a
+    /// host-mapped uniform MQ4 gate_up+down on gfx1201 and no mixed-expert
+    /// layer, Path 2 (grouped-WMMA) is re-admitted even for a verify batch.
+    /// The caller MUST set this only when the routed projections are actually
+    /// host-mapped (see [`RoutedExpertWeights::host_mapped_projections`]);
+    /// resident-only weights or any other format/arch keep the indexed Path 1
+    /// policy unchanged. `resolve` (batch0 legacy) always passes `false`.
     pub fn resolve_with_batch_ctx(
         d: &MoeDtypes<'_>,
         arch: &rdna_compute::arch_caps::ArchCaps,
         flags: &rdna_compute::feature_flags::FeatureFlags,
         batch: usize,
         is_verify: bool,
+        has_host_projection: bool,
     ) -> Self {
         let paro_mode = d.routed_gate_up == DType::ParoQ4G128 && d.has_paro_shared;
         let narrow_verify = is_verify && batch != 0 && batch <= 4;
-        let use_path2 = flags.moe_grouped_gemm && arch.has_wmma() && !narrow_verify;
+        // Host-mapped uniform MQ4 gate_up+down on a narrow gfx1201 verify:
+        // re-admit Path 2 (grouped-WMMA) for this one offloaded case. Only when
+        // the caller reports host projections — resident-only weights or any
+        // other format/arch keep the indexed Path 1 policy. The later mixed /
+        // MQ6 / E8 logic below is unchanged and still governs every other path.
+        let offloaded_uniform_verify = narrow_verify
+            && (2..=4).contains(&batch)
+            && arch.is_gfx1201()
+            && has_host_projection
+            && !d.routed_has_mixed_experts
+            && matches!(d.routed_gate_up, DType::MQ4G256 | DType::MQ4G256V2)
+            && matches!(d.routed_down, DType::MQ4G256 | DType::MQ4G256V2);
+        let use_path2 = flags.moe_grouped_gemm && arch.has_wmma() && (!narrow_verify || offloaded_uniform_verify);
         // MQ6 / MQ6V2 grouped-WMMA: gfx11 `_k2` kernel now exists (alongside the
         // gfx12 `_gfx12` / `mq6g256v2` sisters). Only suppress Path 2 on archs
         // that have NEITHER (gfx9*, gfx1010/1030, CDNA) — i.e. no wmma_w32 and
