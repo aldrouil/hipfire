@@ -681,11 +681,87 @@ fn requests_host_spill() -> bool {
     gpu_layer_budget() != OffloadBudget::Full || moe_expert_budget() != OffloadBudget::Full
 }
 
+/// clr's hardware-queue cap. RDNA4 (gfx1200/gfx1201) can randomly lose inference
+/// throughput with multiple hardware queues when MTP and PCIe offload are used.
+/// One hardware queue avoids that regression. Set the cap before the runtime
+/// loads, without changing older GPUs' defaults.
+const GPU_MAX_HW_QUEUES: &str = "GPU_MAX_HW_QUEUES";
+
+/// Physical KFD topology arches that are RDNA4. `HSA_OVERRIDE_GFX_VERSION` is
+/// deliberately ignored: the queue cap is about the physical card, and the
+/// override is a compatibility lie HIP reports, not a different device.
+fn is_rdna4(arch: &str) -> bool {
+    matches!(arch, "gfx1200" | "gfx1201")
+}
+
+/// Whether the ROCr-exposed cards left by a raw HIP filter include RDNA4.
+/// HIP ordinals follow ROCr agent order, not the BDF-sorted enumeration.
+/// Resolve the whole filter before arming: an unknown entry leaves it unset.
+fn visible_has_rdna4(
+    devices: &mut [hipfire_config::devices::GpuDevice],
+    hip_filter: Option<&str>,
+) -> bool {
+    let Some(filter) = hip_filter else {
+        return devices.iter().any(|device| is_rdna4(&device.arch));
+    };
+    devices.sort_unstable_by_key(|device| device.rocr_index);
+    let mut has_rdna4 = false;
+    for token in filter.split(',').map(str::trim) {
+        let device = match token.parse::<usize>() {
+            Ok(ordinal) => devices.get(ordinal),
+            Err(_) => {
+                let uuid = token
+                    .get(..4)
+                    .filter(|prefix| prefix.eq_ignore_ascii_case("GPU-"))
+                    .and_then(|_| u128::from_str_radix(&token[4..], 16).ok());
+                devices.iter().find(|device| uuid.is_some() && device.unique_id == uuid)
+            }
+        };
+        let Some(device) = device else {
+            return false;
+        };
+        has_rdna4 |= is_rdna4(&device.arch);
+    }
+    has_rdna4
+}
+
+/// Cap hardware queues to one when a visible physical card is RDNA4, unless the
+/// operator set [`GPU_MAX_HW_QUEUES`] (any value, including empty). Identity
+/// comes from the KFD topology, never a HIP probe, so an unreadable topology or
+/// a filter naming no card leaves the variable untouched.
+fn arm_single_hw_queue_on_rdna4() {
+    if std::env::var_os(GPU_MAX_HW_QUEUES).is_some() {
+        return;
+    }
+    if matches!(
+        std::env::var(hipfire_config::devices::ROCR_VISIBLE_DEVICES),
+        Err(std::env::VarError::NotUnicode(_))
+    ) {
+        return;
+    }
+    let Some(mut devices) = hipfire_config::devices::startup_devices() else {
+        return;
+    };
+    let filter = match std::env::var(hipfire_config::devices::HIP_VISIBLE_DEVICES) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        // A filter we cannot read is a filter we cannot resolve.
+        Err(std::env::VarError::NotUnicode(_)) => return,
+    };
+    if !visible_has_rdna4(&mut devices, filter.as_deref()) {
+        return;
+    }
+    std::env::set_var(GPU_MAX_HW_QUEUES, "1");
+    eprintln!("[hip-bridge] {GPU_MAX_HW_QUEUES}=1 (physical RDNA4 visible)");
+}
+
 impl HipRuntime {
     /// Load the HIP runtime via dlopen.
     /// Uses the shared ROCm resolver so runtime, headers, and hipcc stay within
     /// one selected installation.
     pub fn load() -> HipResult<Self> {
+        // Physical-identity knobs must be set before the runtime dlopens.
+        arm_single_hw_queue_on_rdna4();
         // The pageable-copy half is free and covers every load; the
         // `hipHostMalloc` half is scoped to the loads that host-map weights.
         stage_pageable_copies();
@@ -2729,3 +2805,120 @@ pub struct GraphExec(HipGraphExec);
 // between threads is fine; it is not Sync. Concurrent use needs
 // external stream synchronization; destroy only when idle.
 unsafe impl Send for GraphExec {}
+
+#[cfg(test)]
+mod rdna4_hw_queue_tests {
+    use super::*;
+    use hipfire_config::devices::{GpuDevice, PciBdf};
+
+    fn card(index: usize, arch: &str, unique_id: Option<u128>) -> GpuDevice {
+        GpuDevice {
+            index,
+            rocr_index: index,
+            node: index as u32,
+            arch: arch.into(),
+            unique_id,
+            bdf: PciBdf {
+                domain: 0,
+                bus: index as u8,
+                device: 0,
+                function: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn only_exact_rdna4_arches_match() {
+        assert!(is_rdna4("gfx1200"));
+        assert!(is_rdna4("gfx1201"));
+        assert!(!is_rdna4("gfx1202"));
+        assert!(!is_rdna4("gfx1100"));
+        assert!(!is_rdna4("gfx1030"));
+        assert!(!is_rdna4("gfx1200 "));
+        assert!(!is_rdna4("GFX1201"));
+        assert!(!is_rdna4(""));
+    }
+
+    #[test]
+    fn older_only_selection_never_arms() {
+        let mut devices = [card(0, "gfx1100", Some(1)), card(1, "gfx1030", None)];
+        assert!(!visible_has_rdna4(&mut devices, None));
+        assert!(!visible_has_rdna4(&mut devices, Some("0")));
+        assert!(!visible_has_rdna4(&mut devices, Some("0,1")));
+    }
+
+    #[test]
+    fn mixed_selection_arms_only_when_rdna4_visible() {
+        let older = 0x43390a851e296ee5;
+        let rdna4 = 0x9eb7aeda51c88ffd;
+        let mut devices = [card(0, "gfx1100", Some(older)), card(1, "gfx1201", Some(rdna4))];
+        assert!(visible_has_rdna4(&mut devices, None));
+        assert!(!visible_has_rdna4(&mut devices, Some("0")));
+        assert!(visible_has_rdna4(&mut devices, Some("1")));
+        assert!(visible_has_rdna4(&mut devices, Some("0,1")));
+    }
+
+    #[test]
+    fn hidden_rdna4_behind_hip_uuid_filter_leaves_unset() {
+        let older = 0x43390a851e296ee5;
+        let rdna4 = 0x9eb7aeda51c88ffd;
+        let mut devices = [card(0, "gfx1100", Some(older)), card(1, "gfx1201", Some(rdna4))];
+        let older_uuid = format!("GPU-{older:016x}");
+        let rdna4_uuid = format!("GPU-{rdna4:016x}");
+        assert!(!visible_has_rdna4(&mut devices, Some(&older_uuid)));
+        assert!(visible_has_rdna4(&mut devices, Some(&rdna4_uuid)));
+        // Case-insensitive UUID match, like ROCr/HIP.
+        assert!(visible_has_rdna4(&mut devices, Some(&rdna4_uuid.to_ascii_uppercase())));
+    }
+
+    #[test]
+    fn unresolvable_filter_leaves_unset() {
+        let mut devices = [
+            card(0, "gfx1100", Some(0x43390a851e296ee5)),
+            card(1, "gfx1201", None),
+        ];
+        // Malformed / empty entries.
+        assert!(!visible_has_rdna4(&mut devices, Some("")));
+        assert!(!visible_has_rdna4(&mut devices, Some("0,")));
+        assert!(!visible_has_rdna4(&mut devices, Some(",1")));
+        assert!(!visible_has_rdna4(&mut devices, Some("garbage")));
+        assert!(!visible_has_rdna4(&mut devices, Some("1,garbage")));
+        // Ordinal outside the visible set.
+        assert!(!visible_has_rdna4(&mut devices, Some("5")));
+        // A UUID that matches no card.
+        assert!(!visible_has_rdna4(&mut devices, Some("GPU-deadbeefdeadbeef")));
+    }
+
+    #[test]
+    fn hip_ordinal_follows_rocr_not_bdf_order() {
+        // BDF-sorted enumeration is BDF 0 then BDF 1, but ROCr agent order is
+        // the reverse: HIP ordinal 0 is the older card at BDF 1, ordinal 1 is
+        // the RDNA4 at BDF 0.
+        let mut devices = [
+            GpuDevice {
+                index: 0,
+                rocr_index: 1,
+                node: 1,
+                arch: "gfx1201".into(),
+                unique_id: None,
+                bdf: PciBdf { domain: 0, bus: 0, device: 0, function: 0 },
+            },
+            GpuDevice {
+                index: 1,
+                rocr_index: 0,
+                node: 2,
+                arch: "gfx1100".into(),
+                unique_id: Some(0x43390a851e296ee5),
+                bdf: PciBdf { domain: 0, bus: 1, device: 0, function: 0 },
+            },
+        ];
+        assert!(!visible_has_rdna4(&mut devices, Some("0")));
+        assert!(visible_has_rdna4(&mut devices, Some("1")));
+    }
+
+    #[test]
+    fn unknown_arch_is_not_rdna4() {
+        let mut devices = [card(0, "gfx0000", None)];
+        assert!(!visible_has_rdna4(&mut devices, None));
+    }
+}
