@@ -1780,9 +1780,13 @@ impl Rig {
             }
         };
 
-        // Reverse of construction: graph → out_tokens → logits → scratch →
-        // pbs → staging → dn → arenas → weights → caches/pool.
+        // Release slot, GPU-global and MTP graphs before their tensor dependencies.
+        // Then free the remaining tensor owners in reverse construction order.
         graph.release(&gpu);
+        gpu.invalidate_graph_state();
+        for mtp_state in mtp_states.into_iter().flatten() {
+            mtp_state.free_gpu(&mut gpu);
+        }
         note_hip(gpu.free_tensor(out_tokens));
         note_hip(gpu.free_tensor(logits_out));
         note_hip(scratch.free_gpu(&mut gpu));
@@ -1807,9 +1811,6 @@ impl Rig {
         weights.free_gpu(&mut gpu);
         if let Some(h) = mtp_head {
             h.free_gpu(&mut gpu);
-        }
-        for mtp_state in mtp_states.into_iter().flatten() {
-            mtp_state.free_gpu(&mut gpu);
         }
         if let Some((scratch, rot)) = mtp_prefill_batched {
             scratch.free_gpu(&mut gpu);
@@ -1842,7 +1843,6 @@ impl Rig {
             }
         }
         gpu.invalidate_weight_caches();
-        gpu.invalidate_graph_state();
         gpu.drain_pool();
 
         match first_err {
