@@ -6564,6 +6564,15 @@ pub mod memory {
         Cpu,
         /// Every spilled step runs on both: the GPU takes the first
         /// `memory.offload_passback_share` of its output rows, the CPU the rest.
+        ///
+        /// Not reproducible run to run, by design. [`OffloadExec::Cpu`] and
+        /// [`OffloadExec::Pcie`] execute a layer's GEMV on different engines, so
+        /// their arithmetic need not agree, and this mode's row split is
+        /// scheduled per process (a seeding probe plus the online arm timings) —
+        /// two identical greedy runs divide the same step differently. Pin
+        /// `memory.offload_passback_share` to a number, or to `0`, which is
+        /// byte-identical to [`OffloadExec::Cpu`], before diffing output against
+        /// a reference.
         Passback,
     }
 
