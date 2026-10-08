@@ -234,6 +234,17 @@ pub fn prepare_host_memory_for(model: &std::path::Path) {
     let archs = devices.iter().map(|device| device.arch.as_str()).collect::<Vec<_>>();
     if hipfire_arch_qwen4::expert_residency::keeps_host_memory_out_of_reclaim(arch_id, &archs) {
         hip_bridge::keep_host_memory_out_of_reclaim(&format!("Qwen4 model on {}", archs.join(",")));
+    } else if arch_id == 6 {
+        // Qwen3.5/3.6/3.8 MoE (arch 6). An unset budget resolves to auto-fit for
+        // the expert tier (`hipfire_config::memory::resolve_effective_budgets`
+        // maps `(Full, Full)` to `(Auto, Auto)` for a MoE), so an over-fit MoE
+        // host-places its routed experts with no key set. The placement itself is
+        // resolved after this point, but libhsakmt/clr read the switches once,
+        // when the runtime loads, so this is the last place that can arm them.
+        hip_bridge::keep_host_memory_out_of_reclaim(&format!(
+            "Qwen3.5 MoE (arch 6) on {}",
+            archs.join(",")
+        ));
     }
 }
 

@@ -598,30 +598,57 @@ const STAGE_ALL_PAGEABLE_COPIES_MB: &str = "100000";
 /// call, while the process is still single-threaded. APUs ignore the first
 /// switch.
 ///
-/// Both switches are process-global, and together they slow other loads: on
-/// gfx1201, H2's weight sweep took 1.20-1.22 s with them instead of
-/// 1.00-1.01 s. So they are set only in a process that loads a Qwen4 model,
-/// the one known to hold tens of GB of host memory the GPU reads:
-/// [`HipRuntime::load`] sets them in a process configured to host-map Qwen4
-/// experts ([`QWEN4_EXPERT_VRAM_LAYERS_ENV`]), and a process about to load a
-/// Qwen4 model on a discrete GPU calls this before the runtime loads
-/// (`hipfire_loader::prepare_host_memory_for`).
+/// The `hipHostMalloc` switch is the expensive half: on gfx1201, H2's weight
+/// sweep took 1.20-1.22 s with both instead of 1.00-1.01 s. So that half is set
+/// only in a process that will hold host memory the GPU reads: [`HipRuntime::load`]
+/// sets it in a process configured to host-map Qwen4 experts
+/// ([`QWEN4_EXPERT_VRAM_LAYERS_ENV`]) or to spill weights through the
+/// partial-offload budget keys (`memory.gpu_layer_budget` /
+/// `memory.moe_expert_budget`, [`requests_host_spill`]), a process about to load a
+/// Qwen4 model or a Qwen3.5 MoE on discrete GPUs calls this before the runtime
+/// loads (`hipfire_loader::prepare_host_memory_for`), and [`stage_pageable_copies`]
+/// arms the free `GPU_PINNED_MIN_XFER_SIZE` half on its own in every Linux
+/// process.
 pub fn keep_host_memory_out_of_reclaim(reason: &str) {
     if !cfg!(target_os = "linux") {
         return;
     }
     let mut set = Vec::new();
-    for (name, value) in [
-        (HSA_USERPTR_FOR_PAGED_MEM, "0"),
-        (GPU_PINNED_MIN_XFER_SIZE, STAGE_ALL_PAGEABLE_COPIES_MB),
-    ] {
-        if std::env::var_os(name).is_none() {
-            std::env::set_var(name, value);
-            set.push(format!("{name}={value}"));
-        }
-    }
+    arm_if_unset(GPU_PINNED_MIN_XFER_SIZE, STAGE_ALL_PAGEABLE_COPIES_MB, &mut set);
+    arm_if_unset(HSA_USERPTR_FOR_PAGED_MEM, "0", &mut set);
     if !set.is_empty() {
         eprintln!("[hip-bridge] {} ({reason}): host memory out of reclaim", set.join(" "));
+    }
+}
+
+/// Set `name=value` unless the operator already set it, recording what was set.
+fn arm_if_unset(name: &str, value: &str, set: &mut Vec<String>) {
+    if std::env::var_os(name).is_none() {
+        std::env::set_var(name, value);
+        set.push(format!("{name}={value}"));
+    }
+}
+
+/// Stage every pageable copy out of the kernel's userptr pin path, without the
+/// `hipHostMalloc` switch ([`HSA_USERPTR_FOR_PAGED_MEM`]). This is the half that
+/// covers every weight load on every architecture: it is the copy's *source* —
+/// the mapped model file's page-cache pages — that clr otherwise pins in place.
+/// Armed in every Linux process before the HIP runtime loads, because whether a
+/// given load host-maps (an explicit budget, or a Qwen MoE's auto-fit default) is
+/// not known this early. Measured free on gfx1201 / Qwen3.8-27B MQ3-Pro (warm
+/// cache, three reps each): weight sweep 1190-1198 ms armed vs 1204-1210 ms
+/// unarmed.
+pub fn stage_pageable_copies() {
+    if !cfg!(target_os = "linux") {
+        return;
+    }
+    let mut set = Vec::new();
+    arm_if_unset(GPU_PINNED_MIN_XFER_SIZE, STAGE_ALL_PAGEABLE_COPIES_MB, &mut set);
+    if !set.is_empty() {
+        eprintln!(
+            "[hip-bridge] {} (pageable copies staged): host memory out of reclaim",
+            set.join(" ")
+        );
     }
 }
 
@@ -642,13 +669,30 @@ fn host_maps_qwen4_experts() -> bool {
     }
 }
 
+/// Whether this process requests a partial-offload spill through the budget keys
+/// (`memory.gpu_layer_budget` / `memory.moe_expert_budget`). A spill places whole
+/// layers or packed routed experts in host RAM that the kernels then read over
+/// the link, which is the same reclaim-stall case as the Qwen4 expert tier, and
+/// the placement is resolved before the HIP runtime loads. A process that asks
+/// for a spill and then fits anyway pays the switches' measured cost for that one
+/// load; an unconfigured load never arms them.
+fn requests_host_spill() -> bool {
+    use hipfire_config::memory::{gpu_layer_budget, moe_expert_budget, OffloadBudget};
+    gpu_layer_budget() != OffloadBudget::Full || moe_expert_budget() != OffloadBudget::Full
+}
+
 impl HipRuntime {
     /// Load the HIP runtime via dlopen.
     /// Uses the shared ROCm resolver so runtime, headers, and hipcc stay within
     /// one selected installation.
     pub fn load() -> HipResult<Self> {
+        // The pageable-copy half is free and covers every load; the
+        // `hipHostMalloc` half is scoped to the loads that host-map weights.
+        stage_pageable_copies();
         if host_maps_qwen4_experts() {
             keep_host_memory_out_of_reclaim(&format!("{QWEN4_EXPERT_VRAM_LAYERS_ENV} set"));
+        } else if requests_host_spill() {
+            keep_host_memory_out_of_reclaim("memory.gpu_layer_budget / memory.moe_expert_budget");
         }
         // Windows and Unix share one candidate policy in hipfire_config::rocm so a
         // selected/configured root never falls through to another install's DLL
