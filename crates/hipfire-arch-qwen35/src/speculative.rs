@@ -260,7 +260,7 @@ fn dflash_moe_draft_ffn_graph_eligible(
 ///
 /// `HIPFIRE_VERIFY_GRAPH=1` opts back in diagnostically; `=0` force-offs
 /// everywhere; all other arch/dtype pairs stay default-on.
-fn dflash_verify_graph_env_eligible(
+pub(crate) fn dflash_verify_graph_env_eligible(
     arch: &str,
     output_dtype: rdna_compute::DType,
     env_value: Option<&str>,
