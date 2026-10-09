@@ -64,7 +64,7 @@ MTP wins 8/8. CPU-arm % gains are larger only because the CPU AR baseline is slo
 ## Backend change: pcie → cpu (same spec, same placement intent)
 
 | Prompt | Spec arm | Placement | pcie | cpu | Δ | Δ % |
-|---|---|---|---|---:|---:|---:|---:|
+|---|---|---|---:|---:|---:|---:|
 | merge | off | set | 61.3 | 50.2 | −11.1 | −18.1% |
 | merge | off | auto | 64.7 | 52.9 | −11.8 | −18.2% |
 | merge | mtp | set | 77.5 | 67.4 | −10.1 | −13.0% |
@@ -79,7 +79,7 @@ CPU backend loses 8/8 at full seam coverage (16/16 or 14/14 per log) — the def
 ## Placement change: set (pinned 24) → auto (auto-fit)
 
 | Prompt | Spec | Backend | set | auto | Δ | Δ % | Spilled (set → auto, from logs) |
-|---|---|---|---|---:|---:|---:|---:|---|
+|---|---|---|---|---:|---:|---:|---:|
 | merge | off | pcie | 61.3 | 64.7 | +3.4 | +5.5% | 16 → 14 |
 | merge | off | cpu | 50.2 | 52.9 | +2.7 | +5.4% | 16 → 14 |
 | merge | mtp | pcie | 77.5 | 77.5 | 0.0 | 0.0% | 16 → 16 |
