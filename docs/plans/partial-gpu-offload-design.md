@@ -338,7 +338,14 @@ PCIe link (27.1 GB/s measured, §7) instead of device DRAM: this is llama.cpp's
   shape's own mean D2H/GEMV/H2D) plus the running counters, whose second number
   ("host-mapped steps still on GPU") must be 0 for a fully covered model — a
   fused launch the guard missed or a call site that bypasses `execute_steps`
-  shows up there instead of as a mystery. The `calls=` field on the line is what
+  shows up there instead of as a mystery. The routed-expert splice line adds
+  coarse `setup` (expert resolve), `middle` (whole SiLU+FWHT loop), `combine`
+  (whole weighted-combine loop), and `total` (splice wall excluding the trace
+  print) means. Per-phase sums reconcile within a splice, but per-quant
+  attribution does not: `quant` is the first selected expert's gate_up format
+  only, `graded=true` collapses gate_up-mixed, down-mixed, and gate_up≠down
+  mixes into one flag, the down quant is never printed, and no worker count is
+  printed. The `calls=` field on the line is what
   makes the number quotable: a shape's first line is its cold first step.
 - **Not covered, deliberately.** The slots/serve body (`forward_batch_slots` →
   `dense_ffn_body_slots`) and prefill run batched GEMM kernels that never enter
