@@ -2632,6 +2632,20 @@ fn mtp_shared_verify_accept_rollback_inner(
     is_external: bool,
     use_device_token_chain: bool,
 ) -> HipResult<MtpSpecResult> {
+    // CPU-deferred MoE experts (memory.offload_exec=cpu) recompute the routed
+    // FFN on the host from the intact blob views; no device-side expert tables
+    // exist for the verify pass, so the native MTP accept/rollback arithmetic
+    // cannot be validated against them. Refuse *before* any stream creation,
+    // snapshot, draft verify, or state mutation so every caller (the direct
+    // compressed-serial path and the takeover/serve consumers) falls back to
+    // AR or PCIe offload instead of accepting unverified tokens. This is the
+    // runtime backstop; the loader also declines MTP for CPU-deferred loads.
+    if weights.has_cpu_deferred_experts() {
+        return Err(hip_bridge::HipError::new(
+            1,
+            "Native MTP is unavailable with CPU-deferred MoE experts; use AR or PCIe offload",
+        ));
+    }
     let dim = config.dim;
     let vocab = config.vocab_size;
     let trunk_weights: &Qwen35Weights = weights;

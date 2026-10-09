@@ -1495,6 +1495,7 @@ pub(crate) fn seal_moe_decode<'a>(
         norm_topk_prob: config.norm_topk_prob,
         x_rot_prerotated: false,
         defer_routed_combine: false,
+        cpu_deferred_experts: false,
         ep_mode: MoeEpMode::None,
         layer_idx: layer_index as u16,
         x_norm: input,

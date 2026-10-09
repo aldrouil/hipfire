@@ -623,6 +623,9 @@ fn moe_params_for_decode<'a>(
         norm_topk_prob: config.norm_topk_prob,
         x_rot_prerotated,
         defer_routed_combine,
+        cpu_deferred_experts: ffn.cpu_deferred_experts
+            && ep_mode == MoeEpMode::None
+            && !defer_routed_combine,
         ep_mode,
         layer_idx: ffn.layer_idx,
         x_norm,
@@ -631,14 +634,8 @@ fn moe_params_for_decode<'a>(
         skip_shared: ep_skip_shared,
         router: ffn.router.dispatch_ref(),
         shared,
-        expert_gate_up_ptrs: ffn
-            .cpu_sink_gate_up_ptrs
-            .as_ref()
-            .unwrap_or(&ffn.expert_gate_up_ptrs),
-        expert_down_ptrs: ffn
-            .cpu_sink_down_ptrs
-            .as_ref()
-            .unwrap_or(&ffn.expert_down_ptrs),
+        expert_gate_up_ptrs: &ffn.expert_gate_up_ptrs,
+        expert_down_ptrs: &ffn.expert_down_ptrs,
         expert_ptrs_host: None,
         expert_down_awq_ptrs: ffn.expert_down_awq_ptrs.as_ref(),
         expert_dtype_tags: ffn.expert_dtype_tags.as_ref(),
@@ -740,9 +737,10 @@ fn packed_expert_host_bytes<'a>(
 /// `weights` are the per-token top-k (`[rows, top_k]`), and `residual` is the
 /// `[rows, dim]` batch the combine accumulates into.
 ///
-/// No-op when the loader did not arm the splice on this layer (`cpu_expert_sink`
-/// is `None`), which is every PCIe / resident load. Fail closed otherwise: a
-/// missing owner, an undecodable dtype or any out-of-range view is an error.
+/// No-op when the loader did not arm the splice on this layer
+/// (`cpu_deferred_experts` is `false`), which is every PCIe / resident load.
+/// Fail closed otherwise: a missing owner, an undecodable dtype or any
+/// out-of-range view is an error.
 /// The dispatch context is `rows`-agnostic here — the executor handles the batch
 /// and preserves per-token top-k rank order.
 pub(super) fn run_cpu_moe_experts(
@@ -755,7 +753,7 @@ pub(super) fn run_cpu_moe_experts(
     residual: &GpuTensor,
     rows: usize,
 ) -> HipResult<()> {
-    if ffn.cpu_expert_sink.is_none() {
+    if !ffn.cpu_deferred_experts {
         return Ok(());
     }
     let owners = ffn.packed_expert_owners.as_ref().ok_or_else(|| {
@@ -845,14 +843,36 @@ fn moe_ffn_decode_impl<'a>(
     let bound = ffn.bound_experts()?;
     // The CPU expert splice needs the residual and the gate_up activation after
     // `seal_decode` moves `moe_params`; capture the references first (shared
-    // borrows, no copy).
+    // borrows, no copy). The sealed call omits the routed GPU stages exactly
+    // when it carries the CPU-deferred selection, so the splice tracks that and
+    // not merely the loader's arming (an EP partial or a deferred combine keeps
+    // the GPU routed stages).
     let splice_residual = moe_params.x_residual;
     let splice_x_rot = moe_params.x_rot_local;
+    let deferred_routed_experts = moe_params.cpu_deferred_experts;
     // Only when explicitly asked: the oracle downloads the activation and the
     // route for every MoE layer, which is a host sync point on the decode path.
     let oracle_input = hipfire_config::developer_var("HIPFIRE_MOE_CPU_ORACLE")
         .is_ok()
         .then_some((moe_params.x_norm, moe_params.dtypes.routed_gate_up));
+    // Resolve the expert-statistics toggle exactly once: the same answer gates
+    // the CPU-deferred refusal below and the end-of-step capture, and the
+    // `developer_var` lookup must not be repeated on the decode hot path.
+    let stats_enabled = expert_stats_enabled();
+    // When the sealed step below carries the CPU-deferred selection it omits
+    // the entire routed GPU FFN, so `s.down_expanded` is never written. Both
+    // diagnostics depend on that buffer: `moe_cpu_oracle_report` compares the
+    // GPU routed result against the CPU splice, and `capture_expert_stats`
+    // measures the routed output norm. A silent skip or a stale-buffer read
+    // would misreport, so fail closed and point at the supported loads. This
+    // refuses only the CPU-deferred route; EP / PCIe / resident are untouched.
+    if deferred_routed_experts && (oracle_input.is_some() || stats_enabled) {
+        return Err(HipError::new(
+            1,
+            "explicit GPU routed expert oracle/statistics unavailable with \
+             CPU-deferred experts; use PCIe/resident",
+        ));
+    }
     let sealed = hipfire_dispatch::pipeline::sealed_moe::seal_decode(bound, &ctx, moe_params)
         .map_err(HipError::from)?;
     hipfire_dispatch::pipeline::execute_steps(
@@ -861,21 +881,23 @@ fn moe_ffn_decode_impl<'a>(
         &[hipfire_dispatch::pipeline::Step::Moe(sealed)],
     )
     .map_err(HipError::from)?;
-    // CPU expert splice: the decode MoE params bound the loader's zeroed sink
-    // twins, so the sealed step above contributed 0 for the routed experts.
-    // Recompute the whole expert FFN here on the CPU from the intact host blobs
-    // (per-expert dtype/stride, graded included) and accumulate into the
-    // residual. Wide batched forwards bind the real tables and never reach this.
-    run_cpu_moe_experts(
-        gpu,
-        ffn,
-        config,
-        splice_x_rot,
-        s.topk_indices,
-        s.topk_weights,
-        splice_residual,
-        1,
-    )?;
+    // CPU expert splice: the sealed step above omitted the routed GPU stages for
+    // this call, so the whole routed FFN is owed here. Recompute it on the CPU
+    // from the intact host blobs (per-expert dtype/stride, graded included) and
+    // accumulate into the residual. Wide batched forwards bind the real tables,
+    // run the GPU routed stages, and never reach this.
+    if deferred_routed_experts {
+        run_cpu_moe_experts(
+            gpu,
+            ffn,
+            config,
+            splice_x_rot,
+            s.topk_indices,
+            s.topk_weights,
+            splice_residual,
+            1,
+        )?;
+    }
     if let Some((x_norm, routed_gate_up)) = oracle_input {
         if let (Some(q), Some(owners)) = (
             hipfire_dispatch::cpu_exec::cpu_quant_for(routed_gate_up),
@@ -924,7 +946,7 @@ fn moe_ffn_decode_impl<'a>(
         )
         .map_err(|e| HipError::new(0, &e))?;
     }
-    if expert_stats_enabled() {
+    if stats_enabled {
         capture_expert_stats(
             gpu,
             ffn.layer_idx,

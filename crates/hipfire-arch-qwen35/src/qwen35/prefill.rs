@@ -4705,7 +4705,7 @@ fn build_moe_prefill_params<'a>(
     model_has_mq6_moe: bool,
     routed_out: Option<&'a GpuTensor>,
     route: PrefillRouteMode<'a>,
-    cpu_splice_sink: bool,
+    cpu_deferred_experts: bool,
 ) -> HipResult<(
     hipfire_dispatch::pipeline::sealed_moe::BoundMoeExperts<'a>,
     hipfire_dispatch::families::moe::MoePrefillParams<'a>,
@@ -4824,29 +4824,6 @@ fn build_moe_prefill_params<'a>(
         q8_router_policy: hipfire_dispatch::families::moe::MoeQ8RouterPolicy::DispatcherEntry,
     };
 
-    // Point the grouped expert kernels at the zeroed sink twins only for the
-    // narrow CPU-arithmetic forwards (any armed sink at `n <= 4`: the
-    // speculative verify and the accepted-prefix rollback replay, both the
-    // tape-capturing verify and the tape-disabled `Standard` replay); every
-    // other caller binds the real tables and keeps the GPU grouped PCIe read.
-    let (expert_gate_up_ptrs, expert_down_ptrs) = if cpu_splice_sink {
-        (
-            ffn.cpu_sink_gate_up_ptrs.as_ref().ok_or_else(|| {
-                HipError::new(
-                    0,
-                    "moe cpu expert splice: CPU sink armed but gate_up twin missing",
-                )
-            })?,
-            ffn.cpu_sink_down_ptrs.as_ref().ok_or_else(|| {
-                HipError::new(
-                    0,
-                    "moe cpu expert splice: CPU sink armed but down twin missing",
-                )
-            })?,
-        )
-    } else {
-        (&ffn.expert_gate_up_ptrs, &ffn.expert_down_ptrs)
-    };
     let moe_prefill_params = hipfire_dispatch::families::moe::MoePrefillParams {
         dtypes: moe_dtypes,
         recipe: hipfire_dispatch::families::moe::MoeRecipe::SoftmaxGatedShared {
@@ -4866,13 +4843,14 @@ fn build_moe_prefill_params<'a>(
         force_mq4_grouped_fp16: model_has_mq6_moe
             && gpu.arch_caps.is_gfx1151()
             && gpu.flags.moe_grouped_i8.is_none(),
+        cpu_deferred_experts,
         topk_indices,
         topk_weights,
         x_batch: &pbs.x_batch,
         x_norm_batch: &pbs.x_norm_batch,
         x_rot_batch: &pbs.x_rot_batch,
-        expert_gate_up_ptrs,
-        expert_down_ptrs,
+        expert_gate_up_ptrs: &ffn.expert_gate_up_ptrs,
+        expert_down_ptrs: &ffn.expert_down_ptrs,
         expert_stage_ptrs: None,
         routed_experts: ffn,
         expert_down_awq_ptrs: ffn.expert_down_awq_ptrs.as_ref(),
@@ -5026,13 +5004,21 @@ pub(crate) fn prefill_moe_ffn_body_batched_with_route<'a>(
     // accepted-prefix rollback replay) must recompute the routed experts on the
     // CPU, matching single-token decode; the GPU grouped PCIe read would
     // otherwise diverge from the CPU target arithmetic these rows are validated
-    // against. The splice is width-only: any armed sink at `n <= 4` takes it
-    // regardless of dispatch workload, so the tape-disabled accepted-prefix
-    // rollback (a `Standard` `forward_prefill_batch` call) and an ordinary
-    // very short `<=4` prompt prefill both land on the CPU. Wider prompt
-    // prefill and wide verify keep the real tables and the GPU grouped read,
-    // where the CPU expert FFN loses by >10x.
-    let cpu_splice = ffn.cpu_expert_sink.is_some() && n <= MOE_CPU_SPLICE_MAX_ROWS;
+    // against. The splice is width-only: any splice-armed layer at `n <= 4`
+    // takes it regardless of dispatch workload, so the tape-disabled
+    // accepted-prefix rollback (a `Standard` `forward_prefill_batch` call) and
+    // an ordinary very short `<=4` prompt prefill both land on the CPU. Wider
+    // prompt prefill and wide verify keep the real expert tables and the GPU
+    // grouped read, where the CPU expert FFN loses by >10x. Expert-parallel
+    // prefill never defers: its routed partial is gathered and all-reduced, and
+    // the CPU splice would fold the routed FFN into `x_batch` twice.
+    let cpu_deferred_experts = ffn.cpu_deferred_experts
+        && n <= MOE_CPU_SPLICE_MAX_ROWS
+        && routed_out.is_none()
+        && !matches!(
+            route,
+            PrefillRouteMode::ProduceRoot { .. } | PrefillRouteMode::AdoptRoot { .. }
+        );
     let (bound, params) = build_moe_prefill_params(
         gpu,
         ffn,
@@ -5043,14 +5029,14 @@ pub(crate) fn prefill_moe_ffn_body_batched_with_route<'a>(
         model_has_mq6_moe,
         routed_out,
         route,
-        cpu_splice,
+        cpu_deferred_experts,
     )?;
     let compact_ep = matches!(
         &params.prelude.route,
         PrefillRouteMode::ProduceRoot { .. } | PrefillRouteMode::AdoptRoot { .. }
     ) && bound.rank_count() > 1;
-    // The CPU-down splice below adds into `pbs.x_batch` directly, so it is
-    // correct on every down path: the GPU down contributed 0 through the sink.
+    // The CPU splice below adds into `pbs.x_batch` directly, so it is correct
+    // on every down path: the deferred program omitted the routed stages.
     let sealed = if compact_ep {
         hipfire_dispatch::pipeline::sealed_moe::seal_prefill_ep(bound, ctx, params)
     } else {
@@ -5072,12 +5058,12 @@ pub(crate) fn prefill_moe_ffn_body_batched_with_route<'a>(
 
         execute_steps(gpu, ctx, &[Step::Moe(sealed)])
             .map_err(|e| HipError::new(0, &e.to_string()))?;
-        if cpu_splice {
-            // The batched params bound the loader's zeroed sink twins, so the
-            // sealed step above contributed 0 for the routed experts. Recompute
-            // the whole FFN per (token, rank) on the CPU from the intact host
-            // blobs (per-expert dtype/stride, graded included) and accumulate
-            // into `pbs.x_batch` — the bus-ordered residual on every down path.
+        if cpu_deferred_experts {
+            // The sealed step above omitted the routed GPU stages, so the whole
+            // routed FFN is owed here: recompute it per (token, rank) on the CPU
+            // from the intact host blobs (per-expert dtype/stride, graded
+            // included) and accumulate into `pbs.x_batch` — the bus-ordered
+            // residual on every down path.
             let topk_indices = pbs.moe_topk_indices_batch.as_ref().expect("moe scratch");
             let topk_weights = pbs.moe_topk_weights_batch.as_ref().expect("moe scratch");
             super::forward::run_cpu_moe_experts(

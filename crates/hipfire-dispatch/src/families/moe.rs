@@ -767,6 +767,15 @@ pub struct MoeParams<'a> {
     /// output expanded so the architecture layer can combine it into the
     /// residual while producing the next layer's normalized activation.
     pub defer_routed_combine: bool,
+    /// CPU-deferred routed experts (`memory.offload_exec=cpu` on a host-placed
+    /// packed layer). The sealed program keeps the GPU router, rotation, shared
+    /// expert, and residual, but must NOT run the routed
+    /// gate_up/activation/down/combine stages: a host-side batched splice
+    /// (`cpu_exec::moe_cpu_experts`) supplies the routing-weighted routed
+    /// contribution exactly once afterwards, accumulating into `x_residual`.
+    /// Independent of `use_gpu_topk` (the router still runs on the GPU) and
+    /// never a fallback to the per-expert host GEMV path.
+    pub cpu_deferred_experts: bool,
     /// Sealed decode mode (see [`MoeEpMode`]).
     pub ep_mode: MoeEpMode,
     /// Safetensors layer index used by native GPTQ-on-E8 Hessian capture.
@@ -1119,6 +1128,14 @@ pub struct MoePrefillParams<'a> {
     /// routed dtype snapshot is pure MQ4. This keeps pure MQ4 models on the
     /// existing i8 default while avoiding mixed-checkpoint corruption.
     pub force_mq4_grouped_fp16: bool,
+    /// CPU-deferred routed experts (see [`MoeParams::cpu_deferred_experts`]).
+    /// Set only for narrow (`<= 4`-row) windows on a CPU-spliced host-placed
+    /// layer: the sealed program keeps normalize/input-basis/router/shared, but
+    /// must NOT run the routed scatter/gate_up/activation/down/combine stages.
+    /// The arch's batched CPU splice supplies the routed contribution once
+    /// afterwards, accumulating into `x_batch`. Wide prefill keeps the real GPU
+    /// grouped read and stays `false`.
+    pub cpu_deferred_experts: bool,
     // routing inputs (model-produced)
     pub topk_indices: &'a GpuTensor,
     pub topk_weights: &'a GpuTensor,

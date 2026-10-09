@@ -125,6 +125,84 @@ pub fn use_avx2(available: bool, requested: Option<bool>) -> bool {
     }
 }
 
+/// Which cached-`Σx` reduction style a format's row dot can reuse.
+///
+/// The two styles are numerically distinct reductions of the same sum, so a
+/// prepared `Σx` is only valid for the format that produced it — never reused
+/// across styles. See [`prepare_activation_sums`] and
+/// [`row_dot_with_activation_sums`].
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum ActivationSumKind {
+    /// qt 13 `Mq4G256`: [`x86`]'s hand-unrolled nibble path, `(x0+x1)+(x2+x3)`
+    /// per 32-wide block.
+    Mq4Quartets,
+    /// qt 15 `Mq6G256`: [`x86`]'s `codes8` path, even/odd 8-lane chunk chains.
+    Mq6Pairs,
+}
+
+/// The cached-`Σx` style `q` uses, or `None` when `q` has no prepared row dot.
+///
+/// Only [`CpuQuant::Mq4G256`] (qt 13) and [`CpuQuant::Mq6G256`] (qt 15) return
+/// `Some`; every other format recomputes `Σx` inside [`row_dot_avx2`].
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn activation_sum_kind(q: CpuQuant) -> Option<ActivationSumKind> {
+    match q {
+        CpuQuant::Mq4G256 => Some(ActivationSumKind::Mq4Quartets),
+        CpuQuant::Mq6G256 => Some(ActivationSumKind::Mq6Pairs),
+        _ => None,
+    }
+}
+
+/// Precompute the per-256-element-group `Σx` for `kind` into `out` — one `f32`
+/// per 256 activation elements, so `out.len() == k / 256`.
+///
+/// Each style reproduces its row dot's original reduction order exactly, so a
+/// [`row_dot_with_activation_sums`] row is bit-identical to the unprepared
+/// [`row_dot_avx2`] row. The caller resolves the feature decision once per job
+/// ([`row_dot_enabled`]) before calling either prepared entry point.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn prepare_activation_sums(kind: ActivationSumKind, x: &[f32], out: &mut [f32]) {
+    unsafe {
+        match kind {
+            ActivationSumKind::Mq4Quartets => {
+                x86::activation_sums_mq4(x.as_ptr(), out.as_mut_ptr(), out.len())
+            }
+            ActivationSumKind::Mq6Pairs => {
+                x86::activation_sums_mq6(x.as_ptr(), out.as_mut_ptr(), out.len())
+            }
+        }
+    }
+}
+
+/// One weight row dotted with `x`, reusing the per-group `Σx` in `sums`
+/// ([`prepare_activation_sums`]) instead of recomputing it.
+///
+/// Only the formats [`activation_sum_kind`] names have cached sums, and the
+/// caller has already resolved the feature decision ([`row_dot_enabled`]), so
+/// `q` is AVX2-enabled and `sums.len() >= k / 256`. The dot FMAs, group
+/// accumulation and final scaling are the same as [`row_dot_avx2`].
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn row_dot_with_activation_sums(
+    q: CpuQuant,
+    row: &[u8],
+    k: usize,
+    x: &[f32],
+    sums: &[f32],
+) -> f32 {
+    unsafe {
+        match q {
+            CpuQuant::Mq4G256 => {
+                x86::mq4g256_row_dot_cached(row.as_ptr(), k, x.as_ptr(), sums.as_ptr())
+            }
+            CpuQuant::Mq6G256 => {
+                x86::mq6g256_row_dot_cached(row.as_ptr(), k, x.as_ptr(), sums.as_ptr())
+            }
+            _ => unreachable!("row_dot_with_activation_sums: {q:?} has no cached Σx"),
+        }
+    }
+}
+
 /// One weight row dotted with a pre-rotated activation on the AVX2 path.
 ///
 /// This is the single format→kernel map, and like [`features_for`] it is

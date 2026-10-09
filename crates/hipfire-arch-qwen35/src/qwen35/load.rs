@@ -5464,9 +5464,11 @@ pub(crate) struct PendingMoeFfn {
     pub(crate) packed_expert_owners: Option<PackedExpertOwners>,
     pub(crate) expert_gate_up_ptrs: Option<GpuTensor>,
     pub(crate) expert_down_ptrs: Option<GpuTensor>,
-    pub(crate) cpu_expert_sink: Option<GpuTensor>,
-    pub(crate) cpu_sink_gate_up_ptrs: Option<GpuTensor>,
-    pub(crate) cpu_sink_down_ptrs: Option<GpuTensor>,
+    /// `memory.offload_exec=cpu` armed the host-side routed-expert splice on this
+    /// host-placed packed layer. Decode and the narrow (`<= 4`-row) batched
+    /// forwards defer the routed FFN to that splice; wide prefill keeps the GPU
+    /// grouped read.
+    pub(crate) cpu_deferred_experts: bool,
     pub(crate) expert_down_awq_ptrs: Option<GpuTensor>,
     pub(crate) expert_dtype_tags: Option<GpuTensor>,
     pub(crate) paro_shared: Option<MoeParoSidecars>,
@@ -5487,9 +5489,7 @@ impl PendingMoeFfn {
             packed_expert_owners: None,
             expert_gate_up_ptrs: None,
             expert_down_ptrs: None,
-            cpu_expert_sink: None,
-            cpu_sink_gate_up_ptrs: None,
-            cpu_sink_down_ptrs: None,
+            cpu_deferred_experts: false,
             expert_down_awq_ptrs: None,
             expert_dtype_tags: None,
             paro_shared: None,
@@ -5510,15 +5510,6 @@ impl PendingMoeFfn {
             let _ = gpu.free_tensor(tensor);
         }
         if let Some(tensor) = self.expert_down_awq_ptrs.take() {
-            let _ = gpu.free_tensor(tensor);
-        }
-        if let Some(tensor) = self.cpu_expert_sink.take() {
-            let _ = gpu.free_tensor(tensor);
-        }
-        if let Some(tensor) = self.cpu_sink_gate_up_ptrs.take() {
-            let _ = gpu.free_tensor(tensor);
-        }
-        if let Some(tensor) = self.cpu_sink_down_ptrs.take() {
             let _ = gpu.free_tensor(tensor);
         }
         if let Some(tensor) = self.expert_down_ptrs.take() {
@@ -5596,8 +5587,6 @@ impl PendingMoeFfn {
                 .expect("pending MoE down pointer table"),
             self.expert_down_awq_ptrs.as_ref(),
             self.expert_dtype_tags.as_ref(),
-            self.cpu_sink_gate_up_ptrs.as_ref(),
-            self.cpu_sink_down_ptrs.as_ref(),
         );
         if let Err(error) = live_binding {
             return Err(self.rollback(gpu, error));
@@ -5612,9 +5601,7 @@ impl PendingMoeFfn {
             packed_expert_owners,
             expert_gate_up_ptrs,
             expert_down_ptrs,
-            cpu_expert_sink,
-            cpu_sink_gate_up_ptrs,
-            cpu_sink_down_ptrs,
+            cpu_deferred_experts,
             expert_down_awq_ptrs,
             expert_dtype_tags,
             paro_shared,
@@ -5642,9 +5629,7 @@ impl PendingMoeFfn {
             shared_expert_gate: shared_gate_scalar.expect("pending MoE shared gate scalar"),
             expert_gate_up_ptrs: expert_gate_up_ptrs.expect("pending MoE gate/up pointer table"),
             expert_down_ptrs: expert_down_ptrs.expect("pending MoE down pointer table"),
-            cpu_expert_sink,
-            cpu_sink_gate_up_ptrs,
-            cpu_sink_down_ptrs,
+            cpu_deferred_experts,
             expert_down_awq_ptrs,
             expert_dtype_tags,
             layer_idx,
@@ -5728,9 +5713,7 @@ impl PendingMoeFfn {
             packed_expert_owners,
             expert_gate_up_ptrs,
             expert_down_ptrs,
-            cpu_expert_sink,
-            cpu_sink_gate_up_ptrs,
-            cpu_sink_down_ptrs,
+            cpu_deferred_experts,
             expert_down_awq_ptrs,
             expert_dtype_tags,
             paro_shared,
@@ -5762,9 +5745,7 @@ impl PendingMoeFfn {
             shared_expert_gate: shared_gate_scalar.expect("pending EP shared gate scalar"),
             expert_gate_up_ptrs: expert_gate_up_ptrs.expect("pending EP gate/up pointer table"),
             expert_down_ptrs: expert_down_ptrs.expect("pending EP down pointer table"),
-            cpu_expert_sink,
-            cpu_sink_gate_up_ptrs,
-            cpu_sink_down_ptrs,
+            cpu_deferred_experts,
             expert_down_awq_ptrs,
             expert_dtype_tags,
             layer_idx,
@@ -6118,16 +6099,16 @@ pub(crate) fn load_moe_ffn(
     // kill-switch. Splice arming is computed before the tag table exists (it is
     // built below): the CPU arm over a host-placed packed layer with no AWQ
     // sidecar. The loader writes the **real** expert tables (every forward path
-    // reads them) and adds one zeroed sink buffer plus its two pointer-table
-    // twins, which the live-binding proof accepts by name.
+    // reads them); the splice records only that decode and the narrow (`<= 4`
+    // row) batched forwards defer their routed FFN to the CPU, so the sealed
+    // program skips the routed GPU stages entirely instead of reading a sink.
     //
     // Single-token decode and the narrow batched forwards that share the CPU
     // target arithmetic (the `<=4`-row speculative verify and its accepted-prefix
-    // rollback replay) bind the twins, so their GPU routed contribution is 0 and
-    // the CPU recomputes the whole FFN (gate_up + SiLU + down) from the intact
-    // host blobs per (token, rank). Ordinary prompt prefill keeps the real tables
-    // and the GPU grouped PCIe read — the CPU expert FFN is compute-bound and
-    // loses to it by >10x at chunk sizes.
+    // rollback replay) defer, and the CPU recomputes the whole FFN (gate_up +
+    // SiLU + down) from the intact host blobs per (token, rank). Ordinary prompt
+    // prefill keeps the real tables and the GPU grouped PCIe read — the CPU
+    // expert FFN is compute-bound and loses to it by >10x at chunk sizes.
     //
     // Graded (mixed-dtype) layers are spliced too: the executor resolves each
     // selected expert's own `(quant, bucket owner, byte offset)` from the packed
@@ -6157,64 +6138,11 @@ pub(crate) fn load_moe_ffn(
             ),
         ));
     }
-    if cpu_expert_splice {
-        // One zero sink backs both twins: every gate_up and down entry points
-        // at it, so any kernel read (whose extent is that table's stride) stays
-        // in bounds. Sized to the largest expert extent across **every** tier:
-        // a graded layer has one stride per bucket, so sizing to `experts[0]`
-        // would leave a wider-tier read past the buffer.
-        let sink_len = pending.experts.iter().fold(0usize, |acc, e| {
-            acc.max(e.gate_up.buf.buf.size()).max(e.down.buf.buf.size())
-        });
-        let sink = match gpu.zeros(&[sink_len.div_ceil(4)], DType::F32) {
-            Ok(tensor) => tensor,
-            Err(error) => return Err(pending.rollback(gpu, error)),
-        };
-        let sink_ptr = sink.buf.as_ptr() as u64;
-        let sink_bytes: Vec<u8> = vec![sink_ptr; n_exp]
-            .iter()
-            .flat_map(|ptr| ptr.to_ne_bytes())
-            .collect();
-        // CPU-splice twins. The **real** tables stay intact, so ordinary prompt
-        // prefill keeps the GPU grouped PCIe read (the CPU expert FFN is
-        // compute-bound and loses to it by >10x at chunk sizes, measured 15x on
-        // ornith/gfx1201). Single-token decode and the narrow batched forwards
-        // that must match its arithmetic (MTP/DFlash verify, accepted-prefix
-        // rollback replay) bind these twins instead, so their GPU routed
-        // contribution is 0 and the CPU splice supplies it. The live-binding
-        // proof accepts the twins because they are named here at load time.
-        let gu_sink = match gpu.alloc_tensor(&[table_len], DType::F32) {
-            Ok(tensor) => tensor,
-            Err(error) => {
-                let _ = gpu.free_tensor(sink);
-                return Err(pending.rollback(gpu, error));
-            }
-        };
-        if let Err(error) = gpu.hip.memcpy_htod(&gu_sink.buf, &sink_bytes) {
-            let _ = gpu.free_tensor(gu_sink);
-            let _ = gpu.free_tensor(sink);
-            return Err(pending.rollback(gpu, error));
-        }
-        pending.cpu_sink_gate_up_ptrs = Some(gu_sink);
-        let dn_sink = match gpu.alloc_tensor(&[table_len], DType::F32) {
-            Ok(tensor) => tensor,
-            Err(error) => {
-                let _ = gpu.free_tensor(sink);
-                return Err(pending.rollback(gpu, error));
-            }
-        };
-        if let Err(error) = gpu.hip.memcpy_htod(&dn_sink.buf, &sink_bytes) {
-            let _ = gpu.free_tensor(dn_sink);
-            let _ = gpu.free_tensor(sink);
-            return Err(pending.rollback(gpu, error));
-        }
-        pending.cpu_sink_down_ptrs = Some(dn_sink);
-        if layer_idx == 0 {
-            eprintln!(
-                "  [moe-cpu-expert] layer {layer_idx}: zeroed sink twins bound ({sink_len} B/entry); wide prefill keeps the PCIe grouped read"
-            );
-        }
-        pending.cpu_expert_sink = Some(sink);
+    pending.cpu_deferred_experts = cpu_expert_splice;
+    if cpu_expert_splice && layer_idx == 0 {
+        eprintln!(
+            "  [moe-cpu-expert] layer {layer_idx}: routed FFN deferred to the CPU splice; wide prefill keeps the PCIe grouped read"
+        );
     }
 
     let moe_awq_enabled = hipfire_config::developer_var("HIPFIRE_MOE_AWQ")

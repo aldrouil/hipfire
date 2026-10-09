@@ -481,9 +481,10 @@ const MOE_STACK_SLOTS: usize = 256;
 ///
 /// `x_rot` is the already-rotated activation the gate_up projection consumes; the
 /// post-SiLU hidden is rotated here exactly as the fused kernel would (per the
-/// *down* projection's format). The decode MoE params bound the loader's zeroed
-/// sink twins, so the sealed MoE step contributed 0 for the routed experts; this
-/// supplies the whole contribution. `rows` is the window width (1 for decode, up
+/// *down* projection's format). The sealed MoE program of a CPU-deferred call
+/// ([`MoeParams::cpu_deferred_experts`](crate::families::moe::MoeParams::cpu_deferred_experts))
+/// omits every routed GPU stage, so this supplies the whole routed contribution.
+/// `rows` is the window width (1 for decode, up
 /// to the narrow MTP verify width) and `top_k` is `num_experts_per_tok`; both are
 /// explicit so a tensor's spare capacity can never silently become the batch
 /// size.
