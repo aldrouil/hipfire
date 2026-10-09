@@ -124,7 +124,8 @@ struct StepStats {
 static SHAPES: LazyLock<Mutex<BTreeMap<(u8, usize, usize, bool, bool, bool), StepStats>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
-/// Per-shape totals for the MoE expert splice: the d2h / gemv / h2d split of one
+/// Per-shape totals for the MoE expert splice: the d2h / gemv / h2d split plus
+/// the coarse setup/middle/combine phases and total wall of one
 /// `(quant, dim, mi, top_k, rows, graded)` shape's calls. `quant` is the first
 /// selected expert's gate_up format (a representative); `graded` says the call's
 /// experts were not all one tier.
@@ -141,6 +142,15 @@ struct MoeStepStats {
     /// All experts' down GEMV.
     dn_ns: u64,
     h2d_ns: u64,
+    /// Resolving the selected slots to host experts (ids/spans), before any
+    /// arithmetic.
+    setup_ns: u64,
+    /// All experts' SiLU + optional hidden rotation, the whole per-token loop.
+    middle_ns: u64,
+    /// All experts' routing-weighted accumulate into the residual.
+    combine_ns: u64,
+    /// The whole splice call's wall time, exclusive of the trace print itself.
+    total_ns: u64,
 }
 
 /// `(quant, dim, mi, top_k, rows, graded)` → running per-shape totals.
@@ -549,25 +559,30 @@ pub fn moe_cpu_experts<'a>(
             "moe cpu expert splice: top-k scratch needs {slots} elements"
         )));
     }
+    // The splice's whole wall time, started after validation and stopped just
+    // before the trace print (which is not part of the call's cost).
+    let t_total = Instant::now();
     MOE_SCRATCH.with(|cell| {
         let mut scratch = cell.borrow_mut();
         scratch.x.resize(n_x, 0.0);
         scratch.acc.resize(n_x, 0.0);
         scratch.ti.resize(slots, 0.0);
         scratch.tw.resize(slots, 0.0);
+        let mut timing = MoeStepTiming::default();
         let t_first = Instant::now();
         download_into_f32(gpu, x_rot, n_x, &mut scratch.x)?;
-        let d2h_first_ns = t_first.elapsed().as_nanos() as u64;
+        timing.d2h_first_ns = t_first.elapsed().as_nanos() as u64;
         let t_rest = Instant::now();
         download_into_f32(gpu, topk_indices, slots, &mut scratch.ti)?;
         download_into_f32(gpu, topk_weights, slots, &mut scratch.tw)?;
         download_into_f32(gpu, residual, n_x, &mut scratch.acc)?;
-        let d2h_rest_ns = t_rest.elapsed().as_nanos() as u64;
+        timing.d2h_rest_ns = t_rest.elapsed().as_nanos() as u64;
         // Resolve every selected slot up front: a bad id or a short span is then
         // an error before any arithmetic, and the compute never re-enters the
         // resolver. On the warm path the resolved experts live in a
         // fixed-capacity stack array (no per-layer heap allocation); a window
         // wider than `MOE_STACK_SLOTS` slots falls back to a heap `Vec`.
+        let t_setup = Instant::now();
         let dummy: CpuMoeExpert<'a> = CpuMoeExpert {
             gate_up_quant: CpuQuant::F32,
             gate_up: &[],
@@ -587,14 +602,16 @@ pub fn moe_cpu_experts<'a>(
                 .collect::<Result<Vec<_>, _>>()?;
             &heap
         };
-        let (gu_ns, dn_ns) = moe_cpu_experts_host(dim, mi, rows, top_k, experts, &mut scratch)?;
+        timing.setup_ns = t_setup.elapsed().as_nanos() as u64;
+        moe_cpu_experts_host(dim, mi, rows, top_k, experts, &mut scratch, &mut timing)?;
         let t_h2d = Instant::now();
         upload_f32(gpu, residual, &scratch.acc[..n_x])?;
-        let h2d_ns = t_h2d.elapsed().as_nanos() as u64;
+        timing.h2d_ns = t_h2d.elapsed().as_nanos() as u64;
         CPU_STEPS.fetch_add(1, Ordering::Relaxed);
         let mixed = experts.iter().any(|e| {
             e.gate_up_quant != experts[0].gate_up_quant || e.down_quant != experts[0].down_quant
         });
+        timing.total_ns = t_total.elapsed().as_nanos() as u64;
         trace_moe_step(
             experts[0].gate_up_quant,
             dim,
@@ -602,13 +619,7 @@ pub fn moe_cpu_experts<'a>(
             top_k,
             rows,
             mixed,
-            MoeStepTiming {
-                d2h_first_ns,
-                d2h_rest_ns,
-                gu_ns,
-                dn_ns,
-                h2d_ns,
-            },
+            timing,
         );
         Ok(())
     })
@@ -616,7 +627,9 @@ pub fn moe_cpu_experts<'a>(
 
 /// The splice's arithmetic over already-resolved host slices — split out from
 /// [`moe_cpu_experts`] so it is testable without a device. It accumulates into
-/// `scratch.acc` and returns the gate_up and down region timings.
+/// `scratch.acc` and records its `gate_up`/SiLU+rotate/down/combine region
+/// timings into `timing`'s matching fields (the caller owns the D2H/H2D/total
+/// fields).
 ///
 /// Slots are grouped by expert id: one weight, one shared-weight projection,
 /// every token that selected it. A weight row's bytes are therefore read once
@@ -636,7 +649,8 @@ fn moe_cpu_experts_host(
     top_k: usize,
     experts: &[CpuMoeExpert<'_>],
     scratch: &mut MoeScratch,
-) -> Result<(u64, u64), DispatchError> {
+    timing: &mut MoeStepTiming,
+) -> Result<(), DispatchError> {
     let slots = rows * top_k;
     if experts.len() != slots {
         return Err(cpu_err(
@@ -725,7 +739,7 @@ fn moe_cpu_experts_host(
     scratch.dn.resize(dim * slots, 0.0);
     scratch.group_off.resize(groups + 1, 0);
     fill_group_off(&scratch.group_start, &mut scratch.group_off, 2 * mi);
-    let gu_ns = {
+    timing.gu_ns = {
         let src = MoeJobSource {
             experts,
             order: &scratch.order,
@@ -742,6 +756,7 @@ fn moe_cpu_experts_host(
     // SwiGLU + hidden rotation, per token. The gate/up pair sits at strided
     // indices in the row-major output, so gather it; the rotation is the *down*
     // projection's contract (its weights are stored post-rotation).
+    let t_middle = Instant::now();
     {
         let gu = &scratch.gu[..2 * mi * slots];
         let hidden = &mut scratch.hidden[..mi * slots];
@@ -764,9 +779,10 @@ fn moe_cpu_experts_host(
             }
         }
     }
+    timing.middle_ns = t_middle.elapsed().as_nanos() as u64;
     scratch.group_off.resize(groups + 1, 0);
     fill_group_off(&scratch.group_start, &mut scratch.group_off, dim);
-    let dn_ns = {
+    timing.dn_ns = {
         let src = MoeJobSource {
             experts,
             order: &scratch.order,
@@ -783,6 +799,7 @@ fn moe_cpu_experts_host(
     // The down outputs are row-major per group, so a token's vector is strided:
     // `slot_group`/`slot_si` place each slot in its group's run, and the residual
     // accumulates in the original row-major, rank-minor order.
+    let t_combine = Instant::now();
     {
         let dn = &scratch.dn[..dim * slots];
         for s in 0..slots {
@@ -798,7 +815,8 @@ fn moe_cpu_experts_host(
             }
         }
     }
-    Ok((gu_ns, dn_ns))
+    timing.combine_ns = t_combine.elapsed().as_nanos() as u64;
+    Ok(())
 }
 
 /// Which projection of a selected expert a [`MoeJobSource`] job reads.
@@ -912,6 +930,10 @@ fn trace_moe_step(
     stats.gu_ns += timing.gu_ns;
     stats.dn_ns += timing.dn_ns;
     stats.h2d_ns += timing.h2d_ns;
+    stats.setup_ns += timing.setup_ns;
+    stats.middle_ns += timing.middle_ns;
+    stats.combine_ns += timing.combine_ns;
+    stats.total_ns += timing.total_ns;
     let stats = *stats;
     if !stats.calls.is_power_of_two() {
         return;
@@ -922,23 +944,36 @@ fn trace_moe_step(
         "cpu exec: moe expert splice dim={dim} mi={mi} k={k} rows={rows} quant={q:?} \
          graded={graded} | {} calls | {on_cpu} steps on CPU, {on_gpu} host-mapped steps still \
          on GPU | mean per call: d2h_first={:.2}ms d2h_rest={:.2}ms gu={:.2}ms dn={:.2}ms \
-         h2d={:.2}ms",
+         h2d={:.2}ms setup={:.2}ms middle={:.2}ms combine={:.2}ms total={:.2}ms",
         stats.calls,
         per_ms(stats.d2h_first_ns),
         per_ms(stats.d2h_rest_ns),
         per_ms(stats.gu_ns),
         per_ms(stats.dn_ns),
-        per_ms(stats.h2d_ns)
+        per_ms(stats.h2d_ns),
+        per_ms(stats.setup_ns),
+        per_ms(stats.middle_ns),
+        per_ms(stats.combine_ns),
+        per_ms(stats.total_ns)
     );
 }
 
 /// One splice call's wall-time split, handed to [`trace_moe_step`].
+#[derive(Clone, Copy, Default)]
 struct MoeStepTiming {
     d2h_first_ns: u64,
     d2h_rest_ns: u64,
     gu_ns: u64,
     dn_ns: u64,
     h2d_ns: u64,
+    /// Resolving the selected slots to host experts.
+    setup_ns: u64,
+    /// SiLU + optional hidden rotation, the whole per-token loop.
+    middle_ns: u64,
+    /// The routing-weighted accumulate into the residual.
+    combine_ns: u64,
+    /// The whole splice call's wall time.
+    total_ns: u64,
 }
 
 /// Whether [`run_host_mapped_gemv`] / [`run_host_mapped_gemv_residual`] can drive
@@ -1392,7 +1427,16 @@ mod moe_splice_tests {
             acc: seed.clone(),
             ..Default::default()
         };
-        moe_cpu_experts_host(dim, mi, rows, top_k, &experts, &mut scratch).unwrap();
+        moe_cpu_experts_host(
+            dim,
+            mi,
+            rows,
+            top_k,
+            &experts,
+            &mut scratch,
+            &mut MoeStepTiming::default(),
+        )
+        .unwrap();
 
         let blobs = hipfire_cpu::moe::ExpertBlobs {
             gate_up: &gu_all,
@@ -1472,7 +1516,16 @@ mod moe_splice_tests {
             acc: seed.clone(),
             ..Default::default()
         };
-        moe_cpu_experts_host(dim, mi, rows, top_k, &experts, &mut scratch).unwrap();
+        moe_cpu_experts_host(
+            dim,
+            mi,
+            rows,
+            top_k,
+            &experts,
+            &mut scratch,
+            &mut MoeStepTiming::default(),
+        )
+        .unwrap();
 
         let mut reference = seed.clone();
         for t in 0..rows {
@@ -1518,8 +1571,16 @@ mod moe_splice_tests {
             acc: vec![0.0f32; dim],
             ..Default::default()
         };
-        let err = moe_cpu_experts_host(dim, mi, 1, 1, &experts, &mut scratch)
-            .expect_err("a short expert span must fail");
+        let err = moe_cpu_experts_host(
+            dim,
+            mi,
+            1,
+            1,
+            &experts,
+            &mut scratch,
+            &mut MoeStepTiming::default(),
+        )
+        .expect_err("a short expert span must fail");
         assert!(format!("{err}").contains("span"), "unexpected error: {err}");
     }
 
@@ -1544,6 +1605,17 @@ mod moe_splice_tests {
             ..Default::default()
         };
         // rows=2, top_k=1 needs 2 experts; only 1 supplied.
-        assert!(moe_cpu_experts_host(dim, mi, 2, 1, &experts, &mut scratch).is_err());
+        assert!(
+            moe_cpu_experts_host(
+                dim,
+                mi,
+                2,
+                1,
+                &experts,
+                &mut scratch,
+                &mut MoeStepTiming::default()
+            )
+            .is_err()
+        );
     }
 }
