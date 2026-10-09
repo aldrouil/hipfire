@@ -63,31 +63,31 @@ MTP wins 8/8. CPU-arm % gains are larger only because the CPU AR baseline is slo
 
 ## Backend change: pcie → cpu (same spec, same placement intent)
 
-| Prompt | Spec arm | Placement | pcie |  cpu |     Δ |    Δ % |
-| ------ | -------- | --------- | ---: | ---: | ----: | -----: |
-| merge  | off      | set       | 61.3 | 50.2 | −11.1 | −18.1% |
-| merge  | off      | auto      | 64.7 | 52.9 | −11.8 | −18.2% |
-| merge  | mtp      | set       | 77.5 | 67.4 | −10.1 | −13.0% |
-| merge  | mtp      | auto      | 77.5 | 68.2 |  −9.3 | −12.0% |
-| math   | off      | set       | 59.7 | 49.9 |  −9.8 | −16.4% |
-| math   | off      | auto      | 63.2 | 52.6 | −10.6 | −16.8% |
-| math   | mtp      | set       | 70.0 | 63.3 |  −6.7 |  −9.6% |
-| math   | mtp      | auto      | 70.0 | 63.0 |  −7.0 | −10.0% |
+| Prompt | Spec arm | Placement | pcie |  cpu | delta | delta % |
+| ------ | -------- | --------- | ---: | ---: | ----: | ------: |
+| merge  | off      | set       | 61.3 | 50.2 | -11.1 |  -18.1% |
+| merge  | off      | auto      | 64.7 | 52.9 | -11.8 |  -18.2% |
+| merge  | mtp      | set       | 77.5 | 67.4 | -10.1 |  -13.0% |
+| merge  | mtp      | auto      | 77.5 | 68.2 |  -9.3 |  -12.0% |
+| math   | off      | set       | 59.7 | 49.9 |  -9.8 |  -16.4% |
+| math   | off      | auto      | 63.2 | 52.6 | -10.6 |  -16.8% |
+| math   | mtp      | set       | 70.0 | 63.3 |  -6.7 |   -9.6% |
+| math   | mtp      | auto      | 70.0 | 63.0 |  -7.0 |  -10.0% |
 
 CPU backend loses 8/8 at full seam coverage (16/16 or 14/14 per log) — the deficit is compute, not fallback: every spilled expert step ran on the CPU and still lost to the GPU grouped PCIe read. MTP narrows the gap (fewer AR steps per token amortize the slower expert FFN). Prefill is unaffected (≤1 tok/s either way — wide prefill keeps the GPU grouped PCIe read even on cpu arms, by design; cf. `crates/hipfire-arch-qwen35/src/qwen35/prefill.rs:5097-5100`).
 
 ## Placement change: set (pinned 24) → auto (auto-fit)
 
-| Prompt | Spec | Backend | set  | auto |    Δ |   Δ % | Spilled (set → auto, from logs) |
-| ------ | ---- | ------- | ---- | ---: | ---: | ----: | ------------------------------: |
-| merge  | off  | pcie    | 61.3 | 64.7 | +3.4 | +5.5% |                         16 → 14 |
-| merge  | off  | cpu     | 50.2 | 52.9 | +2.7 | +5.4% |                         16 → 14 |
-| merge  | mtp  | pcie    | 77.5 | 77.5 |  0.0 |  0.0% |                         16 → 16 |
-| merge  | mtp  | cpu     | 67.4 | 68.2 | +0.8 | +1.2% |                 16 → 16 (noise) |
-| math   | off  | pcie    | 59.7 | 63.2 | +3.5 | +5.9% |                         16 → 14 |
-| math   | off  | cpu     | 49.9 | 52.6 | +2.7 | +5.4% |                         16 → 14 |
-| math   | mtp  | pcie    | 70.0 | 70.0 |  0.0 |  0.0% |                         16 → 16 |
-| math   | mtp  | cpu     | 63.3 | 63.0 | −0.3 | −0.5% |                 16 → 16 (noise) |
+| Prompt | Spec | Backend | set  | auto | delta | delta % | Spilled (set to auto, from logs) |
+| ------ | ---- | ------- | ---- | ---: | ----: | ------: | -------------------------------: |
+| merge  | off  | pcie    | 61.3 | 64.7 |  +3.4 |   +5.5% |                         16 to 14 |
+| merge  | off  | cpu     | 50.2 | 52.9 |  +2.7 |   +5.4% |                         16 to 14 |
+| merge  | mtp  | pcie    | 77.5 | 77.5 |   0.0 |    0.0% |                         16 to 16 |
+| merge  | mtp  | cpu     | 67.4 | 68.2 |  +0.8 |   +1.2% |                 16 to 16 (noise) |
+| math   | off  | pcie    | 59.7 | 63.2 |  +3.5 |   +5.9% |                         16 to 14 |
+| math   | off  | cpu     | 49.9 | 52.6 |  +2.7 |   +5.4% |                         16 to 14 |
+| math   | mtp  | pcie    | 70.0 | 70.0 |   0.0 |    0.0% |                         16 to 16 |
+| math   | mtp  | cpu     | 63.3 | 63.0 |  -0.3 |   -0.5% |                 16 to 16 (noise) |
 
 Without the head, auto-fit keeps 2 more expert layers resident (14 spilled vs 16, device weights 13083 vs 12263 MiB) and runs ~5–6% faster; with the head on GPU, auto-fit spills the same 16 and the parity pair is exact. AutoMTP ≈ setMTP is therefore a finding, not a missing effect.
 
