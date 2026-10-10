@@ -4494,6 +4494,11 @@ fn run_loop(
                 work[s].spec == SpecKind::Dflash
                     && batch.m_per_slot.get(s).copied().unwrap_or(0) > 0
             });
+            // Step span (opt-in `HIPFIRE_CPU_EXEC_TRACE` only): forward vs
+            // sample vs sync/readback vs emit. Host wall around work this step
+            // already runs; no new sync, no order change.
+            let t_step = std::time::Instant::now();
+            let t_forward = std::time::Instant::now();
             let fwd = rig.model.forward_step(
                 &mut rig.gpu,
                 &batch,
@@ -4503,6 +4508,7 @@ fn run_loop(
                 any_verify,
                 any_dflash_rows,
             );
+            let forward_ns = t_forward.elapsed().as_nanos() as u64;
             // ── Publication (spec §4.6 C6) ──────────────────────────────────
             // After a SUCCESSFUL prefill chunk, publish sealed full pages at
             // committed page-aligned boundaries. Only when prefix_cache is on.
@@ -4933,6 +4939,7 @@ fn run_loop(
                     rig.sample_params[s].temperature = 0.0;
                 }
             }
+            let t_sample = std::time::Instant::now();
             if let Err(e) = rig.gpu.sample_per_slot(
                 &rig.model.logits_out,
                 &mut rig.sample_params,
@@ -4949,9 +4956,14 @@ fn run_loop(
                 poison = Some(reason);
                 break 'serve;
             }
+            let sample_ns = t_sample.elapsed().as_nanos() as u64;
             for (s, t) in sampled_parked {
                 rig.sample_params[s].temperature = t;
             }
+            // Sync + token-id readback: the existing device synchronize and
+            // D2H this step already performs. Timed as one span (wait vs copy
+            // are not separated — no new sync is introduced to split them).
+            let t_sync = std::time::Instant::now();
             if let Err(e) = rig.gpu.hip.device_synchronize() {
                 let reason = format!("device synchronize failed: {e:?}");
                 fail_all_active(&mut rig, &mut slots, &mut work, reason.clone());
@@ -4969,6 +4981,8 @@ fn run_loop(
                     break 'serve;
                 }
             }
+            let sync_readback_ns = t_sync.elapsed().as_nanos() as u64;
+            let t_emit = std::time::Instant::now();
 
             for s in 0..n {
                 // Spec verify/accept: process slots that produced draft outputs.
@@ -5319,6 +5333,18 @@ fn run_loop(
                     }
                     rig.sessions.touch(session);
                 }
+            }
+            let emit_ns = t_emit.elapsed().as_nanos() as u64;
+            let total_ns = t_step.elapsed().as_nanos() as u64;
+            if hipfire_dispatch::moe_trace_enabled() {
+                hipfire_dispatch::moe_step_trace(hipfire_dispatch::MoeStepTime {
+                    total_ns,
+                    forward_ns,
+                    sample_ns,
+                    sync_readback_ns,
+                    emit_ns,
+                    rows: batch.total_rows(),
+                });
             }
         }
     }));

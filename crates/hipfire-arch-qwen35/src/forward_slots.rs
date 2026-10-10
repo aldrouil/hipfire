@@ -1342,6 +1342,10 @@ fn run_deltanet_moe_layer_slots(
     // reference whenever the SAME model mixes an MQ6 layer elsewhere.
     weights_moe_has_mq6: bool,
 ) -> HipResult<()> {
+    // Layer span (opt-in trace only): attention half vs MoE FFN body. Host
+    // wall around work this layer already runs; no new sync, no order change.
+    let t_layer = std::time::Instant::now();
+    let t_attn = std::time::Instant::now();
     let attn_dtype = require_batchable_deltanet_moe_layer(layer)?;
     require_batchable_moe_ffn(gpu, &layer.ffn)?;
 
@@ -1625,8 +1629,10 @@ fn run_deltanet_moe_layer_slots(
     // w_down) block — stateless per row, no slot machinery needed. Takes
     // pbs.x_batch as input and accumulates the FFN output residual back
     // into it (same contract as the reference's own call site).
+    let attn_ns = t_attn.elapsed().as_nanos() as u64;
+    let t_moe = std::time::Instant::now();
     let ctx = DispatchCtx::new(gpu);
-    prefill_moe_ffn_body_batched(
+    let moe_result = prefill_moe_ffn_body_batched(
         gpu,
         &layer.ffn,
         &layer.ffn_norm,
@@ -1636,7 +1642,22 @@ fn run_deltanet_moe_layer_slots(
         &ctx,
         weights_moe_has_mq6,
         /*routed_out=*/ None,
-    )
+    );
+    let moe_ns = t_moe.elapsed().as_nanos() as u64;
+    let total_ns = t_layer.elapsed().as_nanos() as u64;
+    if hipfire_dispatch::moe_trace_enabled() {
+        hipfire_dispatch::moe_layer_trace(
+            layer.ffn.layer_idx as usize,
+            false,
+            hipfire_dispatch::MoeLayerTiming {
+                total_ns,
+                attn_ns,
+                moe_ns,
+                rows: n,
+            },
+        );
+    }
+    moe_result
 }
 
 /// Mirrors the `flash_optin && wmma_ok` gate that
@@ -2647,6 +2668,10 @@ fn run_fullattn_moe_layer_slots(
     weights_moe_has_mq6: bool,
     use_mrope: bool,
 ) -> HipResult<()> {
+    // Layer span (opt-in trace only): attention half vs MoE FFN body. Host
+    // wall around work this layer already runs; no new sync, no order change.
+    let t_layer = std::time::Instant::now();
+    let t_attn = std::time::Instant::now();
     let attn_dtype = require_batchable_fullattn_moe_layer(layer)?;
     require_batchable_moe_ffn(gpu, &layer.ffn)?;
 
@@ -2900,8 +2925,10 @@ fn run_fullattn_moe_layer_slots(
     }
 
     // 10. Batched MoE FFN — stateless per row, no slot machinery needed.
+    let attn_ns = t_attn.elapsed().as_nanos() as u64;
+    let t_moe = std::time::Instant::now();
     let ctx = DispatchCtx::new(gpu);
-    prefill_moe_ffn_body_batched(
+    let moe_result = prefill_moe_ffn_body_batched(
         gpu,
         &layer.ffn,
         &layer.ffn_norm,
@@ -2911,7 +2938,22 @@ fn run_fullattn_moe_layer_slots(
         &ctx,
         weights_moe_has_mq6,
         /*routed_out=*/ None,
-    )
+    );
+    let moe_ns = t_moe.elapsed().as_nanos() as u64;
+    let total_ns = t_layer.elapsed().as_nanos() as u64;
+    if hipfire_dispatch::moe_trace_enabled() {
+        hipfire_dispatch::moe_layer_trace(
+            layer.ffn.layer_idx as usize,
+            true,
+            hipfire_dispatch::MoeLayerTiming {
+                total_ns,
+                attn_ns,
+                moe_ns,
+                rows: n,
+            },
+        );
+    }
+    moe_result
 }
 
 /// Final output norm + per-slot last-token logits. Gathers only the last

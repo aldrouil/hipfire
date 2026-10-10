@@ -190,6 +190,17 @@ pub trait SharedJobSource {
 /// expert) far below this; a wider batch keeps working through the fallback.
 const MAX_STACK_JOBS: usize = 256;
 
+/// Prep/exec split for one [`gemv_shared_sourced`] call, in nanoseconds.
+/// `prep_ns` covers validation, output-chunk splitting, and the x86_64
+/// activation-sum preparation; `exec_ns` covers the Rayon decode-and-dot
+/// region (`run_shared_jobs`). `total_ns` is the whole call (`prep + exec`,
+/// measured as one outer span so the parts reconcile against it).
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct SharedSourcedSplit {
+    pub prep_ns: u64,
+    pub exec_ns: u64,
+    pub total_ns: u64,
+}
 /// Batched shared-weight projection: job `j` is `m` weight rows of `k` applied
 /// to each of its `n(j)` activation rows, writing `m * n(j)` outputs
 /// **row-major** (`out[r * n + t]`), the jobs concatenated in order in `out`.
@@ -217,9 +228,34 @@ pub fn gemv_shared_sourced<S: SharedJobSource + Sync>(
     src: &S,
     requested: Option<bool>,
 ) {
+    let _ = gemv_shared_sourced_split(m, k, out, src, requested);
+}
+
+/// [`gemv_shared_sourced`] with its prep-vs-Rayonal-exec split returned.
+/// Same validation, chunk split, sum-prep, and `run_shared_jobs` call as the
+/// untraced entry point — only two extra host timestamp reads at the Rayon
+/// region boundary. Bit-identical outputs.
+pub fn gemv_shared_sourced_traced<S: SharedJobSource + Sync>(
+    m: usize,
+    k: usize,
+    out: &mut [f32],
+    src: &S,
+    requested: Option<bool>,
+) -> SharedSourcedSplit {
+    gemv_shared_sourced_split(m, k, out, src, requested)
+}
+
+fn gemv_shared_sourced_split<S: SharedJobSource + Sync>(
+    m: usize,
+    k: usize,
+    out: &mut [f32],
+    src: &S,
+    requested: Option<bool>,
+) -> SharedSourcedSplit {
+    let t_total = std::time::Instant::now();
     let jobs = src.jobs();
     if m == 0 || k == 0 || jobs == 0 {
-        return;
+        return SharedSourcedSplit::default();
     }
     assert!(
         k % 256 == 0,
@@ -280,7 +316,7 @@ pub fn gemv_shared_sourced<S: SharedJobSource + Sync>(
     // the `RefCell`/map itself). On other arches the batched path is unchanged.
     #[cfg(target_arch = "x86_64")]
     {
-        ACTIVATION_SUMS.with(|cell| {
+        let split = ACTIVATION_SUMS.with(|cell| {
             // Keep the borrow alive as an owned guard and reborrow it as a
             // plain `&mut ActivationSumCache`: field-splitting (`lookup` vs
             // `sums`) is then visible to the borrow checker, which a `RefMut`
@@ -345,6 +381,9 @@ pub fn gemv_shared_sourced<S: SharedJobSource + Sync>(
             }
             // The outer TLS borrow is held for the whole region; the workers
             // only ever see `&[…]` slices, so nothing shared-mutable is touched.
+            // `prep` ends here: the `exec` span starts at the region boundary,
+            // so the two are adjacent, not nested.
+            let t_exec = std::time::Instant::now();
             run_shared_jobs(
                 m,
                 k,
@@ -356,11 +395,27 @@ pub fn gemv_shared_sourced<S: SharedJobSource + Sync>(
                 &cache.token_base,
                 &cache.job_simd,
             );
+            let exec_ns = t_exec.elapsed().as_nanos() as u64;
+            let total_ns = t_total.elapsed().as_nanos() as u64;
+            SharedSourcedSplit {
+                prep_ns: total_ns.saturating_sub(exec_ns),
+                exec_ns,
+                total_ns,
+            }
         });
+        split
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
+        let t_exec = std::time::Instant::now();
         run_shared_jobs(m, k, chunks, src, requested, &[], &[], &[], &[]);
+        let exec_ns = t_exec.elapsed().as_nanos() as u64;
+        let total_ns = t_total.elapsed().as_nanos() as u64;
+        SharedSourcedSplit {
+            prep_ns: total_ns.saturating_sub(exec_ns),
+            exec_ns,
+            total_ns,
+        }
     }
 }
 

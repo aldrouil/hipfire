@@ -5000,6 +5000,26 @@ pub(crate) fn prefill_moe_ffn_body_batched_with_route<'a>(
     routed_out: Option<&'a GpuTensor>,
     route: PrefillRouteMode<'a>,
 ) -> HipResult<()> {
+    prefill_moe_ffn_body_batched_with_route_layered(
+        gpu, ffn, ffn_norm, config, pbs, n, ctx, model_has_mq6_moe, routed_out, route,
+        ffn.layer_idx as usize,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prefill_moe_ffn_body_batched_with_route_layered<'a>(
+    gpu: &mut Gpu,
+    ffn: &'a MoeFfnWeights,
+    ffn_norm: &'a GpuTensor,
+    config: &Qwen35Config,
+    pbs: &'a PrefillBatchScratch,
+    n: usize,
+    ctx: &'a DispatchCtx,
+    model_has_mq6_moe: bool,
+    routed_out: Option<&'a GpuTensor>,
+    route: PrefillRouteMode<'a>,
+    layer_idx: usize,
+) -> HipResult<()> {
     // Narrow CPU-arithmetic forwards (the `<=4`-row speculative verify and the
     // accepted-prefix rollback replay) must recompute the routed experts on the
     // CPU, matching single-token decode; the GPU grouped PCIe read would
@@ -5056,8 +5076,15 @@ pub(crate) fn prefill_moe_ffn_body_batched_with_route<'a>(
         )
         .map_err(|e| hip_bridge::HipError::new(0, &e))?;
 
+        // Window span (opt-in `HIPFIRE_CPU_EXEC_TRACE` only): sealed GPU program
+        // vs CPU splice vs caller-side gap. Host wall around calls this body
+        // already makes; no new sync, no order change.
+        let t_window = std::time::Instant::now();
+        let t_sealed = std::time::Instant::now();
         execute_steps(gpu, ctx, &[Step::Moe(sealed)])
             .map_err(|e| HipError::new(0, &e.to_string()))?;
+        let sealed_ns = t_sealed.elapsed().as_nanos() as u64;
+        let t_splice = std::time::Instant::now();
         if cpu_deferred_experts {
             // The sealed step above omitted the routed GPU stages, so the whole
             // routed FFN is owed here: recompute it per (token, rank) on the CPU
@@ -5084,6 +5111,25 @@ pub(crate) fn prefill_moe_ffn_body_batched_with_route<'a>(
             // read over the host-mapped blobs (one weight pass per unique expert
             // per chunk). The CPU expert FFN is compute-bound and loses to that
             // by >10x at chunk sizes (measured 15x on ornith/gfx1201).
+        }
+        let splice_ns = t_splice.elapsed().as_nanos() as u64;
+        let total_ns = t_window.elapsed().as_nanos() as u64;
+        if hipfire_dispatch::cpu_exec::moe_trace_enabled() {
+            hipfire_dispatch::cpu_exec::moe_window_trace(
+                layer_idx,
+                hipfire_dispatch::cpu_exec::MoeWindowTiming {
+                    total_ns,
+                    gpu_sealed_ns: sealed_ns,
+                    cpu_splice_ns: if cpu_deferred_experts { splice_ns } else { 0 },
+                    other_ns: total_ns.saturating_sub(sealed_ns).saturating_sub(if cpu_deferred_experts {
+                        splice_ns
+                    } else {
+                        0
+                    }),
+                    rows: n,
+                    top_k: config.num_experts_per_tok,
+                },
+            );
         }
 
         #[cfg(feature = "moe-oracle")]
@@ -10490,6 +10536,10 @@ fn batch_chunk_delta_net_moe(
     routed_out: Option<&GpuTensor>,
     route: PrefillRouteMode<'_>,
 ) -> HipResult<()> {
+    // Layer span (opt-in trace only): attention half vs MoE FFN body. Host
+    // wall around work this chunk already runs; no new sync, no order change.
+    let t_layer = std::time::Instant::now();
+    let t_attn = std::time::Instant::now();
     // Batched MoE LA layer. LA body is the same as DeltaNet
     // (rmsnorm + qkvza + sigmoid_alpha + conv1d + L2norm +
     // repeat_interleave + GDN + gated_norm + wo+residual);
@@ -11287,7 +11337,10 @@ fn batch_chunk_delta_net_moe(
     // silu_mul + w_down) block. Takes pbs.x_batch as input AND
     // accumulates the FFN output residual back into it via the
     // batched indexed down kernel's atomicAdd path.
-    prefill_moe_ffn_body_batched_with_route(
+    // Attn half ends here; MoE FFN body (with its own window span) below.
+    let attn_ns = t_attn.elapsed().as_nanos() as u64;
+    let t_moe = std::time::Instant::now();
+    prefill_moe_ffn_body_batched_with_route_layered(
         gpu,
         &layer.ffn,
         &layer.ffn_norm,
@@ -11298,7 +11351,22 @@ fn batch_chunk_delta_net_moe(
         weights.moe_has_mq6,
         routed_out,
         route,
+        layer_idx,
     )?;
+    let moe_ns = t_moe.elapsed().as_nanos() as u64;
+    let total_ns = t_layer.elapsed().as_nanos() as u64;
+    if hipfire_dispatch::moe_trace_enabled() {
+        hipfire_dispatch::moe_layer_trace(
+            layer_idx,
+            false,
+            hipfire_dispatch::MoeLayerTiming {
+                total_ns,
+                attn_ns,
+                moe_ns,
+                rows: n,
+            },
+        );
+    }
 
     Ok(())
 }
@@ -11327,6 +11395,13 @@ fn batch_chunk_full_attn_moe(
     weights: &Qwen35Weights,
     route: PrefillRouteMode<'_>,
 ) -> HipResult<()> {
+    // Layer span (opt-in trace only): attention half vs MoE FFN body. Host
+    // wall around work this chunk already runs; no new sync, no order change.
+    // `t_attn` starts here so it covers the prep half (QKV projection +
+    // norms + RoPE, the largest GPU piece) plus the finish's attend tail;
+    // `attn_ns` closes just before the finish's MoE FFN body.
+    let t_layer = std::time::Instant::now();
+    let t_attn = std::time::Instant::now();
     // F2 split: QKV projection + norms + RoPE (everything above the old
     // attend call) live in `batch_chunk_full_attn_moe_prep`; called here
     // for the single-chunk path in the original position.
@@ -11341,6 +11416,7 @@ fn batch_chunk_full_attn_moe(
         tree_verify,
         layer_idx,
     )?;
+    let attn_head_ns = t_attn.elapsed().as_nanos() as u64;
     // F2 split: KV-write + flash attention, sigmoid/wo and the MoE FFN now
     // live in `batch_chunk_full_attn_moe_finish` so a chunk pair can share
     // one merged attend step; called here for the single-chunk path in the
@@ -11365,6 +11441,24 @@ fn batch_chunk_full_attn_moe(
         routed_out,
         route,
     )?;
+    // Single-chunk path only: the merged-pair path calls prep/finish directly
+    // and stays untimed. `attn` = prep head (QKV/norms/RoPE); the finish's
+    // attend-tail + MoE body are inside `finish` and not separately timed
+    // here, so `moe` = total − head (reconciles standalone; precise per-layer
+    // MoE comes from the `moe window` lines).
+    let total_ns = t_layer.elapsed().as_nanos() as u64;
+    if hipfire_dispatch::moe_trace_enabled() {
+        hipfire_dispatch::moe_layer_trace(
+            layer_idx,
+            true,
+            hipfire_dispatch::MoeLayerTiming {
+                total_ns,
+                attn_ns: attn_head_ns,
+                moe_ns: total_ns.saturating_sub(attn_head_ns),
+                rows: n,
+            },
+        );
+    }
     Ok(())
 }
 
@@ -11754,6 +11848,8 @@ fn batch_chunk_full_attn_moe_finish(
     routed_out: Option<&GpuTensor>,
     route: PrefillRouteMode<'_>,
 ) -> HipResult<()> {
+    // (Layer timers live in the parent `batch_chunk_full_attn_moe`: `t_attn`
+    // covers the prep half plus this attend tail; `attn_ns` closes below.)
     // Batched KV write + flash attention (via dispatch).
     batch_chunk_fa_attend(
         gpu,
@@ -11912,8 +12008,9 @@ fn batch_chunk_full_attn_moe_finish(
         )?;
     }
 
-    // Batched MoE FFN.
-    prefill_moe_ffn_body_batched_with_route(
+    // Batched MoE FFN (parent `batch_chunk_full_attn_moe` owns the layer
+    // span on the single-chunk path; the pair path calls this untimed).
+    prefill_moe_ffn_body_batched_with_route_layered(
         gpu,
         &layer.ffn,
         &layer.ffn_norm,
@@ -11924,6 +12021,7 @@ fn batch_chunk_full_attn_moe_finish(
         weights.moe_has_mq6,
         routed_out,
         route,
+        layer_idx,
     )?;
     Ok(())
 }

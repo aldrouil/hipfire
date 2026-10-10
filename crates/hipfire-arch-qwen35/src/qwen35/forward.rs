@@ -873,6 +873,8 @@ fn moe_ffn_decode_impl<'a>(
              CPU-deferred experts; use PCIe/resident",
         ));
     }
+    let t_window = std::time::Instant::now();
+    let t_sealed = std::time::Instant::now();
     let sealed = hipfire_dispatch::pipeline::sealed_moe::seal_decode(bound, &ctx, moe_params)
         .map_err(HipError::from)?;
     hipfire_dispatch::pipeline::execute_steps(
@@ -881,6 +883,8 @@ fn moe_ffn_decode_impl<'a>(
         &[hipfire_dispatch::pipeline::Step::Moe(sealed)],
     )
     .map_err(HipError::from)?;
+    let sealed_ns = t_sealed.elapsed().as_nanos() as u64;
+    let t_splice = std::time::Instant::now();
     // CPU expert splice: the sealed step above omitted the routed GPU stages for
     // this call, so the whole routed FFN is owed here. Recompute it on the CPU
     // from the intact host blobs (per-expert dtype/stride, graded included) and
@@ -897,6 +901,25 @@ fn moe_ffn_decode_impl<'a>(
             splice_residual,
             1,
         )?;
+    }
+    let splice_ns = t_splice.elapsed().as_nanos() as u64;
+    let total_ns = t_window.elapsed().as_nanos() as u64;
+    if hipfire_dispatch::cpu_exec::moe_trace_enabled() {
+        hipfire_dispatch::cpu_exec::moe_window_trace(
+            ffn.layer_idx as usize,
+            hipfire_dispatch::cpu_exec::MoeWindowTiming {
+                total_ns,
+                gpu_sealed_ns: sealed_ns,
+                cpu_splice_ns: if deferred_routed_experts { splice_ns } else { 0 },
+                other_ns: total_ns.saturating_sub(sealed_ns).saturating_sub(if deferred_routed_experts {
+                    splice_ns
+                } else {
+                    0
+                }),
+                rows: 1,
+                top_k: k,
+            },
+        );
     }
     if let Some((x_norm, routed_gate_up)) = oracle_input {
         if let (Some(q), Some(owners)) = (
