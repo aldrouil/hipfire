@@ -76,25 +76,29 @@ unsafe fn shifts64<const BITS: usize, const OFF: usize>() -> __m256i {
 /// One broadcast of the chunk plus one variable shift per code. An 8-code chunk
 /// is `8·BITS` bits, so widths up to four fit a 32-bit lane and a single shift.
 /// Three-bit chunks retain the preceding byte and discard it in the vector
-/// shift. A 6-bit pack uses two such 24-bit halves, one per 128-bit lane.
+/// shift. Six-bit chunks broadcast two prefix bytes and their six payload bytes,
+/// then shuffle two 24-bit halves into the corresponding 128-bit lanes.
 /// Five-bit packs need 64-bit lanes, compacted back into eight i32 lanes.
 ///
 /// # Safety
 ///
-/// Requires AVX2 and `BITS` readable payload bytes at `p`. For 3- and 6-bit
-/// packs, `p.sub(1)` must also be readable within the same allocation: `p`
-/// points past a nonempty group header, never at an allocation's first byte.
+/// Requires AVX2 and `BITS` readable payload bytes at `p`. For 3-bit packs,
+/// `p.sub(1)` must also be readable; for 6-bit packs, `p.sub(2)` must be
+/// readable. These prefix bytes belong to the same allocation's group header
+/// or earlier payload, never before the allocation's first byte.
 #[inline]
 #[target_feature(enable = "avx2")]
 unsafe fn codes8<const BITS: usize>(p: *const u8) -> __m256i {
     if BITS == 6 {
-        // Each four-code half is three bytes. Include its preceding byte in
-        // the load and discard it with the lane shifts, avoiding scalar
-        // stitching of a 48-bit word. The first prefix is in the group header;
-        // the second is in the payload. Neither load passes the chunk's end.
-        let lo = _mm_set1_epi32((p.sub(1) as *const i32).read_unaligned());
-        let hi = _mm_set1_epi32((p.add(2) as *const i32).read_unaligned());
-        let v = _mm256_set_m128i(hi, lo);
+        // One qword ends exactly at this chunk's last payload byte. Repeat
+        // [prefix, code bytes] for each four-code half; the shifts below discard
+        // its prefix. Both extra bytes are within the group header or payload.
+        let packed = _mm256_set1_epi64x((p.sub(2) as *const i64).read_unaligned());
+        let bytes = _mm256_setr_epi8(
+            1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4,
+            4, 5, 6, 7, 4, 5, 6, 7, 4, 5, 6, 7, 4, 5, 6, 7,
+        );
+        let v = _mm256_shuffle_epi8(packed, bytes);
         let shifts = _mm256_setr_epi32(8, 14, 20, 26, 8, 14, 20, 26);
         let mask = _mm256_set1_epi32(0x3f);
         _mm256_and_si256(_mm256_srlv_epi32(v, shifts), mask)
@@ -138,7 +142,7 @@ unsafe fn codes_dot_sum<const BITS: usize, const PAYLOAD: usize, const CACHED: b
     last: usize,
     cached_sum: f32,
 ) -> (f32, f32) {
-    const { assert!((BITS != 3 && BITS != 6) || PAYLOAD > 0) };
+    const { assert!((BITS != 3 || PAYLOAD >= 1) && (BITS != 6 || PAYLOAD >= 2)) };
     // Two independent chains per sum, stepped two chunks at a time. A single
     // chain serializes on the `fma`'s four-cycle latency while the decode is
     // several uops per chunk, so a same-chain reuse every *other* iteration
@@ -288,7 +292,7 @@ unsafe fn codebook_group_dot<const BITS: usize, const CB: usize, const PAYLOAD: 
     gptr: *const u8,
     xg: *const f32,
 ) -> f32 {
-    const { assert!((BITS != 3 && BITS != 6) || PAYLOAD > 0) };
+    const { assert!((BITS != 3 || PAYLOAD >= 1) && (BITS != 6 || PAYLOAD >= 2)) };
     let (cb_lo, cb_hi) = codebook_tables::<CB>(gptr);
     let mut dot0 = _mm256_setzero_ps();
     let mut dot1 = _mm256_setzero_ps();
@@ -951,20 +955,21 @@ mod tests {
     #[target_feature(enable = "avx2")]
     unsafe fn check_prefixed_codes<const BITS: usize>() {
         let mask = (1u32 << BITS) - 1;
-        let mut packed = vec![0u8; BITS + 1];
+        let prefix_bytes = if BITS == 6 { 2 } else { 1 };
+        let mut packed = vec![0u8; BITS + prefix_bytes];
         for phase in 0..=mask {
             let expected: [u32; 8] =
                 core::array::from_fn(|lane| (phase + lane as u32 * 13) & mask);
             let word = expected.iter().enumerate().fold(0u64, |word, (lane, &code)| {
                 word | ((code as u64) << (lane * BITS))
             });
-            packed[1..].copy_from_slice(&word.to_le_bytes()[..BITS]);
+            packed[prefix_bytes..].copy_from_slice(&word.to_le_bytes()[..BITS]);
             for prefix in 0..=u8::MAX {
-                packed[0] = prefix;
+                packed[..prefix_bytes].fill(prefix);
                 let mut got = [0u32; 8];
                 _mm256_storeu_si256(
                     got.as_mut_ptr() as *mut __m256i,
-                    codes8::<BITS>(packed.as_ptr().add(1)),
+                    codes8::<BITS>(packed.as_ptr().add(prefix_bytes)),
                 );
                 assert_eq!(got, expected, "bits={BITS} phase={phase} prefix={prefix}");
             }
