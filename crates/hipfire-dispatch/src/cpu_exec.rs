@@ -86,6 +86,13 @@ pub fn moe_cpu_experts_enabled() -> bool {
     *ENABLED
 }
 
+/// Whether the expanded MoE timing trace is armed: the existing
+/// `HIPFIRE_CPU_EXEC_TRACE` diagnostic. Resolved per call (not cached) so the
+/// debug script's trace-off control run in the same process snapshot shape
+/// still works; the lookup is a snapshot-map read, off the hot arithmetic.
+pub fn moe_trace_enabled() -> bool {
+    hipfire_config::developer_var("HIPFIRE_CPU_EXEC_TRACE").is_ok()
+}
 /// (steps executed on the CPU, host-mapped steps that stayed on the GPU).
 ///
 /// The second number is the honest coverage failure signal: it counts steps whose
@@ -124,6 +131,12 @@ struct StepStats {
 static SHAPES: LazyLock<Mutex<BTreeMap<(u8, usize, usize, bool, bool, bool), StepStats>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
+/// Slots per `CpuQuant` discriminant (`q as usize`) in one splice call's
+/// selected experts. Length 32 covers the 28 current variants with headroom;
+/// indices at/above the variant count stay zero. Printed as `NamexCount`
+/// pairs via [`cpu_quant_mix_name`].
+const MOE_QUANT_MIX_LEN: usize = 32;
+
 /// Per-shape totals for the MoE expert splice: the d2h / gemv / h2d split plus
 /// the coarse setup/middle/combine phases and total wall of one
 /// `(quant, dim, mi, top_k, rows, graded)` shape's calls. `quant` is the first
@@ -151,6 +164,24 @@ struct MoeStepStats {
     combine_ns: u64,
     /// The whole splice call's wall time, exclusive of the trace print itself.
     total_ns: u64,
+    /// GU activation-prep/metadata vs Rayon decode-and-dot execution split.
+    /// `gu_ns` stays the whole region (`prep + exec`); `prep` is 0 until the
+    /// traced `gemv_shared_sourced` sibling lands.
+    gu_prep_ns: u64,
+    gu_exec_ns: u64,
+    /// DN activation-prep/metadata vs Rayon decode-and-dot execution split.
+    dn_prep_ns: u64,
+    dn_exec_ns: u64,
+    /// CPU middle split: gather vs SiLU vs FWHT across the per-token loop.
+    middle_gather_ns: u64,
+    middle_silu_ns: u64,
+    middle_fwht_ns: u64,
+    /// GPU-wait portion attributed to the first D2H (0 until event split lands;
+    /// `d2h_first_ns` stays the whole blocking download).
+    d2h_wait_ns: u64,
+    /// Selected-slot GU / DN quant mixture summed across this shape's calls.
+    gu_mix: [u64; MOE_QUANT_MIX_LEN],
+    dn_mix: [u64; MOE_QUANT_MIX_LEN],
 }
 
 /// `(quant, dim, mi, top_k, rows, graded)` → running per-shape totals.
@@ -569,9 +600,48 @@ pub fn moe_cpu_experts<'a>(
         scratch.ti.resize(slots, 0.0);
         scratch.tw.resize(slots, 0.0);
         let mut timing = MoeStepTiming::default();
+        // GPU-wait vs copy split for the first D2H (opt-in trace only): record
+        // a start event on the existing stream *before* the sealed GPU work has
+        // necessarily drained, then resolve the pair after the blocking copy
+        // using the copy itself as the only synchronization. `hipEventRecord`
+        // enqueues (never syncs); `hipEventElapsedTime` after the blocking D2H
+        // reads device time without a new wait. Copy failure skips the split
+        // and keeps the whole blocking span in `d2h_first_ns`.
+        let trace_on = moe_trace_enabled();
+        let wait_start = if trace_on {
+            gpu.hip
+                .event_create()
+                .ok()
+                .and_then(|ev| {
+                    gpu.hip
+                        .event_record(&ev, gpu.active_stream.as_ref())
+                        .ok()
+                        .map(|()| ev)
+                })
+        } else {
+            None
+        };
         let t_first = Instant::now();
         download_into_f32(gpu, x_rot, n_x, &mut scratch.x)?;
         timing.d2h_first_ns = t_first.elapsed().as_nanos() as u64;
+        // The stop event records here (stream position = copy completion) but
+        // is NOT resolved yet: `hipEventElapsedTime` on an uncompleted record
+        // returns hipErrorNotReady, which would silently pin `d2h_wait_ns` at
+        // 0. Resolution happens after the splice's H2D below — the FIFO stream
+        // guarantees both records are complete by then, so no new sync.
+        let wait_stop = if wait_start.is_some() {
+            gpu.hip
+                .event_create()
+                .ok()
+                .and_then(|ev| {
+                    gpu.hip
+                        .event_record(&ev, gpu.active_stream.as_ref())
+                        .ok()
+                        .map(|()| ev)
+                })
+        } else {
+            None
+        };
         let t_rest = Instant::now();
         download_into_f32(gpu, topk_indices, slots, &mut scratch.ti)?;
         download_into_f32(gpu, topk_weights, slots, &mut scratch.tw)?;
@@ -603,11 +673,42 @@ pub fn moe_cpu_experts<'a>(
             &heap
         };
         timing.setup_ns = t_setup.elapsed().as_nanos() as u64;
+        // Actual selected GU/DN quant mixture: one slot count per `CpuQuant as
+        // usize`. Out-of-range discriminants (a future variant past the mix
+        // length) saturate the last bucket rather than panicking the trace.
+        for e in experts.iter() {
+            let gi = (e.gate_up_quant as usize).min(MOE_QUANT_MIX_LEN - 1);
+            let di = (e.down_quant as usize).min(MOE_QUANT_MIX_LEN - 1);
+            timing.gu_mix[gi] = timing.gu_mix[gi].saturating_add(1);
+            timing.dn_mix[di] = timing.dn_mix[di].saturating_add(1);
+        }
         moe_cpu_experts_host(dim, mi, rows, top_k, experts, &mut scratch, &mut timing)?;
         let t_h2d = Instant::now();
         upload_f32(gpu, residual, &scratch.acc[..n_x])?;
         timing.h2d_ns = t_h2d.elapsed().as_nanos() as u64;
         CPU_STEPS.fetch_add(1, Ordering::Relaxed);
+        // Resolve the wait pair now: the blocking H2D above drained the FIFO
+        // stream, so both the start record (pre-copy) and the stop record
+        // (post-copy) are complete — `hipEventElapsedTime` cannot go NotReady
+        // here, and no new sync was introduced. `wait` = device time from the
+        // splice's stream entry to copy completion; `copy ≈ blocking span −
+        // wait` is derived at print time, never stored.
+        match (wait_start, wait_stop) {
+            (Some(start), Some(stop)) => {
+                if let Ok(ms) = gpu.hip.event_elapsed_ms(&start, &stop) {
+                    timing.d2h_wait_ns = (ms as f64 * 1e6) as u64;
+                }
+                let _ = gpu.hip.event_destroy(stop);
+                let _ = gpu.hip.event_destroy(start);
+            }
+            (Some(start), None) => {
+                let _ = gpu.hip.event_destroy(start);
+            }
+            (None, Some(stop)) => {
+                let _ = gpu.hip.event_destroy(stop);
+            }
+            (None, None) => {}
+        }
         let mixed = experts.iter().any(|e| {
             e.gate_up_quant != experts[0].gate_up_quant || e.down_quant != experts[0].down_quant
         });
@@ -739,7 +840,7 @@ fn moe_cpu_experts_host(
     scratch.dn.resize(dim * slots, 0.0);
     scratch.group_off.resize(groups + 1, 0);
     fill_group_off(&scratch.group_start, &mut scratch.group_off, 2 * mi);
-    timing.gu_ns = {
+    let gu_split = {
         let src = MoeJobSource {
             experts,
             order: &scratch.order,
@@ -749,14 +850,18 @@ fn moe_cpu_experts_host(
             top_k,
             proj: MoeProj::GateUp,
         };
-        let t = Instant::now();
-        hipfire_cpu::gemv::gemv_shared_sourced(2 * mi, dim, &mut scratch.gu, &src, None);
-        t.elapsed().as_nanos() as u64
+        hipfire_cpu::gemv::gemv_shared_sourced_traced(2 * mi, dim, &mut scratch.gu, &src, None)
     };
+    timing.gu_ns = gu_split.total_ns;
+    timing.gu_prep_ns = gu_split.prep_ns;
+    timing.gu_exec_ns = gu_split.exec_ns;
     // SwiGLU + hidden rotation, per token. The gate/up pair sits at strided
     // indices in the row-major output, so gather it; the rotation is the *down*
     // projection's contract (its weights are stored post-rotation).
     let t_middle = Instant::now();
+    let mut gather_ns: u64 = 0;
+    let mut silu_ns: u64 = 0;
+    let mut fwht_ns: u64 = 0;
     {
         let gu = &scratch.gu[..2 * mi * slots];
         let hidden = &mut scratch.hidden[..mi * slots];
@@ -768,21 +873,30 @@ fn moe_cpu_experts_host(
             let rotate = experts[first].down_quant.is_fwht_g256();
             for si in 0..n {
                 let s = scratch.order[scratch.group_start[gi] as usize + si] as usize;
+                let t_gather = Instant::now();
                 for (r, g) in gather.iter_mut().enumerate() {
                     *g = gu[base + r * n + si];
                 }
+                gather_ns += t_gather.elapsed().as_nanos() as u64;
                 let hid = &mut hidden[s * mi..(s + 1) * mi];
+                let t_silu = Instant::now();
                 silu_mul(gather, hid);
+                silu_ns += t_silu.elapsed().as_nanos() as u64;
                 if rotate {
+                    let t_fwht = Instant::now();
                     rotate_x(hid);
+                    fwht_ns += t_fwht.elapsed().as_nanos() as u64;
                 }
             }
         }
     }
     timing.middle_ns = t_middle.elapsed().as_nanos() as u64;
+    timing.middle_gather_ns = gather_ns;
+    timing.middle_silu_ns = silu_ns;
+    timing.middle_fwht_ns = fwht_ns;
     scratch.group_off.resize(groups + 1, 0);
     fill_group_off(&scratch.group_start, &mut scratch.group_off, dim);
-    timing.dn_ns = {
+    let dn_split = {
         let src = MoeJobSource {
             experts,
             order: &scratch.order,
@@ -792,10 +906,11 @@ fn moe_cpu_experts_host(
             top_k,
             proj: MoeProj::Down,
         };
-        let t = Instant::now();
-        hipfire_cpu::gemv::gemv_shared_sourced(dim, mi, &mut scratch.dn, &src, None);
-        t.elapsed().as_nanos() as u64
+        hipfire_cpu::gemv::gemv_shared_sourced_traced(dim, mi, &mut scratch.dn, &src, None)
     };
+    timing.dn_ns = dn_split.total_ns;
+    timing.dn_prep_ns = dn_split.prep_ns;
+    timing.dn_exec_ns = dn_split.exec_ns;
     // The down outputs are row-major per group, so a token's vector is strided:
     // `slot_group`/`slot_si` place each slot in its group's run, and the residual
     // accumulates in the original row-major, rank-minor order.
@@ -934,17 +1049,35 @@ fn trace_moe_step(
     stats.middle_ns += timing.middle_ns;
     stats.combine_ns += timing.combine_ns;
     stats.total_ns += timing.total_ns;
+    stats.gu_prep_ns += timing.gu_prep_ns;
+    stats.gu_exec_ns += timing.gu_exec_ns;
+    stats.dn_prep_ns += timing.dn_prep_ns;
+    stats.dn_exec_ns += timing.dn_exec_ns;
+    stats.middle_gather_ns += timing.middle_gather_ns;
+    stats.middle_silu_ns += timing.middle_silu_ns;
+    stats.middle_fwht_ns += timing.middle_fwht_ns;
+    stats.d2h_wait_ns += timing.d2h_wait_ns;
+    for i in 0..MOE_QUANT_MIX_LEN {
+        stats.gu_mix[i] += timing.gu_mix[i] as u64;
+        stats.dn_mix[i] += timing.dn_mix[i] as u64;
+    }
     let stats = *stats;
     if !stats.calls.is_power_of_two() {
         return;
     }
     let (on_cpu, on_gpu) = cpu_exec_counters();
     let per_ms = |ns: u64| ns as f64 / 1e6 / stats.calls as f64;
+    // Derived copy estimate: blocking span minus device-wait, clamped at zero
+    // (event resolution rounds up; a zero-wait split prints the whole span).
+    let d2h_copy_ns = stats.d2h_first_ns.saturating_sub(stats.d2h_wait_ns);
     eprintln!(
         "cpu exec: moe expert splice dim={dim} mi={mi} k={k} rows={rows} quant={q:?} \
          graded={graded} | {} calls | {on_cpu} steps on CPU, {on_gpu} host-mapped steps still \
          on GPU | mean per call: d2h_first={:.2}ms d2h_rest={:.2}ms gu={:.2}ms dn={:.2}ms \
-         h2d={:.2}ms setup={:.2}ms middle={:.2}ms combine={:.2}ms total={:.2}ms",
+         h2d={:.2}ms setup={:.2}ms middle={:.2}ms combine={:.2}ms total={:.2}ms \
+         | gu_prep={:.2}ms gu_exec={:.2}ms dn_prep={:.2}ms dn_exec={:.2}ms \
+         gather={:.2}ms silu={:.2}ms fwht={:.2}ms d2h_wait={:.2}ms d2h_copy~{:.2}ms \
+         | gu_mix=[{}] dn_mix=[{}]",
         stats.calls,
         per_ms(stats.d2h_first_ns),
         per_ms(stats.d2h_rest_ns),
@@ -954,8 +1087,76 @@ fn trace_moe_step(
         per_ms(stats.setup_ns),
         per_ms(stats.middle_ns),
         per_ms(stats.combine_ns),
-        per_ms(stats.total_ns)
+        per_ms(stats.total_ns),
+        per_ms(stats.gu_prep_ns),
+        per_ms(stats.gu_exec_ns),
+        per_ms(stats.dn_prep_ns),
+        per_ms(stats.dn_exec_ns),
+        per_ms(stats.middle_gather_ns),
+        per_ms(stats.middle_silu_ns),
+        per_ms(stats.middle_fwht_ns),
+        per_ms(stats.d2h_wait_ns),
+        per_ms(d2h_copy_ns),
+        format_quant_mix(&stats.gu_mix, stats.calls),
+        format_quant_mix(&stats.dn_mix, stats.calls),
     );
+}
+
+/// `CpuQuant` discriminant (`q as usize`) → short variant name for the
+/// per-call quant-mixture print. Order matches the enum declaration; unknown
+/// indices (past the current variant count) print as `q{N}`.
+fn cpu_quant_mix_name(idx: usize) -> &'static str {
+    match idx {
+        0 => "Mq4G256",
+        1 => "Mq4G256V2",
+        2 => "Mq6G256",
+        3 => "Mq3G256",
+        4 => "Mq3G256Lloyd",
+        5 => "Hfq6G256",
+        6 => "Hfq3G256",
+        7 => "Hfq2G256",
+        8 => "Hfq4G128",
+        9 => "Hfq3G128",
+        10 => "Hfq2G128",
+        11 => "Mq5G256",
+        12 => "Mq2G256",
+        13 => "Mq2G256Lloyd",
+        14 => "Mq2G256LloydU",
+        15 => "Mq4G256Lloyd",
+        16 => "Mq4CG256",
+        17 => "Mq6G256V2",
+        18 => "Mq5G256V2",
+        19 => "Mq3G256V2",
+        20 => "Mq2G256V2",
+        21 => "Tq2G128",
+        22 => "Bq1G128",
+        23 => "Hfq4G256",
+        24 => "F16",
+        25 => "F32",
+        26 => "Bf16",
+        27 => "Q8F16",
+        _ => "q?",
+    }
+}
+
+/// Mean slots per call per quant (`NamexMean` pairs, one decimal) from summed
+/// mixture counts. Empty (trace shapes that predate the mix) prints `-`.
+fn format_quant_mix(mix: &[u64; MOE_QUANT_MIX_LEN], calls: usize) -> String {
+    let mut out = String::new();
+    for (i, &sum) in mix.iter().enumerate() {
+        if sum == 0 {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        let mean = sum as f64 / calls.max(1) as f64;
+        out.push_str(&format!("{}x{mean:.1}", cpu_quant_mix_name(i)));
+    }
+    if out.is_empty() {
+        out.push('-');
+    }
+    out
 }
 
 /// One splice call's wall-time split, handed to [`trace_moe_step`].
@@ -974,6 +1175,25 @@ struct MoeStepTiming {
     combine_ns: u64,
     /// The whole splice call's wall time.
     total_ns: u64,
+    /// GU prep (activation-sum/metadata) vs Rayon decode-and-dot execution.
+    /// `gu_ns` stays the whole region (`prep + exec`); `prep_ns` is 0 until
+    /// the traced `gemv_shared_sourced` sibling lands.
+    gu_prep_ns: u64,
+    gu_exec_ns: u64,
+    /// DN prep (activation-sum/metadata) vs Rayon decode-and-dot execution.
+    dn_prep_ns: u64,
+    dn_exec_ns: u64,
+    /// CPU middle split: gather vs SiLU vs FWHT sums across the per-token loop.
+    middle_gather_ns: u64,
+    middle_silu_ns: u64,
+    middle_fwht_ns: u64,
+    /// GPU-wait attributed to the first D2H (0 until the event split lands;
+    /// `d2h_first_ns` stays the whole blocking download).
+    d2h_wait_ns: u64,
+    /// Selected-slot GU / DN quant mixture of this call, indexed by
+    /// `CpuQuant as usize`; summed into the shape stats by [`trace_moe_step`].
+    gu_mix: [u16; MOE_QUANT_MIX_LEN],
+    dn_mix: [u16; MOE_QUANT_MIX_LEN],
 }
 
 /// Whether [`run_host_mapped_gemv`] / [`run_host_mapped_gemv_residual`] can drive
@@ -1285,9 +1505,308 @@ struct StepTiming {
     h2d_ns: u64,
 }
 
+/// One MoE layer window's wall-time split on the CPU-deferred route, handed to
+/// [`moe_window_trace`]. All spans are host wall (`Instant`), adjacent not
+/// nested: `gpu_sealed_ns` covers the sealed GPU program (`execute_steps`),
+/// `cpu_splice_ns` the CPU splice (`moe_cpu_experts`), and `other_ns` the
+/// caller-side gap between/around them (scratch access, flag checks). The
+/// caller records all three from one outer span so they reconcile against
+/// `total_ns`; nothing here launches, syncs, or allocates on the hot path
+/// beyond the guide struct itself.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct MoeWindowTiming {
+    /// Whole window: sealed GPU program + CPU splice + caller-side gap.
+    pub total_ns: u64,
+    /// Sealed GPU program (`execute_steps`): router/norm/shared GPU stages.
+    pub gpu_sealed_ns: u64,
+    /// CPU splice (`moe_cpu_experts`): whole routed FFN on the CPU.
+    pub cpu_splice_ns: u64,
+    /// Caller-side gap: `total - sealed - splice` (scratch, flags, hooks).
+    pub other_ns: u64,
+    /// Forward width that selected this route (1 = decode, ≤4 = narrow).
+    pub rows: usize,
+    /// Routed-expert count per token (`num_experts_per_tok`).
+    pub top_k: usize,
+}
+
+/// Per-shape totals for [`moe_window_trace`]: one line per `(layer, rows,
+/// top_k)` at its first window and at every doubling — the same power-of-two
+/// schedule as [`trace_moe_step`], so the `calls=1` line is the cold first
+/// window and later lines are steady state. Keyed per layer (not just shape)
+/// so the printed `layer=` owns its `calls` count.
+#[derive(Clone, Copy, Default)]
+struct MoeWindowStats {
+    calls: u64,
+    total_ns: u64,
+    gpu_sealed_ns: u64,
+    cpu_splice_ns: u64,
+    other_ns: u64,
+}
+
+/// `(layer, rows, top_k)` → running per-layer window totals.
+static MOE_WINDOWS: LazyLock<Mutex<BTreeMap<(usize, usize, usize), MoeWindowStats>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+/// Opt-in aggregated per-layer window timing on the CPU-deferred MoE route,
+/// under the same `HIPFIRE_CPU_EXEC_TRACE=1` gate as [`trace_moe_step`].
+///
+/// The arch caller records one window per MoE layer: the sealed GPU program
+/// span, the CPU splice span, and the caller-side gap, all from host wall
+/// timestamps around calls it already makes. No GPU events, no new device
+/// sync, no execution-order change. Summaries print outside the measured
+/// region (power-of-two schedule), and tracing is disabled by default with a
+/// single snapshot-map read on the hot path.
+pub fn moe_window_trace(layer_idx: usize, timing: MoeWindowTiming) {
+    if moe_trace_enabled() {
+        moe_window_trace_inner(layer_idx, timing);
+    }
+}
+
+fn moe_window_trace_inner(layer_idx: usize, timing: MoeWindowTiming) {
+    let Ok(mut windows) = MOE_WINDOWS.lock() else {
+        return;
+    };
+    let stats = windows
+        .entry((layer_idx, timing.rows, timing.top_k))
+        .or_default();
+    stats.calls += 1;
+    stats.total_ns += timing.total_ns;
+    stats.gpu_sealed_ns += timing.gpu_sealed_ns;
+    stats.cpu_splice_ns += timing.cpu_splice_ns;
+    stats.other_ns += timing.other_ns;
+    let stats = *stats;
+    if !stats.calls.is_power_of_two() {
+        return;
+    }
+    let per_ms = |ns: u64| ns as f64 / 1e6 / stats.calls as f64;
+    eprintln!(
+        "cpu exec: moe window layer={layer_idx} rows={} k={} | {} calls | \
+         mean per window: sealed_gpu={:.2}ms cpu_splice={:.2}ms other={:.2}ms total={:.2}ms",
+        timing.rows,
+        timing.top_k,
+        stats.calls,
+        per_ms(stats.gpu_sealed_ns),
+        per_ms(stats.cpu_splice_ns),
+        per_ms(stats.other_ns),
+        per_ms(stats.total_ns),
+    );
+}
+
+/// One MoE layer's GPU-vs-CPU interleave on the batched-slots route, handed to
+/// [`moe_layer_trace`]. Host wall around the two halves the layer already
+/// executes: `attn_ns` covers the attention half (QKVZA/recurrence or
+/// QKV/attention + output projection, host wall including queued GPU work, not
+/// device-only time), `moe_ns` covers the MoE FFN body (`prefill_moe_ffn_body`
+/// including any CPU splice). Adjacent, not nested; `total_ns` is the outer
+/// span so the parts reconcile. No GPU events, no new sync, no order change.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct MoeLayerTiming {
+    pub total_ns: u64,
+    pub attn_ns: u64,
+    pub moe_ns: u64,
+    pub rows: usize,
+}
+
+/// Per-layer totals for [`moe_layer_trace`]: one line per `(layer, attn-kind,
+/// rows)` at its first window and at every doubling — same power-of-two
+/// schedule as the splice. Keyed per layer (not just shape) so the printed
+/// `layer=` owns its `calls` count.
+#[derive(Clone, Copy, Default)]
+struct MoeLayerStats {
+    calls: u64,
+    total_ns: u64,
+    attn_ns: u64,
+    moe_ns: u64,
+}
+
+/// `(layer, full_attn, rows)` → running per-layer totals.
+static MOE_LAYERS: LazyLock<Mutex<BTreeMap<(usize, bool, usize), MoeLayerStats>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+/// Opt-in per-layer GPU/CPU interleave timing on the batched-slots MoE route,
+/// under the same `HIPFIRE_CPU_EXEC_TRACE=1` gate. The layer caller records
+/// host wall around the attention half and the MoE FFN body it already runs;
+/// summaries print outside the measured region. Disabled by default with a
+/// single snapshot-map read on the hot path.
+pub fn moe_layer_trace(layer_idx: usize, is_full_attn: bool, timing: MoeLayerTiming) {
+    if moe_trace_enabled() {
+        moe_layer_trace_inner(layer_idx, is_full_attn, timing);
+    }
+}
+
+fn moe_layer_trace_inner(layer_idx: usize, is_full_attn: bool, timing: MoeLayerTiming) {
+    let Ok(mut layers) = MOE_LAYERS.lock() else {
+        return;
+    };
+    let stats = layers.entry((layer_idx, is_full_attn, timing.rows)).or_default();
+    stats.calls += 1;
+    stats.total_ns += timing.total_ns;
+    stats.attn_ns += timing.attn_ns;
+    stats.moe_ns += timing.moe_ns;
+    let stats = *stats;
+    if !stats.calls.is_power_of_two() {
+        return;
+    }
+    let per_ms = |ns: u64| ns as f64 / 1e6 / stats.calls as f64;
+    eprintln!(
+        "cpu exec: moe layer layer={layer_idx} {} rows={} | {} calls | \
+         mean per layer: attn={:.2}ms moe_ffn={:.2}ms total={:.2}ms",
+        if is_full_attn { "fullattn" } else { "deltanet" },
+        timing.rows,
+        stats.calls,
+        per_ms(stats.attn_ns),
+        per_ms(stats.moe_ns),
+        per_ms(stats.total_ns),
+    );
+}
+
+/// One batched serve-engine step's wall-time split on the MoE route, handed to
+/// [`moe_step_trace`]. Host wall around work the step already does:
+/// `forward_ns` covers the batched forward (`ModelRig::forward_step` →
+/// `forward_batch_slots_graphed_opts`, all layers), `sample_ns` the sampler
+/// (`sample_per_slot`, GPU kernels + launch), `sync_readback_ns` the device
+/// synchronize + token-id D2H, and `emit_ns` the accept/commit/emit loop.
+/// Adjacent, not nested; `total_ns` is the outer step span so the parts
+/// reconcile. No GPU events, no new sync, no order change.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct MoeStepTime {
+    pub total_ns: u64,
+    pub forward_ns: u64,
+    pub sample_ns: u64,
+    pub sync_readback_ns: u64,
+    pub emit_ns: u64,
+    pub rows: usize,
+}
+
+/// Per-shape totals for [`moe_step_trace`]: one line per `rows` at its first
+/// step and at every doubling — same power-of-two schedule as the splice.
+#[derive(Clone, Copy, Default)]
+struct MoeServeStepStats {
+    calls: u64,
+    total_ns: u64,
+    forward_ns: u64,
+    sample_ns: u64,
+    sync_readback_ns: u64,
+    emit_ns: u64,
+}
+
+/// `rows` → running per-shape step totals.
+static MOE_STEPS: LazyLock<Mutex<BTreeMap<usize, MoeServeStepStats>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+/// Opt-in whole-step timing on the batched MoE route, under the same
+/// `HIPFIRE_CPU_EXEC_TRACE=1` gate. The serve engine records host wall around
+/// the forward, the sampler, the sync/readback, and the emit loop it already
+/// runs; summaries print outside the measured region. Disabled by default
+/// with a single snapshot-map read on the hot path.
+pub fn moe_step_trace(timing: MoeStepTime) {
+    if moe_trace_enabled() {
+        moe_step_trace_inner(timing);
+    }
+}
+
+fn moe_step_trace_inner(timing: MoeStepTime) {
+    let Ok(mut steps) = MOE_STEPS.lock() else {
+        return;
+    };
+    let stats = steps.entry(timing.rows).or_default();
+    stats.calls += 1;
+    stats.total_ns += timing.total_ns;
+    stats.forward_ns += timing.forward_ns;
+    stats.sample_ns += timing.sample_ns;
+    stats.sync_readback_ns += timing.sync_readback_ns;
+    stats.emit_ns += timing.emit_ns;
+    let stats = *stats;
+    if !stats.calls.is_power_of_two() {
+        return;
+    }
+    let per_ms = |ns: u64| ns as f64 / 1e6 / stats.calls as f64;
+    eprintln!(
+        "cpu exec: moe step rows={} | {} calls | \
+         mean per step: forward={:.2}ms sample={:.2}ms sync_readback={:.2}ms emit={:.2}ms total={:.2}ms",
+        timing.rows,
+        stats.calls,
+        per_ms(stats.forward_ns),
+        per_ms(stats.sample_ns),
+        per_ms(stats.sync_readback_ns),
+        per_ms(stats.emit_ns),
+        per_ms(stats.total_ns),
+    );
+}
+/// One AR whole-token wall-time split on the single-token decode route
+/// (`hipfire-generate/ar.rs`), handed to [`moe_token_trace`]. Host wall around
+/// work the loop already does: `forward_ns` covers the whole forward
+/// (`qwen35::forward_scratch`, all layers including CPU splices), `sample_ns`
+/// the sampler (GPU or grammar-gated CPU path), and `emit_ns` the
+/// decode/commit/emit tail. Adjacent, not nested; `total_ns` is the outer
+/// loop-iteration span so the parts reconcile. The critical-path caveat
+/// stands: this is elapsed wall per token, not a proof that the parts are
+/// serial — the forward's own CPU splices already serialize on the host, but
+/// GPU work queued across the boundary still overlaps. No GPU events, no new
+/// sync, no order change.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct MoeTokenTiming {
+    pub total_ns: u64,
+    pub forward_ns: u64,
+    pub sample_ns: u64,
+    pub emit_ns: u64,
+}
+
+/// Running totals for [`moe_token_trace`]: one line at the first token and at
+/// every doubling — same power-of-two schedule as the splice.
+#[derive(Clone, Copy, Default)]
+struct MoeTokenStats {
+    calls: u64,
+    total_ns: u64,
+    forward_ns: u64,
+    sample_ns: u64,
+    emit_ns: u64,
+}
+
+/// Process-wide AR token totals (single shape — no key).
+static MOE_TOKENS: LazyLock<Mutex<MoeTokenStats>> =
+    LazyLock::new(|| Mutex::new(MoeTokenStats::default()));
+
+/// Opt-in AR whole-token timing, under the same `HIPFIRE_CPU_EXEC_TRACE=1`
+/// gate. The generate loop records host wall around the forward, the sample,
+/// and the emit tail it already runs; summaries print outside the measured
+/// region. Disabled by default with a single snapshot-map read on the hot
+/// path. Against this the per-layer/per-splice critical path must reconcile
+/// (16 splices + sealed GPU work + sample/emit ≈ token wall).
+pub fn moe_token_trace(timing: MoeTokenTiming) {
+    if moe_trace_enabled() {
+        moe_token_trace_inner(timing);
+    }
+}
+
+fn moe_token_trace_inner(timing: MoeTokenTiming) {
+    let Ok(mut guard) = MOE_TOKENS.lock() else {
+        return;
+    };
+    guard.calls += 1;
+    guard.total_ns += timing.total_ns;
+    guard.forward_ns += timing.forward_ns;
+    guard.sample_ns += timing.sample_ns;
+    guard.emit_ns += timing.emit_ns;
+    let stats = *guard;
+    drop(guard);
+    if !stats.calls.is_power_of_two() {
+        return;
+    }
+    let per_ms = |ns: u64| ns as f64 / 1e6 / stats.calls as f64;
+    eprintln!(
+        "cpu exec: moe token | {} calls | \
+         mean per token: forward={:.2}ms sample={:.2}ms emit={:.2}ms total={:.2}ms",
+        stats.calls,
+        per_ms(stats.forward_ns),
+        per_ms(stats.sample_ns),
+        per_ms(stats.emit_ns),
+        per_ms(stats.total_ns),
+    );
+}
+
 /// Per-shape step accounting under `HIPFIRE_CPU_EXEC_TRACE=1`: one line per
 /// distinct step shape at its first call and then at every doubling of that
-/// shape's call count, followed by the running counters.
 ///
 /// Both halves of that schedule matter. The `calls=1` line is the *cold* first
 /// step of the shape (host-mapped page first touch, rayon pool wake-up); the
