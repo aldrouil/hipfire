@@ -145,10 +145,10 @@ const MOE_QUANT_MIX_LEN: usize = 32;
 #[derive(Clone, Copy, Default)]
 struct MoeStepStats {
     calls: usize,
-    /// Blocking activation download after the trace-only producer drain.
-    d2h_first_ns: u64,
-    /// The other three blocking downloads (`ti`, `tw`, `residual`).
-    d2h_rest_ns: u64,
+    /// Four D2H submissions, including HIP API overhead.
+    d2h_enqueue_ns: u64,
+    /// Single completion barrier for all four downloads.
+    d2h_complete_ns: u64,
     /// All experts' gate_up GEMV.
     gu_ns: u64,
     /// All experts' down GEMV.
@@ -434,7 +434,7 @@ pub struct CpuMoeExpert<'a> {
 /// per-token decode does not re-allocate them every layer. Resized on demand,
 /// never shrunk — the buffers are the splice's, not the caller's.
 ///
-/// The first eight are the `f32` workspaces. The rest is plain index metadata
+/// The first four are the arithmetic `f32` workspaces. The rest is index metadata
 /// (counts and offsets, no borrows), rebuilt each call in reusable storage so
 /// the warm path makes no heap allocation: the selected slots are grouped by
 /// expert id by a counting sort, which needs no per-group `Vec`. The
@@ -443,10 +443,6 @@ pub struct CpuMoeExpert<'a> {
 /// [`MoeJobSource`] instead.
 #[derive(Default)]
 struct MoeScratch {
-    x: Vec<f32>,
-    ti: Vec<f32>,
-    tw: Vec<f32>,
-    acc: Vec<f32>,
     gu: Vec<f32>,
     hidden: Vec<f32>,
     dn: Vec<f32>,
@@ -471,10 +467,6 @@ struct MoeScratch {
 thread_local! {
     static MOE_SCRATCH: std::cell::RefCell<MoeScratch> =
         const { std::cell::RefCell::new(MoeScratch {
-            x: Vec::new(),
-            ti: Vec::new(),
-            tw: Vec::new(),
-            acc: Vec::new(),
             gu: Vec::new(),
             hidden: Vec::new(),
             dn: Vec::new(),
@@ -486,6 +478,8 @@ thread_local! {
             slot_si: Vec::new(),
             group_off: Vec::new(),
         }) };
+    static MOE_TRANSFER: std::cell::RefCell<Option<hip_bridge::PinnedHostBuffer>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// The top-k scratch's expert id, decoded exactly as the loader packed it: the
@@ -592,95 +586,139 @@ pub fn moe_cpu_experts<'a>(
     // The splice's whole wall time, started after validation and stopped just
     // before the trace print (which is not part of the call's cost).
     let t_total = Instant::now();
-    MOE_SCRATCH.with(|cell| {
-        let mut scratch = cell.borrow_mut();
-        scratch.x.resize(n_x, 0.0);
-        scratch.acc.resize(n_x, 0.0);
-        scratch.ti.resize(slots, 0.0);
-        scratch.tw.resize(slots, 0.0);
-        let mut timing = MoeStepTiming::default();
-        // A stream event inserted here is *after* the producers and cannot
-        // measure the host's wait for them. In diagnostic runs only, drain
-        // before copying to separate readiness from blocking copy/API cost.
-        // Controls retain the original synchronization and execution order.
-        if moe_trace_enabled() {
-            gpu.bind_thread().map_err(|e| cpu_err(&format!("bind: {e}")))?;
-            let t_wait = Instant::now();
+    gpu.bind_thread().map_err(|e| cpu_err(&format!("bind: {e}")))?;
+    let stage_bytes = n_x
+        .checked_add(slots)
+        .and_then(|n| n.checked_mul(8))
+        .ok_or_else(|| cpu_err("moe cpu expert splice: transfer extent overflows"))?;
+    // Check every span before the first async enqueue: a later HIP size assert
+    // must never unwind while a download still writes the reusable stage.
+    for (tensor, n) in [
+        (x_rot, n_x),
+        (topk_indices, slots),
+        (topk_weights, slots),
+        (residual, n_x),
+    ] {
+        if tensor.buf.size() < n * 4 {
+            return Err(cpu_err("moe cpu expert splice: transfer buffer too small"));
+        }
+    }
+    MOE_TRANSFER.with(|transfer_cell| {
+        let mut transfer = transfer_cell.borrow_mut();
+        if transfer.as_ref().is_none_or(|b| b.size() < stage_bytes) {
+            *transfer = Some(
+                gpu.hip.host_buffer(stage_bytes)
+                    .map_err(|e| cpu_err(&format!("pinned transfer stage: {e}")))?,
+            );
+        }
+        let result = MOE_SCRATCH.with(|cell| {
+            let mut scratch = cell.borrow_mut();
+            let bytes = transfer
+                .as_mut()
+                .expect("stage allocated above")
+                .as_bytes_mut();
+            // SAFETY: hipHostMalloc is suitably aligned for f32, every byte was
+            // initialized on allocation, and the four nonoverlapping slices stay
+            // alive until both download completion and the blocking upload.
+            let values = unsafe {
+                std::slice::from_raw_parts_mut(bytes.as_mut_ptr().cast::<f32>(), stage_bytes / 4)
+            };
+            let (x, rest) = values.split_at_mut(n_x);
+            let (ti, rest) = rest.split_at_mut(slots);
+            let (tw, acc) = rest.split_at_mut(slots);
+            let mut timing = MoeStepTiming::default();
+            // An event inserted here is after the producers and cannot measure
+            // the host wait for them. Trace only: drain before copying to
+            // separate readiness from copy/API cost. Controls wait once after
+            // enqueueing all four downloads.
+            if moe_trace_enabled() {
+                let t_wait = Instant::now();
+                match gpu.active_stream.as_ref() {
+                    Some(stream) => gpu.hip.stream_synchronize(stream),
+                    None => gpu.hip.stream_synchronize_default(),
+                }
+                .map_err(|e| cpu_err(&format!("D2H producer drain: {e}")))?;
+                timing.d2h_wait_ns = t_wait.elapsed().as_nanos() as u64;
+            }
+            let t_enqueue = Instant::now();
+            download_into_f32_async(gpu, x_rot, x)?;
+            download_into_f32_async(gpu, topk_indices, ti)?;
+            download_into_f32_async(gpu, topk_weights, tw)?;
+            download_into_f32_async(gpu, residual, acc)?;
+            timing.d2h_enqueue_ns = t_enqueue.elapsed().as_nanos() as u64;
+            let t_complete = Instant::now();
             match gpu.active_stream.as_ref() {
                 Some(stream) => gpu.hip.stream_synchronize(stream),
-                None => gpu.hip.device_synchronize(),
+                None => gpu.hip.stream_synchronize_default(),
             }
-            .map_err(|e| cpu_err(&format!("D2H producer drain: {e}")))?;
-            timing.d2h_wait_ns = t_wait.elapsed().as_nanos() as u64;
-        }
-        let t_first = Instant::now();
-        download_into_f32(gpu, x_rot, n_x, &mut scratch.x)?;
-        timing.d2h_first_ns = t_first.elapsed().as_nanos() as u64;
-        let t_rest = Instant::now();
-        download_into_f32(gpu, topk_indices, slots, &mut scratch.ti)?;
-        download_into_f32(gpu, topk_weights, slots, &mut scratch.tw)?;
-        download_into_f32(gpu, residual, n_x, &mut scratch.acc)?;
-        timing.d2h_rest_ns = t_rest.elapsed().as_nanos() as u64;
-        // Resolve every selected slot up front: a bad id or a short span is then
-        // an error before any arithmetic, and the compute never re-enters the
-        // resolver. On the warm path the resolved experts live in a
-        // fixed-capacity stack array (no per-layer heap allocation); a window
-        // wider than `MOE_STACK_SLOTS` slots falls back to a heap `Vec`.
-        let t_setup = Instant::now();
-        let dummy: CpuMoeExpert<'a> = CpuMoeExpert {
-            gate_up_quant: CpuQuant::F32,
-            gate_up: &[],
-            down_quant: CpuQuant::F32,
-            down: &[],
-        };
-        let mut stack = [dummy; MOE_STACK_SLOTS];
-        let heap: Vec<CpuMoeExpert<'a>>;
-        let experts: &[CpuMoeExpert<'a>] = if slots <= MOE_STACK_SLOTS {
-            for s in 0..slots {
-                stack[s] = resolve(expert_id(scratch.ti[s]))?;
+            .map_err(|e| cpu_err(&format!("D2H completion: {e}")))?;
+            timing.d2h_complete_ns = t_complete.elapsed().as_nanos() as u64;
+            // Resolve every selected slot up front: a bad id or a short span is
+            // an error before arithmetic. Warm decode/verify resolves into a
+            // fixed stack array; wider windows retain the heap fallback.
+            let t_setup = Instant::now();
+            let dummy: CpuMoeExpert<'a> = CpuMoeExpert {
+                gate_up_quant: CpuQuant::F32,
+                gate_up: &[],
+                down_quant: CpuQuant::F32,
+                down: &[],
+            };
+            let mut stack = [dummy; MOE_STACK_SLOTS];
+            let heap: Vec<CpuMoeExpert<'a>>;
+            let experts: &[CpuMoeExpert<'a>] = if slots <= MOE_STACK_SLOTS {
+                for s in 0..slots {
+                    stack[s] = resolve(expert_id(ti[s]))?;
+                }
+                &stack[..slots]
+            } else {
+                heap = (0..slots)
+                    .map(|s| resolve(expert_id(ti[s])))
+                    .collect::<Result<Vec<_>, _>>()?;
+                &heap
+            };
+            timing.setup_ns = t_setup.elapsed().as_nanos() as u64;
+            // Actual GU/DN tier mixture, independent of the first expert label.
+            for e in experts.iter() {
+                let gi = (e.gate_up_quant as usize).min(MOE_QUANT_MIX_LEN - 1);
+                let di = (e.down_quant as usize).min(MOE_QUANT_MIX_LEN - 1);
+                timing.gu_mix[gi] = timing.gu_mix[gi].saturating_add(1);
+                timing.dn_mix[di] = timing.dn_mix[di].saturating_add(1);
             }
-            &stack[..slots]
-        } else {
-            heap = (0..slots)
-                .map(|s| resolve(expert_id(scratch.ti[s])))
-                .collect::<Result<Vec<_>, _>>()?;
-            &heap
-        };
-        timing.setup_ns = t_setup.elapsed().as_nanos() as u64;
-        // Actual selected GU/DN quant mixture: one slot count per `CpuQuant as
-        // usize`. Out-of-range discriminants (a future variant past the mix
-        // length) saturate the last bucket rather than panicking the trace.
-        for e in experts.iter() {
-            let gi = (e.gate_up_quant as usize).min(MOE_QUANT_MIX_LEN - 1);
-            let di = (e.down_quant as usize).min(MOE_QUANT_MIX_LEN - 1);
-            timing.gu_mix[gi] = timing.gu_mix[gi].saturating_add(1);
-            timing.dn_mix[di] = timing.dn_mix[di].saturating_add(1);
-        }
-        moe_cpu_experts_host(dim, mi, rows, top_k, experts, &mut scratch, &mut timing)?;
-        let t_h2d = Instant::now();
-        upload_f32(gpu, residual, &scratch.acc[..n_x])?;
-        timing.h2d_ns = t_h2d.elapsed().as_nanos() as u64;
-        CPU_STEPS.fetch_add(1, Ordering::Relaxed);
-        let mixed = experts.iter().any(|e| {
-            e.gate_up_quant != experts[0].gate_up_quant || e.down_quant != experts[0].down_quant
+            moe_cpu_experts_host(
+                dim, mi, rows, top_k, experts, x, ti, tw, acc, &mut scratch, &mut timing,
+            )?;
+            let t_h2d = Instant::now();
+            upload_f32(gpu, residual, acc)?;
+            timing.h2d_ns = t_h2d.elapsed().as_nanos() as u64;
+            CPU_STEPS.fetch_add(1, Ordering::Relaxed);
+            let mixed = experts.iter().any(|e| {
+                e.gate_up_quant != experts[0].gate_up_quant || e.down_quant != experts[0].down_quant
+            });
+            timing.total_ns = t_total.elapsed().as_nanos() as u64;
+            trace_moe_step(
+                experts[0].gate_up_quant,
+                dim,
+                mi,
+                top_k,
+                rows,
+                mixed,
+                timing,
+            );
+            Ok(())
         });
-        timing.total_ns = t_total.elapsed().as_nanos() as u64;
-        trace_moe_step(
-            experts[0].gate_up_quant,
-            dim,
-            mi,
-            top_k,
-            rows,
-            mixed,
-            timing,
-        );
-        Ok(())
+        // Even a failed enqueue may leave earlier copies in flight. Retire
+        // them before any reuse/free; if the device cannot drain, retain the
+        // allocation forever instead of allowing a GPU use-after-free.
+        if result.is_err() && gpu.hip.device_synchronize().is_err() {
+            std::mem::forget(transfer.take());
+        }
+        result
     })
 }
 
 /// The splice's arithmetic over already-resolved host slices — split out from
 /// [`moe_cpu_experts`] so it is testable without a device. It accumulates into
-/// `scratch.acc` and records its `gate_up`/SiLU+rotate/down/combine region
+/// `acc` and records its `gate_up`/SiLU+rotate/down/combine region
 /// timings into `timing`'s matching fields (the caller owns the D2H/H2D/total
 /// fields).
 ///
@@ -701,6 +739,10 @@ fn moe_cpu_experts_host(
     rows: usize,
     top_k: usize,
     experts: &[CpuMoeExpert<'_>],
+    x: &[f32],
+    ti: &[f32],
+    tw: &[f32],
+    residual_acc: &mut [f32],
     scratch: &mut MoeScratch,
     timing: &mut MoeStepTiming,
 ) -> Result<(), DispatchError> {
@@ -711,16 +753,9 @@ fn moe_cpu_experts_host(
         ));
     }
     let n_x = rows * dim;
-    if scratch.x.len() < n_x
-        || scratch.acc.len() < n_x
-        || scratch.ti.len() < slots
-        || scratch.tw.len() < slots
-    {
+    if x.len() < n_x || residual_acc.len() < n_x || ti.len() < slots || tw.len() < slots {
         return Err(cpu_err("moe cpu expert splice: scratch too small"));
     }
-    let x = &scratch.x[..n_x];
-    let ti = &scratch.ti[..slots];
-    let tw = &scratch.tw[..slots];
 
     // Group the selected slots by expert id, in first-seen order, validating each
     // expert's spans as we go. A counting sort into the reusable index vectors
@@ -876,7 +911,7 @@ fn moe_cpu_experts_host(
             let n = group_n(&scratch.group_start, gi);
             let base = scratch.group_off[gi];
             let w = tw[s];
-            let accrow = &mut scratch.acc[t * dim..(t + 1) * dim];
+            let accrow = &mut residual_acc[t * dim..(t + 1) * dim];
             for (r, a) in accrow.iter_mut().enumerate() {
                 *a += w * dn[base + r * n + si];
             }
@@ -992,8 +1027,8 @@ fn trace_moe_step(
     };
     let stats = shapes.entry((q as u8, dim, mi, k, rows, graded)).or_default();
     stats.calls += 1;
-    stats.d2h_first_ns += timing.d2h_first_ns;
-    stats.d2h_rest_ns += timing.d2h_rest_ns;
+    stats.d2h_enqueue_ns += timing.d2h_enqueue_ns;
+    stats.d2h_complete_ns += timing.d2h_complete_ns;
     stats.gu_ns += timing.gu_ns;
     stats.dn_ns += timing.dn_ns;
     stats.h2d_ns += timing.h2d_ns;
@@ -1019,20 +1054,20 @@ fn trace_moe_step(
     }
     let (on_cpu, on_gpu) = cpu_exec_counters();
     let per_ms = |ns: u64| ns as f64 / 1e6 / stats.calls as f64;
-    // Blocking copy calls include HIP API/staging overhead. The producer drain
-    // is separate; neither field is a physical PCIe transfer measurement.
-    let d2h_copy_ns = stats.d2h_first_ns + stats.d2h_rest_ns;
+    // Enqueue + completion is copy/API wall after the diagnostic producer drain;
+    // neither region is a physical PCIe transfer measurement.
+    let d2h_copy_ns = stats.d2h_enqueue_ns + stats.d2h_complete_ns;
     eprintln!(
         "cpu exec: moe expert splice dim={dim} mi={mi} k={k} rows={rows} quant={q:?} \
          graded={graded} | {} calls | {on_cpu} steps on CPU, {on_gpu} host-mapped steps still \
-         on GPU | mean per call: d2h_first={:.2}ms d2h_rest={:.2}ms gu={:.2}ms dn={:.2}ms \
+         on GPU | mean per call: d2h_enqueue={:.2}ms d2h_complete={:.2}ms gu={:.2}ms dn={:.2}ms \
          h2d={:.2}ms setup={:.2}ms middle={:.2}ms combine={:.2}ms total={:.2}ms \
          | gu_prep={:.2}ms gu_exec={:.2}ms dn_prep={:.2}ms dn_exec={:.2}ms \
          gather={:.2}ms silu={:.2}ms fwht={:.2}ms d2h_wait={:.2}ms d2h_copy_api={:.2}ms \
          | gu_mix=[{}] dn_mix=[{}]",
         stats.calls,
-        per_ms(stats.d2h_first_ns),
-        per_ms(stats.d2h_rest_ns),
+        per_ms(stats.d2h_enqueue_ns),
+        per_ms(stats.d2h_complete_ns),
         per_ms(stats.gu_ns),
         per_ms(stats.dn_ns),
         per_ms(stats.h2d_ns),
@@ -1114,8 +1149,8 @@ fn format_quant_mix(mix: &[u64; MOE_QUANT_MIX_LEN], calls: usize) -> String {
 /// One splice call's wall-time split, handed to [`trace_moe_step`].
 #[derive(Clone, Copy, Default)]
 struct MoeStepTiming {
-    d2h_first_ns: u64,
-    d2h_rest_ns: u64,
+    d2h_enqueue_ns: u64,
+    d2h_complete_ns: u64,
     gu_ns: u64,
     dn_ns: u64,
     h2d_ns: u64,
@@ -1435,6 +1470,22 @@ fn download_into_f32(
         unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, n * 4) };
     gpu.memcpy_dtoh_auto(bytes, &t.buf)
         .map_err(|e| cpu_err(&format!("D2H: {e}")))
+}
+
+/// Enqueue into the pinned MoE stage on the producers' own stream. The caller
+/// owns the stage and must drain on success, error, and before buffer reuse.
+fn download_into_f32_async(
+    gpu: &Gpu,
+    t: &GpuTensor,
+    out: &mut [f32],
+) -> Result<(), DispatchError> {
+    // SAFETY: the initialized f32 slice covers exactly these bytes. The
+    // caller retains the allocation until the batch's completion barrier.
+    let bytes = unsafe {
+        std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), std::mem::size_of_val(out))
+    };
+    gpu.hip.memcpy_dtoh_async(bytes, &t.buf, gpu.active_stream.as_ref())
+        .map_err(|e| cpu_err(&format!("D2H enqueue: {e}")))
 }
 
 fn upload_f32(gpu: &Gpu, t: &GpuTensor, v: &[f32]) -> Result<(), DispatchError> {
@@ -1890,19 +1941,18 @@ mod moe_splice_tests {
                 }
             })
             .collect();
-        let mut scratch = MoeScratch {
-            x: x.clone(),
-            ti,
-            tw: wts.to_vec(),
-            acc: seed.clone(),
-            ..Default::default()
-        };
+        let mut scratch = MoeScratch::default();
+        let mut acc = seed.clone();
         moe_cpu_experts_host(
             dim,
             mi,
             rows,
             top_k,
             &experts,
+            &x,
+            &ti,
+            &wts,
+            &mut acc,
             &mut scratch,
             &mut MoeStepTiming::default(),
         )
@@ -1931,7 +1981,7 @@ mod moe_splice_tests {
             .unwrap();
         }
         assert_eq!(
-            scratch.acc, reference,
+            acc, reference,
             "multirow CPU output != repeated single-row run_experts"
         );
     }
@@ -1979,19 +2029,18 @@ mod moe_splice_tests {
                 }
             })
             .collect();
-        let mut scratch = MoeScratch {
-            x: x.clone(),
-            ti,
-            tw: wts.to_vec(),
-            acc: seed.clone(),
-            ..Default::default()
-        };
+        let mut scratch = MoeScratch::default();
+        let mut acc = seed.clone();
         moe_cpu_experts_host(
             dim,
             mi,
             rows,
             top_k,
             &experts,
+            &x,
+            &ti,
+            &wts,
+            &mut acc,
             &mut scratch,
             &mut MoeStepTiming::default(),
         )
@@ -2017,7 +2066,7 @@ mod moe_splice_tests {
             }
         }
         assert_eq!(
-            scratch.acc, reference,
+            acc, reference,
             "graded multirow CPU output != per-expert gemv reference"
         );
     }
@@ -2034,19 +2083,17 @@ mod moe_splice_tests {
             down_quant: q,
             down: &short,
         }];
-        let mut scratch = MoeScratch {
-            x: vec![0.0f32; dim],
-            ti: vec![id_bits(0)],
-            tw: vec![1.0],
-            acc: vec![0.0f32; dim],
-            ..Default::default()
-        };
+        let mut scratch = MoeScratch::default();
         let err = moe_cpu_experts_host(
             dim,
             mi,
             1,
             1,
             &experts,
+            &vec![0.0f32; dim],
+            &[id_bits(0)],
+            &[1.0],
+            &mut vec![0.0f32; dim],
             &mut scratch,
             &mut MoeStepTiming::default(),
         )
@@ -2067,13 +2114,7 @@ mod moe_splice_tests {
             down_quant: q,
             down: &dn,
         }];
-        let mut scratch = MoeScratch {
-            x: vec![0.0f32; 2 * dim],
-            ti: vec![id_bits(0), id_bits(0)],
-            tw: vec![1.0, 1.0],
-            acc: vec![0.0f32; 2 * dim],
-            ..Default::default()
-        };
+        let mut scratch = MoeScratch::default();
         // rows=2, top_k=1 needs 2 experts; only 1 supplied.
         assert!(
             moe_cpu_experts_host(
@@ -2082,6 +2123,10 @@ mod moe_splice_tests {
                 2,
                 1,
                 &experts,
+                &vec![0.0f32; 2 * dim],
+                &[id_bits(0), id_bits(0)],
+                &[1.0, 1.0],
+                &mut vec![0.0f32; 2 * dim],
                 &mut scratch,
                 &mut MoeStepTiming::default()
             )

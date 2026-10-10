@@ -11,6 +11,7 @@ use libloading::{Library, Symbol};
 use std::ffi::{c_char, c_int, c_uint, c_void, CString};
 use std::ptr;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 /// Per-thread accumulators for time spent inside HIP FFI calls. Used by
 /// Phase 3a host-vs-GPU diagnostics to attribute the forward pass wall
@@ -406,7 +407,7 @@ impl HipMemAccessDesc {
 
 /// Loaded HIP runtime — holds the dlopen'd library and resolved function pointers.
 pub struct HipRuntime {
-    _lib: Library,
+    _lib: Arc<Library>,
 
     // Init
     fn_init: unsafe extern "C" fn(c_uint) -> u32,
@@ -1244,7 +1245,7 @@ impl HipRuntime {
                     "hipMemGetInfo",
                     unsafe extern "C" fn(*mut usize, *mut usize) -> u32
                 ) },
-                _lib: lib,
+                _lib: Arc::new(lib),
                 launch_grid_yz_limit: AtomicU32::new(u32::MAX),
         };
 
@@ -1577,6 +1578,27 @@ impl HipRuntime {
         // # Safety or documented preconditions; out-params are stack locals.
         let code = unsafe { func(host) };
         self.check(code, "hipHostFree")
+    }
+
+    /// Own reusable pinned host storage, portable across devices. The library
+    /// stays loaded until the allocation is freed, even if the runtime drops.
+    pub fn host_buffer(&self, size: usize) -> HipResult<PinnedHostBuffer> {
+        if size == 0 {
+            return Err(HipError::new(0, "host_buffer requires non-zero size"));
+        }
+        let free = self.missing_vmm_symbol("hipHostFree", self.fn_host_free)?;
+        // hipHostMallocPortable: this thread-local stage may outlive a Gpu or
+        // be reused with another device after a model swap.
+        let ptr = self.host_malloc(size, 1)?;
+        // SAFETY: hipHostMalloc succeeded with a non-zero extent. Initialize
+        // once so as_bytes_mut can expose ordinary initialized Rust bytes.
+        unsafe { std::ptr::write_bytes(ptr.cast::<u8>(), 0, size) };
+        Ok(PinnedHostBuffer {
+            ptr,
+            size,
+            free,
+            _lib: Arc::clone(&self._lib),
+        })
     }
 
     pub fn mem_get_allocation_granularity(
@@ -2116,6 +2138,18 @@ impl HipRuntime {
         self.check(code, "hipStreamSynchronize")
     }
 
+    /// Drain only the legacy/default stream, not every stream on the device.
+    pub fn stream_synchronize_default(&self) -> HipResult<()> {
+        if hip_fault_consume(2, "sync") {
+            return Err(hip_fault_err("sync"));
+        }
+        let t = std::time::Instant::now();
+        // SAFETY: null denotes the legacy stream, as in default-stream copies.
+        let code = unsafe { (self.fn_stream_synchronize)(ptr::null_mut()) };
+        crate::ffi::launch_counters::stream_sync::record(t.elapsed().as_nanos() as u64);
+        self.check(code, "hipStreamSynchronize default stream")
+    }
+
     pub fn stream_destroy(&self, stream: Stream) -> HipResult<()> {
         // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
         // wrappers; out-params are stack locals. Destroy/sync require the caller
@@ -2472,7 +2506,7 @@ impl HipRuntime {
         &self,
         dst: &mut [u8],
         src: &DeviceBuffer,
-        stream: &Stream,
+        stream: Option<&Stream>,
     ) -> HipResult<()> {
         assert!(dst.len() <= src.size);
         // SAFETY: pointers are live HIP allocations or host slices; sizes were
@@ -2484,7 +2518,7 @@ impl HipRuntime {
                 src.ptr as *const c_void,
                 dst.len(),
                 MemcpyKind::DeviceToHost as c_uint,
-                stream.0,
+                stream.map_or(ptr::null_mut(), |s| s.0),
             )
         };
         memory_effects::dtoh();
@@ -2753,6 +2787,37 @@ impl HipRuntime {
 }
 
 // ── Handle wrappers ─────────────────────────────────────────────
+
+/// Owned, initialized `hipHostMallocPortable` storage. Async users must finish
+/// all copies before accessing or dropping it. On an unrecoverable drain error,
+/// retain/leak the owner rather than freeing memory still used by the device.
+pub struct PinnedHostBuffer {
+    ptr: *mut c_void,
+    size: usize,
+    free: unsafe extern "C" fn(*mut c_void) -> u32,
+    _lib: Arc<Library>,
+}
+
+impl PinnedHostBuffer {
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: this owner holds size initialized bytes until Drop. The
+        // mutable borrow excludes other host access; GPU quiescence is the
+        // caller's async-copy contract.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.cast(), self.size) }
+    }
+}
+
+impl Drop for PinnedHostBuffer {
+    fn drop(&mut self) {
+        // SAFETY: unique hipHostMalloc owner; its library is still live. The
+        // caller must have drained async copies before dropping the owner.
+        let _ = unsafe { (self.free)(self.ptr) };
+    }
+}
 
 /// GPU stream handle.
 pub struct Stream(HipStream);

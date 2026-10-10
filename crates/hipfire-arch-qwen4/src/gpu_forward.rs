@@ -3568,7 +3568,7 @@ impl Qwen4GpuForward {
                     gpu.hip.event_synchronize(&readback.event)?;
                     let mut bytes = [0u8; 4];
                     gpu.hip
-                        .memcpy_dtoh_async(&mut bytes, &token_ids.buf, &readback.stream)?;
+                        .memcpy_dtoh_async(&mut bytes, &token_ids.buf, Some(&readback.stream))?;
                     gpu.hip.stream_synchronize(&readback.stream)?;
                     let token = i32::from_ne_bytes(bytes) as u32;
                     if token as usize >= vocab {
