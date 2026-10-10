@@ -949,7 +949,7 @@ fn graded_cpu_moe_experts_multirow_parity() -> Result<(), Box<dyn std::error::Er
     let prefix_w = gpu.upload_f32(&w_host[..ADVANCE * KTOP], &[ADVANCE * KTOP])?;
     // Resolver: slice each expert's own bytes out of its bucket owner, exactly as
     // `qwen35::forward::run_cpu_moe_experts` does through the view pointer walk.
-    let resolve = |e: usize| {
+    let resolve = |gpu: &Gpu, e: usize| {
         let (gtag, goff, glen) = gu_pos[e];
         let (dtag, doff, dlen) = dn_pos[e];
         let gb = gpu
@@ -966,7 +966,7 @@ fn graded_cpu_moe_experts_multirow_parity() -> Result<(), Box<dyn std::error::Er
         })
     };
     moe_cpu_experts(
-        &gpu, dim, mi, N, KTOP, &x, &indices, &weights, &residual, false, &resolve,
+        &gpu, dim, mi, N, KTOP, &x, &indices, &weights, &residual, false, |e| resolve(&gpu, e),
     )?;
     let got = gpu.download_f32(&residual)?;
     let scale = want.iter().fold(1e-6f32, |a, v| a.max(v.abs()));
@@ -1000,7 +1000,7 @@ fn graded_cpu_moe_experts_multirow_parity() -> Result<(), Box<dyn std::error::Er
         &prefix_w,
         &prefix_residual,
         false,
-        &resolve,
+        |e| resolve(&gpu, e),
     )?;
     let prefix_got = gpu.download_f32(&prefix_residual)?;
     let prefix_worst = prefix_got
@@ -1013,5 +1013,65 @@ fn graded_cpu_moe_experts_multirow_parity() -> Result<(), Box<dyn std::error::Er
         prefix_worst / scale
     );
     eprintln!("GRADED_CPU_MULTIROW_PARITY PASS (layer {l})");
+    // Nonblocking-stream producers must precede every download on that same
+    // stream. A legacy-stream copy cannot supply this dependency. Reuse the
+    // pinned stage after the smaller prefix call, then shrink the logical row
+    // count without shrinking the tensors; the spare residual rows stay intact.
+    gpu.active_stream = Some(gpu.hip.stream_create_non_blocking()?);
+    let inputs = [
+        (&x, x_rot.as_slice()),
+        (&indices, idx_bits.as_slice()),
+        (&weights, w_host.as_slice()),
+        (&residual, seed.as_slice()),
+    ];
+    let mut upload_stage = gpu.hip.host_buffer(
+        inputs.iter().map(|(_, data)| std::mem::size_of_val(*data)).sum(),
+    )?;
+    let mut offset = 0;
+    for (tensor, data) in inputs {
+        // Poison old GPU values before enqueueing any nonblocking producer.
+        gpu.hip.memset(&tensor.buf, 0, tensor.buf.size())?;
+        // SAFETY: data is an initialized f32 slice; the byte view covers it.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), std::mem::size_of_val(data))
+        };
+        upload_stage.as_bytes_mut()[offset..offset + bytes.len()].copy_from_slice(bytes);
+        offset += bytes.len();
+    }
+    // Retire default-stream poisoning before the independent producer stream.
+    // This orders test setup, not the producer uploads the splice must await.
+    gpu.hip.stream_synchronize_default()?;
+    let mut offset = 0;
+    for (tensor, data) in inputs {
+        let len = std::mem::size_of_val(data);
+        // Pinned sources make these genuinely host-asynchronous. All staged
+        // bytes remain unchanged until the splice's stream completion barrier.
+        gpu.hip.memcpy_htod_async(
+            &tensor.buf,
+            &upload_stage.as_bytes_mut()[offset..offset + len],
+            gpu.active_stream.as_ref().expect("test stream"),
+        )?;
+        offset += len;
+    }
+    moe_cpu_experts(
+        &gpu, dim, mi, N, KTOP, &x, &indices, &weights, &residual, false, |e| resolve(&gpu, e),
+    )?;
+    assert_eq!(
+        gpu.download_f32(&residual)?, got,
+        "nonblocking-stream splice differs from default-stream splice",
+    );
+    let seed_bytes = unsafe {
+        // SAFETY: seed is initialized and the blocking upload ends its borrow.
+        std::slice::from_raw_parts(seed.as_ptr().cast::<u8>(), seed.len() * 4)
+    };
+    gpu.hip.memcpy_htod(&residual.buf, seed_bytes)?;
+    moe_cpu_experts(
+        &gpu, dim, mi, 1, KTOP, &x, &indices, &weights, &residual, false, |e| resolve(&gpu, e),
+    )?;
+    let single = gpu.download_f32(&residual)?;
+    assert_eq!(&single[..dim], &got[..dim], "stage reuse changed the committed row");
+    assert_eq!(&single[dim..], &seed[dim..], "splice overwrote spare residual rows");
+    gpu.hip.stream_destroy(gpu.active_stream.take().expect("test stream"))?;
+    eprintln!("GRADED_CPU_STREAM_REUSE_PARITY PASS (rows 3 -> 2 -> 3 -> 1)");
     Ok(())
 }
