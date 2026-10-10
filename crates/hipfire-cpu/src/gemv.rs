@@ -408,10 +408,23 @@ impl ActivationSumCache {
     }
 }
 
+/// Balance subdivision overhead against indivisible row work, rather than
+/// targeting a fixed number of blocks per worker. More outer jobs increase
+/// the row budget per worker; more activation rows make each weight row
+/// heavier and reduce the grain. All arguments are positive.
+fn shared_rows_per_block(m: usize, n: usize, workers_per_job: usize) -> usize {
+    m.div_ceil(workers_per_job).div_ceil(n).isqrt().max(1)
+}
+
 /// The batched GEMV's per-job rayon region. On x86_64 `sums`/`offsets`/
 /// `token_base`/`job_simd` are the prepared views (see [`ActivationSumCache`]);
 /// on other arches they are empty and each job resolves its own `use_simd`,
 /// exactly as before.
+///
+/// Nonempty output chunks supply the outer parallelism. The inner iterator
+/// groups consecutive rows using a square-root grain of the per-worker row
+/// budget; Rayon still decides how to split and steal those blocks. A
+/// single-worker pool consumes each job in one block.
 #[cfg_attr(not(target_arch = "x86_64"), allow(unused_variables))]
 fn run_shared_jobs<S: SharedJobSource + Sync>(
     m: usize,
@@ -424,6 +437,15 @@ fn run_shared_jobs<S: SharedJobSource + Sync>(
     token_base: &[usize],
     job_simd: &[bool],
 ) {
+    let active_jobs = chunks
+        .iter()
+        .filter(|slot| slot.as_ref().is_some_and(|out| !out.is_empty()))
+        .count();
+    if active_jobs == 0 {
+        return;
+    }
+    let workers = rayon::current_num_threads();
+    let workers_per_job = workers.div_ceil(active_jobs);
     chunks.par_iter_mut().enumerate().for_each(|(j, slot)| {
         let Some(o) = slot.as_deref_mut() else {
             return;
@@ -432,6 +454,11 @@ fn run_shared_jobs<S: SharedJobSource + Sync>(
         if n == 0 {
             return;
         }
+        let rows_per_block = if workers == 1 {
+            m
+        } else {
+            shared_rows_per_block(m, n, workers_per_job)
+        };
         let q = src.quant(j);
         let rb = row_bytes(q, k);
         #[cfg(target_arch = "x86_64")]
@@ -441,28 +468,31 @@ fn run_shared_jobs<S: SharedJobSource + Sync>(
         #[cfg(target_arch = "x86_64")]
         let prepared = use_simd && simd::activation_sum_kind(q).is_some();
         o[..m * n]
-            .par_chunks_mut(n)
+            .par_chunks_mut(rows_per_block * n)
             .enumerate()
-            .for_each(|(r, chunk)| {
-                let row = &src.packed(j)[r * rb..];
-                #[cfg(target_arch = "x86_64")]
-                if prepared {
-                    let base = token_base[j];
-                    for (t, v) in chunk.iter_mut().enumerate() {
-                        let off = offsets[base + t];
-                        debug_assert_ne!(off, usize::MAX, "unprepared token in a prepared job");
-                        *v = simd::row_dot_with_activation_sums(
-                            q,
-                            row,
-                            k,
-                            &src.xs_row(j, t)[..k],
-                            &sums[off..off + k / 256],
-                        );
+            .for_each(|(block, rows)| {
+                for (within_block, chunk) in rows.chunks_mut(n).enumerate() {
+                    let r = block * rows_per_block + within_block;
+                    let row = &src.packed(j)[r * rb..];
+                    #[cfg(target_arch = "x86_64")]
+                    if prepared {
+                        let base = token_base[j];
+                        for (t, v) in chunk.iter_mut().enumerate() {
+                            let off = offsets[base + t];
+                            debug_assert_ne!(off, usize::MAX, "unprepared token in a prepared job");
+                            *v = simd::row_dot_with_activation_sums(
+                                q,
+                                row,
+                                k,
+                                &src.xs_row(j, t)[..k],
+                                &sums[off..off + k / 256],
+                            );
+                        }
+                        continue;
                     }
-                    return;
-                }
-                for (t, v) in chunk.iter_mut().enumerate() {
-                    *v = dot_row_simd(q, row, k, &src.xs_row(j, t)[..k], use_simd);
+                    for (t, v) in chunk.iter_mut().enumerate() {
+                        *v = dot_row_simd(q, row, k, &src.xs_row(j, t)[..k], use_simd);
+                    }
                 }
             });
     });
@@ -553,8 +583,7 @@ mod test {
     /// verification rows). It is the routed-expert CPU path's replacement for a
     /// loop of per-expert GEMVs, and a rounding change there would flip greedy
     /// tokens.
-    #[test]
-    fn gemv_shared_matches_per_row_gemv() {
+    fn check_shared_gemv(m: usize, jobs: usize, requested: Option<bool>) {
         /// A batched source over plain slices — the same index/slice shape the
         /// CPU MoE splice builds from its reusable metadata.
         struct Batch<'a> {
@@ -580,17 +609,17 @@ mod test {
             }
         }
 
-        let (m, k) = (8usize, 512usize);
-        // A graded set: three tiers plus a repeated uniform format, with one,
-        // two, three and four activation rows so both the mixed-format and the
-        // shared-weight (expert across rows) shapes run in one call.
-        let quants = [
+        let k = 512;
+        let tiers = [
             CpuQuant::Mq6G256,
             CpuQuant::Mq4G256,
             CpuQuant::Mq3G256Lloyd,
             CpuQuant::Mq4G256,
         ];
-        let ns = [3usize, 1, 4, 2];
+        let quants: Vec<_> = (0..jobs).map(|j| tiers[j % tiers.len()]).collect();
+        // Mixed tiers and token counts, including empty jobs between active
+        // ones, exercise both prepared and unprepared row kernels.
+        let ns: Vec<_> = (0..jobs).map(|j| [3usize, 1, 4, 2, 0][j % 5]).collect();
         let packed: Vec<Vec<u8>> = quants.iter().map(|&q| weights(q, m, k)).collect();
         let xs: Vec<Vec<Vec<f32>>> = ns
             .iter()
@@ -613,8 +642,8 @@ mod test {
             packs: &packs,
             xs: &xs_nested,
         };
-        let mut out = vec![0.0f32; total];
-        gemv_shared_sourced(m, k, &mut out, &src, None);
+        let mut out = vec![-999.0f32; total + 3];
+        gemv_shared_sourced(m, k, &mut out, &src, requested);
         let mut reference = vec![0.0f32; total];
         let mut off = 0usize;
         for (j, &q) in quants.iter().enumerate() {
@@ -623,13 +652,14 @@ mod test {
             // batched output is row-major (`out[r * n + t]`), so transpose.
             let mut token_major = vec![0.0f32; n * m];
             for t in 0..n {
-                gemv(
+                gemv_with_simd(
                     q,
                     &packed[j],
                     m,
                     k,
                     &xs[j][t],
                     &mut token_major[t * m..(t + 1) * m],
+                    requested,
                 );
             }
             for r in 0..m {
@@ -639,7 +669,49 @@ mod test {
             }
             off += n * m;
         }
-        assert_eq!(out, reference, "gemv_shared_sourced != per-row gemv");
+        for (i, (got, want)) in out[..total].iter().zip(&reference).enumerate() {
+            assert_eq!(got.to_bits(), want.to_bits(), "m={m} jobs={jobs} output {i}");
+        }
+        assert_eq!(&out[total..], &[-999.0; 3], "output tail overwritten");
+    }
+
+    #[test]
+    fn gemv_shared_matches_per_row_gemv() {
+        for workers in [1, 2, 4, 8] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                for requested in [Some(false), None] {
+                    for m in [1, 7, 65, 257] {
+                        for jobs in [1, 4, 9] {
+                            check_shared_gemv(m, jobs, requested);
+                        }
+                    }
+                    // Exercise the output-chunk heap fallback, empty batches,
+                    // and zero rows without allocating a large weight fixture.
+                    check_shared_gemv(3, MAX_STACK_JOBS + 1, requested);
+                    check_shared_gemv(3, 0, requested);
+                    check_shared_gemv(0, 4, requested);
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn shared_row_grain_stays_within_worker_budget_without_overflow() {
+        for m in [1, 7, 257, usize::MAX] {
+            for n in [1, 4, usize::MAX] {
+                for workers_per_job in [1, 2, 17, usize::MAX] {
+                    let grain = shared_rows_per_block(m, n, workers_per_job);
+                    assert!(
+                        (1..=m.div_ceil(workers_per_job)).contains(&grain),
+                        "m={m} n={n} workers_per_job={workers_per_job} grain={grain}"
+                    );
+                }
+            }
+        }
     }
 
     /// The batched path caches each unique activation row's Σx in a
