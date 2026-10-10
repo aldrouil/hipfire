@@ -645,6 +645,106 @@ fn gpu_cpu_gemv_parity_per_format() {
     );
 }
 
+/// Exercise the actual CPU/GPU seam, not only the CPU GEMV transcription.
+/// Consecutive CPU returns share storage without an intervening host read,
+/// while GPU consumers and the next CPU download must see every update.
+#[test]
+#[ignore = "requires HIP GPU and HIPFIRE_OFFLOAD_EXEC=cpu"]
+fn cpu_offload_return_stream_and_reuse_parity() -> Result<(), Box<dyn std::error::Error>> {
+    assert!(hipfire_dispatch::cpu_exec_enabled(), "run with HIPFIRE_OFFLOAD_EXEC=cpu");
+    let mut gpu = Gpu::init()?;
+    for stream_case in 0..3 {
+        if stream_case != 0 {
+            gpu.active_stream = Some(gpu.hip.stream_create_non_blocking()?);
+        }
+        for (dtype, q) in [
+            (DType::MQ4G256, CpuQuant::Mq4G256),
+            (DType::HFQ6G256, CpuQuant::Hfq6G256),
+            (DType::Q8_0, CpuQuant::Q8F16),
+        ] {
+            // Growth, then a smaller logical extent in the same allocation.
+            for (case, k) in [256usize, 1024, 256].into_iter().enumerate() {
+                let m = k;
+                let bytes = synth_weights(q, m, k);
+                let w = gpu.upload_raw_host_mapped(&bytes, &[bytes.len()])?;
+                let scales: Vec<f32> = (0..k).map(|i| 0.75 + (i % 7) as f32 * 0.125).collect();
+                let scale = gpu.upload_f32(&scales, &[k])?;
+                let mut x_host = activation(k, case + stream_case * 3);
+                let prerotated = q.is_fwht_g256() && case == 1;
+                if prerotated {
+                    divide_by_awq_scale(&mut x_host, &scales);
+                    rotate_x(&mut x_host);
+                }
+                let x = gpu.upload_f32(&x_host, &[k])?;
+                let out = gpu.zeros(&[m], DType::F32)?;
+                let seed = activation(m, case + 17);
+                let acc = gpu.upload_f32(&seed, &[m])?;
+                let delta = gpu.upload_f32(&vec![0.125; m], &[m])?;
+                let wr = WeightRef {
+                    buf: &w,
+                    dtype,
+                    m,
+                    k,
+                    row_stride: 0,
+                    rotation: None,
+                    awq_scale: Some(&scale),
+                    lloyd_lut_e4m3: None,
+                    lloyd_lut_f16: None,
+                    lloyd_lut_c16: None,
+                };
+                let rotate = q.is_fwht_g256() && !prerotated;
+                let mut prepared = x_host;
+                if rotate {
+                    divide_by_awq_scale(&mut prepared, &scales);
+                    rotate_x(&mut prepared);
+                }
+                let mut want_out = vec![0.0; m];
+                cpu_gemv(q, &bytes, m, k, &prepared, &mut want_out);
+                for value in &mut want_out {
+                    *value += 0.125;
+                }
+                let mut residual_input = want_out.clone();
+                if q.is_fwht_g256() {
+                    divide_by_awq_scale(&mut residual_input, &scales);
+                    rotate_x(&mut residual_input);
+                }
+                let mut increment = vec![0.0; m];
+                cpu_gemv(q, &bytes, m, k, &residual_input, &mut increment);
+                let mut want_acc = seed;
+                for _ in 0..4 {
+                    hipfire_dispatch::run_host_mapped_gemv(&gpu, &wr, &x, rotate, &out)?;
+                    gpu.add_inplace_f32(&out, &delta)?;
+                    hipfire_dispatch::run_host_mapped_gemv_residual(&gpu, &wr, &out, &acc)?;
+                    gpu.add_inplace_f32(&acc, &delta)?;
+                    hipfire_cpu::epilogue::residual_add(&mut want_acc, &increment);
+                    for value in &mut want_acc {
+                        *value += 0.125;
+                    }
+                }
+                match gpu.active_stream.as_ref() {
+                    Some(stream) => gpu.hip.stream_synchronize(stream)?,
+                    None => gpu.hip.stream_synchronize_default()?,
+                }
+                assert_eq!(gpu.download_f32(&out)?, want_out,
+                    "{q:?} stream {stream_case} k={k}: GPU consumer saw a stale CPU output");
+                assert_eq!(gpu.download_f32(&acc)?, want_acc,
+                    "{q:?} stream {stream_case} k={k}: residual return/storage reuse changed arithmetic");
+                gpu.free_tensor(w)?;
+                gpu.free_tensor(scale)?;
+                gpu.free_tensor(x)?;
+                gpu.free_tensor(out)?;
+                gpu.free_tensor(acc)?;
+                gpu.free_tensor(delta)?;
+            }
+        }
+        if let Some(stream) = gpu.active_stream.take() {
+            gpu.hip.stream_destroy(stream)?;
+        }
+    }
+    eprintln!("CPU_OFFLOAD_RETURN_STREAM_REUSE_PARITY PASS");
+    Ok(())
+}
+
 fn q_format_name(q: CpuQuant) -> &'static str {
     match q {
         CpuQuant::Mq4G256 => "Mq4G256",

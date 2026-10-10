@@ -313,33 +313,42 @@ pub fn run_host_mapped_gemv(
     let bytes = gpu
         .host_bytes(w.buf)
         .ok_or_else(|| cpu_err("weight tensor is host-mapped but has no host pointer"))?;
-    let (x_host, d2h_ns) = prepare_activation(gpu, w, x, rotate_input)?;
-    let mut y = vec![0.0f32; m];
-    let t1 = Instant::now();
-    gemv(q, bytes, m, k, &x_host, &mut y);
-    let gemv_ns = t1.elapsed().as_nanos() as u64;
-    let t2 = Instant::now();
-    upload_f32(gpu, out, &y)?;
-    let h2d_ns = t2.elapsed().as_nanos() as u64;
-    CPU_STEPS.fetch_add(1, Ordering::Relaxed);
-    trace_step(
-        q,
-        w,
-        rotate_input,
-        false,
-        StepTiming {
-            d2h_ns,
-            gemv_ns,
-            h2d_ns,
-        },
-    );
-    Ok(())
+    let activation_len = activation_stage_len(w, rotate_input)?;
+    let stage_len = activation_len
+        .checked_add(m)
+        .ok_or_else(|| cpu_err("dense transfer extent overflows"))?;
+    with_cpu_transfer(gpu, stage_len, |transfer| {
+        let d2h_ns = prepare_activation(gpu, w, x, rotate_input, transfer)?;
+        let t1 = Instant::now();
+        {
+            let (activation, y) = transfer_values(transfer, stage_len).split_at_mut(activation_len);
+            gemv(q, bytes, m, k, &activation[..k], y);
+        }
+        let gemv_ns = t1.elapsed().as_nanos() as u64;
+        let t2 = Instant::now();
+        upload_transfer(gpu, transfer, out, activation_len, m)?;
+        let h2d_ns = t2.elapsed().as_nanos() as u64;
+        CPU_STEPS.fetch_add(1, Ordering::Relaxed);
+        trace_step(
+            q,
+            w,
+            rotate_input,
+            false,
+            StepTiming { d2h_ns, gemv_ns, h2d_ns },
+        );
+        Ok(())
+    })
 }
 
-/// Read the activation for a CPU step, applying the same pre-rotation
-/// transforms the launcher's rotate step would, and return it with the elapsed
-/// nanoseconds — the trace's `d2h` figure, which therefore covers the AWQ divide
-/// and the FWHT whenever they apply, not just the copy.
+fn activation_stage_len(w: &WeightRef, rotate_input: bool) -> Result<usize, DispatchError> {
+    w.k.checked_mul(if rotate_input && w.awq_scale.is_some() { 2 } else { 1 })
+        .ok_or_else(|| cpu_err("activation transfer extent overflows"))
+}
+
+/// Download into owned pinned storage and apply the launcher's pre-rotation
+/// transforms. The trace's `d2h` figure covers AWQ divide and FWHT as well as
+/// the copies. Independent activation/scale downloads share one readiness
+/// boundary, which also retires the preceding same-stream CPU return.
 ///
 /// * AWQ (`w.awq_scale`): the quantizer pre-scaled the weights by `s` and the
 ///   rotate kernel divides the activation by it (`(W·s)·(x/s) = W·x`). This
@@ -353,17 +362,25 @@ fn prepare_activation(
     w: &WeightRef,
     x: &GpuTensor,
     rotate_input: bool,
-) -> Result<(Vec<f32>, u64), DispatchError> {
+    transfer: &mut hip_bridge::PinnedTransferBuffer,
+) -> Result<u64, DispatchError> {
     let t0 = Instant::now();
-    let mut host = download_f32(gpu, x, w.k)?;
+    download_transfer(gpu, transfer, x, 0, w.k)?;
     if rotate_input {
         if let Some(scale) = w.awq_scale {
-            let scale = download_f32(gpu, scale, w.k)?;
-            divide_by_awq_scale(&mut host, &scale);
+            download_transfer(gpu, transfer, scale, w.k, w.k)?;
         }
-        rotate_x(&mut host);
     }
-    Ok((host, t0.elapsed().as_nanos() as u64))
+    transfer.complete(&gpu.hip).map_err(|e| cpu_err(&format!("D2H completion: {e}")))?;
+    if rotate_input {
+        let values = transfer_values(transfer, activation_stage_len(w, rotate_input)?);
+        let (host, scale) = values.split_at_mut(w.k);
+        if w.awq_scale.is_some() {
+            divide_by_awq_scale(host, scale);
+        }
+        rotate_x(host);
+    }
+    Ok(t0.elapsed().as_nanos() as u64)
 }
 
 /// `acc += W · x` on the CPU, over a host-mapped weight — the residual form the
@@ -384,29 +401,39 @@ pub fn run_host_mapped_gemv_residual(
     let bytes = gpu
         .host_bytes(w.buf)
         .ok_or_else(|| cpu_err("weight tensor is host-mapped but has no host pointer"))?;
-    let (x_host, d2h_ns) = prepare_activation(gpu, w, x, rotate_input)?;
-    let mut y = vec![0.0f32; m];
-    let t1 = Instant::now();
-    gemv(q, bytes, m, k, &x_host, &mut y);
-    let gemv_ns = t1.elapsed().as_nanos() as u64;
-    let t2 = Instant::now();
-    let mut acc_host = download_f32(gpu, acc, m)?;
-    residual_add(&mut acc_host, &y);
-    upload_f32(gpu, acc, &acc_host)?;
-    let h2d_ns = t2.elapsed().as_nanos() as u64;
-    CPU_STEPS.fetch_add(1, Ordering::Relaxed);
-    trace_step(
-        q,
-        w,
-        rotate_input,
-        true,
-        StepTiming {
-            d2h_ns,
-            gemv_ns,
-            h2d_ns,
-        },
-    );
-    Ok(())
+    let activation_len = activation_stage_len(w, rotate_input)?;
+    let stage_len = m
+        .checked_mul(2)
+        .and_then(|n| activation_len.checked_add(n))
+        .ok_or_else(|| cpu_err("dense residual transfer extent overflows"))?;
+    with_cpu_transfer(gpu, stage_len, |transfer| {
+        let d2h_ns = prepare_activation(gpu, w, x, rotate_input, transfer)?;
+        let t1 = Instant::now();
+        {
+            let (activation, rest) = transfer_values(transfer, stage_len).split_at_mut(activation_len);
+            gemv(q, bytes, m, k, &activation[..k], &mut rest[..m]);
+        }
+        let gemv_ns = t1.elapsed().as_nanos() as u64;
+        let t2 = Instant::now();
+        download_transfer(gpu, transfer, acc, activation_len + m, m)?;
+        transfer.complete(&gpu.hip).map_err(|e| cpu_err(&format!("residual D2H completion: {e}")))?;
+        {
+            let (_, rest) = transfer_values(transfer, stage_len).split_at_mut(activation_len);
+            let (y, acc_host) = rest.split_at_mut(m);
+            residual_add(acc_host, y);
+        }
+        upload_transfer(gpu, transfer, acc, activation_len + m, m)?;
+        let h2d_ns = t2.elapsed().as_nanos() as u64;
+        CPU_STEPS.fetch_add(1, Ordering::Relaxed);
+        trace_step(
+            q,
+            w,
+            rotate_input,
+            true,
+            StepTiming { d2h_ns, gemv_ns, h2d_ns },
+        );
+        Ok(())
+    })
 }
 
 /// One selected expert's host-resident weight bytes for the CPU splice.
@@ -478,7 +505,7 @@ thread_local! {
             slot_si: Vec::new(),
             group_off: Vec::new(),
         }) };
-    static MOE_TRANSFER: std::cell::RefCell<Option<hip_bridge::PinnedHostBuffer>> =
+    static CPU_TRANSFER: std::cell::RefCell<Option<hip_bridge::PinnedTransferBuffer>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -603,29 +630,9 @@ pub fn moe_cpu_experts<'a>(
             return Err(cpu_err("moe cpu expert splice: transfer buffer too small"));
         }
     }
-    MOE_TRANSFER.with(|transfer_cell| {
-        let mut transfer = transfer_cell.borrow_mut();
-        if transfer.as_ref().is_none_or(|b| b.size() < stage_bytes) {
-            *transfer = Some(
-                gpu.hip.host_buffer(stage_bytes)
-                    .map_err(|e| cpu_err(&format!("pinned transfer stage: {e}")))?,
-            );
-        }
-        let result = MOE_SCRATCH.with(|cell| {
+    with_cpu_transfer(gpu, stage_bytes / 4, |transfer| {
+        MOE_SCRATCH.with(|cell| {
             let mut scratch = cell.borrow_mut();
-            let bytes = transfer
-                .as_mut()
-                .expect("stage allocated above")
-                .as_bytes_mut();
-            // SAFETY: hipHostMalloc is suitably aligned for f32, every byte was
-            // initialized on allocation, and the four nonoverlapping slices stay
-            // alive until both download completion and the blocking upload.
-            let values = unsafe {
-                std::slice::from_raw_parts_mut(bytes.as_mut_ptr().cast::<f32>(), stage_bytes / 4)
-            };
-            let (x, rest) = values.split_at_mut(n_x);
-            let (ti, rest) = rest.split_at_mut(slots);
-            let (tw, acc) = rest.split_at_mut(slots);
             let mut timing = MoeStepTiming::default();
             // An event inserted here is after the producers and cannot measure
             // the host wait for them. Trace only: drain before copying to
@@ -641,18 +648,22 @@ pub fn moe_cpu_experts<'a>(
                 timing.d2h_wait_ns = t_wait.elapsed().as_nanos() as u64;
             }
             let t_enqueue = Instant::now();
-            download_into_f32_async(gpu, x_rot, x)?;
-            download_into_f32_async(gpu, topk_indices, ti)?;
-            download_into_f32_async(gpu, topk_weights, tw)?;
-            download_into_f32_async(gpu, residual, acc)?;
+            // Enqueue through owned raw extents, not host slices: the previous
+            // return may still read this allocation. FIFO ordering prevents
+            // these D2H writes from overtaking it on the same stream.
+            download_transfer(gpu, transfer, x_rot, 0, n_x)?;
+            download_transfer(gpu, transfer, topk_indices, n_x, slots)?;
+            download_transfer(gpu, transfer, topk_weights, n_x + slots, slots)?;
+            download_transfer(gpu, transfer, residual, n_x + 2 * slots, n_x)?;
             timing.d2h_enqueue_ns = t_enqueue.elapsed().as_nanos() as u64;
             let t_complete = Instant::now();
-            match gpu.active_stream.as_ref() {
-                Some(stream) => gpu.hip.stream_synchronize(stream),
-                None => gpu.hip.stream_synchronize_default(),
-            }
-            .map_err(|e| cpu_err(&format!("D2H completion: {e}")))?;
+            transfer.complete(&gpu.hip)
+                .map_err(|e| cpu_err(&format!("D2H completion: {e}")))?;
             timing.d2h_complete_ns = t_complete.elapsed().as_nanos() as u64;
+            let values = transfer_values(transfer, stage_bytes / 4);
+            let (x, rest) = values.split_at_mut(n_x);
+            let (ti, rest) = rest.split_at_mut(slots);
+            let (tw, acc) = rest.split_at_mut(slots);
             // Resolve every selected slot up front: a bad id or a short span is
             // an error before arithmetic. Warm decode/verify resolves into a
             // fixed stack array; wider windows retain the heap fallback.
@@ -688,7 +699,7 @@ pub fn moe_cpu_experts<'a>(
                 dim, mi, rows, top_k, experts, x, ti, tw, acc, &mut scratch, &mut timing,
             )?;
             let t_h2d = Instant::now();
-            upload_f32(gpu, residual, acc)?;
+            upload_transfer(gpu, transfer, residual, n_x + 2 * slots, n_x)?;
             timing.h2d_ns = t_h2d.elapsed().as_nanos() as u64;
             CPU_STEPS.fetch_add(1, Ordering::Relaxed);
             let mixed = experts.iter().any(|e| {
@@ -705,14 +716,7 @@ pub fn moe_cpu_experts<'a>(
                 timing,
             );
             Ok(())
-        });
-        // Even a failed enqueue may leave earlier copies in flight. Retire
-        // them before any reuse/free; if the device cannot drain, retain the
-        // allocation forever instead of allowing a GPU use-after-free.
-        if result.is_err() && gpu.hip.device_synchronize().is_err() {
-            std::mem::forget(transfer.take());
-        }
-        result
+        })
     })
 }
 
@@ -1472,32 +1476,72 @@ fn download_into_f32(
         .map_err(|e| cpu_err(&format!("D2H: {e}")))
 }
 
-/// Enqueue into the pinned MoE stage on the producers' own stream. The caller
-/// owns the stage and must drain on success, error, and before buffer reuse.
-fn download_into_f32_async(
+/// Reuse owned pinned storage across CPU steps. Growth/device transitions
+/// drop an owner that drains pending accesses; the warm same-stream path has
+/// no return-side host wait, event record, or extra staging copy.
+fn with_cpu_transfer<R>(
     gpu: &Gpu,
-    t: &GpuTensor,
-    out: &mut [f32],
+    values: usize,
+    run: impl FnOnce(&mut hip_bridge::PinnedTransferBuffer) -> Result<R, DispatchError>,
+) -> Result<R, DispatchError> {
+    if gpu.graphs.capture_mode || gpu.replay.is_recording() {
+        return Err(cpu_err("CPU transfer cannot run during capture or retained recording"));
+    }
+    gpu.bind_thread().map_err(|e| cpu_err(&format!("bind: {e}")))?;
+    let bytes = values.checked_mul(4)
+        .ok_or_else(|| cpu_err("CPU transfer extent overflows"))?;
+    CPU_TRANSFER.with(|cell| {
+        let mut owner = cell.borrow_mut();
+        if owner.as_ref().is_none_or(|b| b.size() < bytes || b.device() != gpu.device_id) {
+            // Retire the old allocation before binding/allocating the new one.
+            // Its destructor restores this caller's current device.
+            drop(owner.take());
+            *owner = Some(gpu.hip.transfer_buffer(bytes)
+                .map_err(|e| cpu_err(&format!("pinned transfer stage: {e}")))?);
+        }
+        let result = run(owner.as_mut().expect("stage allocated above"));
+        // Earlier enqueues can survive a later error. Protect their device
+        // allocations as well as the stage before returning the failure.
+        if result.is_err() && gpu.hip.device_synchronize().is_err() {
+            std::mem::forget(owner.take());
+        }
+        result
+    })
+}
+
+fn transfer_values(transfer: &mut hip_bridge::PinnedTransferBuffer, n: usize) -> &mut [f32] {
+    let bytes = &mut transfer.as_bytes_mut()[..n * 4];
+    // SAFETY: hipHostMalloc is f32-aligned, bytes are initialized, and the
+    // owner permits host access only after queued GPU accesses have completed.
+    unsafe { std::slice::from_raw_parts_mut(bytes.as_mut_ptr().cast::<f32>(), n) }
+}
+
+fn download_transfer(
+    gpu: &Gpu,
+    transfer: &mut hip_bridge::PinnedTransferBuffer,
+    tensor: &GpuTensor,
+    offset: usize,
+    n: usize,
 ) -> Result<(), DispatchError> {
-    // SAFETY: the initialized f32 slice covers exactly these bytes. The
-    // caller retains the allocation until the batch's completion barrier.
-    let bytes = unsafe {
-        std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), std::mem::size_of_val(out))
-    };
-    gpu.hip.memcpy_dtoh_async(bytes, &t.buf, gpu.active_stream.as_ref())
+    if tensor.numel() < n {
+        return Err(cpu_err("D2H tensor extent too small"));
+    }
+    transfer.download_async(&gpu.hip, &tensor.buf, offset * 4, n * 4, gpu.active_stream.as_ref())
         .map_err(|e| cpu_err(&format!("D2H enqueue: {e}")))
 }
 
-fn upload_f32(gpu: &Gpu, t: &GpuTensor, v: &[f32]) -> Result<(), DispatchError> {
-    assert!(
-        t.numel() >= v.len(),
-        "cpu exec: destination has {} elements, source has {}",
-        t.numel(),
-        v.len()
-    );
-    let bytes = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
-    gpu.memcpy_htod_auto(&t.buf, bytes)
-        .map_err(|e| cpu_err(&format!("H2D: {e}")))
+fn upload_transfer(
+    gpu: &Gpu,
+    transfer: &mut hip_bridge::PinnedTransferBuffer,
+    tensor: &GpuTensor,
+    offset: usize,
+    n: usize,
+) -> Result<(), DispatchError> {
+    if tensor.numel() < n {
+        return Err(cpu_err("H2D tensor extent too small"));
+    }
+    transfer.upload_async(&gpu.hip, &tensor.buf, offset * 4, n * 4, gpu.active_stream.as_ref())
+        .map_err(|e| cpu_err(&format!("H2D enqueue: {e}")))
 }
 
 /// One step's own wall-time split, handed to [`trace_step`].
