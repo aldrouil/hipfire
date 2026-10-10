@@ -332,3 +332,37 @@ fn forced_scalar_path_is_the_s1_arithmetic() {
         assert_eq!(*got, acc, "row {row}");
     }
 }
+
+/// Cached activation sums must not change MQ4's arithmetic. Awkward metadata
+/// and activations expose rounding differences hidden by the power-of-two
+/// shared-job fixtures.
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn mq4_cached_and_uncached_agree_on_awkward_inputs() {
+    let q = CpuQuant::Mq4G256;
+    if !row_dot_enabled(q, None) {
+        return;
+    }
+    for k in [256, 512, 2048, 12288] {
+        let m = 7;
+        let mut packed = testfix::weight_bytes(q, m, k);
+        awkward_headers(q, &mut packed, m, k);
+        for token in 0..4 {
+            let x: Vec<f32> = (0..k)
+                .map(|i| (((i + token * 71) as u64 * 2654435761) % 4096) as f32 * 0.001 - 2.0)
+                .collect();
+            let mut sums = vec![0.0; k / 256];
+            prepare_activation_sums(ActivationSumKind::Mq4Quartets, &x, &mut sums);
+            for row in 0..m {
+                let weights = &packed[row * row_bytes(q, k)..];
+                let uncached = row_dot_avx2(q, weights, k, &x);
+                let cached = row_dot_with_activation_sums(q, weights, k, &x, &sums);
+                assert_eq!(
+                    cached.to_bits(),
+                    uncached.to_bits(),
+                    "k={k} token={token} row={row}"
+                );
+            }
+        }
+    }
+}
