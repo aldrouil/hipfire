@@ -942,6 +942,8 @@ fn graded_cpu_moe_experts_multirow_parity() -> Result<(), Box<dyn std::error::Er
     let indices = gpu.upload_f32(&idx_bits, &[N * KTOP])?;
     let weights = gpu.upload_f32(&w_host, &[N * KTOP])?;
     let residual = gpu.upload_f32(&seed, &[N * dim])?;
+    let delta_host = vec![0.125f32; N * dim];
+    let delta = gpu.upload_f32(&delta_host, &[N * dim])?;
     const ADVANCE: usize = 2;
     let prefix_residual = gpu.upload_f32(&seed[..ADVANCE * dim], &[ADVANCE * dim])?;
     let prefix_x = gpu.upload_f32(&x_rot[..ADVANCE * dim], &[ADVANCE * dim])?;
@@ -1024,7 +1026,7 @@ fn graded_cpu_moe_experts_multirow_parity() -> Result<(), Box<dyn std::error::Er
         (&weights, w_host.as_slice()),
         (&residual, seed.as_slice()),
     ];
-    let mut upload_stage = gpu.hip.host_buffer(
+    let mut upload_stage = gpu.hip.transfer_buffer(
         inputs.iter().map(|(_, data)| std::mem::size_of_val(*data)).sum(),
     )?;
     let mut offset = 0;
@@ -1046,19 +1048,26 @@ fn graded_cpu_moe_experts_multirow_parity() -> Result<(), Box<dyn std::error::Er
         let len = std::mem::size_of_val(data);
         // Pinned sources make these genuinely host-asynchronous. All staged
         // bytes remain unchanged until the splice's stream completion barrier.
-        gpu.hip.memcpy_htod_async(
+        upload_stage.upload_async(
+            &gpu.hip,
             &tensor.buf,
-            &upload_stage.as_bytes_mut()[offset..offset + len],
-            gpu.active_stream.as_ref().expect("test stream"),
+            offset,
+            len,
+            gpu.active_stream.as_ref(),
         )?;
         offset += len;
     }
     moe_cpu_experts(
         &gpu, dim, mi, N, KTOP, &x, &indices, &weights, &residual, false, |e| resolve(&gpu, e),
     )?;
+    // Exercise an actual same-stream GPU consumer before host readback. The
+    // splice returns after enqueue, not after its residual DMA completes.
+    gpu.add_inplace_f32(&residual, &delta)?;
+    gpu.hip.stream_synchronize(gpu.active_stream.as_ref().expect("test stream"))?;
+    let consumed: Vec<f32> = got.iter().map(|v| v + 0.125).collect();
     assert_eq!(
-        gpu.download_f32(&residual)?, got,
-        "nonblocking-stream splice differs from default-stream splice",
+        gpu.download_f32(&residual)?, consumed,
+        "GPU consumer overtook the nonblocking-stream CPU return",
     );
     let seed_bytes = unsafe {
         // SAFETY: seed is initialized and the blocking upload ends its borrow.
@@ -1068,6 +1077,7 @@ fn graded_cpu_moe_experts_multirow_parity() -> Result<(), Box<dyn std::error::Er
     moe_cpu_experts(
         &gpu, dim, mi, 1, KTOP, &x, &indices, &weights, &residual, false, |e| resolve(&gpu, e),
     )?;
+    gpu.hip.stream_synchronize(gpu.active_stream.as_ref().expect("test stream"))?;
     let single = gpu.download_f32(&residual)?;
     assert_eq!(&single[..dim], &got[..dim], "stage reuse changed the committed row");
     assert_eq!(&single[dim..], &seed[dim..], "splice overwrote spare residual rows");

@@ -29,7 +29,7 @@ pub use ffi::{launch_counters, memory_effects};
 pub use ffi::{
     Event, Function, Graph, GraphExec, HipMemAccessDesc, HipMemAllocationProp,
     HipMemGenericAllocationHandle, HipMemLocation, HipPointerAttribute, HipRuntime, Module,
-    PinnedHostBuffer, Stream,
+    PinnedHostBuffer, PinnedTransferBuffer, Stream,
     HIP_ERROR_NOT_READY, HIP_EVENT_DISABLE_TIMING, HIP_EVENT_RELEASE_TO_SYSTEM,
     HIP_HOST_MALLOC_MAPPED, HIP_MEM_ALLOCATION_GRANULARITY_MINIMUM,
     HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED, HIP_MEM_LOCATION_TYPE_DEVICE,

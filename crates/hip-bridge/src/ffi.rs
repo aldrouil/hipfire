@@ -1601,6 +1601,20 @@ impl HipRuntime {
         })
     }
 
+    /// Reusable pinned CPU/GPU transfer storage. Same-stream downloads may be
+    /// queued after an outstanding upload without exposing host references.
+    pub fn transfer_buffer(&self, size: usize) -> HipResult<PinnedTransferBuffer> {
+        Ok(PinnedTransferBuffer {
+            storage: Some(self.host_buffer(size)?),
+            device: self.current_device()?,
+            stream: ptr::null_mut(),
+            pending: false,
+            get_device: self.fn_get_device,
+            set_device: self.fn_set_device,
+            synchronize: self.fn_device_synchronize,
+        })
+    }
+
     pub fn mem_get_allocation_granularity(
         &self,
         prop: &HipMemAllocationProp,
@@ -2816,6 +2830,166 @@ impl Drop for PinnedHostBuffer {
         // SAFETY: unique hipHostMalloc owner; its library is still live. The
         // caller must have drained async copies before dropping the owner.
         let _ = unsafe { (self.free)(self.ptr) };
+    }
+}
+
+/// Pinned transfer storage whose outstanding GPU accesses survive a CPU call.
+///
+/// Host access is available only after `complete` drains the queued downloads.
+/// Uploads and following downloads on the same stream reuse the allocation
+/// without an intervening host wait. Stream changes and teardown must retire
+/// the old accesses first; a failed teardown retains the allocation.
+pub struct PinnedTransferBuffer {
+    storage: Option<PinnedHostBuffer>,
+    device: i32,
+    stream: HipStream,
+    pending: bool,
+    get_device: unsafe extern "C" fn(*mut c_int) -> u32,
+    set_device: unsafe extern "C" fn(c_int) -> u32,
+    synchronize: unsafe extern "C" fn() -> u32,
+}
+
+impl PinnedTransferBuffer {
+    pub fn size(&self) -> usize {
+        self.storage.as_ref().expect("live transfer storage").size()
+    }
+
+    pub fn device(&self) -> i32 {
+        self.device
+    }
+
+    /// The runtime must be bound to this buffer's device, and the stream and
+    /// device allocation must remain live until their queued work completes.
+    pub fn download_async(
+        &mut self,
+        hip: &HipRuntime,
+        src: &DeviceBuffer,
+        offset: usize,
+        size: usize,
+        stream: Option<&Stream>,
+    ) -> HipResult<()> {
+        self.check_span(offset, size)?;
+        if size > src.size() {
+            return Err(HipError::new(0, "pinned download exceeds device buffer"));
+        }
+        self.begin(hip, stream)?;
+        let storage = self.storage.as_ref().expect("live transfer storage");
+        // SAFETY: checked allocation extent; no host reference exists while
+        // pending. Same-stream copies order prior upload reads before these
+        // writes, and the owner drains before host reuse/free.
+        let code = unsafe {
+            (hip.fn_memcpy_async)(
+                storage.ptr.cast::<u8>().add(offset).cast(),
+                src.ptr,
+                size,
+                MemcpyKind::DeviceToHost as c_uint,
+                self.stream,
+            )
+        };
+        memory_effects::dtoh();
+        hip.check(code, "hipMemcpyAsync pinned D2H")
+    }
+
+    /// Enqueue a return from owned storage, not a caller's temporary slice.
+    /// The runtime, stream and destination obey `download_async`'s contract.
+    pub fn upload_async(
+        &mut self,
+        hip: &HipRuntime,
+        dst: &DeviceBuffer,
+        offset: usize,
+        size: usize,
+        stream: Option<&Stream>,
+    ) -> HipResult<()> {
+        self.check_span(offset, size)?;
+        if size > dst.size() {
+            return Err(HipError::new(0, "pinned upload exceeds device buffer"));
+        }
+        if hip_fault_consume(0, "upload") {
+            return Err(hip_fault_err("upload"));
+        }
+        self.begin(hip, stream)?;
+        let storage = self.storage.as_ref().expect("live transfer storage");
+        // SAFETY: checked source extent, and no host access is allowed until
+        // complete drains the stream. The pinned owner survives this enqueue.
+        let code = unsafe {
+            (hip.fn_memcpy_async)(
+                dst.ptr,
+                storage.ptr.cast::<u8>().add(offset).cast(),
+                size,
+                MemcpyKind::HostToDevice as c_uint,
+                self.stream,
+            )
+        };
+        memory_effects::htod();
+        hip.check(code, "hipMemcpyAsync pinned H2D")
+    }
+
+    /// Complete the caller's existing D2H readiness boundary.
+    pub fn complete(&mut self, hip: &HipRuntime) -> HipResult<()> {
+        if self.pending {
+            if self.stream.is_null() {
+                hip.stream_synchronize_default()?;
+            } else {
+                hip.stream_synchronize(&Stream(self.stream))?;
+            }
+            self.pending = false;
+        }
+        Ok(())
+    }
+
+    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+        assert!(!self.pending, "host access before pinned transfer completion");
+        self.storage.as_mut().expect("live transfer storage").as_bytes_mut()
+    }
+
+    fn check_span(&self, offset: usize, size: usize) -> HipResult<()> {
+        if offset.checked_add(size).is_none_or(|end| end > self.size()) {
+            return Err(HipError::new(0, "pinned transfer extent exceeds storage"));
+        }
+        Ok(())
+    }
+
+    fn begin(&mut self, hip: &HipRuntime, stream: Option<&Stream>) -> HipResult<()> {
+        let raw = stream.map_or(ptr::null_mut(), |s| s.0);
+        if self.pending && self.stream != raw {
+            // The old stream may have been destroyed already. Drain the owning
+            // device, not a potentially stale handle, on this rare transition.
+            hip.device_synchronize()?;
+            self.pending = false;
+        }
+        self.stream = raw;
+        // Mark before submission: even a failed API call must not release or
+        // expose storage while an earlier copy might still be using it.
+        self.pending = true;
+        Ok(())
+    }
+}
+
+impl Drop for PinnedTransferBuffer {
+    fn drop(&mut self) {
+        if !self.pending {
+            return;
+        }
+        let mut previous = 0;
+        // SAFETY: the pinned owner keeps the function-pointer library live.
+        // Bind its device before draining; restore the caller's device so
+        // cached thread binding remains valid outside this destructor.
+        let drained = unsafe {
+            if (self.get_device)(&mut previous) != HIP_SUCCESS {
+                false
+            } else if (self.set_device)(self.device) != HIP_SUCCESS {
+                false
+            } else {
+                let code = (self.synchronize)();
+                let restored = (self.set_device)(previous);
+                code == HIP_SUCCESS && restored == HIP_SUCCESS
+            }
+        };
+        if !drained {
+            // Retain both allocation and library rather than freeing memory
+            // that the device may still access after a failed drain.
+            std::mem::forget(self.storage.take());
+        }
     }
 }
 
