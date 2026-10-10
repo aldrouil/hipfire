@@ -145,10 +145,9 @@ const MOE_QUANT_MIX_LEN: usize = 32;
 #[derive(Clone, Copy, Default)]
 struct MoeStepStats {
     calls: usize,
-    /// The `x_rot` download, which starts before the sealed MoE step's writes to
-    /// it have drained — so this carries the GPU wait, not just copy cost.
+    /// Blocking activation download after the trace-only producer drain.
     d2h_first_ns: u64,
-    /// The other three downloads (`ti`, `tw`, `residual`), pure copy latency.
+    /// The other three blocking downloads (`ti`, `tw`, `residual`).
     d2h_rest_ns: u64,
     /// All experts' gate_up GEMV.
     gu_ns: u64,
@@ -176,8 +175,8 @@ struct MoeStepStats {
     middle_gather_ns: u64,
     middle_silu_ns: u64,
     middle_fwht_ns: u64,
-    /// GPU-wait portion attributed to the first D2H (0 until event split lands;
-    /// `d2h_first_ns` stays the whole blocking download).
+    /// Host time to drain the producers before downloads (trace only). Includes
+    /// the synchronization API cost, not physical copy time.
     d2h_wait_ns: u64,
     /// Selected-slot GU / DN quant mixture summed across this shape's calls.
     gu_mix: [u64; MOE_QUANT_MIX_LEN],
@@ -600,48 +599,23 @@ pub fn moe_cpu_experts<'a>(
         scratch.ti.resize(slots, 0.0);
         scratch.tw.resize(slots, 0.0);
         let mut timing = MoeStepTiming::default();
-        // GPU-wait vs copy split for the first D2H (opt-in trace only): record
-        // a start event on the existing stream *before* the sealed GPU work has
-        // necessarily drained, then resolve the pair after the blocking copy
-        // using the copy itself as the only synchronization. `hipEventRecord`
-        // enqueues (never syncs); `hipEventElapsedTime` after the blocking D2H
-        // reads device time without a new wait. Copy failure skips the split
-        // and keeps the whole blocking span in `d2h_first_ns`.
-        let trace_on = moe_trace_enabled();
-        let wait_start = if trace_on {
-            gpu.hip
-                .event_create()
-                .ok()
-                .and_then(|ev| {
-                    gpu.hip
-                        .event_record(&ev, gpu.active_stream.as_ref())
-                        .ok()
-                        .map(|()| ev)
-                })
-        } else {
-            None
-        };
+        // A stream event inserted here is *after* the producers and cannot
+        // measure the host's wait for them. In diagnostic runs only, drain
+        // before copying to separate readiness from blocking copy/API cost.
+        // Controls retain the original synchronization and execution order.
+        if moe_trace_enabled() {
+            gpu.bind_thread().map_err(|e| cpu_err(&format!("bind: {e}")))?;
+            let t_wait = Instant::now();
+            match gpu.active_stream.as_ref() {
+                Some(stream) => gpu.hip.stream_synchronize(stream),
+                None => gpu.hip.device_synchronize(),
+            }
+            .map_err(|e| cpu_err(&format!("D2H producer drain: {e}")))?;
+            timing.d2h_wait_ns = t_wait.elapsed().as_nanos() as u64;
+        }
         let t_first = Instant::now();
         download_into_f32(gpu, x_rot, n_x, &mut scratch.x)?;
         timing.d2h_first_ns = t_first.elapsed().as_nanos() as u64;
-        // The stop event records here (stream position = copy completion) but
-        // is NOT resolved yet: `hipEventElapsedTime` on an uncompleted record
-        // returns hipErrorNotReady, which would silently pin `d2h_wait_ns` at
-        // 0. Resolution happens after the splice's H2D below — the FIFO stream
-        // guarantees both records are complete by then, so no new sync.
-        let wait_stop = if wait_start.is_some() {
-            gpu.hip
-                .event_create()
-                .ok()
-                .and_then(|ev| {
-                    gpu.hip
-                        .event_record(&ev, gpu.active_stream.as_ref())
-                        .ok()
-                        .map(|()| ev)
-                })
-        } else {
-            None
-        };
         let t_rest = Instant::now();
         download_into_f32(gpu, topk_indices, slots, &mut scratch.ti)?;
         download_into_f32(gpu, topk_weights, slots, &mut scratch.tw)?;
@@ -687,28 +661,6 @@ pub fn moe_cpu_experts<'a>(
         upload_f32(gpu, residual, &scratch.acc[..n_x])?;
         timing.h2d_ns = t_h2d.elapsed().as_nanos() as u64;
         CPU_STEPS.fetch_add(1, Ordering::Relaxed);
-        // Resolve the wait pair now: the blocking H2D above drained the FIFO
-        // stream, so both the start record (pre-copy) and the stop record
-        // (post-copy) are complete — `hipEventElapsedTime` cannot go NotReady
-        // here, and no new sync was introduced. `wait` = device time from the
-        // splice's stream entry to copy completion; `copy ≈ blocking span −
-        // wait` is derived at print time, never stored.
-        match (wait_start, wait_stop) {
-            (Some(start), Some(stop)) => {
-                if let Ok(ms) = gpu.hip.event_elapsed_ms(&start, &stop) {
-                    timing.d2h_wait_ns = (ms as f64 * 1e6) as u64;
-                }
-                let _ = gpu.hip.event_destroy(stop);
-                let _ = gpu.hip.event_destroy(start);
-            }
-            (Some(start), None) => {
-                let _ = gpu.hip.event_destroy(start);
-            }
-            (None, Some(stop)) => {
-                let _ = gpu.hip.event_destroy(stop);
-            }
-            (None, None) => {}
-        }
         let mixed = experts.iter().any(|e| {
             e.gate_up_quant != experts[0].gate_up_quant || e.down_quant != experts[0].down_quant
         });
@@ -1067,16 +1019,16 @@ fn trace_moe_step(
     }
     let (on_cpu, on_gpu) = cpu_exec_counters();
     let per_ms = |ns: u64| ns as f64 / 1e6 / stats.calls as f64;
-    // Derived copy estimate: blocking span minus device-wait, clamped at zero
-    // (event resolution rounds up; a zero-wait split prints the whole span).
-    let d2h_copy_ns = stats.d2h_first_ns.saturating_sub(stats.d2h_wait_ns);
+    // Blocking copy calls include HIP API/staging overhead. The producer drain
+    // is separate; neither field is a physical PCIe transfer measurement.
+    let d2h_copy_ns = stats.d2h_first_ns + stats.d2h_rest_ns;
     eprintln!(
         "cpu exec: moe expert splice dim={dim} mi={mi} k={k} rows={rows} quant={q:?} \
          graded={graded} | {} calls | {on_cpu} steps on CPU, {on_gpu} host-mapped steps still \
          on GPU | mean per call: d2h_first={:.2}ms d2h_rest={:.2}ms gu={:.2}ms dn={:.2}ms \
          h2d={:.2}ms setup={:.2}ms middle={:.2}ms combine={:.2}ms total={:.2}ms \
          | gu_prep={:.2}ms gu_exec={:.2}ms dn_prep={:.2}ms dn_exec={:.2}ms \
-         gather={:.2}ms silu={:.2}ms fwht={:.2}ms d2h_wait={:.2}ms d2h_copy~{:.2}ms \
+         gather={:.2}ms silu={:.2}ms fwht={:.2}ms d2h_wait={:.2}ms d2h_copy_api={:.2}ms \
          | gu_mix=[{}] dn_mix=[{}]",
         stats.calls,
         per_ms(stats.d2h_first_ns),
@@ -1187,8 +1139,7 @@ struct MoeStepTiming {
     middle_gather_ns: u64,
     middle_silu_ns: u64,
     middle_fwht_ns: u64,
-    /// GPU-wait attributed to the first D2H (0 until the event split lands;
-    /// `d2h_first_ns` stays the whole blocking download).
+    /// Trace-only host producer drain, including synchronization API overhead.
     d2h_wait_ns: u64,
     /// Selected-slot GU / DN quant mixture of this call, indexed by
     /// `CpuQuant as usize`; summed into the shape stats by [`trace_moe_step`].
