@@ -29,7 +29,7 @@ decode core:
 
 | piece | what it does |
 |---|---|
-| `codes8::<BITS>` | eight `BITS`-wide codes as `i32` lanes. Eight codes are exactly `BITS` bytes, so 1/2/3/4-bit chunks are one broadcast + one `vpsrlvd` + one mask, and the 40/48-bit 5/6-bit chunks use 64-bit lanes with the low dwords compacted back into eight lanes. |
+| `codes8::<BITS>` | eight `BITS`-wide codes as `i32` lanes. The 1/2/4-bit chunks use a broadcast, `vpsrlvd` and mask. Three-bit chunks include a preceding header/payload byte in a 32-bit memory broadcast and discard it with the vector shifts. Six-bit chunks use two such 24-bit halves in separate 128-bit lanes. Only 5-bit chunks use 64-bit lanes with low-dword compaction. |
 | `codes_dot_sum::<BITS, PAYLOAD>` | `(Σ c·x, Σ x)` over a run of chunks — two vector accumulators, one horizontal sum each per group. |
 | `uniform_group_dot::<BITS, PAYLOAD, CHUNKS>` | `scale·Σ(c·x) + zero·Σx` for one `(scale, zero)` header. |
 | `v2_group_dot::<BITS>` | the V2 family's per-128 `fp16` header, each half scored then affinely corrected. |
@@ -46,10 +46,12 @@ Two consequences worth keeping in mind when adding a format:
   the TQ2/BQ1 pair needs no kernel of its own: `(code-1)·d` and `bit ? +d : -d` are
   the affine form with `(d, -d)` and `(2d, -d)`.
 
-`load_le` reads *exactly* a chunk's `BITS` bytes — a wider load would be one
-instruction cheaper and would run up to three bytes past the group on its last
-chunk, which the caller's row slice licenses only for rows that are not the
-tensor's last.
+`load_le` reads exactly the 1/2/4/5-bit chunk's bytes. The 3/6-bit decoder
+instead reads a preceding byte within the same group allocation, never beyond
+the payload's end. Its callers require a nonempty header at compile time;
+even the first chunk follows an 8-byte header or a 16-byte MQ3-Lloyd codebook.
+The prefix is removed by logical vector shifts, with no change to the decoded
+codes, floating-point accumulation order, or single-/multi-row layout.
 
 `Mq4G256` (qt 13) keeps a hand-unrolled nibble group (32 codes per 16-byte load)
 rather than the `codes8` path; its recorded measurements were taken with it.
