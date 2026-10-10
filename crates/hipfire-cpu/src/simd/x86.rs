@@ -28,10 +28,8 @@
 //! FWHT-rotated for the rotated formats (see [`crate::quant`]) — so one kernel
 //! serves a rotated format and its byte-identical unrotated sibling.
 //!
-//! `Mq4G256` (qt 13) keeps its own hand-unrolled nibble path ([`mq4_group_dot`]):
-//! it predates this core, decodes 32 codes per 16-byte load instead of 8 per
-//! 4-byte load, and its numbers are the ones the recorded qt 13 measurements
-//! were taken with, so it is left alone rather than re-derived from the table.
+//! `Mq4G256` (qt 13) keeps its own nibble path ([`mq4_group_dot`]), decoding
+//! 32 codes per 16-byte load instead of 8 per 4-byte load.
 
 use core::arch::x86_64::*;
 
