@@ -57,17 +57,9 @@ unsafe fn load_le<const BITS: usize>(p: *const u8) -> u64 {
     match BITS {
         1 => *p as u64,
         2 => (p as *const u16).read_unaligned() as u64,
-        // Three bytes from one 32-bit load of the byte *before* the chunk plus
-        // the chunk, shifted down. In bounds for every chunk: a group's payload
-        // always starts at least one header byte in.
-        3 => ((p.sub(1) as *const u32).read_unaligned() >> 8) as u64,
         4 => (p as *const u32).read_unaligned() as u64,
         5 => (p as *const u32).read_unaligned() as u64 | ((*p.add(4) as u64) << 32),
-        6 => {
-            (p as *const u32).read_unaligned() as u64
-                | (((p.add(4) as *const u16).read_unaligned() as u64) << 32)
-        }
-        _ => unreachable!("no format packs codes wider than six bits"),
+        _ => unreachable!("load_le handles only 1-, 2-, 4- and 5-bit chunks"),
     }
 }
 
@@ -85,26 +77,35 @@ unsafe fn shifts64<const BITS: usize, const OFF: usize>() -> __m256i {
 ///
 /// One broadcast of the chunk plus one variable shift per code. An 8-code chunk
 /// is `8·BITS` bits, so widths up to four fit a 32-bit lane and a single shift.
-/// A 6-bit pack is 48 bits and splits into two 24-bit halves, one per 128-bit
-/// lane, still 32-bit shifts; the 5-bit pack is 40 bits and needs the field in
-/// 64-bit lanes, where each lane carries one code and the four low dwords of
-/// each half are compacted back into eight lanes.
+/// Three-bit chunks retain the preceding byte and discard it in the vector
+/// shift. A 6-bit pack uses two such 24-bit halves, one per 128-bit lane.
+/// Five-bit packs need 64-bit lanes, compacted back into eight i32 lanes.
+///
+/// # Safety
+///
+/// Requires AVX2 and `BITS` readable payload bytes at `p`. For 3- and 6-bit
+/// packs, `p.sub(1)` must also be readable within the same allocation: `p`
+/// points past a nonempty group header, never at an allocation's first byte.
 #[inline]
 #[target_feature(enable = "avx2")]
 unsafe fn codes8<const BITS: usize>(p: *const u8) -> __m256i {
     if BITS == 6 {
-        // A 48-bit pack splits cleanly into two 24-bit halves: codes 0..3 in
-        // bits 0..23, codes 4..7 in bits 24..47. Broadcast each half's low 32
-        // bits into its own 128-bit lane and shift every i32 lane by
-        // [0,6,12,18] within the half — one 32-bit shift/mask stream instead of
-        // the 64-bit-lane shifts and permutes the generic path needs.
-        let word = load_le::<6>(p);
-        let lo = _mm_set1_epi32(word as u32 as i32);
-        let hi = _mm_set1_epi32((word >> 24) as u32 as i32);
+        // Each four-code half is three bytes. Include its preceding byte in
+        // the load and discard it with the lane shifts, avoiding scalar
+        // stitching of a 48-bit word. The first prefix is in the group header;
+        // the second is in the payload. Neither load passes the chunk's end.
+        let lo = _mm_set1_epi32((p.sub(1) as *const i32).read_unaligned());
+        let hi = _mm_set1_epi32((p.add(2) as *const i32).read_unaligned());
         let v = _mm256_set_m128i(hi, lo);
-        let shifts = _mm256_setr_epi32(0, 6, 12, 18, 0, 6, 12, 18);
+        let shifts = _mm256_setr_epi32(8, 14, 20, 26, 8, 14, 20, 26);
         let mask = _mm256_set1_epi32(0x3f);
         _mm256_and_si256(_mm256_srlv_epi32(v, shifts), mask)
+    } else if BITS == 3 {
+        // Fold the prefix-byte removal into the existing vector shifts. This
+        // enables a memory broadcast instead of a scalar load/shift/transfer.
+        let v = _mm256_set1_epi32((p.sub(1) as *const i32).read_unaligned());
+        let shifts = _mm256_setr_epi32(8, 11, 14, 17, 20, 23, 26, 29);
+        _mm256_and_si256(_mm256_srlv_epi32(v, shifts), _mm256_set1_epi32(7))
     } else if BITS <= 4 {
         let v = _mm256_set1_epi32(load_le::<BITS>(p) as i32);
         let b = BITS as i32;
@@ -139,6 +140,7 @@ unsafe fn codes_dot_sum<const BITS: usize, const PAYLOAD: usize, const CACHED: b
     last: usize,
     cached_sum: f32,
 ) -> (f32, f32) {
+    const { assert!((BITS != 3 && BITS != 6) || PAYLOAD > 0) };
     // Two independent chains per sum, stepped two chunks at a time. A single
     // chain serializes on the `fma`'s four-cycle latency while the decode is
     // several uops per chunk, so a same-chain reuse every *other* iteration
@@ -288,6 +290,7 @@ unsafe fn codebook_group_dot<const BITS: usize, const CB: usize, const PAYLOAD: 
     gptr: *const u8,
     xg: *const f32,
 ) -> f32 {
+    const { assert!((BITS != 3 && BITS != 6) || PAYLOAD > 0) };
     let (cb_lo, cb_hi) = codebook_tables::<CB>(gptr);
     let mut dot0 = _mm256_setzero_ps();
     let mut dot1 = _mm256_setzero_ps();
@@ -939,4 +942,44 @@ unsafe fn q8f16_group(gptr: *const u8, xg: *const f32) -> f32 {
         dot = _mm256_fmadd_ps(v, _mm256_loadu_ps(xg.add(c * 8)), dot);
     }
     scale * hsum256(dot)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Prefix bytes must not leak into codes, including a chunk ending at the
+    /// packed buffer's last byte. Every possible code occupies every lane.
+    #[target_feature(enable = "avx2")]
+    unsafe fn check_prefixed_codes<const BITS: usize>() {
+        let mask = (1u32 << BITS) - 1;
+        let mut packed = vec![0u8; BITS + 1];
+        for phase in 0..=mask {
+            let expected: [u32; 8] =
+                core::array::from_fn(|lane| (phase + lane as u32 * 13) & mask);
+            let word = expected.iter().enumerate().fold(0u64, |word, (lane, &code)| {
+                word | ((code as u64) << (lane * BITS))
+            });
+            packed[1..].copy_from_slice(&word.to_le_bytes()[..BITS]);
+            for prefix in 0..=u8::MAX {
+                packed[0] = prefix;
+                let mut got = [0u32; 8];
+                _mm256_storeu_si256(
+                    got.as_mut_ptr() as *mut __m256i,
+                    codes8::<BITS>(packed.as_ptr().add(1)),
+                );
+                assert_eq!(got, expected, "bits={BITS} phase={phase} prefix={prefix}");
+            }
+        }
+    }
+
+    #[test]
+    fn three_and_six_bit_codes_ignore_prefix_bytes() {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            unsafe {
+                check_prefixed_codes::<3>();
+                check_prefixed_codes::<6>();
+            }
+        }
+    }
 }
