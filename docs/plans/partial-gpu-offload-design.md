@@ -287,6 +287,18 @@ PCIe link (27.1 GB/s measured, §7) instead of device DRAM: this is llama.cpp's
   `out` scratch). `weight_gemv_swiglu_residual` — the one op family that fuses a
   GEMV into a kernel the seam cannot see — splits itself: GPU `silu_mul_f32`,
   then the CPU GEMV plus residual.
+- **Async CPU return.** Dense outputs and routed-expert residuals return with
+  `hipMemcpyAsync` from reusable, owned pinned transfer storage on the active
+  GPU stream (default stream when none is active). Dense GEMV writes directly
+  into that storage; no temporary-vector upload or extra output staging copy.
+  The next same-stream D2H batch is enqueued through raw owned extents before
+  exposing host slices. Its existing completion barrier retires the previous
+  upload and makes CPU reuse safe. Normal returns add no host wait or event.
+  Allocation growth, stream/device changes, and teardown retire pending access;
+  a failed drain retains the allocation rather than freeing a live DMA source.
+  Host readback or another GPU stream still needs an explicit dependency.
+  `h2d` timing now measures enqueue API wall time, not DMA completion; judge
+  gains using timing-disabled throughput, not the shorter splice trace alone.
 - **Native MTP with CPU-deferred experts.** Qwen3.5-family MTP is available.
   Narrow verify and accepted-prefix rollback retain the existing `<=4`-row CPU splice;
   wider forwards retain the GPU grouped PCIe read. At the CPU-deferred expert
