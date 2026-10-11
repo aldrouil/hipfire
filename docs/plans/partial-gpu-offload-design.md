@@ -287,6 +287,13 @@ PCIe link (27.1 GB/s measured, §7) instead of device DRAM: this is llama.cpp's
   `out` scratch). `weight_gemv_swiglu_residual` — the one op family that fuses a
   GEMV into a kernel the seam cannot see — splits itself: GPU `silu_mul_f32`,
   then the CPU GEMV plus residual.
+- **Native MTP with CPU-deferred experts.** Qwen3.5-family MTP is available.
+  Narrow verify and accepted-prefix rollback retain the existing `<=4`-row CPU splice;
+  wider forwards retain the GPU grouped PCIe read. At the CPU-deferred expert
+  handoff, invalidate pointer-keyed FP16 staging before the next layer reuses
+  activation scratch; the omitted GPU routed tail no longer changes that cache
+  key. Shared GPU launchers, kernel arithmetic, CPU accumulation order, Rayon
+  scheduling and placement/dispatch rules are unchanged.
 - **Two launcher properties the CPU path must reproduce exactly**, both of which
   fail *silently* rather than erroring, and both now pinned by parity arms in
   `crates/hipfire-arch-qwen35/tests/gpu_gemv_parity.rs`: the per-channel **AWQ**
