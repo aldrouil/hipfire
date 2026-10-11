@@ -3477,6 +3477,10 @@ mod tests {
         assert_eq!(inner.as_bytes(), &ELF[2..8]);
         assert_eq!(inner.subimage(1..3).unwrap().as_bytes(), &ELF[3..5]);
         assert_eq!(inner.subimage(6..6).unwrap().as_bytes(), &[] as &[u8]);
+        // The empty (`7..7`) and reversed (`4..3`) ranges are the point: each
+        // must be refused as out of bounds, so the loop is deliberately written
+        // with ranges clippy's deny-by-default `reversed_empty_ranges` rejects.
+        #[allow(clippy::reversed_empty_ranges)]
         for bad in [0..7, 7..7, 4..3] {
             let err = inner.subimage(bad.clone()).unwrap_err();
             assert!(
