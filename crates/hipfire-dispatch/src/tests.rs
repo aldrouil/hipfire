@@ -2658,6 +2658,7 @@ fn cpu_quant_rotation_agrees_with_plan() {
         DType::MQ2G256Lloyd,
         DType::MQ2G256LloydU,
         DType::MQ4G256Lloyd,
+        DType::MFP4G32E8,
         DType::HFQ6G256,
         DType::HFQ4G256,
         DType::HFQ4G128,
@@ -2695,7 +2696,6 @@ fn cpu_quant_refuses_unimplemented_formats() {
         DType::MFP4G32,
         DType::MFP4G32Lloyd,
         DType::MFP4G32P,
-        DType::MFP4G32E8,
         DType::MFP4G32E8SOA,
         DType::ParoQ4G128, // Givens rotation on the activation
         DType::Q4K,        // no dense HFQ artifact uses it

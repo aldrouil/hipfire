@@ -213,6 +213,7 @@ pub fn cpu_quant_for(dtype: DType) -> Option<CpuQuant> {
         DType::MQ2G256Lloyd => Some(CpuQuant::Mq2G256Lloyd),
         DType::MQ2G256LloydU => Some(CpuQuant::Mq2G256LloydU),
         DType::MQ4G256Lloyd => Some(CpuQuant::Mq4G256Lloyd),
+        DType::MFP4G32E8 => Some(CpuQuant::Mfp4G32E8),
         DType::HFQ6G256 => Some(CpuQuant::Hfq6G256),
         DType::HFQ4G256 => Some(CpuQuant::Hfq4G256),
         DType::HFQ4G128 => Some(CpuQuant::Hfq4G128),

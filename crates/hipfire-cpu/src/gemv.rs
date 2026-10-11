@@ -35,12 +35,12 @@ use crate::simd;
 /// scratch is stack-local, so no allocation is on the inner loop.
 const MAX_GROUP_ELEMS: usize = 256;
 
-/// Bytes per weight row: `(k / group_elems) * group_bytes`.
+/// Bytes per weight row: `row_header_bytes + (k / group_elems) * group_bytes`.
 ///
 /// G256 formats need `k % 256 == 0`, which every fixture shape satisfies and
 /// which [`gemv`]/[`gemm`] assert.
 pub fn row_bytes(q: CpuQuant, k: usize) -> usize {
-    (k / q.group_elems()) * q.group_bytes()
+    q.row_header_bytes() + (k / q.group_elems()) * q.group_bytes()
 }
 
 /// `y[0..m] = W[m,k] · x[0..k]`.
@@ -577,9 +577,19 @@ fn dot_row_scalar(q: CpuQuant, row: &[u8], k: usize, x: &[f32]) -> f32 {
     let gb = q.group_bytes();
     let mut scratch = [0.0f32; MAX_GROUP_ELEMS];
     let mut acc = 0.0f32;
+    let e8 = q == CpuQuant::Mfp4G32E8;
+    let row_scale = if e8 {
+        crate::quant::half_f16_to_f32(u16::from_le_bytes([row[0], row[1]]))
+    } else {
+        0.0
+    };
     for g in 0..k / ge {
         let codes = &mut scratch[..ge];
-        decode_group_codes(q, &row[g * gb..], codes);
+        if e8 {
+            crate::quant::decode_mfp4_e8_group(&row[16 + g * gb..], row_scale, codes);
+        } else {
+            decode_group_codes(q, &row[g * gb..], codes);
+        }
         let xg = &x[g * ge..g * ge + ge];
         let mut partial = 0.0f32;
         for i in 0..ge {
@@ -669,7 +679,7 @@ mod test {
             CpuQuant::Mq6G256,
             CpuQuant::Mq4G256,
             CpuQuant::Mq3G256Lloyd,
-            CpuQuant::Mq4G256,
+            CpuQuant::Mfp4G32E8,
         ];
         let quants: Vec<_> = (0..jobs).map(|j| tiers[j % tiers.len()]).collect();
         // Mixed tiers and token counts, including empty jobs between active
@@ -809,9 +819,9 @@ mod test {
         }
 
         let (m, k, tokens) = (5usize, 512usize, 3usize);
-        // qt 13 and qt 15 are the two formats with a prepared Σx and they use
-        // different reduction styles; both carry the same rotation, so one
-        // activation buffer serves every job.
+        // MQ4 has a different reduction style; MQ5/MQ6 share the `codes8`
+        // style. The same activation buffer exercises both separation and
+        // reuse, including a changed value at an unchanged address.
         let quants = [
             CpuQuant::Mq4G256,
             CpuQuant::Mq6G256,

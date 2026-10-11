@@ -79,7 +79,8 @@ fn features_for(q: CpuQuant) -> bool {
         | CpuQuant::Mq3G256Lloyd
         | CpuQuant::Mq4G256Lloyd
         | CpuQuant::Q8F16
-        | CpuQuant::F16 => avx2_f16c_available(),
+        | CpuQuant::F16
+        | CpuQuant::Mfp4G32E8 => avx2_f16c_available(),
         // Kernels over a plain f32 header, or over weights that need no fp16
         // step at all.
         CpuQuant::Mq4G256
@@ -137,14 +138,14 @@ pub(crate) enum ActivationSumKind {
     /// qt 13 `Mq4G256`: [`x86`]'s hand-unrolled nibble path, `(x0+x1)+(x2+x3)`
     /// per 32-wide block.
     Mq4Quartets,
-    /// qt 15 `Mq6G256`: [`x86`]'s `codes8` path, even/odd 8-lane chunk chains.
+    /// qt 15 `Mq6G256`: even/odd 8-lane chunk chains.
     Mq6Pairs,
 }
 
 /// The cached-`Σx` style `q` uses, or `None` when `q` has no prepared row dot.
 ///
-/// Only [`CpuQuant::Mq4G256`] (qt 13) and [`CpuQuant::Mq6G256`] (qt 15) return
-/// `Some`; every other format recomputes `Σx` inside [`row_dot_avx2`].
+/// MQ4 and MQ6 reuse prepared sums. Codebook formats have no affine zero term
+/// and do not need `Σx`.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn activation_sum_kind(q: CpuQuant) -> Option<ActivationSumKind> {
     match q {
@@ -216,7 +217,7 @@ pub(crate) fn row_dot_with_activation_sums(
 pub(crate) fn row_dot_avx2(q: CpuQuant, row: &[u8], k: usize, x: &[f32]) -> f32 {
     debug_assert!(features_for(q), "row_dot_avx2({q:?}): features absent");
     debug_assert!(
-        row.len() >= (k / q.group_elems()) * q.group_bytes() && x.len() >= k,
+        row.len() >= crate::gemv::row_bytes(q, k) && x.len() >= k,
         "row_dot_avx2({q:?}): row or activation shorter than the shape"
     );
     let (p, xp) = (row.as_ptr(), x.as_ptr());
@@ -242,6 +243,7 @@ pub(crate) fn row_dot_avx2(q: CpuQuant, row: &[u8], k: usize, x: &[f32]) -> f32 
         CpuQuant::Mq4CG256 => unsafe { x86::mq4cg256_row_dot(p, k, xp) },
         CpuQuant::Tq2G128 => unsafe { x86::tq2g128_row_dot(p, k, xp) },
         CpuQuant::Bq1G128 => unsafe { x86::bq1g128_row_dot(p, k, xp) },
+        CpuQuant::Mfp4G32E8 => unsafe { x86::mfp4g32_e8_row_dot(p, k, xp) },
         // V2 family: per-128 fp16 header.
         CpuQuant::Mq4G256V2 => unsafe { x86::mq4g256v2_row_dot(p, k, xp) },
         CpuQuant::Mq6G256V2 => unsafe { x86::mq6g256v2_row_dot(p, k, xp) },

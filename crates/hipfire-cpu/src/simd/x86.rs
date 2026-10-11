@@ -986,3 +986,55 @@ mod tests {
         }
     }
 }
+
+/// AoS E8 rows: one fp16 row scale, then 17-byte blocks of 32 weights.
+///
+/// # Safety
+/// Requires AVX2/FMA/F16C, `16 + (k / 32) * 17` readable bytes at `row`,
+/// `k` readable f32 values at `x`, and `k % 256 == 0`.
+#[target_feature(enable = "avx2,fma,f16c")]
+pub(super) unsafe fn mfp4g32_e8_row_dot(row: *const u8, k: usize, x: *const f32) -> f32 {
+    let row_scale = f16_pair(row).0;
+    let shifts = _mm256_setr_epi32(0, 4, 8, 12, 16, 20, 24, 28);
+    let mask = _mm256_set1_epi32(15);
+    let center = _mm256_set1_epi32(7);
+    let mut acc = 0.0f32;
+    for group in 0..k / 256 {
+        let mut dot = _mm256_setzero_ps();
+        for block in 0..8 {
+            let at = row.add(16 + (group * 8 + block) * 17);
+            let scale = row_scale * crate::quant::mfp4_e8_scale(*at) * 0.88;
+            let scale = _mm256_set1_ps(scale);
+            for word in 0..4 {
+                // Exactly four codeword bytes, including at the final row end.
+                let index = (at.add(1 + word * 4) as *const u32).read_unaligned();
+                let parity = (index
+                    ^ (index >> 4)
+                    ^ (index >> 8)
+                    ^ (index >> 12)
+                    ^ (index >> 16)
+                    ^ (index >> 20)
+                    ^ (index >> 24))
+                    & 1;
+                let last = ((index >> 27) & 14) | parity;
+                let nibbles = _mm256_and_si256(
+                    _mm256_srlv_epi32(_mm256_set1_epi32(index as i32), shifts),
+                    mask,
+                );
+                let nibbles =
+                    _mm256_blend_epi32(nibbles, _mm256_set1_epi32(last as i32), 0x80);
+                let coordinates = _mm256_add_ps(
+                    _mm256_cvtepi32_ps(_mm256_sub_epi32(nibbles, center)),
+                    _mm256_set1_ps((index >> 31) as f32 * 0.5),
+                );
+                // Round the decoded weight before its FMA, as in the scalar
+                // decoder. Folding scale into x changes the format's bits.
+                let weights = _mm256_mul_ps(scale, coordinates);
+                let xp = x.add(group * 256 + block * 32 + word * 8);
+                dot = _mm256_fmadd_ps(weights, _mm256_loadu_ps(xp), dot);
+            }
+        }
+        acc += hsum256(dot);
+    }
+    acc
+}

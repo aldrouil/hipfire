@@ -109,7 +109,7 @@ fn dequant_group_matches_the_canonical_decoder_on_real_tensors() {
             };
             let k = elems / m;
             let (ge, gb) = (q.group_elems(), q.group_bytes());
-            let rb = (k / ge) * gb;
+            let rb = hipfire_cpu::gemv::row_bytes(q, k);
 
             let rows = m.min(CHECK_ROWS);
             let mut got = vec![0.0f32; k];
@@ -121,7 +121,15 @@ fn dequant_group_matches_the_canonical_decoder_on_real_tensors() {
 
                 // … versus the transcription, group by group.
                 for g in 0..k / ge {
-                    dequant_group(q, &row_bytes[g * gb..], &mut got[g * ge..(g + 1) * ge]);
+                    if q.row_header_bytes() == 0 {
+                        dequant_group(q, &row_bytes[g * gb..], &mut got[g * ge..(g + 1) * ge]);
+                    } else {
+                        // E8 keeps its row scale once, before all FWHT groups.
+                        let mut group = [0u8; 152];
+                        group[..16].copy_from_slice(&row_bytes[..16]);
+                        group[16..].copy_from_slice(&row_bytes[16 + g * gb..16 + (g + 1) * gb]);
+                        dequant_group(q, &group, &mut got[g * ge..(g + 1) * ge]);
+                    }
                 }
 
                 for (i, (a, b)) in got.iter().zip(&want).enumerate() {

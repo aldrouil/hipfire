@@ -128,7 +128,7 @@ pub(crate) fn bind_live_expert_cache(
 
 /// Owning storage for a layer's packed routed experts.
 ///
-/// Uniform MQ4 layers pack into exactly one bucket per projection
+/// Uniform raw layers pack into exactly one bucket per projection
 /// (`gate_up.len() == down.len() == 1`); graded (mixed-dtype) host layers
 /// pack one blob per distinct `(gate_up, down)` tag bucket. `experts` still
 /// carries one [`WeightTensor`] view per routed expert so the CPU fallback
@@ -259,6 +259,7 @@ pub(crate) fn dtype_from_quant_type(qt: u8) -> HipResult<DType> {
         19 => Ok(DType::MQ2G256Lloyd),
         20 => Ok(DType::MQ3G256Lloyd),
         30 => Ok(DType::MQ4G256Lloyd),
+        31 => Ok(DType::MQ5G256),
         34 => Ok(DType::MFP4G32E8),
         36 => Ok(DType::MFP3G32E8),
         38 => Ok(DType::MQ2G256GL),

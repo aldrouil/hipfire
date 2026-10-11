@@ -4819,22 +4819,24 @@ fn e8_soa_experts() -> bool {
     })
 }
 
-/// Quant types that share the 136 B/group stride and can be packed into
-/// layer-level blobs via `try_load_packed_mq4_experts`. All three have
-/// identical byte layout for concatenation purposes — only the 8-byte group
-/// header interpretation differs, which is handled by kernel dispatch on
-/// `gpu_dtype`. qt=30 (MQ4G256Lloyd, 160 B/group) and qt=47 (MQ6G256V2,
-/// 200 B/group) are excluded because their strides differ.
-fn packable_mq4_dtype(qt: u8) -> Option<DType> {
+/// Uniform raw layouts supported by the existing indexed expert dispatch.
+/// Device packing retains the validated MQ4 family. Host packing additionally
+/// admits raw uniform expert formats: projection strides come from HFQ byte
+/// counts, not MQ4's group size, and views retain their exact dtype.
+fn packable_expert_dtype(qt: u8, target: MemoryTarget) -> Option<DType> {
     match qt {
         13 => Some(DType::MQ4G256),
         44 => Some(DType::MQ4G256V2),
         45 => Some(DType::MQ4CG256),
+        15 if target == MemoryTarget::HostMapped => Some(DType::MQ6G256),
+        19 if target == MemoryTarget::HostMapped => Some(DType::MQ2G256Lloyd),
+        31 if target == MemoryTarget::HostMapped => Some(DType::MQ5G256),
+        34 if target == MemoryTarget::HostMapped => Some(DType::MFP4G32E8),
         _ => None,
     }
 }
 
-struct PackedMq4ExpertSpec {
+struct PackedExpertSpec {
     gate_up_name: String,
     down_name: String,
 }
@@ -4849,11 +4851,6 @@ struct PackedMq4ExpertSpec {
 fn packed_mq4_experts_supported(gpu: &Gpu) -> bool {
     gpu.arch_caps.is_rdna3()
 }
-
-/// Pack a uniform MQ4 routed-expert layer into two GPU allocations while
-/// preserving one `WeightTensor` view and one device pointer-table entry per
-/// expert. Returns `None` for every non-uniform/non-MQ4 layout so mixed tiers,
-/// ParoQuant, paged experts, and EP streaming retain their literal behavior.
 
 /// Host-side byte source for a packed blob: either a borrowed mmap slice
 enum HostBlob<'a> {
@@ -4894,7 +4891,12 @@ fn contiguous_tensor_span<'a>(hfq: &'a HfqFile, names: &[&str], stride: usize) -
     hfq.data_range(first.data_offset, expect - first.data_offset)
 }
 
-fn try_load_packed_mq4_experts(
+/// Pack a uniform routed-expert layer into two allocations while preserving
+/// one `WeightTensor` view and one device pointer-table entry per expert.
+/// Non-uniform host layouts use the graded packer; device layouts outside
+/// the validated MQ4 family retain their literal behavior.
+
+fn try_load_packed_experts(
     hfq: &HfqFile,
     gpu: &mut Gpu,
     p: &str,
@@ -4935,17 +4937,18 @@ fn try_load_packed_mq4_experts(
         else {
             return Ok(None);
         };
-        // Uniform fast-path gate: every expert must share the packable MQ4
-        // dtype and stride. Anything else falls through to the graded host
-        // packer below (host-only) or `None` (device keeps literal tensors).
-        let uniform_ok = packable_mq4_dtype(gate_up_qt)
-            .zip(packable_mq4_dtype(down_qt))
+        // Every expert must share the admitted dtype and projection strides.
+        // Other layouts retain the graded host or literal device path.
+        let uniform_ok = packable_expert_dtype(gate_up_qt, target)
+            .zip(packable_expert_dtype(down_qt, target))
             .is_some_and(|(gu_dt, dn_dt)| gu_dt == dn_dt);
         if !uniform_ok {
             return try_load_graded_host_experts(hfq, gpu, p, expert_ids, mi, dim, target);
         }
-        let gu_dt = packable_mq4_dtype(gate_up_qt).expect("graded fallback checked packable");
-        let dn_dt = packable_mq4_dtype(down_qt).expect("graded fallback checked packable");
+        let gu_dt =
+            packable_expert_dtype(gate_up_qt, target).expect("graded fallback checked packable");
+        let dn_dt =
+            packable_expert_dtype(down_qt, target).expect("graded fallback checked packable");
         debug_assert_eq!(gu_dt, dn_dt, "uniform gate must equal uniform down dtype");
         match expert_dtype {
             None => expert_dtype = Some(gu_dt),
@@ -4962,14 +4965,14 @@ fn try_load_packed_mq4_experts(
             Some(stride) if stride == down_bytes => {}
             Some(_) => return Ok(None),
         }
-        specs.push(PackedMq4ExpertSpec {
+        specs.push(PackedExpertSpec {
             gate_up_name,
             down_name,
         });
     }
 
-    let gate_up_stride = gate_up_stride.expect("non-empty packed MQ4 expert list");
-    let down_stride = down_stride.expect("non-empty packed MQ4 expert list");
+    let gate_up_stride = gate_up_stride.expect("non-empty packed expert list");
+    let down_stride = down_stride.expect("non-empty packed expert list");
     // Zero-copy fast path: when every expert's tensor lies contiguous in-file
     // (expert 0's gate_up ends exactly where expert 1's begins, etc.) and the
     // mmap is alive (dGPU, no overlay), upload both blobs straight from the
@@ -5003,7 +5006,7 @@ fn try_load_packed_mq4_experts(
                     HipError::new(
                         0,
                         &format!(
-                            "qwen35: packed MQ4 tensor disappeared: {}",
+                            "qwen35: packed tensor disappeared: {}",
                             spec.gate_up_name
                         ),
                     )
@@ -5012,7 +5015,7 @@ fn try_load_packed_mq4_experts(
                     return Err(HipError::new(
                         0,
                         &format!(
-                            "qwen35: packed MQ4 gate_up stride changed for {}: {} != {gate_up_stride}",
+                            "qwen35: packed gate_up stride changed for {}: {} != {gate_up_stride}",
                             spec.gate_up_name,
                             bytes.len()
                         ),
@@ -5025,14 +5028,14 @@ fn try_load_packed_mq4_experts(
                 let (_, bytes) = hfq.tensor_data_pread(&spec.down_name).ok_or_else(|| {
                     HipError::new(
                         0,
-                        &format!("qwen35: packed MQ4 tensor disappeared: {}", spec.down_name),
+                        &format!("qwen35: packed tensor disappeared: {}", spec.down_name),
                     )
                 })?;
                 if bytes.len() != down_stride {
                     return Err(HipError::new(
                         0,
                         &format!(
-                            "qwen35: packed MQ4 down stride changed for {}: {} != {down_stride}",
+                            "qwen35: packed down stride changed for {}: {} != {down_stride}",
                             spec.down_name,
                             bytes.len()
                         ),
@@ -5046,13 +5049,13 @@ fn try_load_packed_mq4_experts(
         let jobs = [
             HfqReadJob::packed(
                 hfq,
-                format!("{p}.packed_mq4_gate_up"),
+                format!("{p}.packed_gate_up"),
                 specs.iter().map(|spec| spec.gate_up_name.as_str()),
             )
             .map_err(|e| HipError::new(0, &format!("qwen35: plan packed gate_up: {e}")))?,
             HfqReadJob::packed(
                 hfq,
-                format!("{p}.packed_mq4_down"),
+                format!("{p}.packed_down"),
                 specs.iter().map(|spec| spec.down_name.as_str()),
             )
             .map_err(|e| HipError::new(0, &format!("qwen35: plan packed down: {e}")))?,
@@ -5061,8 +5064,8 @@ fn try_load_packed_mq4_experts(
             .map_err(|e| HipError::new(0, &format!("qwen35: parallel packed expert read: {e}")))?
             .into_iter();
         (
-            HostBlob::Owned(results.next().expect("two packed MQ4 jobs").data),
-            HostBlob::Owned(results.next().expect("two packed MQ4 jobs").data),
+            HostBlob::Owned(results.next().expect("two packed expert jobs").data),
+            HostBlob::Owned(results.next().expect("two packed expert jobs").data),
         )
     };
     let trace = hipfire_config::developer_var_os("HIPFIRE_LOAD_TRACE").is_some();
@@ -5097,7 +5100,7 @@ fn try_load_packed_mq4_experts(
         );
     }
 
-    let expert_dtype = expert_dtype.expect("non-empty packed MQ4 expert list");
+    let expert_dtype = expert_dtype.expect("non-empty packed expert list");
     let mut experts = Vec::with_capacity(specs.len());
     for (slot, spec) in specs.iter().enumerate() {
         let mut gate_up = WeightTensor {
@@ -5925,7 +5928,7 @@ pub(crate) fn load_moe_ffn(
     );
 
     let expert_ids = source_expert_ids;
-    let packed = match try_load_packed_mq4_experts(
+    let packed = match try_load_packed_experts(
         hfq,
         gpu,
         p,
@@ -5938,10 +5941,10 @@ pub(crate) fn load_moe_ffn(
         Err(error) => return Err(pending.rollback(gpu, error)),
     };
     if packed.is_none() && residency.experts_host() {
-        // No packer covered this layer (uniform packer needs one MQ4/MQ4V2/MQ4C
-        // dtype+stride; graded host packer needs one tag-mapped pair per
-        // expert with no AWQ/LUT/GL sidecars). Per-expert host tensors would
-        // each pay `HOST_TAIL_PAD_BYTES` (1 MiB) of tail pad — ~512 MiB per
+        // No packer covered this layer (uniform host packing needs an admitted
+        // dtype and shared projection strides; graded packing needs one
+        // tag-mapped pair per expert with no AWQ/LUT/GL sidecars). Literal
+        // host tensors each pay `HOST_TAIL_PAD_BYTES` (1 MiB) — ~512 MiB per
         // layer against a ~430 MB payload — so fail closed and name the layer.
         return Err(pending.rollback(
             gpu,
@@ -5950,10 +5953,10 @@ pub(crate) fn load_moe_ffn(
                 &format!(
                     "qwen35: layer {layer_idx} routed experts are host-placed \
                      (memory.moe_expert_budget) but expert packing does not apply: uniform packing needs \
-                     one shared MQ4/MQ4V2/MQ4C dtype and stride, and graded host packing needs every \
+                     one supported raw dtype and shared projection strides, and graded host packing needs every \
                      expert on a tag-mapped (gate, down) pair with no AWQ/LUT/GL sidecars. Refusing a \
                      per-expert host fallback, which would cost ~512 MiB \
-                     of tail pad per layer; re-quantize the experts to a packable MQ4 format"
+                     of tail pad per layer"
                 ),
             ),
         ));
@@ -5962,7 +5965,7 @@ pub(crate) fn load_moe_ffn(
         if layer_idx == 0 {
             let n_blobs = owners.gate_up.len() + owners.down.len();
             eprintln!(
-                "  routed MQ4 expert packing: {} per-expert weight buffers -> {n_blobs} layer blobs",
+                "  routed expert packing: {} per-expert weight buffers -> {n_blobs} layer blobs",
                 table_len
             );
         }
@@ -6109,6 +6112,12 @@ pub(crate) fn load_moe_ffn(
     let packed_host = residency.experts_host() && pending.packed_expert_owners.is_some();
     let cpu_expert_splice = hipfire_dispatch::cpu_exec::moe_cpu_experts_enabled()
         && packed_host
+        // An unsupported CPU format keeps the existing GPU-over-host-RAM
+        // route. Arming the splice would fail only after loading the model.
+        && pending.experts.iter().all(|e| {
+            hipfire_dispatch::cpu_exec::cpu_quant_for(e.gate_up.gpu_dtype).is_some()
+                && hipfire_dispatch::cpu_exec::cpu_quant_for(e.down.gpu_dtype).is_some()
+        })
         && matches!(pending.experts.first(), Some(e) if e.gate_up.awq_scale.is_none() && e.down.awq_scale.is_none());
     // Fail closed rather than silently leave host-placed AWQ experts on the
     // PCIe read while the coverage line claims the CPU. A bare `gemv` would
@@ -8103,5 +8112,223 @@ mod direct_load_fault_tests {
             format!("{err:?}").contains("at least one device"),
             "production route changed validation: {err:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod packed_host_expert_tests {
+    use super::*;
+    use hipfire_dispatch::context::DispatchCtx;
+    use hipfire_dispatch::cpu_exec::{cpu_quant_for, moe_cpu_experts, CpuMoeExpert};
+    use hipfire_dispatch::families::gemv::{GemvFamily, WeightRef};
+    use hipfire_dispatch::types::DispatchError;
+
+    /// Real loader views must preserve numerical output at nonzero offsets,
+    /// repeated expert selections, and accepted-prefix replay widths.
+    #[test]
+    #[ignore = "requires HIP GPU and HIPFIRE_MOE_PARITY_FIXTURE"]
+    fn packed_host_experts_preserve_multirow_outputs() -> Result<(), Box<dyn std::error::Error>> {
+        let path = std::env::var("HIPFIRE_MOE_PARITY_FIXTURE")?;
+        let hfq = HfqFile::open(std::path::Path::new(&path))?;
+        let config = super::super::config_from_hfq(&hfq)?;
+        let (dim, mi) = (config.dim, config.moe_intermediate_size);
+        let mut gpu = Gpu::init()?;
+        // Reverse, nonadjacent source ids exercise the ordered-read path and
+        // prevent an expert-zero or contiguous-file assumption from passing.
+        let ids = [3usize, 0];
+        let (experts, owners) = try_load_packed_experts(
+            &hfq,
+            &mut gpu,
+            "layers.0",
+            &ids,
+            mi,
+            dim,
+            MemoryTarget::HostMapped,
+        )?
+        .ok_or("uniform fixture was not host-packable")?;
+        let gemv = GemvFamily::new();
+        let mut original = Vec::new();
+        for (slot, &id) in ids.iter().enumerate() {
+            let mut raw = Vec::new();
+            for (projection, view) in [
+                ("gate_up_proj", &experts[slot].gate_up),
+                ("down_proj", &experts[slot].down),
+            ] {
+                let bare = format!("layers.0.mlp.experts.{id}.{projection}.weight");
+                let name = qwen35_tensor_name_candidates(&bare)
+                    .into_iter()
+                    .find(|name| hfq.find_tensor_info(name).is_some())
+                    .ok_or("fixture projection missing")?;
+                let bytes = hfq
+                    .tensor_data_pread(&name)
+                    .map(|(_, bytes)| bytes.to_vec())
+                    .ok_or("fixture bytes missing")?;
+                let resident = load_weight_tensor(
+                    &hfq,
+                    &mut gpu,
+                    &name,
+                    view.m,
+                    view.k,
+                    qwen35_tensor_name_candidates,
+                    MemoryTarget::Device,
+                )?;
+                let x_host: Vec<f32> = (0..view.k)
+                    .map(|i| ((i * 17 + slot * 31) % 257) as f32 / 256.0 - 0.5)
+                    .collect();
+                let x = gpu.upload_f32(&x_host, &[view.k])?;
+                let y_host = gpu.zeros(&[view.m], DType::F32)?;
+                let y_device = gpu.zeros(&[view.m], DType::F32)?;
+                for (weight, y) in [(view, &y_host), (&resident, &y_device)] {
+                    let wr = WeightRef {
+                        buf: &weight.buf,
+                        dtype: weight.gpu_dtype,
+                        m: weight.m,
+                        k: weight.k,
+                        row_stride: weight.row_stride,
+                        rotation: None,
+                        awq_scale: weight.awq_scale.as_ref(),
+                        lloyd_lut_e4m3: weight.lloyd_lut_e4m3,
+                        lloyd_lut_f16: weight.lloyd_lut_f16,
+                        lloyd_lut_c16: weight.lloyd_lut_c16,
+                    };
+                    gemv.run_auto(&DispatchCtx::new(&gpu), &mut gpu, &wr, &x, y)?;
+                }
+                let bits =
+                    |values: Vec<f32>| values.into_iter().map(f32::to_bits).collect::<Vec<_>>();
+                assert_eq!(
+                    bits(gpu.download_f32(&y_host)?),
+                    bits(gpu.download_f32(&y_device)?),
+                    "packed host {projection} expert {id} changed GPU output",
+                );
+                gpu.free_tensor(resident.buf)?;
+                if let Some(scale) = resident.awq_scale {
+                    gpu.free_tensor(scale)?;
+                }
+                for tensor in [x, y_host, y_device] {
+                    gpu.free_tensor(tensor)?;
+                }
+                raw.push(bytes);
+            }
+            original.push(raw);
+        }
+
+        if let Some(q) = cpu_quant_for(experts[0].gate_up.gpu_dtype) {
+            const ROWS: usize = 4;
+            const TOP_K: usize = 2;
+            let indices = [0usize, 1, 1, 1, 1, 0, 0, 0];
+            let weights = [0.6f32, 0.4, 0.25, 0.75, 0.7, 0.3, 0.5, 0.5];
+            let seed: Vec<f32> = (0..ROWS * dim).map(|i| (i % 7) as f32 * 0.01).collect();
+            let mut xr: Vec<f32> = (0..ROWS * dim)
+                .map(|i| ((i * 13) % 251) as f32 / 250.0 - 0.5)
+                .collect();
+            for row in xr.chunks_exact_mut(dim) {
+                hipfire_cpu::quant::rotate_x(row);
+            }
+            let mut reference = seed.clone();
+            for row in 0..ROWS {
+                for rank in 0..TOP_K {
+                    let slot = row * TOP_K + rank;
+                    let e = indices[slot];
+                    let mut gu = vec![0.0f32; 2 * mi];
+                    hipfire_cpu::gemv::gemv(
+                        q,
+                        &original[e][0],
+                        2 * mi,
+                        dim,
+                        &xr[row * dim..(row + 1) * dim],
+                        &mut gu,
+                    );
+                    let mut hidden = vec![0.0f32; mi];
+                    hipfire_cpu::epilogue::silu_mul(&gu, &mut hidden);
+                    hipfire_cpu::quant::rotate_x(&mut hidden);
+                    let mut down = vec![0.0f32; dim];
+                    hipfire_cpu::gemv::gemv(q, &original[e][1], dim, mi, &hidden, &mut down);
+                    for i in 0..dim {
+                        reference[row * dim + i] += weights[slot] * down[i];
+                    }
+                }
+            }
+            let x = gpu.upload_f32(&xr, &[ROWS * dim])?;
+            let index_bits: Vec<f32> = indices
+                .iter()
+                .map(|&id| f32::from_bits(id as u32))
+                .collect();
+            let idx = gpu.upload_f32(&index_bits, &[ROWS * TOP_K])?;
+            let w = gpu.upload_f32(&weights, &[ROWS * TOP_K])?;
+            fn owner_slice<'a>(
+                gpu: &Gpu,
+                view: &GpuTensor,
+                owner: &'a GpuTensor,
+            ) -> Result<&'a [u8], DispatchError> {
+                let bytes = gpu
+                    .host_bytes(owner)
+                    .ok_or_else(|| DispatchError::Hip("owner not host-mapped".into()))?;
+                let offset = (view.buf.as_ptr() as usize)
+                    .checked_sub(owner.buf.as_ptr() as usize)
+                    .ok_or_else(|| DispatchError::Hip("view before owner".into()))?;
+                bytes
+                    .get(offset..offset + view.byte_size())
+                    .ok_or_else(|| DispatchError::Hip("view outside owner".into()))
+            }
+            // Run wide verify, then its accepted prefix, then single-row decode.
+            // Spare tensor capacity must not be interpreted as active rows.
+            for rows in [ROWS, 2, 1] {
+                let residual = gpu.upload_f32(&seed, &[ROWS * dim])?;
+                moe_cpu_experts(
+                    &gpu,
+                    dim,
+                    mi,
+                    rows,
+                    TOP_K,
+                    &x,
+                    &idx,
+                    &w,
+                    &residual,
+                    false,
+                    |e| {
+                        Ok(CpuMoeExpert {
+                            gate_up_quant: q,
+                            gate_up: owner_slice(
+                                &gpu,
+                                &experts[e].gate_up.buf,
+                                &owners.gate_up[0],
+                            )?,
+                            down_quant: q,
+                            down: owner_slice(&gpu, &experts[e].down.buf, &owners.down[0])?,
+                        })
+                    },
+                )?;
+                let got = gpu.download_f32(&residual)?;
+                let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+                assert_eq!(
+                    bits(&got[..rows * dim]),
+                    bits(&reference[..rows * dim]),
+                    "CPU width {rows} changed output bits"
+                );
+                assert_eq!(
+                    bits(&got[rows * dim..]),
+                    bits(&seed[rows * dim..]),
+                    "CPU width {rows} overwrote spare rows"
+                );
+                gpu.free_tensor(residual)?;
+            }
+            for tensor in [x, idx, w] {
+                gpu.free_tensor(tensor)?;
+            }
+        }
+        for expert in experts {
+            for weight in [expert.gate_up, expert.down] {
+                if let Some(scale) = weight.awq_scale {
+                    gpu.free_tensor(scale)?;
+                }
+            }
+        }
+        for owner in owners.gate_up.into_iter().chain(owners.down) {
+            gpu.free_tensor(owner)?;
+        }
+        eprintln!(
+            "PACKED_HOST_EXPERT_PARITY PASS: {path} (GPU bits; CPU widths 4/2/1 when supported)"
+        );
+        Ok(())
     }
 }

@@ -75,6 +75,12 @@ const REAL: &[(&str, u8, DType, CpuQuant)] = &[
     ("qwen3.5-2b.hf6", 8, DType::HFQ6G256, CpuQuant::Hfq6G256),
     // Same format, larger model: the 9B's 4096-wide rows exercise 16 groups.
     ("qwen3.5-9b.mq4", 13, DType::MQ4G256, CpuQuant::Mq4G256),
+    (
+        "qwen3.6-35b-a3b.mfp4",
+        34,
+        DType::MFP4G32E8,
+        CpuQuant::Mfp4G32E8,
+    ),
 ];
 
 /// Formats with no fixture on disk: (quant_type, DType, CpuQuant).
@@ -114,6 +120,7 @@ const SYNTH: &[(u8, DType, CpuQuant)] = &[
 const EXTRA: &[(u8, DType, CpuQuant)] = &[
     (49, DType::MQ3G256V2, CpuQuant::Mq3G256V2),
     (45, DType::MQ4CG256, CpuQuant::Mq4CG256),
+    (34, DType::MFP4G32E8, CpuQuant::Mfp4G32E8),
 ];
 
 fn models_dir() -> PathBuf {
@@ -195,6 +202,10 @@ fn synth_weights(q: CpuQuant, m: usize, k: usize) -> Vec<u8> {
                     0xb400, 0xb000, 0x3000, 0x3400, 0x3800, 0x3c00,
                 ])),
                 CpuQuant::Q8F16 => bytes[..2].copy_from_slice(&0x3800u16.to_le_bytes()),
+                // qt 34 is covered by the REAL row (real quantizer bytes) and
+                // the packed-host multirow oracle — never by this synthetic
+                // path, so this arm is unreachable by construction.
+                CpuQuant::Mfp4G32E8 => {}
                 // The element formats are covered bit-exactly by the fixture
                 // tables in `hipfire-cpu` and by the cross-check over real norms.
                 CpuQuant::F16 | CpuQuant::F32 | CpuQuant::Bf16 => unreachable!("not in SYNTH"),
@@ -637,7 +648,12 @@ fn gpu_cpu_gemv_parity_per_format() {
     }
     // A format with no canonical decoder has no other oracle: state which ones
     // were only checked synthetically, so the record is not read as if every row
-    // came from a real tensor.
+    // came from a real tensor. qt 34 (MFP4G32-E8) keeps its canonical-group
+    // decode inside `hipfire-cpu` (`decode_group_codes` + the row-header arm),
+    // covered there by the literal oracle and `row_bytes` stride test; it has
+    // no `dequantize_to_f32` row-tensor arm, so its tensor-level oracle here is
+    // the production launcher vs the transcription over the REAL row (plus the
+    // packed-host multirow oracle) — never a synthetic buffer.
     eprintln!(
         "\nnote: qt 45/47/48/49/50/9/10/31 have no canonical `dequantize_to_f32` arm; \
          their rows are the production launcher vs the transcription (synthetic buffers, \
@@ -775,5 +791,6 @@ fn q_format_name(q: CpuQuant) -> &'static str {
         CpuQuant::F32 => "F32",
         CpuQuant::Bf16 => "Bf16",
         CpuQuant::Q8F16 => "Q8F16",
+        CpuQuant::Mfp4G32E8 => "Mfp4G32E8",
     }
 }
