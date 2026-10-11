@@ -681,8 +681,8 @@ pub const DECISIONS: &[Decision] = &[
     },
     Decision {
         id: "eager-only-refusals",
-        predicates: &[IsRecording, CaptureMode, ReplayEnabled, GraphSlotCapturing],
-        condition: "entry points that return an error (or `false`) when recorded/captured before any launch: prepare_mq4v2_fp8_x (dispatch.rs:2880), gfx12 FP8 WMMA GEMMs and producers (gemm.rs *_fp8*, gemv.rs *_fp8_gfx12_batched), F2 launch (gemm.rs:9782), Lloyd MMQ pad-to-128 (pad_f32_batch_to_128, gemm.rs:20157), wide gfx11 FA2 Q16 scratch growth (attention.rs:5895-5908), DFlash gfx1100 bulk state copy (dflash_state_copy.rs:130), VMM KV growth (saddle-core kv.rs:1908), DS4 heterogeneous G4 (forward.rs:3267-3273), MoE CPU top-k fallback (pipeline/mod.rs:1914), batched spec serving bodies forward_prefill_batch_multi (qwen35 prefill_multi.rs:294) and dflash_cb_verify (qwen35 dflash_cb.rs:508), gfx1201 rows/segment twin table staging under graph capture (stage_rows_table, rows_batched.rs:251; stage_attention_fp8_e4m3_kv_batched_segs, verify_twins.rs:199)",
+        predicates: &[IsRecording, CaptureMode, ReplayEnabled, GraphSlotCapturing, G0Observing],
+        condition: "entry points that return an error (or `false`) when recorded/captured before any launch: prepare_mq4v2_fp8_x (dispatch.rs:2880), gfx12 FP8 WMMA GEMMs and producers (gemm.rs *_fp8*, gemv.rs *_fp8_gfx12_batched), F2 launch (gemm.rs:9782), Lloyd MMQ pad-to-128 (pad_f32_batch_to_128, gemm.rs:20157), wide gfx11 FA2 Q16 scratch growth (attention.rs:5895-5908), DFlash gfx1100 bulk state copy (dflash_state_copy.rs:130), VMM KV growth (saddle-core kv.rs:1908), DS4 heterogeneous G4 (forward.rs:3267-3273), MoE CPU top-k fallback (pipeline/mod.rs:1914), batched spec serving bodies forward_prefill_batch_multi (qwen35 prefill_multi.rs:294) and dflash_cb_verify (qwen35 dflash_cb.rs:508), gfx1201 rows/segment twin table staging under graph capture (stage_rows_table, rows_batched.rs:251; stage_attention_fp8_e4m3_kv_batched_segs, verify_twins.rs:199), gfx1201 DFlash-draft overwrite-twin GEMM (gemm_mq4g256v2_overwrite_gfx12_dflash, dflash_draft_fusion.rs:181-183; the refused branch launches nothing and the caller runs the legacy memset + residual route)",
         effect: Refusal,
         switches: "error before any launch; the admission predicate that routes to the eager-only entry is inventoried at the caller",
         kernels: &[],
@@ -1240,6 +1240,7 @@ pub const SITES: &[Site] = &[
     Site { file: "rdna-compute/src/attention.rs", function: "launch_verify_gqa", occurrences: 1, decisions: &["verify-attention-wmma-gqa"] },
     Site { file: "rdna-compute/src/attention.rs", function: "replay_stable_tile_count", occurrences: 4, decisions: &["attention-tile-grid-superset"] },
     Site { file: "rdna-compute/src/dflash_draft_fusion.rs", function: "draft_collapse_mq4v2_route", occurrences: 2, decisions: &["dflash-gfx1100-fusions"] },
+    Site { file: "rdna-compute/src/dflash_draft_fusion.rs", function: "gemm_mq4g256v2_overwrite_gfx12_dflash", occurrences: 3, decisions: &["eager-only-refusals"] },
     Site { file: "rdna-compute/src/dflash_hidden_scatter.rs", function: "dflash_hidden_commit5_applicable", occurrences: 2, decisions: &["dflash-gfx1100-fusions"] },
     Site { file: "rdna-compute/src/dflash_hidden_scatter.rs", function: "dflash_hidden_scatter5_try", occurrences: 2, decisions: &["dflash-gfx1100-fusions"] },
     Site { file: "rdna-compute/src/dflash_state_copy.rs", function: "dflash_state_bulk_copy_gfx1100_on_stream", occurrences: 1, decisions: &["eager-only-refusals"] },
