@@ -2294,12 +2294,6 @@ fn finish_qwen35_load(
             "  qwen35 MTP: off by default with host-mapped experts; opt in with --spec mtp"
         );
     }
-    let mtp_cpu_deferred_decline = cpu_deferred_moe && ctx.spec.mtp.is_none();
-    if mtp_cpu_deferred_decline {
-        eprintln!(
-            "  qwen35 MTP: unavailable with CPU-deferred MoE experts (memory.offload_exec=cpu); running AR"
-        );
-    }
     // ── qwen35 MTP head (single resolver: bundled .mq4-mtp trailer then .mtp sidecar) ──
     // Precedence: DSpark > DFlash > MTP > n-gram. Gate: only arch 5/6, no adaptive/eviction,
     // and typed mtp != off. Bundled first, then the sidecar the CLI resolved
@@ -2311,24 +2305,11 @@ fn finish_qwen35_load(
         || !matches!(arch_id, 5 | 6)
         || ctx.spec.mtp == Some(false)
         || mtp_spill_degrade
-        || mtp_cpu_deferred_decline
         || dflash.is_some()
         || dspark_speculator.is_some()
     {
         None
     } else {
-        // CPU-deferred MoE experts (memory.offload_exec=cpu) recompute the routed
-        // FFN on the host with no device-side expert tables for the verify pass,
-        // so native MTP cannot be validated. Forced on (`mtp=on`) is a hard error
-        // here, before the head is resolved/uploaded; `auto` already declined above.
-        if cpu_deferred_moe {
-            return Err(rollback_unfinished_qwen35(
-                "Native MTP is unavailable with CPU-deferred MoE experts (memory.offload_exec=cpu); use AR or PCIe offload".to_string(),
-                bundle,
-                vision_weights,
-                ctx.gpu,
-            ));
-        }
         // `ctx.path` is canonical, so a sidecar beside a symlinked trunk is not
         // its sibling; the CLI resolves that case into `ctx.mtp_path`. Direct
         // daemon clients keep the canonical-sibling lookup.

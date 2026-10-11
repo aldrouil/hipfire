@@ -927,6 +927,9 @@ fn moe_ffn_decode_impl<'a>(
             splice_residual,
             1,
         )?;
+        // CPU deferral omits the GPU tail that used to change the activation
+        // staging cache key; reused scratch must be refreshed by the next layer.
+        gpu.invalidate_fp16_cache();
     }
     let splice_ns = t_splice.elapsed().as_nanos() as u64;
     let total_ns = t_window.elapsed().as_nanos() as u64;

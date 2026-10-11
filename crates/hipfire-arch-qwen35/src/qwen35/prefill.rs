@@ -5361,6 +5361,9 @@ pub(crate) fn prefill_moe_ffn_body_batched_with_route_layered<'a>(
                 &pbs.x_batch,
                 n,
             )?;
+            // The omitted GPU routed tail no longer changes the FP16 staging
+            // cache key. The next layer reuses x_rot_batch with new contents.
+            gpu.invalidate_fp16_cache();
         } else {
             // `memory.offload_exec=cpu` deliberately does **not** splice the
             // routed experts for ordinary wide prefill: the batched prefill
