@@ -34,6 +34,7 @@ use crate::mtp_head::{
     self, Qwen35MtpHead, Qwen35MtpHeadBatchedScratch, Qwen35MtpHeadKvCache, Qwen35MtpHeadScratch,
 };
 use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
+use crate::qwen35::prefill::{fp8_verify_open, fp8_verify_target};
 use crate::qwen35::{LayerType, LayerWeights, PrefillBatchScratch, StateQuant};
 
 /// Debug tracing for the slot-engine MTP cycle (`HIPFIRE_MTP_TRACE=1`).
@@ -102,6 +103,10 @@ use hipfire_runtime::llama::KvCache;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::time::Instant;
 
+/// Cross-request batched MTP cycle (continuous batching).
+#[path = "mtp_cb.rs"]
+pub mod cb;
+
 // ─── Sampling primitives (host-side, used by temp>0 spec-decode path) ────
 
 /// Sampling configuration matching the Unsloth-recommended MTP defaults
@@ -111,7 +116,7 @@ use std::time::Instant;
 #[derive(Copy, Clone, Debug)]
 pub struct MtpSamplingConfig {
     pub temp: f32,
-    pub top_k: usize, // 0 = disabled (no top-K cutoff)
+    pub top_k: usize, // AR candidate cap (`llama::ar_candidate_cap`); 0 = none
     pub top_p: f32,   // 1.0 = disabled (no nucleus cutoff)
     pub min_p: f32,   // 0.0 = disabled (no min-prob cutoff)
     /// Repeat penalty (1.0 = off). With the presence/frequency penalties it
@@ -1477,6 +1482,17 @@ pub(crate) fn mtp_trunk_verify_lm_head(
     dim: usize,
     vocab: usize,
 ) -> HipResult<()> {
+    // Fail closed: inside the PM FP8 verify scope only the dense MQ4G256V2
+    // head has an FP8 verify arm (no GEMV / other-dtype fallback).
+    if gpu.fp8_verify_scope && w_out.gpu_dtype != DType::MQ4G256V2 {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "MTP verify lm_head: fp8 verify scope requires a dense MQ4G256V2 head, got {:?}",
+                w_out.gpu_dtype
+            ),
+        ));
+    }
     match w_out.gpu_dtype {
         DType::Q8_0 => {
             if mtp_q8_verify_wmma_enabled_from_env() {
@@ -1558,6 +1574,8 @@ pub(crate) fn mtp_trunk_verify_lm_head(
         DType::MQ4G256V2 => {
             let rot = verify_rot.sub_offset(0, n_verify * w_out.k);
             llama::rotate_x_mq_batched_for(gpu, w_out, verify_hidden, &rot, w_out.k, n_verify)?;
+            // Inside the PM FP8 verify scope rdna routes this head to the FP8
+            // `set` op at every row count (`gemm_mq4g256v2_batched_lmhead`).
             gpu.gemm_mq4g256v2_batched_lmhead(
                 &w_out.buf,
                 &rot,
@@ -1849,17 +1867,48 @@ pub(crate) fn mtp_verify_accept(
     cur_pos: usize,
     eos_token_id: u32,
 ) -> HipResult<MtpVerifyAccepted> {
+    mtp_verify_accept_impl(
+        gpu, w_out, dim, vocab, state, n_verify, candidates, drafts_generated, use_sampling, sampling,
+        draft_probs, draft_softmaxes, is_external, use_device_token_chain, cur_pos, eos_token_id, false,
+    )
+}
+
+/// [`mtp_verify_accept`] with the head evaluation optional: `head_ready`
+/// means the caller already wrote this window's verify-head logits into
+/// `state.verify_logits` rows `0..n_verify` (cross-request batched head).
+#[allow(clippy::too_many_arguments)]
+fn mtp_verify_accept_impl(
+    gpu: &mut Gpu,
+    w_out: &llama::WeightTensor,
+    dim: usize,
+    vocab: usize,
+    state: &mut MtpSpecState,
+    n_verify: usize,
+    candidates: &[u32],
+    drafts_generated: usize,
+    use_sampling: bool,
+    sampling: MtpSamplingConfig,
+    draft_probs: &[f32],
+    draft_softmaxes: &[Vec<f32>],
+    is_external: bool,
+    use_device_token_chain: bool,
+    cur_pos: usize,
+    eos_token_id: u32,
+    head_ready: bool,
+) -> HipResult<MtpVerifyAccepted> {
     let logits_view = state.verify_logits.sub_offset(0, n_verify * vocab);
-    mtp_trunk_verify_lm_head(
-        gpu,
-        w_out,
-        &state.verify_hidden,
-        &state.verify_rot,
-        &logits_view,
-        n_verify,
-        dim,
-        vocab,
-    )?;
+    if !head_ready {
+        mtp_trunk_verify_lm_head(
+            gpu,
+            w_out,
+            &state.verify_hidden,
+            &state.verify_rot,
+            &logits_view,
+            n_verify,
+            dim,
+            vocab,
+        )?;
+    }
 
     // Exact-AR penalties on every verify row the verdict can read (incl. the
     // bonus row), before softmax (sampled) or argmax (greedy). No-op, no
@@ -1979,7 +2028,7 @@ fn mtp_accept_and_rollback(
     config: &Qwen35Config,
     kv_cache: &mut KvCache,
     dn_state: &mut DeltaNetState,
-    scratch: &mut Qwen35Scratch,
+    scratch: &Qwen35Scratch,
     state: &mut MtpSpecState,
     n_verify: usize,
     verify_tokens: &[u32],
@@ -1995,13 +2044,14 @@ fn mtp_accept_and_rollback(
     tape_captured: bool,
     cur_pos: usize,
     eos_token_id: u32,
+    head_ready: bool,
 ) -> HipResult<MtpSpecResult> {
     let trunk_weights: &Qwen35Weights = weights;
     let MtpVerifyAccepted {
         committed,
         accept_count,
         hit_eos,
-    } = mtp_verify_accept(
+    } = mtp_verify_accept_impl(
         gpu,
         &trunk_weights.output,
         config.dim,
@@ -2018,6 +2068,7 @@ fn mtp_accept_and_rollback(
         use_device_token_chain,
         cur_pos,
         eos_token_id,
+        head_ready,
     )?;
     let advance = committed.len();
 
@@ -2033,20 +2084,25 @@ fn mtp_accept_and_rollback(
         } else {
             if advance >= 2 {
                 let replay = &verify_tokens[..advance];
-                qwen35::forward_prefill_batch(
-                    gpu,
-                    trunk_weights,
-                    config,
-                    replay,
-                    cur_pos,
-                    kv_cache,
-                    dn_state,
-                    scratch,
-                    None,
-                    None,
-                    None,
-                    None,
-                )?;
+                // Rollback replay inside the PM FP8 verify scope: n >= 2 rows
+                // reproduce the verify's FP8 rows (row-count independent).
+                let fp8 = fp8_verify_target(trunk_weights, config, kv_cache);
+                crate::speculative::fp8_verify_scoped(gpu, fp8, |gpu| {
+                    qwen35::forward_prefill_batch(
+                        gpu,
+                        trunk_weights,
+                        config,
+                        replay,
+                        cur_pos,
+                        kv_cache,
+                        dn_state,
+                        scratch,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                })?;
             } else {
                 gpu.graphs.ar_graph_eligible = false;
                 qwen35::forward_scratch(
@@ -2080,7 +2136,7 @@ fn mtp_shared_verify_accept_rollback_inner(
     config: &Qwen35Config,
     kv_cache: &mut KvCache,
     dn_state: &mut DeltaNetState,
-    scratch: &mut Qwen35Scratch,
+    scratch: &Qwen35Scratch,
     state: &mut MtpSpecState,
     cur_pos: usize,
     last_committed: u32,
@@ -2131,7 +2187,11 @@ fn mtp_shared_verify_accept_rollback_inner(
         None
     };
 
-    qwen35::forward_prefill_batch_with_pbs_opts(
+    // PM FP8 verify scope (`HIPFIRE_CB_VERIFY_FP8`): the target verify forward and
+    // its verify lm_head run the one E4M3 verify arithmetic (== the batched MTP
+    // CB verify); the head runs here (`head_ready` below), scope closed on every path.
+    let prev = fp8_verify_open(gpu, trunk_weights, config, kv_cache)?;
+    let fwd = qwen35::forward_prefill_batch_with_pbs_opts(
         gpu,
         trunk_weights,
         config,
@@ -2149,7 +2209,22 @@ fn mtp_shared_verify_accept_rollback_inner(
         None,
         false,
         qwen35::DflashFusionCtx::Off,
-    )?;
+    );
+    let logits_view = state.verify_logits.sub_offset(0, n_verify * vocab);
+    let head = fwd.and_then(|()| {
+        mtp_trunk_verify_lm_head(
+            gpu,
+            &trunk_weights.output,
+            &state.verify_hidden,
+            &state.verify_rot,
+            &logits_view,
+            n_verify,
+            dim,
+            vocab,
+        )
+    });
+    gpu.fp8_verify_exit(prev);
+    head?;
 
     mtp_accept_and_rollback(
         gpu,
@@ -2173,6 +2248,7 @@ fn mtp_shared_verify_accept_rollback_inner(
         tape_captured,
         cur_pos,
         eos_token_id,
+        true, // head_ready: the verify lm_head ran above inside the scope
     )
 }
 
@@ -2678,8 +2754,9 @@ pub fn prefill_trunk_and_mtp_cache(
 }
 
 /// Like [`prefill_trunk_and_mtp_cache`], but invokes `on_committed_boundary`
-/// after each trunk chunk and its MTP fill commit, with the exclusive end
-/// position of the committed prefix (`start_pos + tokens_written_so_far`).
+/// after each trunk chunk and its MTP fill commit, with the trunk DeltaNet
+/// state and the exclusive end position of the committed prefix
+/// (`start_pos + tokens_written_so_far`).
 ///
 /// The callback runs while `target.kv_cache` holds the just-written prefix.
 /// Failures propagate and abort the remaining prefill (caller must free MTP
@@ -2693,10 +2770,45 @@ pub fn prefill_trunk_and_mtp_cache_with_boundary<F>(
     prompt_tokens: &[u32],
     start_pos: usize,
     route: MtpPromptRoute,
+    on_committed_boundary: F,
+) -> HipResult<TrunkSpinePrefillTimings>
+where
+    F: FnMut(&mut Gpu, &DeltaNetState, usize) -> HipResult<()>,
+{
+    let mut parts = MtpPrefillTarget {
+        weights: &target.weights,
+        config: &target.config,
+        kv_cache: &mut target.kv_cache,
+        dn_state: &mut target.dn_state,
+        scratch: &target.scratch,
+    };
+    prefill_trunk_and_mtp_cache_parts(gpu, &mut parts, head, state, prompt_tokens, start_pos, route, on_committed_boundary)
+}
+
+/// The trunk owners a prompt prefill writes: a [`ModelSlot`]'s, or a
+/// continuous-batching request's own KV/DeltaNet over the shared weights.
+pub struct MtpPrefillTarget<'a> {
+    pub weights: &'a Qwen35Weights,
+    pub config: &'a Qwen35Config,
+    pub kv_cache: &'a mut KvCache,
+    pub dn_state: &'a mut DeltaNetState,
+    pub scratch: &'a Qwen35Scratch,
+}
+
+/// [`prefill_trunk_and_mtp_cache_with_boundary`] over explicit trunk owners.
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_trunk_and_mtp_cache_parts<F>(
+    gpu: &mut Gpu,
+    target: &mut MtpPrefillTarget<'_>,
+    head: &Qwen35MtpHead,
+    state: &mut MtpSpecState,
+    prompt_tokens: &[u32],
+    start_pos: usize,
+    route: MtpPromptRoute,
     mut on_committed_boundary: F,
 ) -> HipResult<TrunkSpinePrefillTimings>
 where
-    F: FnMut(&mut Gpu, &mut ModelSlot, usize) -> HipResult<()>,
+    F: FnMut(&mut Gpu, &DeltaNetState, usize) -> HipResult<()>,
 {
     let Some(head_rows) =
         mtp_prompt_fill_scratch_rows(prompt_tokens.len(), qwen35::prefill_max_batch(gpu))
@@ -2880,7 +2992,7 @@ where
             mtp_prompt_fill_secs += t_mtp_fill.elapsed().as_secs_f64();
 
             // Committed boundary: trunk + MTP private KV now cover [0, committed_pos).
-            on_committed_boundary(gpu, target, committed_pos)?;
+            on_committed_boundary(gpu, target.dn_state, committed_pos)?;
             off = end;
         }
 
@@ -3171,7 +3283,10 @@ pub fn spec_step_mtp(
     } else {
         None
     };
-    qwen35::forward_prefill_batch_with_pbs_opts(
+    // PM FP8 verify scope (`HIPFIRE_CB_VERIFY_FP8`): trunk verify forward + verify
+    // lm_head under the one E4M3 verify arithmetic; closed on every path.
+    let prev = fp8_verify_open(gpu, trunk_weights, &target.config, &target.kv_cache)?;
+    let fwd = qwen35::forward_prefill_batch_with_pbs_opts(
         gpu,
         trunk_weights,
         &target.config,
@@ -3189,7 +3304,7 @@ pub fn spec_step_mtp(
         None,  // max_layer
         false, // MTP computes all verify logits from verify_hidden below
         qwen35::DflashFusionCtx::Off,
-    )?;
+    );
 
     // ── 5. Per-position lm_head + batched argmax ─────────────────────────
     //
@@ -3199,16 +3314,20 @@ pub fn spec_step_mtp(
     // n_verify is hoisted above (before tape_captured computation).
     let w_out = &trunk_weights.output;
     let logits_view = state.verify_logits.sub_offset(0, n_verify * vocab);
-    mtp_trunk_verify_lm_head(
-        gpu,
-        w_out,
-        &state.verify_hidden,
-        &state.verify_rot,
-        &logits_view,
-        n_verify,
-        dim,
-        vocab,
-    )?;
+    let head = fwd.and_then(|()| {
+        mtp_trunk_verify_lm_head(
+            gpu,
+            w_out,
+            &state.verify_hidden,
+            &state.verify_rot,
+            &logits_view,
+            n_verify,
+            dim,
+            vocab,
+        )
+    });
+    gpu.fp8_verify_exit(prev);
+    head?;
 
     // GPU-side batched argmax over (max_n + 1) rows.
     let argmax_view = state.verify_argmax.sub_offset(0, n_verify);
@@ -3329,20 +3448,24 @@ pub fn spec_step_mtp(
         // (decode-mode-GEMV vs batch-WMMA ULP mismatch — use decode path for identity).
         if advance >= 2 {
             let replay = &verify_tokens[..advance];
-            qwen35::forward_prefill_batch(
-                gpu,
-                trunk_weights,
-                &target.config,
-                replay,
-                cur_pos,
-                &mut target.kv_cache,
-                &mut target.dn_state,
-                &target.scratch,
-                None,
-                None,
-                None,
-                None,
-            )?;
+            // Rollback replay inside the PM FP8 verify scope (see `mtp_accept_and_rollback`).
+            let fp8 = fp8_verify_target(trunk_weights, &target.config, &target.kv_cache);
+            crate::speculative::fp8_verify_scoped(gpu, fp8, |gpu| {
+                qwen35::forward_prefill_batch(
+                    gpu,
+                    trunk_weights,
+                    &target.config,
+                    replay,
+                    cur_pos,
+                    &mut target.kv_cache,
+                    &mut target.dn_state,
+                    &target.scratch,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            })?;
         } else {
             // advance == 1: only the seed (last_committed) is "replayed". This
             // happens when EOS hits with accept_count==0 AND bonus==eos
@@ -3550,7 +3673,10 @@ pub fn spec_step_mtp_compressed(
 
     state.trunk_snap.save_from(&target.dn_state, gpu)?;
 
-    qwen35::forward_prefill_batch_with_pbs_opts(
+    // PM FP8 verify scope (`HIPFIRE_CB_VERIFY_FP8`): trunk verify forward + verify
+    // lm_head under the one E4M3 verify arithmetic; closed on every path.
+    let prev = fp8_verify_open(gpu, trunk_weights, &target.config, &target.kv_cache)?;
+    let fwd = qwen35::forward_prefill_batch_with_pbs_opts(
         gpu,
         trunk_weights,
         &target.config,
@@ -3568,21 +3694,25 @@ pub fn spec_step_mtp_compressed(
         None,  // max_layer
         false, // MTP computes all verify logits from verify_hidden below
         qwen35::DflashFusionCtx::Off,
-    )?;
+    );
 
     // ── 3. Trunk batched lm_head over verify positions ─────────────────────
     let w_out = &trunk_weights.output;
     let logits_view = state.verify_logits.sub_offset(0, n_verify * vocab);
-    mtp_trunk_verify_lm_head(
-        gpu,
-        w_out,
-        &state.verify_hidden,
-        &state.verify_rot,
-        &logits_view,
-        n_verify,
-        dim,
-        vocab,
-    )?;
+    let head = fwd.and_then(|()| {
+        mtp_trunk_verify_lm_head(
+            gpu,
+            w_out,
+            &state.verify_hidden,
+            &state.verify_rot,
+            &logits_view,
+            n_verify,
+            dim,
+            vocab,
+        )
+    });
+    gpu.fp8_verify_exit(prev);
+    head?;
 
     let argmax_v = state.verify_argmax.sub_offset(0, n_verify);
     gpu.argmax_f32_batched(&logits_view, &argmax_v, vocab, n_verify)?;
@@ -3629,20 +3759,24 @@ pub fn spec_step_mtp_compressed(
     state.trunk_snap.restore_to(&mut target.dn_state, gpu)?;
     if advance >= 2 {
         let replay = &verify_tokens[..advance];
-        qwen35::forward_prefill_batch(
-            gpu,
-            trunk_weights,
-            &target.config,
-            replay,
-            cur_pos,
-            &mut target.kv_cache,
-            &mut target.dn_state,
-            &target.scratch,
-            None,
-            None,
-            None,
-            None,
-        )?;
+        // Rollback replay inside the PM FP8 verify scope (see `mtp_accept_and_rollback`).
+        let fp8 = fp8_verify_target(trunk_weights, &target.config, &target.kv_cache);
+        crate::speculative::fp8_verify_scoped(gpu, fp8, |gpu| {
+            qwen35::forward_prefill_batch(
+                gpu,
+                trunk_weights,
+                &target.config,
+                replay,
+                cur_pos,
+                &mut target.kv_cache,
+                &mut target.dn_state,
+                &target.scratch,
+                None,
+                None,
+                None,
+                None,
+            )
+        })?;
     } else {
         gpu.graphs.ar_graph_eligible = false; // spec re-seed: never the plain-AR graph
         qwen35::forward_scratch(
@@ -3756,9 +3890,9 @@ fn mtp_sampled_accept(
     let _ = gpu.free_tensor(z_gpu);
     debug_assert_eq!(host_probs.len(), n_verify * vocab);
 
-    // Build a single position's TRUNCATED target nucleus row on demand. The
-    // softmax kernel already folded any top_k cutoff into tau (tau = max(tau_p,
-    // tau_k)), so apply_topp_trunc applies the combined top_k+top_p nucleus.
+    // Build a single position's TRUNCATED target row on demand. The softmax
+    // kernel's tau/Z encode AR's law (top_k pool, min_p, nucleus over the pool
+    // mass), so apply_topp_trunc yields AR's distribution for the row.
     let target_row_at = |pos: usize| -> Vec<f32> {
         let mut row = host_probs[pos * vocab..(pos + 1) * vocab].to_vec();
         apply_topp_trunc(&mut row, tau[pos], z[pos]);
@@ -4355,10 +4489,10 @@ pub fn mtp_draft_phase_inner(
                     0.0
                 };
 
-                // Host nucleus cut. The softmax kernel already folded
-                // sampling.top_k into tau (tau = max(tau_p, tau_k)), so
-                // apply_topp_trunc applies the combined top_k+top_p nucleus —
-                // the SAME cut the target side gets (keeps the accept lossless).
+                // Host truncation cut. The softmax kernel's tau/Z already
+                // encode AR's law (top_k pool, min_p, nucleus over the pool
+                // mass), so apply_topp_trunc applies the SAME cut the target
+                // side gets.
                 apply_topp_trunc(&mut probs, tau[0], z[0]);
 
                 // Host-RNG categorical sample from the SAME truncated nucleus we

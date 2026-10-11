@@ -27,6 +27,16 @@ BOOTSTRAP_ENV = {
     "HIPFIRE_KERNEL_CACHE",
     "HIPFIRE_SPILL_DIR",
     "HIPFIRE_QUANT_DIAG_PATH",
+    # Test-harness marker read by the shared ROCm resolver (crates/rocm.rs);
+    # only #[test] code calls it, it never affects runtime behaviour.
+    "HIPFIRE_TEST_REQUIRE_ROCM",
+    # Test-only real-compiler path for the bounded-executor CPU gate in
+    # rdna-compute compiler.rs #[cfg(test)]; never read by runtime code.
+    "HIPFIRE_TEST_REAL_HIPCC",
+    # Test-only probe inputs of the #[ignore]d real-rows check in
+    # hipfire-runtime ple_q4.rs #[cfg(test)]; never read by runtime code.
+    "HIPFIRE_PROBE_MODEL",
+    "HIPFIRE_PROBE_ROWS",
     # Read by the daemon's init_tracing() before the CLI has sent the process
     # config; going through developer_var there installs the local fallback
     # snapshot and makes the real install fail ("already initialized").
@@ -37,6 +47,12 @@ BOOTSTRAP_ENV = {
     # contending for a card must read the same ambient dir before either has
     # its own config.
     "HIPFIRE_LOCK_DIR",
+    # Shared-weight host opt-in, its socket and the dev-fabric admission
+    # token: read before install_process_config() because they select the
+    # GPU claim kind (shared vs exclusive), exactly like HIPFIRE_LOCK_DIR.
+    "HIPFIRE_WEIGHT_HOST",
+    "HIPFIRE_WEIGHT_HOST_SOCKET",
+    "HIPFIRE_FABRIC_ADMISSION",
 }
 CENTRAL_CONFIG_READERS = {
     "crates/hipfire-config/src/lib.rs",

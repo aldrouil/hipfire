@@ -333,9 +333,12 @@ fn rejection(result: Result<Lifted<Program>, LiftError>) -> (Option<String>, u64
     }
 }
 
+#[path = "../../rocm.rs"]
+mod rocm;
+
 /// Pinned second-opinion toolchain: `PEACEMAKER_ROCM` must hold the tools (fail, never
-/// skip); `PEACEMAKER_NO_ROCM` forces the committed-fixture path; otherwise the default
-/// install is used when present.
+/// skip); `PEACEMAKER_NO_ROCM` forces the committed-fixture path; otherwise `ROCM_PATH`
+/// (default `/opt/rocm`) is required unless explicitly disabled.
 struct Tools {
     objdump: PathBuf,
     mc: PathBuf,
@@ -348,11 +351,13 @@ fn toolchain() -> Option<Tools> {
         assert!(tools.objdump.is_file() && tools.mc.is_file(), "PEACEMAKER_ROCM={root:?} holds no llvm-objdump/llvm-mc");
         return Some(tools);
     }
-    if std::env::var_os("PEACEMAKER_NO_ROCM").is_some() {
+    if std::env::var_os("PEACEMAKER_NO_ROCM").is_some() || rocm::tests_disabled() {
         return None;
     }
-    let tools = at(Path::new("/opt/rocm/core-10.0"));
-    (tools.objdump.is_file() && tools.mc.is_file()).then_some(tools)
+    let root = rocm::root();
+    let tools = at(&root);
+    assert!(tools.objdump.is_file() && tools.mc.is_file(), "required ROCm tools missing from {}", root.display());
+    Some(tools)
 }
 
 #[derive(Debug, PartialEq)]

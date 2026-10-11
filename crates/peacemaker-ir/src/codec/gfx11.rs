@@ -81,11 +81,11 @@ mod tests {
         ];
         // The encoding cross-check needs the pinned llvm-mc (resolved like
         // the gfx12 table gate); the no-GPU CI runner still checks decode.
-        let mc = std::env::var_os("ROCM_PATH")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from("/opt/rocm/core-10.0"))
-            .join("lib/llvm/bin/llvm-mc");
-        let mc = mc.exists().then_some(mc);
+        let mc = crate::rocm_llvm_mc();
+        let mc = if crate::rocm::tests_disabled() { None } else {
+            assert!(mc.is_file(), "required ROCm assembler missing: {}", mc.display());
+            Some(mc)
+        };
         for arch in [Arch::Gfx1100, Arch::Gfx1151] {
             let cpu = if arch == Arch::Gfx1100 { "gfx1100" } else { "gfx1151" };
             for (words, text, returns) in cases {

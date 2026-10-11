@@ -3798,11 +3798,15 @@ pub fn generate(
     // `build_cached_history_jinja` (verbatim assistant-turn splice through the
     // model's trained template) instead of the ChatScaffold `build_cached_history`,
     // so the LCP forward-extension cache now works under HIPFIRE_JINJA_CHAT too.
+    // VMM batch route: conversations finished on batch lanes (or parked
+    // between singleton turns) are kept in the store's prefix pool; one of
+    // them may be this request's resident conversation.
+    let vmm_pool = jinja_active && tools.is_none() && crate::vmm_conv::pool_active(m);
     let cache_eligible = !cache_kill_switch
         && messages_history.is_some()
         && m.eviction.is_none()
         && !pflash_active
-        && !m.conversation_tokens.is_empty();
+        && (!m.conversation_tokens.is_empty() || vmm_pool);
     if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
         .ok()
         .as_deref()
@@ -3835,16 +3839,6 @@ pub fn generate(
             // Qwen3.8 re-emits the empty-think block. Prepend the primer THIS
             // turn's cold render emitted only when the template does not, so
             // the spliced stream byte-matches `conversation_tokens`.
-            let primer: Vec<u32> = {
-                let im_start = tokenizer.special_token_id("<|im_start|>");
-                let opener_len = tokenizer.encode("<|im_start|>assistant\n").len();
-                match im_start.and_then(|id| new_tokens.iter().rposition(|&t| t == id)) {
-                    Some(q) if q + opener_len <= new_tokens.len() => {
-                        new_tokens[q + opener_len..].to_vec()
-                    }
-                    _ => Vec::new(),
-                }
-            };
             let template = m.chat_template.as_ref().unwrap();
             let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
                 tokenizer,
@@ -3856,30 +3850,15 @@ pub fn generate(
                 reasoning_strength: None,
                 reasoning_effort,
             };
-            let primer: Vec<u32> =
-                if hipfire_runtime::prompt_frame::template_emits_history_primer(&frame, &primer) {
-                    Vec::new()
-                } else {
-                    primer
-                };
-            let cache_ref = &mut m.asst_turn_cache;
-            let built = hipfire_runtime::prompt_frame::build_cached_history_jinja(
+            let built = crate::qwen::qwen_jinja_cached_history_tokens(
                 &frame,
+                &mut m.asst_turn_cache,
+                &new_tokens,
                 history,
                 tools,
-                |msg| {
-                    let hit = crate::qwen::qwen_jinja_lookup_turn(&mut *cache_ref, msg, &primer);
-                    if trace_cache {
-                        let normalized =
-                            crate::common::normalize_asst_turn_for_fingerprint(&msg.content);
-                        let fp = crate::common::asst_turn_fingerprint(&normalized, &msg.tool_calls);
-                        eprintln!(
-                            "[qwen-cache jinja lookup] fp={:#018x} role={:?} content.len={}/stripped.len={} primer={} hit={}",
-                            fp, msg.role, msg.content.len(), normalized.len(), primer.len(), hit.is_some(),
-                        );
-                    }
-                    hit
-                },
+                "dense-ar",
+                // Exact-prefix guarded: a non-extending repair falls back to the safe miss.
+                Some(&m.conversation_tokens),
             );
             match built {
                 Ok(t) => t,
@@ -3944,6 +3923,19 @@ pub fn generate(
                 },
             )
         };
+        if vmm_pool {
+            // Make the kept conversation this render reuses most resident
+            // (parking the current one); the decision below is unchanged.
+            crate::vmm_conv::singleton_adopt(
+                &mut m.state,
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                gpu,
+                &rendered,
+            );
+        }
         // LCP detection vs m.conversation_tokens.
         let prior_len = m.conversation_tokens.len();
         let max_match = prior_len.min(rendered.len());
@@ -5018,6 +5010,112 @@ pub fn generate(
                 let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
                 crate::common::emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
                 return;
+            }
+            // VMM continuous batching: a serve-batched peer is waiting and
+            // this request may join the batch (the daemon granted a permit).
+            // Promote at this committed boundary — `next_token` is the
+            // pending seed, not yet fed — instead of making the peer wait
+            // for this whole generation. Features the batch lane does not
+            // carry (grammar, budget alerts, logprobs, eviction/adaptive KV)
+            // keep the request here; think budgets/latches continue per lane
+            // (`vmm_conv::ThinkCtl`) and stop strings in the moved producer.
+            if let Some(permit) = crate::batch::promotion_permit().filter(|_| {
+                crate::batch::promotion_wanted(generated)
+                    && !grammar_active
+                    && budget_alert_at_tok == 0
+                    && logprobs_top_k.is_none()
+                    && m.eviction.is_none()
+                    && m.kv_adaptive.is_none()
+            }) {
+                let boundary = crate::batch::SingletonBoundary {
+                    id,
+                    permit,
+                    config,
+                    kv: &mut *kv,
+                    dn: &mut *dn,
+                    position: m.seq_pos,
+                    pending_seed: next_token,
+                    sampler: SamplerConfig {
+                        temperature: temp,
+                        top_p,
+                        repeat_penalty,
+                        repeat_window: repeat_buf_cap,
+                        presence_penalty,
+                        frequency_penalty,
+                        blocked_tokens: Vec::new(),
+                        top_k,
+                        min_p,
+                    },
+                    rng_state,
+                    // The executor's history already holds the pending seed
+                    // (pushed at its pick); the singleton pushes it when fed.
+                    history: m.conversation_tokens[ngram_scope_start..]
+                        .iter()
+                        .copied()
+                        .chain(std::iter::once(next_token))
+                        .collect(),
+                    prompt_len: ngram_scope_start,
+                    conversation_tokens: m.conversation_tokens.clone(),
+                    streamed_tokens: streamed_tokens.clone(),
+                    bytes_fed_to_filter: stream_bytes.len(),
+                    created_at: t0,
+                    prefill_done_at: t_prefill,
+                    first_token_at: (generated > 0).then_some(t_prefill),
+                    started_in_think,
+                };
+                match crate::batch::promote_singleton(gpu, boundary) {
+                    Ok((pending, progress, state)) => {
+                        // The bundle now holds a fresh owner: its conversation
+                        // (tokens + resume checkpoints) moves with the swapped
+                        // KV/DN into the lane, which keeps it for the next turn.
+                        // The assistant-turn cache is not tied to an owner.
+                        m.seq_pos = 0;
+                        m.conversation_tokens.clear();
+                        let checkpoints = std::mem::take(&mut m.prefill_checkpoints);
+                        crate::common::free_checkpoints(&mut m.dflash_checkpoints, gpu);
+                        if let Some(spec) = m.speculator.as_mut() {
+                            if let Err(e) = spec.reset(gpu) {
+                                eprintln!("[vmm-promote] speculator reset after promotion: {e}");
+                            }
+                        }
+                        crate::common::fail_closed_invalidate_graphs_and_replay(gpu);
+                        // A prepared PM4/AQL replay route bakes the old KV/DN
+                        // addresses (no per-call binding check): drop it so
+                        // the next singleton forward re-records on the new
+                        // owners.
+                        gpu.replay.rearm_after_layout_growth();
+                        eprintln!(
+                            "[vmm-promote] id={id} promoted from AR singleton at generated={generated} position={}",
+                            progress.seq_pos
+                        );
+                        crate::batch::put_promoted(crate::batch::PromotedRequest {
+                            pending,
+                            progress,
+                            state,
+                            producer: semantic,
+                            loop_guard,
+                            kind: crate::batch::PromotedDecode::Ar,
+                            seed_emitted: false,
+                            conv: crate::vmm_conv::PromotedConv {
+                                think: Some(crate::vmm_conv::ThinkCtl {
+                                    max_think_tokens,
+                                    max_total_think,
+                                    post_latch_budget: post_latch_answer_budget,
+                                    think_count,
+                                    prev_in_think,
+                                    total_think_tokens,
+                                    force_answer_latched,
+                                    latch_gen_mark,
+                                }),
+                                checkpoints,
+                                cached_tokens: cached_tokens_count,
+                                prefill_tokens,
+                            },
+                        });
+                        return;
+                    }
+                    Err(e) => eprintln!("[vmm-promote] id={id} stays singleton: {e}"),
+                }
             }
             // Write this token's K/V to the cache BEFORE any client-visible
             // emit so a VMM map/growth failure cannot stream a token whose

@@ -76,6 +76,11 @@ impl ArchModel for Qwen35Bundle {
             vision_config: _,
             vision_weights,
             qwen35_decode_batch,
+            vmm_store,
+            // Infallible free cannot prove a clean teardown: drop the lease
+            // unacknowledged (the loader's unload_model takes it out first
+            // and releases it after a verified clean unload).
+            weight_lease: _,
         } = *self;
         debug_assert!(
             pp_scratch_set.is_none(),
@@ -87,6 +92,11 @@ impl ArchModel for Qwen35Bundle {
         // pp>1 bundle that incorrectly reaches here would leak, not
         // double-free, and the assert surfaces the bug.
         let _ = pp_scratch_set;
+        // Request owners and executor scratch go first: they reference no
+        // weights, and their VMM leases must not outlive the device.
+        if let Some(store) = vmm_store {
+            let _ = store.free_gpu(gpu);
+        }
         if let Some(batch) = qwen35_decode_batch {
             let _ = batch.free_gpu(gpu);
         }

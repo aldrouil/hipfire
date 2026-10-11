@@ -273,40 +273,40 @@ macro_rules! launch_params_blob {
 }
 pub(crate) use launch_params_blob;
 
-/// Resolve the compiled artifact that owns a launched symbol.
+/// Resolve the admitted code object that owns a launched symbol.
 ///
-/// `KernelCompiler::compiled_kernels()` is keyed by module name while the
-/// recorder stores the launched *function* name, so runtime-specialized
-/// variants resolve through this one alias table. `None` means the artifact is
+/// Every loader binds the functions it loads; module-name lookup and the
+/// alias table below cover functions loaded by name through a module whose
+/// name differs (runtime-specialized variants). `None` means the owner is
 /// unknown and preparation will reject the tape rather than guess.
 pub(crate) fn recorded_launch_artifact(
     compiler: &KernelCompiler,
     func_name: &str,
-) -> Option<std::path::PathBuf> {
-    let compiled = compiler.compiled_kernels();
-    compiled
-        .get(func_name)
+) -> Option<crate::code_object::RecordedArtifact> {
+    let registry = compiler.code_objects();
+    let module = |name: &str| registry.module(name);
+    registry
+        .function(func_name)
+        .or_else(|| module(func_name))
         .or_else(|| match func_name {
-            "mq_rotate_x" => compiled.get("gemv_mq4g256"),
-            "deinterleave_f32_batched" => compiled.get("deinterleave_batched"),
+            "mq_rotate_x" => module("gemv_mq4g256"),
+            "deinterleave_f32_batched" => module("deinterleave_batched"),
             name if name.starts_with("gemv_hfq4g256_residual_sigmoid_scaled_gpu") => {
-                compiled.get("gemv_hfq4g256_residual_scaled")
+                module("gemv_hfq4g256_residual_scaled")
             }
             "gemv_hfq4g256_moe_gate_up_k8_indexed" => {
-                compiled.get("gemv_hfq4g256_moe_gate_up_indexed")
+                module("gemv_hfq4g256_moe_gate_up_indexed")
             }
-            name if name.starts_with("gemv_hfq4g256_multirow_r") => compiled
-                .get("gemv_hfq4g256_multirow_default")
-                .or_else(|| compiled.get("gemv_hfq4g256_multirow_rdna3")),
-            name if name.starts_with("gemv_hfq4g256_residual_multirow_r") => compiled
-                .get("gemv_hfq4g256_residual_multirow_default")
-                .or_else(|| compiled.get("gemv_hfq4g256_residual_multirow_rdna3")),
+            name if name.starts_with("gemv_hfq4g256_multirow_r") => module("gemv_hfq4g256_multirow_default")
+                .or_else(|| module("gemv_hfq4g256_multirow_rdna3")),
+            name if name.starts_with("gemv_hfq4g256_residual_multirow_r") => module("gemv_hfq4g256_residual_multirow_default")
+                .or_else(|| module("gemv_hfq4g256_residual_multirow_rdna3")),
             _ => None,
         })
         .or_else(|| {
             func_name
                 .strip_suffix("_f32")
-                .and_then(|name| compiled.get(name))
+                .and_then(module)
         })
         .cloned()
 }
@@ -360,6 +360,68 @@ const HOST_TAIL_PAD_BYTES: usize = 1024 * 1024;
 /// routing — choose the kernel that wins for the actual shape rather
 /// than uniformly applying FP8 everywhere.
 pub(crate) const FP8_GEMV_MIN_M: usize = 4096;
+
+/// Zero tail every exported weight allocation carries past its logical bytes.
+/// GEMV/attention kernels issue phantom header/vector reads beyond the exact
+/// tensor size; hipMalloc absorbed those in allocator slack, a device VMM
+/// mapping does not. Same rationale as [`HOST_TAIL_PAD_BYTES`], sized for VRAM.
+#[cfg(target_os = "linux")]
+pub const EXPORT_WEIGHT_TAIL_PAD_BYTES: usize = 64 * 1024;
+
+/// Extents of one shared weight allocation, as received by an importer.
+/// `physical_bytes` is the exporter's fully mapped, granularity-aligned size and
+/// must be at least `logical_bytes + EXPORT_WEIGHT_TAIL_PAD_BYTES`.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImportedWeightAllocationDesc {
+    pub physical_bytes: usize,
+    pub logical_bytes: usize,
+    pub granularity: usize,
+}
+
+/// Result of [`Gpu::create_exportable_weight_copy`]: the registered read-only VMM
+/// owner, the POSIX FD of its single physical allocation, and the exact extents.
+#[cfg(target_os = "linux")]
+pub struct ExportedWeightAllocation {
+    pub owner: GpuTensor,
+    pub fd: std::os::fd::OwnedFd,
+    pub physical_bytes: usize,
+    pub logical_bytes: usize,
+    pub granularity: usize,
+}
+
+/// Pure extent check shared by export and import: positive sizes and granularity,
+/// aligned physical size, and `physical >= logical + EXPORT_WEIGHT_TAIL_PAD_BYTES`
+/// (checked add, so it also implies `logical <= physical`).
+#[cfg(target_os = "linux")]
+fn validate_weight_extents(
+    physical_bytes: usize,
+    logical_bytes: usize,
+    granularity: usize,
+) -> HipResult<()> {
+    let bad = |what: &str| {
+        Err(HipError::new(
+            0,
+            &format!(
+                "invalid weight allocation extents (physical {physical_bytes}, logical \
+                 {logical_bytes}, granularity {granularity}): {what}"
+            ),
+        ))
+    };
+    if physical_bytes == 0 || logical_bytes == 0 || granularity == 0 {
+        return bad("sizes and granularity must be positive");
+    }
+    if physical_bytes % granularity != 0 {
+        return bad("physical bytes are not granularity aligned");
+    }
+    match logical_bytes.checked_add(EXPORT_WEIGHT_TAIL_PAD_BYTES) {
+        None => bad("logical bytes plus tail pad overflows"),
+        Some(required) if physical_bytes < required => {
+            bad("physical bytes are smaller than logical bytes plus the tail pad")
+        }
+        Some(_) => Ok(()),
+    }
+}
 
 /// Tensor stored on the GPU. Tracks shape and element type.
 pub struct GpuTensor {
@@ -437,6 +499,20 @@ impl GpuTensor {
             buf: unsafe { hip_bridge::DeviceBuffer::from_raw(self.buf.as_ptr(), self.buf.size()) },
             shape: self.shape.clone(),
             dtype: self.dtype,
+        }
+    }
+
+    /// Non-owning F16 view of the first `len_elems` 2-byte elements of this
+    /// tensor's buffer, whatever its own dtype (a producer that writes F16 into
+    /// a larger F32 scratch it owns). The returned tensor is a view — do NOT
+    /// free it.
+    pub fn prefix_as_f16(&self, len_elems: usize) -> GpuTensor {
+        let byte_len = len_elems.checked_mul(2).expect("F16 view length overflow");
+        assert!(byte_len <= self.buf.size(), "F16 view exceeds accessible buffer prefix");
+        GpuTensor {
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(self.buf.as_ptr(), byte_len) },
+            shape: vec![len_elems],
+            dtype: DType::F16,
         }
     }
 }
@@ -1034,6 +1110,12 @@ pub(crate) struct ResidualFold {
     pub n: usize,
 }
 
+/// IU4 verify route receipts (see [`Gpu::iu4_verify_exit`]).
+static IU4_VERIFY_SCOPE_IU4: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static IU4_VERIFY_SCOPE_ROWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static IU4_VERIFY_SCOPE_F16: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static IU4_VERIFY_SCOPES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// High-level GPU context. Owns the HIP runtime, compiler, and loaded kernels.
 ///
 /// Tape completeness invariant: for any body executed via `Gpu`,
@@ -1056,6 +1138,13 @@ pub struct Gpu {
     pub(crate) modules: HashMap<String, hip_bridge::Module>,
     pub(crate) functions: HashMap<String, hip_bridge::Function>,
     pub(crate) pool: crate::pool::GpuPool,
+    /// Railgun E0: the multi-layer GDN replay scratch shared by every armed
+    /// `GdnTape` of one shape on this device, keyed by shape (see
+    /// `dflash_gdn_replay::GdnReplaySharedScratch`). Drained on unload.
+    pub(crate) dflash_gdn_replay_scratch: HashMap<
+        crate::dflash_gdn_replay::GdnReplayScratchShape,
+        crate::dflash_gdn_replay::GdnReplaySharedScratch,
+    >,
     /// VMM owners keyed by their base virtual address. VMM-backed tensors use
     /// non-owning DeviceBuffer views and must bypass GpuPool/hipFree teardown.
     vmm_arenas: HashMap<usize, VmmArena>,
@@ -1091,6 +1180,27 @@ pub struct Gpu {
     /// Artifact-level MQ4V2 grid contract. Set by the model loader from HFQ
     /// metadata; false for legacy/asymmetric artifacts.
     pub mq4v2_symmetric: bool,
+    /// `HIPFIRE_CB_VERIFY_FP8` scope (see `crate::gemm_fp8_verify`): set by
+    /// [`Gpu::fp8_verify_enter`] for the duration of a target verify forward.
+    /// While true, every dense MQ4G256V2 verify GEMM runs the PeaceMaker FP8
+    /// family or fails; F16-input producers error. Always false when the flag
+    /// is off.
+    pub fp8_verify_scope: bool,
+    /// IU4 verify scope (DFlash; numerics differ from the F16 verify): set by
+    /// the DFlash target verify call sites for the duration of the verify
+    /// trunk when [`Gpu::iu4_verify_route_admitted`]. While set, the gfx1201
+    /// A4 producer gates (`iu4_producer_quant_fused_active`,
+    /// `iu4_silu_quant_fused_active`) admit any batch >= 1 and the A8 /
+    /// FP8-stream projection routes are off, so every verify row count (the
+    /// singleton and the batched trunk up to 128 rows alike) takes the same
+    /// A4 producers + IU4 GEMMs, whose output rows do not depend on the row
+    /// count. lm_head is untouched (F16). See [`Gpu::iu4_verify_enter`].
+    pub iu4_verify_scope: bool,
+    /// The current DFlash load's IU4 verify decision (`load_dflash_state`):
+    /// `HIPFIRE_CB_VERIFY_IU4` forced, or by default on when the load's
+    /// `speculation.dflash_block` resolves to 8 and `HIPFIRE_CB_VERIFY_FP8`
+    /// is off. Read by [`Gpu::iu4_verify_route_admitted`].
+    pub iu4_verify_load: bool,
     /// Qwen4 symmetric MQ4 trunk verified for the dense IU4 route
     /// (`HIPFIRE_QWEN4_TRUNK_IU4`); set by the Qwen4 forward after every
     /// trunk header passed [`Gpu::qwen4_trunk_sym_check`]. See
@@ -1164,6 +1274,16 @@ pub struct Gpu {
     /// on prefill chunks of >= 512 rows).  An explicit value of those
     /// variables applies everywhere, as before.
     pub qwen4_scope: bool,
+    /// True while the Flash-Next lane step runs (set by the lane-step driver):
+    /// together with the `fn_lane_pm_rows` flag it routes the four incumbent
+    /// rows launchers to the gfx1151 PeaceMaker lane-rows kernels
+    /// ([`Gpu::lane_rows_pm_enabled`]).
+    pub lane_rows_scope: bool,
+    /// True while a Qwen4 prefill forward runs under the batch-invariant
+    /// profile (`HIPFIRE_PREFILL_PM_INVARIANT` on gfx1151): every row-count
+    /// ROUTING predicate sees `prefill_invariant::QWEN4_PREFILL_CANON_ROWS`
+    /// via `Gpu::route_rows` while launches keep the real row count.
+    pub prefill_invariant_scope: bool,
 }
 /// Per-256-block XX^T accumulator for ONE weight tensor (one expert), keyed
 /// inside [`HessianCapture`] by the full safetensors name. Byte-for-byte the
@@ -1420,6 +1540,42 @@ impl Gpu {
         }
     }
 
+    /// `(free, total)` device bytes for sizing allocations: `hipMemGetInfo`,
+    /// with the free figure of a GTT-backed unified-memory APU clamped to
+    /// the host RAM a GTT allocation can take (`MemAvailable` plus TTM's
+    /// page pool estimate); see [`crate::uma_memory::device_free_from`].
+    /// Discrete GPUs and carve-out APUs get `hipMemGetInfo` unchanged. Every
+    /// free-memory sizing site uses this, not `hip.get_vram_info` directly.
+    pub fn device_mem_info(&self) -> HipResult<(usize, usize)> {
+        self.bind_thread()?;
+        let (free, total) = self.hip.get_vram_info()?;
+        if !self.is_uma() {
+            return Ok((free, total));
+        }
+        use crate::uma_memory;
+        let carveout_total = self
+            .hip
+            .device_pci_bus_id(self.device_id)
+            .ok()
+            .and_then(|bdf| uma_memory::carveout_total_bytes(&bdf));
+        let memory = uma_memory::DeviceMemory {
+            device_free: free as u64,
+            device_total: total as u64,
+            uma: true,
+            carveout_total,
+            host_available: uma_memory::gtt_backed(total as u64, carveout_total)
+                .then(uma_memory::host_available_bytes)
+                .flatten(),
+        };
+        let free = uma_memory::device_free_from(memory).ok_or_else(|| {
+            HipError::new(
+                0,
+                "unified-memory free bytes: /proc/meminfo has no readable MemAvailable",
+            )
+        })?;
+        Ok((free.min(usize::MAX as u64) as usize, total))
+    }
+
     /// Install a real stream if launches are still going to the null stream.
     ///
     /// HIP refuses to capture the legacy default stream, so anything that
@@ -1442,6 +1598,7 @@ impl Gpu {
     /// compile mid-capture is exactly the kind of call the mode forbids.
     pub fn begin_stream_capture(&mut self) -> HipResult<()> {
         self.bind_thread()?;
+        self.ensure_route_modules_preloaded()?;
         let stream = self.active_stream.as_ref().ok_or_else(|| {
             hip_bridge::HipError::new(0, "begin_stream_capture: no active stream")
         })?;
@@ -1643,6 +1800,26 @@ impl Gpu {
     }
 
     pub fn init_with_device(id: i32) -> HipResult<Self> {
+        // Honor HIPFIRE_DEVICES for every direct entry point before the HIP
+        // runtime initializes; a no-op when unset or already applied (daemon).
+        match hipfire_config::devices::apply_entry_point_device_visibility() {
+            Ok(Some(hipfire_config::devices::DeviceSelection::Resolved { devices, visibility })) => {
+                eprintln!(
+                    "[devices] HIPFIRE_DEVICES -> {} (ROCR_VISIBLE_DEVICES={} HIP_VISIBLE_DEVICES={})",
+                    devices
+                        .iter()
+                        .map(|d| format!("index {} {} {}", d.index, d.arch, d.bdf))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    visibility.rocr,
+                    visibility.hip
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                return Err(hip_bridge::HipError::new(0, &format!("HIPFIRE_DEVICES: {error}")));
+            }
+        }
         let hip = HipRuntime::load()?;
         let count = hip.device_count()?;
         if count == 0 {
@@ -1780,6 +1957,7 @@ impl Gpu {
                 None
             };
 
+        let pm_decode = flags.pm_decode;
         Ok(Self {
             hip,
             arch,
@@ -1790,6 +1968,7 @@ impl Gpu {
             modules: HashMap::new(),
             functions: HashMap::new(),
             pool: crate::pool::GpuPool::new(),
+            dflash_gdn_replay_scratch: HashMap::new(),
             vmm_arenas: HashMap::new(),
             vmm_generations: HashMap::new(),
             vmm_generation_counter: 0,
@@ -1851,6 +2030,10 @@ impl Gpu {
                 mq4v2_fp8_half_sums_scratch_bytes: 0,
                 mq4v2_fp8_row_scales_scratch: None,
                 mq4v2_fp8_row_scales_scratch_bytes: 0,
+                fp8_verify_x8_scratch: None,
+                fp8_verify_x8_scratch_bytes: 0,
+                fp8_verify_scales_scratch: None,
+                fp8_verify_scales_scratch_bytes: 0,
                 fp8_f2_weights: None,
                 fp8_f2_weights_bytes: 0,
                 ksplit_det_partials: None,
@@ -1861,9 +2044,14 @@ impl Gpu {
                 fa2_q16_scratch_bytes: 0,
                 fa2_fp8_q_scratch: None,
                 fa2_fp8_q_scratch_bytes: 0,
+                route_load: Default::default(),
+                pm_decode,
             },
             replay: crate::replay::ReplayController::from_config(),
             mq4v2_symmetric: false,
+            fp8_verify_scope: false,
+            iu4_verify_scope: false,
+            iu4_verify_load: false,
             qwen4_trunk_iu4: false,
             residual_fold_arm: None,
             residual_fold_pending: None,
@@ -1908,6 +2096,8 @@ impl Gpu {
             capture_names: HashMap::new(),
             hessian_capture: None,
             qwen4_scope: false,
+            lane_rows_scope: false,
+            prefill_invariant_scope: false,
         })
         .map(|mut gpu| {
             if gpu.flags.force_blob_path {
@@ -2944,6 +3134,7 @@ impl Gpu {
         railgun_words: &[railgun::kernel::DeclaredWord],
         blob_builder: impl FnOnce() -> hip_bridge::KernargBlob,
     ) -> HipResult<()> {
+        self.ensure_route_modules_preloaded()?;
         // Fail closed before the recorder / capture tapes see the launch: an
         // oversized grid.y/grid.z must never be recorded, captured, or clamped.
         self.hip
@@ -3045,6 +3236,7 @@ impl Gpu {
     /// Inputs/state must be restored by the caller first.
     pub fn replay_recorded_hip_prefix(&self, count: usize) -> HipResult<()> {
         self.bind_thread()?;
+        self.refuse_unprepared_route("replay_recorded_hip_prefix")?;
         if count > self.replay.recorded_launches().len() {
             return Err(hip_bridge::HipError::new(
                 0,
@@ -3087,6 +3279,7 @@ impl Gpu {
     /// between them is then a submission difference, never a patching one.
     pub fn replay_recorded_hip_prefix_at(&self, count: usize, position: usize) -> HipResult<()> {
         self.bind_thread()?;
+        self.refuse_unprepared_route("replay_recorded_hip_prefix_at")?;
         let launches = self.replay.recorded_launches();
         if count > launches.len() {
             return Err(hip_bridge::HipError::new(
@@ -3170,6 +3363,7 @@ impl Gpu {
         kernargs: &mut [u8],
     ) -> HipResult<()> {
         self.bind_thread()?;
+        self.refuse_unprepared_route("launch_kernel_blob")?;
         let func = self.functions.get(func_name).ok_or_else(|| {
             hip_bridge::HipError::new(
                 0,
@@ -3220,6 +3414,7 @@ impl Gpu {
         bindings: ReplayLaunchBindings<'_>,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        self.ensure_route_modules_preloaded()?;
         // Fail closed before the recorder / capture tapes see the launch.
         self.hip
             .validate_launch_grid(grid)
@@ -3294,7 +3489,20 @@ impl Gpu {
         result.map_err(|e| e.with_kernel(func_name))
     }
 
-    /// Compile and load a kernel, caching the result.
+    /// Immutable raw launch paths cannot drain the barrier; they refuse a
+    /// route whose planned modules are not yet loaded.
+    fn refuse_unprepared_route(&self, what: &str) -> HipResult<()> {
+        if self.scratch.route_load.pending() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("{what}: planned route kernels are not preloaded yet"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Compile and load a kernel, caching the result. A pending planned route
+    /// is drained first (see [`Self::ensure_route_modules_preloaded`]).
     pub(crate) fn ensure_kernel(
         &mut self,
         module_name: &str,
@@ -3306,6 +3514,8 @@ impl Gpu {
             &self.hip,
             &mut self.modules,
             &mut self.functions,
+            &mut self.scratch.route_load,
+            self.scratch.pm_decode,
             module_name,
             source,
             func_name,
@@ -3314,25 +3524,147 @@ impl Gpu {
 
     /// Load the admitted builder bundle into the same module/function cache as
     /// JIT kernels. The embedded image keeps runtime independent of hipfire-isa
-    /// and of a working-tree-relative artifact path.
+    /// and of a working-tree-relative artifact path; it is admitted as an
+    /// in-memory code object (no file is written) and every requested export
+    /// binds to that one digest. A function already bound to a different image
+    /// is rejected before the function-cache early return. Embedded images get
+    /// the same planned-route barrier as HIP modules.
     pub(crate) fn ensure_embedded_kernel(
         &mut self,
-        module_name: &str,
-        image: &[u8],
+        module_name: &'static str,
+        image: impl Into<redline_dispatch::aql::CodeObjectBytes>,
         func_name: &str,
     ) -> HipResult<()> {
+        self.ensure_route_modules_preloaded()?;
+        let image = image.into();
         if self.functions.contains_key(func_name) {
-            return Ok(());
+            return self
+                .compiler
+                .code_objects()
+                .check_function_image(func_name, image.as_bytes())
+                .map_err(|reason| hip_bridge::HipError::new(0, &reason));
+        }
+        if matches!(self.scratch.route_load, crate::scratch::RouteLoad::Sealed) {
+            return Err(crate::scratch::unplanned_route_kernel(module_name, func_name));
         }
         if !self.modules.contains_key(module_name) {
-            self.modules
-                .insert(module_name.to_owned(), self.hip.module_load_data(image)?);
+            let module = self.hip.module_load_data(image.as_bytes())?;
+            self.compiler
+                .code_objects_mut()
+                .admit_module(
+                    module_name,
+                    crate::code_object::CodeObjectArtifact::native_embedded(module_name, image, None),
+                )
+                .map_err(|reason| hip_bridge::HipError::new(0, &reason))?;
+            self.modules.insert(module_name.to_owned(), module);
+        } else if let Some(bound) = self.compiler.code_objects().module(module_name) {
+            if bound.id() != crate::code_object::CodeObjectId::of(image.as_bytes()) {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!("module {module_name:?} is bound to image {} and a different image was requested", bound.id()),
+                ));
+            }
         }
         let func = self
             .hip
             .module_get_function(&self.modules[module_name], func_name)?;
+        crate::scratch::bind_loaded_function(&mut self.compiler, module_name, func_name)?;
         self.functions.insert(func_name.to_owned(), func);
         Ok(())
+    }
+
+    // ── Planned-route kernel load barrier ───────────────────────────────
+
+    /// Start loading a planner-closed route's kernels: freeze the plan and
+    /// start its missing HIP compiles on at most `jobs` CPU workers, so they
+    /// overlap the caller's non-dispatching weight read/upload. Nothing is
+    /// loaded on the GPU here. Replaces any earlier route state.
+    pub fn begin_route_kernel_load(
+        &mut self,
+        plan: crate::kernel_registry::RouteKernelPlan,
+        jobs: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.abort_route_kernel_load()?;
+        crate::kernel_registry::validate_route_plan(&plan)
+            .map_err(|e| hip_bridge::HipError::new(0, &format!("route plan: {e:?}")))?;
+        let hip_entries: Vec<crate::kernel_registry::KernelEntry> = plan
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                crate::kernel_registry::PlannedKernel::Hip(entry) => {
+                    Some(crate::kernel_registry::KernelEntry {
+                        arch: entry.arch,
+                        module: entry.module,
+                        symbols: entry.symbols,
+                        source: entry.source.clone(),
+                        flags: entry.flags.clone(),
+                        scheduler_profile: entry.scheduler_profile.clone(),
+                    })
+                }
+                crate::kernel_registry::PlannedKernel::Embedded { .. } => None,
+            })
+            .collect();
+        let batch = self.compiler.begin_batch(hip_entries, jobs)?;
+        self.scratch.route_load = crate::scratch::RouteLoad::Pending {
+            plan,
+            batch: Some(batch),
+        };
+        Ok(())
+    }
+
+    /// First-dispatch barrier: join the whole planned compile batch, then
+    /// load every planned HIP and embedded module and bind every planned
+    /// symbol. Idempotent; every kernel request and mutable launch funnel
+    /// calls it, so no dispatch precedes the full plan.
+    pub fn ensure_route_modules_preloaded(&mut self) -> HipResult<()> {
+        // bind_thread: skip — hot launch-funnel check; binds below only when a
+        // plan is pending and modules are about to load.
+        if !self.scratch.route_load.pending() {
+            return Ok(());
+        }
+        self.bind_thread()?;
+        crate::scratch::prepare_route_modules(
+            &mut self.scratch.route_load,
+            &mut self.compiler,
+            &self.hip,
+            &mut self.modules,
+            &mut self.functions,
+            self.scratch.pm_decode,
+        )
+    }
+
+    /// Seal a route after its weights loaded: preload if no dispatch has yet,
+    /// then refuse any unplanned kernel compile/module load. No-op when no
+    /// route was begun (lazy loading stays).
+    pub fn finish_route_kernel_load(&mut self) -> HipResult<()> {
+        self.bind_thread()?;
+        match self.scratch.route_load {
+            crate::scratch::RouteLoad::Idle | crate::scratch::RouteLoad::Sealed => Ok(()),
+            _ => {
+                self.ensure_route_modules_preloaded()?;
+                self.scratch.route_load = crate::scratch::RouteLoad::Sealed;
+                Ok(())
+            }
+        }
+    }
+
+    /// Drop any route state and return to lazy loading, joining every
+    /// outstanding compile worker. Modules already loaded stay cached.
+    pub fn abort_route_kernel_load(&mut self) -> HipResult<()> {
+        // bind_thread: skip — CPU-only: joins compile workers, no HIP call.
+        match std::mem::take(&mut self.scratch.route_load) {
+            crate::scratch::RouteLoad::Pending {
+                batch: Some(batch), ..
+            } => self.compiler.finish_batch(batch),
+            _ => Ok(()),
+        }
+    }
+
+    /// True while a begun route's modules are not yet on the GPU.
+    pub fn route_kernels_pending(&self) -> bool {
+        // bind_thread: skip — pure state query.
+        self.scratch.route_load.pending()
     }
 
     /// Ensure the FP16 X scratch contains the conversion of `x`. Skips the
@@ -3938,9 +4270,12 @@ impl Gpu {
         prepared.checked_ptr(generation, ptr, k, n)
     }
 
+    /// The A8 projection route. Off inside the IU4 verify scope, whose
+    /// producers must not depend on the row count.
     pub fn a8_prefill_active(&self, n: usize, k: usize) -> bool {
         self.flags.a8_prefill_enabled()
             && self.mq4v2_symmetric
+            && !self.iu4_verify_scope
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
             && n >= 64 && k > 0 && k % 256 == 0
@@ -3960,10 +4295,11 @@ impl Gpu {
     }
     /// True when the gfx1201 slice-1 silu+quant fusion is live for this call:
     /// IU4 + exact gfx1201 + eager (no replay/capture) + K constraint of the
-    /// iu4 MMQ consumer. Any batch >= 64: every producer grid is row-parallel
-    /// in batch (one row per workgroup), and the gfx1201 iu4 MMQ consumer
-    /// handles partial 128-row tiles natively (zero-filled slab / guarded
-    /// writeback), so the old %128 multiple was grid convenience only.
+    /// iu4 MMQ consumer. Any batch >= 64 (any batch >= 1 inside the IU4
+    /// verify scope): every producer grid is row-parallel in batch (one row
+    /// per workgroup), and the gfx1201 iu4 MMQ consumer handles partial
+    /// 128-row tiles natively (zero-filled slab / guarded writeback), so the
+    /// old %128 multiple was grid convenience only.
     /// Default on for the IU4 route (`HIPFIRE_GFX12_SILU_QUANT_FUSED=0` opts out).
     pub fn iu4_silu_quant_fused_active(&self, batch: usize, k: usize) -> bool {
         self.flags.gfx12_silu_quant_fused_enabled()
@@ -3971,25 +4307,105 @@ impl Gpu {
             && self.flags.iu4_prefill_enabled()
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
-            && batch >= 64
+            && (batch >= 64 || (self.iu4_verify_scope && batch >= 1))
             && k > 0
             && k % 256 == 0
     }
     /// True when a gfx1201 slices-2-4 producer+quant fusion is live for this
     /// call: IU4 + `HIPFIRE_GFX12_PRODUCER_QUANT_FUSED` on exact gfx1201 +
     /// eager (no replay/capture) + K constraint of the iu4 MMQ consumer. Any
-    /// batch >= 64, same row-parallel justification as
-    /// `iu4_silu_quant_fused_active`; the GDN fused producer additionally
-    /// requires head_dim == 128 at its callsite helper.
+    /// batch >= 64 (any batch >= 1 inside the IU4 verify scope), same
+    /// row-parallel justification as `iu4_silu_quant_fused_active`; the GDN
+    /// fused producer additionally requires head_dim == 128 at its callsite
+    /// helper.
     pub fn iu4_producer_quant_fused_active(&self, batch: usize, k: usize) -> bool {
         self.flags.gfx12_producer_quant_fused_enabled()
             && !self.a8_prefill_active(batch, k)
             && self.flags.iu4_prefill_enabled()
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
-            && batch >= 64
+            && (batch >= 64 || (self.iu4_verify_scope && batch >= 1))
             && k > 0
             && k % 256 == 0
+    }
+
+    /// The IU4 verify decision of a DFlash load whose proposal width resolved
+    /// to `dflash_block`: `HIPFIRE_CB_VERIFY_IU4=0` off, `=1` on, unset = on
+    /// iff `dflash_block == 8` (a batching serve) and `HIPFIRE_CB_VERIFY_FP8`
+    /// is off. `Err` when both verify opt-ins are forced on (two different
+    /// verify arithmetics).
+    pub fn iu4_verify_load_decision(flags: &crate::FeatureFlags, dflash_block: usize) -> Result<bool, String> {
+        // bind_thread: skip — pure flag decision, no HIP call or device state.
+        match flags.cb_verify_iu4 {
+            Some(true) if flags.cb_verify_fp8 => Err(
+                "HIPFIRE_CB_VERIFY_IU4=1 and HIPFIRE_CB_VERIFY_FP8=1 are mutually exclusive \
+                 (two different verify arithmetics); unset one of them"
+                    .to_string(),
+            ),
+            Some(on) => Ok(on),
+            None => Ok(dflash_block == 8 && !flags.cb_verify_fp8),
+        }
+    }
+
+    /// The device/flag half of the IU4 verify admission: this load's
+    /// decision ([`Self::iu4_verify_load`]), exact gfx1201, a symmetric MQ4V2
+    /// artifact, the IU4 route and both gfx1201 A4 producer fusions on (the
+    /// verify trunk has no other A4 producer for its out-projections and FFN
+    /// down). The target half (dense MQ4G256V2 weights) is the caller's.
+    pub fn iu4_verify_route_admitted(&self) -> bool {
+        // bind_thread: skip — pure host-side flag/property query, no HIP call.
+        self.iu4_verify_load
+            && self.arch == "gfx1201"
+            && self.mq4v2_symmetric
+            && self.flags.iu4_prefill_enabled()
+            && self.flags.gfx12_producer_quant_fused_enabled()
+            && self.flags.gfx12_silu_quant_fused_enabled()
+    }
+
+    /// Open the IU4 verify scope (`admitted` = the caller's full admission);
+    /// returns the previous scope for [`Self::iu4_verify_exit`]. Graph
+    /// capture and Redline recording never run inside the scope: the A4
+    /// producers are eager-only, and the verify callers take their eager
+    /// route while it is set.
+    pub fn iu4_verify_enter(&mut self, admitted: bool) -> bool {
+        // bind_thread: skip — updates a CPU-side scope flag, no device call.
+        let prev = self.iu4_verify_scope;
+        self.iu4_verify_scope = admitted;
+        prev
+    }
+
+    /// Close the scope. The first 3 closed scopes (and every 1000th) print the
+    /// route receipt: IU4 GEMM launches and F16 MQ4V2 GEMM calls inside them.
+    pub fn iu4_verify_exit(&mut self, prev: bool) {
+        // bind_thread: skip — CPU-side scope/counter updates and logging, no HIP call.
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.iu4_verify_scope && !prev {
+            let iu4 = IU4_VERIFY_SCOPE_IU4.swap(0, Relaxed);
+            let rows = IU4_VERIFY_SCOPE_ROWS.swap(0, Relaxed);
+            let f16 = IU4_VERIFY_SCOPE_F16.swap(0, Relaxed);
+            let i = IU4_VERIFY_SCOPES.fetch_add(1, Relaxed);
+            if i < 3 || i % 1000 == 0 {
+                eprintln!("[dflash-iu4-verify] scope #{i}: {iu4} IU4 GEMM launches ({rows} rows total), {f16} F16 MQ4V2 GEMM calls");
+            }
+        }
+        self.iu4_verify_scope = prev;
+    }
+
+    /// Route receipt: one IU4 GEMM launch over `n` rows (inside the scope only).
+    pub fn iu4_verify_note_iu4(&self, n: usize) {
+        // bind_thread: skip — updates host-side receipt counters, no device call.
+        if self.iu4_verify_scope {
+            IU4_VERIFY_SCOPE_IU4.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            IU4_VERIFY_SCOPE_ROWS.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Route receipt: one F16 MQ4V2 GEMM call (inside the scope only).
+    pub fn iu4_verify_note_f16(&self) {
+        // bind_thread: skip — updates a host-side receipt counter, no device call.
+        if self.iu4_verify_scope {
+            IU4_VERIFY_SCOPE_F16.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
     /// True when a gfx11 sigmoid/gated-norm producer+quant fusion is live
     /// for this call: IU4 + `HIPFIRE_GFX11_PRODUCER_QUANT_FUSED` on
@@ -4017,6 +4433,7 @@ impl Gpu {
     pub fn fp8_stream_active(&self, batch: usize, k: usize) -> bool {
         self.flags.gfx12_fp8_stream_enabled()
             && !self.a8_prefill_active(batch, k)
+            && !self.iu4_verify_scope
             && self.arch == "gfx1201"
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
@@ -4340,48 +4757,6 @@ impl Gpu {
         self.flags.slots_attn_crossover
     }
 
-    /// Pre-compile a batch of kernels in parallel (hipcc), then load modules + functions.
-    /// Each entry is (module_name, source, func_name). Turbo kernels should have
-    /// TURBO_COMMON_H already prepended in their source.
-    pub fn precompile_kernels(&mut self, specs: &[(&str, &str, &str)]) -> HipResult<()> {
-        self.bind_thread()?;
-        let batch: Vec<(&str, &str, &str)> = specs
-            .iter()
-            .filter(|(_, _, func)| !self.functions.contains_key(*func))
-            .copied()
-            .collect();
-
-        if batch.is_empty() {
-            return Ok(());
-        }
-
-        // Parallel hipcc compilation
-        self.compiler.compile_batch_for_symbols(&batch)?;
-
-        // Now load modules + extract functions (must be sequential — GPU API calls)
-        for &(module_name, source, func_name) in specs {
-            if self.functions.contains_key(func_name) {
-                continue;
-            }
-            let obj_path = self.compiler.compile_for_symbol(module_name, source, func_name)?;
-            let obj_path_str = obj_path.to_str().unwrap().to_string();
-            if !self.modules.contains_key(module_name) {
-                let module = crate::scratch::module_load_or_recompile(
-                    &self.hip,
-                    &mut self.compiler,
-                    module_name,
-                    source,
-                    func_name,
-                    &obj_path_str,
-                )?;
-                self.modules.insert(module_name.to_string(), module);
-            }
-            let module = &self.modules[module_name];
-            let func = self.hip.module_get_function(module, func_name)?;
-            self.functions.insert(func_name.to_string(), func);
-        }
-        Ok(())
-    }
 
     // ── Tensor allocation ───────────────────────────────────────
 
@@ -4470,7 +4845,12 @@ impl Gpu {
             .min(arena.reserved_bytes());
         if initial_mapped_bytes > 0 {
             if let Err(err) = arena.map_next(&self.hip, initial_mapped_bytes, access_devices) {
-                return Err(self.retain_failed_vmm_arena(arena, err));
+                if !self.vmm_pool_drain_for_retry(&err, initial_mapped_bytes) {
+                    return Err(self.retain_failed_vmm_arena(arena, err));
+                }
+                if let Err(err) = arena.map_next(&self.hip, initial_mapped_bytes, access_devices) {
+                    return Err(self.retain_failed_vmm_arena(arena, err));
+                }
             }
         }
         self.register_vmm_arena(arena, byte_size, shape, dtype)
@@ -4508,6 +4888,137 @@ impl Gpu {
             shape: shape.to_vec(),
             dtype,
         })
+    }
+
+    /// Copy exactly `source.buf.size()` bytes (not shape*dtype) into a new
+    /// exportable single-allocation VMM owner and return it with a POSIX FD.
+    /// Borrowed sources are accepted: callers must supply a bounded view when
+    /// typed logical bytes are shorter than the owning allocation's capacity.
+    /// The allocation is `logical + EXPORT_WEIGHT_TAIL_PAD_BYTES` rounded up to the
+    /// arena granularity; the zeroed tail stands in for the hipMalloc slack that
+    /// kernels' phantom header/vector reads past the exact size rely on.
+    ///
+    /// `source` is untouched and never freed here; the caller promotes aliases
+    /// and releases the actual owning tensor with
+    /// [`Self::release_weight_source_immediate`], not the borrowed source view.
+    /// The new owner is registered as a `Raw [logical_bytes]` VMM owner and
+    /// published read-only. Any failure after the
+    /// arena exists retires it through the orphan machinery; the FD closes on drop.
+    /// No pool retry: a map failure is returned as-is.
+    #[cfg(target_os = "linux")]
+    pub fn create_exportable_weight_copy(
+        &mut self,
+        source: &GpuTensor,
+    ) -> HipResult<ExportedWeightAllocation> {
+        self.bind_thread()?;
+        let logical = source.buf.size();
+        if source.buf.as_ptr().is_null() || logical == 0 {
+            return Err(HipError::new(
+                0,
+                "exportable weight copy needs a non-null, non-empty source",
+            ));
+        }
+        // Producer streams may still be writing the source.
+        self.hip.device_synchronize()?;
+        let reserve_bytes = logical.checked_add(EXPORT_WEIGHT_TAIL_PAD_BYTES).ok_or_else(|| {
+            HipError::new(0, "exportable weight size plus tail pad overflows")
+        })?;
+        let mut arena = VmmArena::reserve_exportable(&self.hip, self.device_id, reserve_bytes)?;
+        let fd = match self.fill_exportable_weight_arena(&mut arena, &source.buf, logical) {
+            Ok(fd) => fd,
+            Err(err) => return Err(self.retain_failed_vmm_arena(arena, err)),
+        };
+        let physical_bytes = arena.mapped_bytes();
+        let granularity = arena.granularity();
+        // On error the arena is retained by register_vmm_arena and `fd` drops.
+        let owner = self.register_vmm_arena(arena, logical, &[logical], DType::Raw)?;
+        Ok(ExportedWeightAllocation {
+            owner,
+            fd,
+            physical_bytes,
+            logical_bytes: logical,
+            granularity,
+        })
+    }
+
+    /// Map the single RW allocation, copy, zero the whole `[logical, physical)` tail
+    /// (at least [`EXPORT_WEIGHT_TAIL_PAD_BYTES`]), synchronize, publish read-only
+    /// and export the FD.
+    #[cfg(target_os = "linux")]
+    fn fill_exportable_weight_arena(
+        &self,
+        arena: &mut VmmArena,
+        source: &DeviceBuffer,
+        logical: usize,
+    ) -> HipResult<std::os::fd::OwnedFd> {
+        arena.map_next(&self.hip, arena.reserved_bytes(), &[])?;
+        let physical = arena.mapped_bytes();
+        validate_weight_extents(physical, logical, arena.granularity())?;
+        let dst = arena.buffer(logical)?;
+        self.hip.memcpy_dtod(&dst, source, logical)?;
+        let tail = physical - logical;
+        if tail > 0 {
+            // SAFETY: [base+logical, base+physical) lies inside the mapped RW arena.
+            let tail_view = unsafe {
+                DeviceBuffer::from_raw((arena.base_address() + logical) as *mut c_void, tail)
+            };
+            self.hip.memset(&tail_view, 0, tail)?;
+        }
+        self.hip.device_synchronize()?;
+        arena.publish_read_only(&self.hip)?;
+        arena.export_posix(&self.hip)
+    }
+
+    /// Import a shared weight allocation as a read-only `Raw [logical_bytes]` VMM owner.
+    ///
+    /// Extents are validated (pure, checked) before any HIP import. `fd` is borrowed
+    /// and left open. A granularity/size mismatch or registration failure retires the
+    /// imported arena through the orphan machinery.
+    #[cfg(target_os = "linux")]
+    pub fn import_weight_allocation(
+        &mut self,
+        fd: std::os::fd::BorrowedFd<'_>,
+        allocation: &ImportedWeightAllocationDesc,
+    ) -> HipResult<GpuTensor> {
+        self.bind_thread()?;
+        validate_weight_extents(
+            allocation.physical_bytes,
+            allocation.logical_bytes,
+            allocation.granularity,
+        )?;
+        let arena =
+            VmmArena::import_posix(&self.hip, self.device_id, fd, allocation.physical_bytes)?;
+        if arena.granularity() != allocation.granularity
+            || arena.mapped_bytes() != allocation.physical_bytes
+        {
+            let err = HipError::new(
+                0,
+                &format!(
+                    "imported weight allocation mismatch: granularity {} vs {}, mapped {} vs {}",
+                    arena.granularity(),
+                    allocation.granularity,
+                    arena.mapped_bytes(),
+                    allocation.physical_bytes
+                ),
+            );
+            return Err(self.retain_failed_vmm_arena(arena, err));
+        }
+        let logical = allocation.logical_bytes;
+        let owner = self.register_vmm_arena(arena, logical, &[logical], DType::Raw)?;
+        if !owner.buf.is_vmm_owner() || owner.buf.size() != logical {
+            let err = HipError::new(
+                0,
+                &format!(
+                    "imported weight owner has {} bytes, expected {logical}",
+                    owner.buf.size()
+                ),
+            );
+            return Err(match self.free_tensor(owner) {
+                Ok(()) => err,
+                Err(cleanup) => HipError::new(0, &format!("{err}; cleanup also failed: {cleanup}")),
+            });
+        }
+        Ok(owner)
     }
 
     /// Allocate a **host-mapped** tensor: system RAM the GPU reads directly over PCIe.
@@ -4655,20 +5166,70 @@ impl Gpu {
         self.bind_thread()?;
         let key = tensor.buf.as_ptr() as usize;
         let logical_bytes = tensor.byte_size();
-        let arena = self.vmm_arenas.get_mut(&key).ok_or_else(|| {
-            HipError::new(
+        if !self.vmm_arenas.contains_key(&key) {
+            return Err(HipError::new(
                 0,
                 &format!("tensor at 0x{key:x} is not a registered VMM owner"),
-            )
-        })?;
+            ));
+        }
+        // A failed granule map aborts the arena, so it cannot be retried:
+        // return pooled memory before the map instead.
+        if granules {
+            self.vmm_pool_headroom(additional_bytes);
+        }
+        let arena = self.vmm_arenas.get_mut(&key).expect("checked above");
         if granules {
             arena.map_next_granules(&self.hip, additional_bytes, access_devices)?;
-        } else {
+        } else if let Err(err) = arena.map_next(&self.hip, additional_bytes, access_devices) {
+            if !self.vmm_pool_drain_for_retry(&err, additional_bytes) {
+                return Err(err);
+            }
+            let arena = self.vmm_arenas.get_mut(&key).expect("checked above");
             arena.map_next(&self.hip, additional_bytes, access_devices)?;
         }
+        let arena = self.vmm_arenas.get_mut(&key).expect("checked above");
         let mapped_bytes = arena.mapped_bytes();
         tensor.buf = unsafe { arena.owner_buffer(logical_bytes)? };
         Ok(mapped_bytes)
+    }
+
+    /// Before a VMM granule map of `bytes`: when HIP's free figure cannot
+    /// cover it (plus a 64 MiB margin) and the pool holds buffers, return
+    /// every pooled buffer to HIP first and log it. Pooled buffers are
+    /// invisible to `hipMemCreate`, exactly as to `hipMalloc`
+    /// ([`crate::pool::GpuPool::alloc`]); a failed granule map aborts its
+    /// arena, so these maps drain up front instead of retrying.
+    fn vmm_pool_headroom(&mut self, bytes: usize) {
+        const MARGIN: usize = 64 << 20;
+        let pooled = self.pool.pooled_bytes();
+        if pooled == 0 {
+            return;
+        }
+        let free = self.device_mem_info().map_or(0, |(free, _)| free);
+        if free >= bytes.saturating_add(MARGIN) {
+            return;
+        }
+        self.pool.drain(&self.hip);
+        eprintln!(
+            "GpuPool: VMM map of {bytes} B with {free} B free; returned {pooled} B of pooled \
+             buffers to HIP before mapping"
+        );
+    }
+
+    /// After a whole-segment VMM map (`VmmArena::map_next`, which leaves the
+    /// arena unchanged when `hipMemCreate` fails) ran out of memory: return
+    /// the pool's buffers to HIP and report whether a single retry is due.
+    fn vmm_pool_drain_for_retry(&mut self, err: &HipError, bytes: usize) -> bool {
+        let pooled = self.pool.pooled_bytes();
+        if err.code != hip_bridge::HIP_ERROR_OUT_OF_MEMORY || pooled == 0 {
+            return false;
+        }
+        self.pool.drain(&self.hip);
+        eprintln!(
+            "GpuPool: VMM map of {bytes} B out of memory; returned {pooled} B of pooled buffers \
+             to HIP and retrying once"
+        );
+        true
     }
 
     pub fn vmm_mapped_bytes(&self, tensor: &GpuTensor) -> Option<usize> {
@@ -4985,6 +5546,7 @@ impl Gpu {
                 .valid_bytes
                 .next_multiple_of(arena.granule_bytes())
                 .min(arena.reserved_bytes());
+            self.vmm_pool_headroom(end - entry.alias_bytes);
             if let Err(err) =
                 arena.map_next_granules(&self.hip, end - entry.alias_bytes, access_devices)
             {
@@ -5935,6 +6497,38 @@ impl Gpu {
         self.hip.free(tensor.buf)
     }
 
+    /// Release the old hipMalloc owner of a weight that was promoted to a shared
+    /// VMM allocation, physically and immediately (never parked in the pool).
+    ///
+    /// Order is load-bearing: bind the thread, reject anything that is not a
+    /// `hipMalloc` owner, then synchronize the whole device (every stream, so no
+    /// producer kernel or async copy can still touch the source). A
+    /// synchronization error leaves `source` completely unchanged. Only after
+    /// the sync succeeds is the owner taken out of `source`, which is replaced by
+    /// an empty borrowed `Raw [0]` descriptor, and handed to the HIP free path.
+    ///
+    /// A HIP free error is terminal for the old owner: the descriptor is already
+    /// gone from `source` and there is no retry. The caller must treat the
+    /// weight host as `Failed` and never publish. [`Self::release_tensor_immediate`]
+    /// is unchanged.
+    pub fn release_weight_source_immediate(&mut self, source: &mut GpuTensor) -> HipResult<()> {
+        self.bind_thread()?;
+        let key = source.buf.as_ptr() as usize;
+        if !source.buf.is_hip_allocation() {
+            return Err(HipError::new(
+                0,
+                &format!("refusing to release non-hipMalloc weight source at 0x{key:x}"),
+            ));
+        }
+        self.hip.device_synchronize()?;
+        // SAFETY: an empty (null, 0) borrowed descriptor never reaches HIP.
+        let empty = unsafe { DeviceBuffer::from_raw(std::ptr::null_mut(), 0) };
+        let owner = std::mem::replace(&mut source.buf, empty);
+        source.shape = vec![0];
+        source.dtype = DType::Raw;
+        self.hip.free(owner)
+    }
+
     /// Host→device `upload_f32` calls since process start. A hot loop that
     /// re-uploads a constant vector every call shows up here; a loop that
     /// uploads once and caches does not.
@@ -5952,6 +6546,14 @@ impl Gpu {
             self.pool.total_reused,
             self.pool.total_allocated,
         )
+    }
+
+    /// Bytes parked in the buffer pool's free lists: allocated from HIP but
+    /// owned by no tensor. `hipMemGetInfo` counts them as used; every pool
+    /// allocation and VMM map returns them to HIP on demand before failing.
+    pub fn pool_parked_bytes(&self) -> usize {
+        // bind_thread: skip — pure read of the pool's host-side byte counter, no HIP call.
+        self.pool.pooled_bytes()
     }
 
     /// Drain the GPU memory pool. Actually calls hipFree on all pooled buffers.
@@ -5974,6 +6576,9 @@ impl Gpu {
     ///     (`ScratchState::qsa_gather_vmm`): released, so the next model
     ///     reserves its own context and unload's VMM gate sees no Gpu-held
     ///     owner. The legacy slot (`qsa_gather_f16`) is kept, as before.
+    ///   * the shared GDN replay scratch (`dflash_gdn_replay_scratch`): every
+    ///     entry returns to the pool, so a model swap never inherits one; a
+    ///     tape that outlived the unload fails loudly at its next replay.
     pub fn invalidate_weight_caches(&mut self) {
         self.bind_thread_or_warn();
         self.mmq_screen.cache.clear();
@@ -5984,6 +6589,7 @@ impl Gpu {
         // A failed release is retained for `ensure_vmm_cleaned` to retry
         // and report.
         let _ = self.release_qsa_gather_workspace();
+        self.drain_dflash_gdn_replay_scratch();
     }
 
     /// Invalidate the pointer-keyed F16 conversion cache. Must be called
@@ -6484,765 +7090,23 @@ impl Gpu {
 
     /// PARO4-G128T fused SwiGLU rotate-once down projection.
 
-    /// PARO4-G128T fused gate/up decode path. Gate and up have distinct
-    /// Paro rotations, so this still rotates both, but batches the two
-    /// rotations and the two pack4 GEMVs into two launches instead of four.
-
-    /// PARO4-G128T fused LA projection path. The four Paro projections have
-    /// distinct rotations, so this batches four rotates and four pack4 GEMVs
-    /// into two launches.
-    #[allow(clippy::too_many_arguments)]
     // ═══════════════════════════════════════════════════════════════════════════
-    // Batch precompilation — compile all kernels a model needs in parallel
+    // Registry precompilation (profiling)
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// Pre-compile all kernels needed for Qwen3.5 inference with a given
-    /// weight quantization and KV cache type. Runs hipcc in parallel.
-    #[cfg(feature = "deltanet")]
-    pub fn precompile_qwen35(
-        &mut self,
-        weight_quant: &str,
-        kv_type: &str,
-        head_dim: usize,
-    ) -> HipResult<()> {
-        self.bind_thread()?;
-        // asym kernels #include "turbo_common.h" + "givens_common.h"; the
-        // runtime dispatch path (see ensure_givens4_kernel) prepends the
-        // header bodies and strips the #includes. We mirror that exactly so
-        // the hash matches and the runtime re-uses our cached .hsaco.
-        //
-        // asym3 (SP1) additionally #includes "kv_slot_desc.h" — mirror
-        // ensure_givens4_kernel's conditional handling (only sources that
-        // actually contain the directive get it stripped/prepended) so the
-        // other assemble_asym callers (asym2/asym4/fwht2/fwht3/fwht4), which
-        // don't include it, keep producing byte-identical source to what the
-        // runtime compiles for them, and only asym3's precompiled hash grows
-        // to include the header.
-        let assemble_asym = |body: &str| -> String {
-            let needs_kv_slot_desc = body.contains("#include \"kv_slot_desc.h\"");
-            let stripped = body
-                .replace("#include \"turbo_common.h\"", "")
-                .replace("#include \"givens_common.h\"", "")
-                .replace("#include \"kv_slot_desc.h\"", "");
-            if needs_kv_slot_desc {
-                format!(
-                    "{}\n{}\n{}\n{}",
-                    kernels::TURBO_COMMON_H,
-                    kernels::GIVENS_COMMON_SRC,
-                    kernels::KV_SLOT_DESC_H,
-                    stripped
-                )
-            } else {
-                format!(
-                    "{}\n{}\n{}",
-                    kernels::TURBO_COMMON_H,
-                    kernels::GIVENS_COMMON_SRC,
-                    stripped
-                )
-            }
-        };
-
-        // Common kernels for all Qwen3.5 models (DeltaNet + FullAttn shared ops)
-        let mut specs: Vec<(&str, String)> = vec![
-            ("rmsnorm", kernels::RMSNORM_SRC.to_string()),
-            ("add_inplace", kernels::ADD_INPLACE_SRC.to_string()),
-            ("mul", kernels::MUL_SRC.to_string()),
-            ("silu_mul", kernels::SILU_MUL_SRC.to_string()),
-            ("sigmoid", kernels::SIGMOID_SRC.to_string()),
-            ("alpha_gate", kernels::ALPHA_GATE_SRC.to_string()),
-            ("conv1d_silu", kernels::CONV1D_SILU_SRC.to_string()),
-            ("l2_norm", kernels::L2_NORM_SRC.to_string()),
-            (
-                "fused_qk_l2_norm_scale",
-                kernels::FUSED_QK_L2_NORM_SCALE_SRC.to_string(),
-            ),
-            (
-                "fused_sigmoid_alpha_gate",
-                kernels::FUSED_SIGMOID_ALPHA_GATE_SRC.to_string(),
-            ),
-            (
-                "conv1d_silu_split",
-                kernels::CONV1D_SILU_SPLIT_SRC.to_string(),
-            ),
-            (
-                "conv1d_silu_split_tree",
-                kernels::CONV1D_SILU_SPLIT_TREE_SRC.to_string(),
-            ),
-            (
-                "gated_delta_net_q8_tree",
-                kernels::GATED_DELTA_NET_Q8_TREE_SRC.to_string(),
-            ),
-            ("sigmoid_mul", kernels::SIGMOID_MUL_SRC.to_string()),
-            ("topk_logits", kernels::TOPK_LOGITS_SRC.to_string()),
-            ("scale_f32", kernels::SCALE_F32_SRC.to_string()),
-            ("gated_norm", kernels::GATED_NORM_SRC.to_string()),
-            (
-                "rope_partial_interleaved",
-                kernels::ROPE_PARTIAL_INTERLEAVED_SRC.to_string(),
-            ),
-            // FullAttn: Q+gate deinterleave split
-            ("deinterleave", kernels::DEINTERLEAVE_SRC.to_string()),
-            // DeltaNet: Q/K repeat-interleave for asymmetric MQA (replaces 64+ memcpy_dtod calls per layer on 4B/9B)
-            (
-                "repeat_interleave_qk",
-                kernels::REPEAT_INTERLEAVE_QK_SRC.to_string(),
-            ),
-        ];
-
-        // Weight-format-specific GEMV
-        match weight_quant {
-            "hfq6" => {
-                specs.push(("gemv_hfq6g256", kernels::GEMV_HFQ6G256_SRC.to_string()));
-            }
-            "paro4" => {
-                specs.push(("gemv_paro4g128", kernels::GEMV_PARO4G128_SRC.to_string()));
-            }
-            "mq6" => {
-                // MQ6 = FWHT-rotated HFQ6-G256. Needs both the MQ6 GEMV and the
-                // raw HFQ6 GEMV (used by a few residual paths), plus the new
-                // batched MQ6 GEMM for gemma4 Promote6 tensors (v_proj/down_proj).
-                specs.push(("gemv_mq6g256", kernels::GEMV_MQ6G256_SRC.to_string()));
-                specs.push(("gemv_hfq6g256", kernels::GEMV_HFQ6G256_SRC.to_string()));
-                specs.push(("gemm_mq6g256", kernels::GEMM_MQ6G256_SRC.to_string()));
-            }
-            "hfq4" => {
-                let (src, module) =
-                    kernels::gemv_hfq4g256_for_arch(&self.arch_caps, self.flags.rdna2_variant);
-                specs.push((module, src.to_string()));
-                specs.push((
-                    "gemv_hfq4g256_wide",
-                    kernels::GEMV_HFQ4G256_WIDE_SRC.to_string(),
-                ));
-                // Multi-projection fused kernels (LA 4-way, FA 3-way, FFN
-                // gate+up). Cross-arch — same 4-accumulator inner loop as
-                // gemv_hfq4g256.hip; precompile on every arch that uses
-                // the HFQ4 weight path.
-                if self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_qkvza_hoist_x32 {
-                    specs.push((
-                        "fused_qkvza_hfq4g256_hoist_x32_gfx1100",
-                        kernels::FUSED_QKVZA_HFQ4G256_HOIST_X32_GFX1100_SRC.to_string(),
-                    ));
-                } else {
-                    specs.push((
-                        "fused_qkvza_hfq4g256",
-                        kernels::FUSED_QKVZA_HFQ4G256_SRC.to_string(),
-                    ));
-                }
-                if self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_qkvza_2wave {
-                    specs.push((
-                        "fused_qkvza_hfq4g256_2wave",
-                        kernels::FUSED_QKVZA_HFQ4G256_2WAVE_GFX1100_SRC.to_string(),
-                    ));
-                }
-                if self.arch_caps.is_gfx1100() && self.flags.rdna3_hfq4_qkvza_k2048 {
-                    specs.push((
-                        "fused_qkvza_hfq4g256_k2048_gfx1100",
-                        kernels::FUSED_QKVZA_HFQ4G256_K2048_GFX1100_SRC.to_string(),
-                    ));
-                }
-                specs.push((
-                    "fused_qkv_hfq4g256",
-                    kernels::FUSED_QKV_HFQ4G256_SRC.to_string(),
-                ));
-                specs.push((
-                    "fused_gate_up_hfq4g256",
-                    kernels::FUSED_GATE_UP_HFQ4G256_SRC.to_string(),
-                ));
-                if self.arch_caps.is_gfx1100() {
-                    specs.push((
-                        "fused_gate_up_hfq4g256_stage_x32_gfx1100",
-                        kernels::FUSED_GATE_UP_HFQ4G256_STAGE_X32_GFX1100_SRC.to_string(),
-                    ));
-                }
-                // gfx906/gfx908/gfx94x wave64-native variants — cut
-                // wavefront pressure in half on the hottest kernels. Wave32
-                // block=[32,1,1] kernels otherwise waste the upper 32 lanes
-                // of every wave slot on these wave64-native arches.
-                if self.arch_caps.is_wave64_native()
-                    || (self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_qkv_wave64)
-                {
-                    // Single-token QKV paths. RDNA3 may opt into Radiowave's
-                    // explicit wave64 packing experiment; native-wave64
-                    // targets retain their established selection.
-                    specs.push((
-                        "fused_qkvza_hfq4g256_wave64",
-                        kernels::FUSED_QKVZA_HFQ4G256_WAVE64_SRC.to_string(),
-                    ));
-                    specs.push((
-                        "fused_qkv_hfq4g256_wave64",
-                        kernels::FUSED_QKV_HFQ4G256_WAVE64_SRC.to_string(),
-                    ));
-                }
-                if self.arch_caps.is_wave64_native() {
-                    // Remaining single-token and batched native-wave64 paths.
-                    specs.push((
-                        "fused_gate_up_hfq4g256_wave64",
-                        kernels::FUSED_GATE_UP_HFQ4G256_WAVE64_SRC.to_string(),
-                    ));
-                    specs.push((
-                        "gemv_hfq4g256_moe_gate_up_indexed_wave64",
-                        kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_WAVE64_SRC.to_string(),
-                    ));
-                    specs.push((
-                        "gemv_hfq4g256_moe_down_indexed_wave64",
-                        kernels::GEMV_HFQ4G256_MOE_DOWN_INDEXED_WAVE64_SRC.to_string(),
-                    ));
-                    // Batched (DFlash verify path — hottest).
-                    specs.push((
-                        "gemm_qkvza_hfq4g256_wave64",
-                        kernels::GEMM_QKVZA_HFQ4G256_WAVE64_SRC.to_string(),
-                    ));
-                    specs.push((
-                        "gemm_qkv_hfq4g256_wave64",
-                        kernels::GEMM_QKV_HFQ4G256_WAVE64_SRC.to_string(),
-                    ));
-                    specs.push((
-                        "gemm_hfq4g256_wave64",
-                        kernels::GEMM_HFQ4G256_WAVE64_SRC.to_string(),
-                    ));
-                    specs.push((
-                        "gemm_hfq4g256_residual_wave64",
-                        kernels::GEMM_HFQ4G256_RESIDUAL_WAVE64_SRC.to_string(),
-                    ));
-                    specs.push((
-                        "gemv_hfq4g256_moe_gate_up_indexed_batched_wave64",
-                        kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_WAVE64_SRC.to_string(),
-                    ));
-                    specs.push((
-                        "gemv_hfq4g256_moe_down_indexed_batched_wave64",
-                        kernels::GEMV_HFQ4G256_MOE_DOWN_INDEXED_BATCHED_WAVE64_SRC.to_string(),
-                    ));
-                }
-                // gfx1100 multi-row GEMV is opt-in via HIPFIRE_GEMV_ROWS={2,4,8}.
-                // Empirically slower than the single-row kernel on gfx1100 at all
-                // tested matrix sizes (see commit log / multi-row kernel header),
-                // so we only precompile when the env var explicitly requests it.
-                if self.arch_caps.is_rdna3_dgpu() && self.flags.gemv_rows.unwrap_or(1) > 1 {
-                    specs.push((
-                        "gemv_hfq4g256_multirow_rdna3",
-                        kernels::GEMV_HFQ4G256_MULTIROW_GFX1100_SRC.to_string(),
-                    ));
-                    specs.push((
-                        "gemv_hfq4g256_residual_multirow_rdna3",
-                        kernels::GEMV_HFQ4G256_RESIDUAL_MULTIROW_GFX1100_SRC.to_string(),
-                    ));
-                }
-            }
-            "mq4" => {
-                // MQ4 = FWHT-rotated HFQ4-G256 — default format for current registry.
-                // Shares the HFQ4 fused kernels (same blob, different dispatch key)
-                // plus MQ-specific rotation kernels.
-                let (src, module) =
-                    kernels::gemv_hfq4g256_for_arch(&self.arch_caps, self.flags.rdna2_variant);
-                specs.push((module, src.to_string()));
-                specs.push(("gemv_mq4g256", kernels::GEMV_MQ4G256_SRC.to_string()));
-                if self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_qkvza_hoist_x32 {
-                    specs.push((
-                        "fused_qkvza_hfq4g256_hoist_x32_gfx1100",
-                        kernels::FUSED_QKVZA_HFQ4G256_HOIST_X32_GFX1100_SRC.to_string(),
-                    ));
-                } else {
-                    specs.push((
-                        "fused_qkvza_hfq4g256",
-                        kernels::FUSED_QKVZA_HFQ4G256_SRC.to_string(),
-                    ));
-                }
-                if self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_qkvza_2wave {
-                    specs.push((
-                        "fused_qkvza_hfq4g256_2wave",
-                        kernels::FUSED_QKVZA_HFQ4G256_2WAVE_GFX1100_SRC.to_string(),
-                    ));
-                }
-                if self.arch_caps.is_gfx1100() && self.flags.rdna3_hfq4_qkvza_k2048 {
-                    specs.push((
-                        "fused_qkvza_hfq4g256_k2048_gfx1100",
-                        kernels::FUSED_QKVZA_HFQ4G256_K2048_GFX1100_SRC.to_string(),
-                    ));
-                }
-                specs.push((
-                    "fused_qkv_hfq4g256",
-                    kernels::FUSED_QKV_HFQ4G256_SRC.to_string(),
-                ));
-                specs.push((
-                    "fused_gate_up_hfq4g256",
-                    kernels::FUSED_GATE_UP_HFQ4G256_SRC.to_string(),
-                ));
-                if self.arch_caps.is_gfx1100() {
-                    specs.push((
-                        "fused_gate_up_hfq4g256_stage_x32_gfx1100",
-                        kernels::FUSED_GATE_UP_HFQ4G256_STAGE_X32_GFX1100_SRC.to_string(),
-                    ));
-                }
-                specs.push((
-                    "fused_rmsnorm_mq_rotate",
-                    kernels::FUSED_RMSNORM_MQ_ROTATE_SRC.to_string(),
-                ));
-                if self.arch_caps.is_gfx1100() && self.flags.rdna3_rmsnorm_wavegrid {
-                    specs.push((
-                        "fused_rmsnorm_mq_rotate_wavegrid",
-                        kernels::FUSED_RMSNORM_MQ_ROTATE_WAVEGRID_GFX1100_SRC.to_string(),
-                    ));
-                }
-                if self.arch_caps.is_gfx1100() && self.flags.rdna3_rmsnorm_split {
-                    specs.push((
-                        "rmsnorm_reduce_gfx1100",
-                        kernels::RMSNORM_REDUCE_GFX1100_SRC.to_string(),
-                    ));
-                    specs.push((
-                        "rotate_with_rms_gfx1100",
-                        kernels::ROTATE_WITH_RMS_GFX1100_SRC.to_string(),
-                    ));
-                }
-                if self.arch_caps.is_gfx1100() && self.flags.rdna3_rmsnorm_vecsum {
-                    specs.push((
-                        "fused_rmsnorm_mq_rotate_vecsum",
-                        kernels::FUSED_RMSNORM_MQ_ROTATE_VECSUM_GFX1100_SRC.to_string(),
-                    ));
-                }
-                specs.push((
-                    "fused_silu_mul_mq_rotate",
-                    kernels::FUSED_SILU_MUL_MQ_ROTATE_SRC.to_string(),
-                ));
-                // gfx906/gfx908/gfx94x wave64 variants — see hfq4 branch for rationale.
-                if self.arch_caps.is_wave64_native()
-                    || (self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_qkv_wave64)
-                {
-                    // Single-token QKV paths. RDNA3 may opt into Radiowave's
-                    // explicit wave64 packing experiment; native-wave64
-                    // targets retain their established selection.
-                    specs.push((
-                        "fused_qkvza_hfq4g256_wave64",
-                        kernels::FUSED_QKVZA_HFQ4G256_WAVE64_SRC.to_string(),
-                    ));
-                    specs.push((
-                        "fused_qkv_hfq4g256_wave64",
-                        kernels::FUSED_QKV_HFQ4G256_WAVE64_SRC.to_string(),
-                    ));
-                }
-                if self.arch_caps.is_wave64_native() {
-                    // Remaining single-token and batched native-wave64 paths.
-                    specs.push((
-                        "fused_gate_up_hfq4g256_wave64",
-                        kernels::FUSED_GATE_UP_HFQ4G256_WAVE64_SRC.to_string(),
-                    ));
-                    specs.push((
-                        "gemv_hfq4g256_moe_gate_up_indexed_wave64",
-                        kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_WAVE64_SRC.to_string(),
-                    ));
-                    specs.push((
-                        "gemv_hfq4g256_moe_down_indexed_wave64",
-                        kernels::GEMV_HFQ4G256_MOE_DOWN_INDEXED_WAVE64_SRC.to_string(),
-                    ));
-                    // Batched (DFlash verify path — hottest).
-                    specs.push((
-                        "gemm_qkvza_hfq4g256_wave64",
-                        kernels::GEMM_QKVZA_HFQ4G256_WAVE64_SRC.to_string(),
-                    ));
-                    specs.push((
-                        "gemm_qkv_hfq4g256_wave64",
-                        kernels::GEMM_QKV_HFQ4G256_WAVE64_SRC.to_string(),
-                    ));
-                    specs.push((
-                        "gemm_hfq4g256_wave64",
-                        kernels::GEMM_HFQ4G256_WAVE64_SRC.to_string(),
-                    ));
-                    specs.push((
-                        "gemm_hfq4g256_residual_wave64",
-                        kernels::GEMM_HFQ4G256_RESIDUAL_WAVE64_SRC.to_string(),
-                    ));
-                    specs.push((
-                        "gemv_hfq4g256_moe_gate_up_indexed_batched_wave64",
-                        kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_WAVE64_SRC.to_string(),
-                    ));
-                    specs.push((
-                        "gemv_hfq4g256_moe_down_indexed_batched_wave64",
-                        kernels::GEMV_HFQ4G256_MOE_DOWN_INDEXED_BATCHED_WAVE64_SRC.to_string(),
-                    ));
-                }
-            }
-            "q8" => {
-                specs.push(("gemv_q8_0", kernels::GEMV_Q8_0_SRC.to_string()));
-            }
-            _ => {}
-        }
-
-        // Embedding kernels — Q8_0 is most common, also cover HFQ4G256/G128 variants
-        specs.push(("embedding_q8", kernels::EMBEDDING_Q8_SRC.to_string()));
-        specs.push((
-            "embedding_hfq4g256",
-            kernels::EMBEDDING_HFQ4G256_SRC.to_string(),
-        ));
-        specs.push((
-            "embedding_hfq4g128",
-            kernels::EMBEDDING_HFQ4G128_SRC.to_string(),
-        ));
-        specs.push((
-            "embedding_hfq4g128_batched",
-            kernels::EMBEDDING_HFQ4G128_BATCHED_SRC.to_string(),
-        ));
-        specs.push((
-            "embedding_hfq4g256_batched",
-            kernels::EMBEDDING_HFQ4G256_BATCHED_SRC.to_string(),
-        ));
-        specs.push((
-            "embedding_q8_batched",
-            kernels::EMBEDDING_Q8_BATCHED_SRC.to_string(),
-        ));
-
-        // DeltaNet kernels
-        specs.push((
-            "gated_delta_net_q8",
-            kernels::GATED_DELTA_NET_Q8_SRC.to_string(),
-        ));
-
-        // KV cache kernels. asym3 is the current default — always ships flash.
-        // q8 is the compat path with its own flash tile+reduce for long context.
-        match kv_type {
-            "asym4" => {
-                specs.push((
-                    "kv_cache_write_asym_k_givens4",
-                    assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_GIVENS4_SRC),
-                ));
-                specs.push((
-                    "kv_cache_write_asym_k_givens4_batched",
-                    assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_GIVENS4_BATCHED_SRC),
-                ));
-                specs.push((
-                    "attention_flash_asym4_tile",
-                    assemble_asym(kernels::ATTENTION_FLASH_ASYM4_TILE_SRC),
-                ));
-                specs.push((
-                    "attention_flash_asym4_tile_batched",
-                    assemble_asym(kernels::ATTENTION_FLASH_ASYM4_TILE_BATCHED_SRC),
-                ));
-                specs.push((
-                    "attention_flash_asym_reduce_batched",
-                    kernels::ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC.to_string(),
-                ));
-            }
-            "fwht4" => {
-                // Same byte layout as asym4 — just different K-rotation primitive.
-                specs.push((
-                    "kv_cache_write_asym_k_fwht4",
-                    assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_FWHT4_SRC),
-                ));
-                specs.push((
-                    "kv_cache_write_asym_k_fwht4_batched",
-                    assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_FWHT4_BATCHED_SRC),
-                ));
-                specs.push((
-                    "attention_flash_fwht4_tile",
-                    assemble_asym(kernels::ATTENTION_FLASH_FWHT4_TILE_SRC),
-                ));
-                specs.push((
-                    "attention_flash_fwht4_tile_batched",
-                    assemble_asym(kernels::ATTENTION_FLASH_FWHT4_TILE_BATCHED_SRC),
-                ));
-                specs.push((
-                    "attention_flash_asym_reduce_batched",
-                    kernels::ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC.to_string(),
-                ));
-            }
-            "fwht3" => {
-                // Same byte layout as asym3 (single-pass 256-element), FWHT rotation.
-                specs.push((
-                    "kv_cache_write_asym_k_fwht3",
-                    assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_FWHT3_SRC),
-                ));
-                specs.push((
-                    "kv_cache_write_asym_k_fwht3_batched",
-                    assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_FWHT3_BATCHED_SRC),
-                ));
-                specs.push((
-                    "attention_flash_fwht3_tile",
-                    assemble_asym(kernels::ATTENTION_FLASH_FWHT3_TILE_SRC),
-                ));
-                specs.push((
-                    "attention_flash_fwht3_tile_batched",
-                    assemble_asym(kernels::ATTENTION_FLASH_FWHT3_TILE_BATCHED_SRC),
-                ));
-                specs.push((
-                    "attention_flash_asym_reduce_batched",
-                    kernels::ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC.to_string(),
-                ));
-            }
-            "fwht2" => {
-                // Same byte layout as asym2, FWHT rotation. 2-pass over 128.
-                specs.push((
-                    "kv_cache_write_asym_k_fwht2",
-                    assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_FWHT2_SRC),
-                ));
-                specs.push((
-                    "kv_cache_write_asym_k_fwht2_batched",
-                    assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_FWHT2_BATCHED_SRC),
-                ));
-                specs.push((
-                    "attention_flash_fwht2_tile",
-                    assemble_asym(kernels::ATTENTION_FLASH_FWHT2_TILE_SRC),
-                ));
-                specs.push((
-                    "attention_flash_fwht2_tile_batched",
-                    assemble_asym(kernels::ATTENTION_FLASH_FWHT2_TILE_BATCHED_SRC),
-                ));
-                specs.push((
-                    "attention_flash_asym_reduce_batched",
-                    kernels::ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC.to_string(),
-                ));
-            }
-            "asym3" => {
-                specs.push((
-                    "kv_cache_write_asym_k_givens3",
-                    assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_GIVENS3_SRC),
-                ));
-                if self.arch_caps.is_gfx1100() && head_dim == 256 {
-                    specs.push((
-                        "kv_cache_write_asym3_q8_pair_gfx1100",
-                        assemble_asym(kernels::KV_CACHE_WRITE_ASYM3_Q8_PAIR_GFX1100_SRC),
-                    ));
-                }
-                specs.push((
-                    "kv_cache_write_asym_k_givens3_batched",
-                    assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_GIVENS3_BATCHED_SRC),
-                ));
-                specs.push((
-                    "attention_flash_asym3_tile",
-                    assemble_asym(kernels::ATTENTION_FLASH_ASYM3_TILE_SRC),
-                ));
-                specs.push((
-                    "attention_flash_asym3_tile_batched",
-                    assemble_asym(kernels::ATTENTION_FLASH_ASYM3_TILE_BATCHED_SRC),
-                ));
-                specs.push((
-                    "attention_flash_asym_reduce_batched",
-                    kernels::ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC.to_string(),
-                ));
-            }
-            "asym2" => {
-                specs.push((
-                    "kv_cache_write_asym_k_givens2",
-                    assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_GIVENS2_SRC),
-                ));
-                specs.push((
-                    "kv_cache_write_asym_k_givens2_batched",
-                    assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_GIVENS2_BATCHED_SRC),
-                ));
-                specs.push((
-                    "attention_flash_asym2_tile",
-                    assemble_asym(kernels::ATTENTION_FLASH_ASYM2_TILE_SRC),
-                ));
-                specs.push((
-                    "attention_flash_asym2_tile_batched",
-                    assemble_asym(kernels::ATTENTION_FLASH_ASYM2_TILE_BATCHED_SRC),
-                ));
-                specs.push((
-                    "attention_flash_asym_reduce_batched",
-                    kernels::ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC.to_string(),
-                ));
-            }
-            "q8" | _ => {
-                specs.push((
-                    "kv_cache_write_q8_0",
-                    kernels::KV_CACHE_WRITE_Q8_0_SRC.to_string(),
-                ));
-                specs.push((
-                    "attention_q8_0_kv",
-                    kernels::ATTENTION_Q8_0_KV_SRC.to_string(),
-                ));
-                specs.push(("attention_q8_0_kv_batched", {
-                    // Same header-stripping treatment as
-                    // attention_q8_0_kv_batched_masked_slots: the kernel
-                    // #includes kv_slot_desc.h, but this precompile path
-                    // (like the runtime hipcc compile) has no -I to
-                    // kernels/src, so the directive must be stripped and
-                    // the header body prepended instead.
-                    let stripped = kernels::ATTENTION_Q8_0_KV_BATCHED_SRC
-                        .replace("#include \"kv_slot_desc.h\"", "");
-                    format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped)
-                }));
-                specs.push(("attention_q8_0_kv_independent_masked_windowed", {
-                    // Shares ATTENTION_Q8_0_KV_BATCHED_SRC with the entry
-                    // above, so it needs the identical strip-and-prepend:
-                    // that source #includes kv_slot_desc.h and this
-                    // precompile path has no -I to kernels/src.
-                    let stripped = kernels::ATTENTION_Q8_0_KV_BATCHED_SRC
-                        .replace("#include \"kv_slot_desc.h\"", "");
-                    format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped)
-                }));
-                specs.push(("attention_q8_0_flash_prefill", {
-                    // Same header-stripping treatment as
-                    // attention_q8_0_kv_batched above: the kernel now
-                    // #includes kv_slot_desc.h (Task 6), but this
-                    // precompile path (like the runtime hipcc compile in
-                    // attention_q8_0_flash_prefill_slots) has no -I to
-                    // kernels/src, so the directive must be stripped and
-                    // the header body prepended instead.
-                    let stripped = kernels::ATTENTION_Q8_0_FLASH_PREFILL_SRC
-                        .replace("#include \"kv_slot_desc.h\"", "");
-                    format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped)
-                }));
-                specs.push(("kv_cache_write_q8_0_batched", {
-                    // Same header-stripping treatment as
-                    // attention_q8_0_kv_batched above: the kernel now
-                    // #includes kv_slot_desc.h (Task 3), but this
-                    // precompile path (like the runtime hipcc compile in
-                    // kv_cache_write_q8_0_batched_slots) has no -I to
-                    // kernels/src, so the directive must be stripped and
-                    // the header body prepended instead.
-                    let stripped = kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC
-                        .replace("#include \"kv_slot_desc.h\"", "");
-                    format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped)
-                }));
-                specs.push(("kv_cache_write_q8_0_independent", {
-                    // Shares KV_CACHE_WRITE_Q8_0_BATCHED_SRC with the entry
-                    // above, so it needs the identical strip-and-prepend:
-                    // that source #includes kv_slot_desc.h and this
-                    // precompile path has no -I to kernels/src. Warms the
-                    // module the continuous-batch decode path JITs first.
-                    let stripped = kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC
-                        .replace("#include \"kv_slot_desc.h\"", "");
-                    format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped)
-                }));
-                specs.push(("kv_cache_write_q8_0_independent_masked", {
-                    // Shares KV_CACHE_WRITE_Q8_0_BATCHED_SRC with the entries
-                    // above, so it needs the identical strip-and-prepend.
-                    // Warms the module forward_tick JITs first on a
-                    // partially-active batch.
-                    let stripped = kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC
-                        .replace("#include \"kv_slot_desc.h\"", "");
-                    format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped)
-                }));
-                specs.push((
-                    "attention_flash_q8_0_tile",
-                    kernels::ATTENTION_FLASH_Q8_0_TILE_SRC.to_string(),
-                ));
-                specs.push((
-                    "attention_flash_q8_0_reduce",
-                    kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC.to_string(),
-                ));
-            }
-        }
-
-        // Exact parallel-sampler modules used by sample_top_p_pf. Sources are
-        // the same string rewrites as runtime (see sampling.rs helpers) so the
-        // compile-cache hash hits on first token instead of hipcc JIT.
-        for (name, src) in crate::sampling::sample_top_p_parallel_precompile_specs() {
-            specs.push((name, src));
-        }
-
-        fn precompile_symbols(name: &str) -> Vec<&str> {
-            match name {
-                "rmsnorm" => vec!["rmsnorm_f32"],
-                "add_inplace" => vec!["add_inplace_f32"],
-                "mul" => vec!["mul_f32"],
-                "silu_mul" => vec!["silu_mul_f32"],
-                "sigmoid" => vec!["sigmoid_f32"],
-                "alpha_gate" => vec!["alpha_gate_f32"],
-                "conv1d_silu" => vec!["conv1d_silu_f32"],
-                "l2_norm" => vec!["l2_norm_f32"],
-                "fused_qk_l2_norm_scale" => vec!["fused_qk_l2_norm_scale_f32"],
-                "fused_sigmoid_alpha_gate" => vec!["fused_sigmoid_alpha_gate_f32"],
-                "conv1d_silu_split" => vec!["conv1d_silu_split_f32"],
-                "conv1d_silu_split_tree" => vec!["conv1d_silu_split_tree_f32"],
-                "gated_delta_net_q8_tree" => vec!["gated_delta_net_q8_tree"],
-                "sigmoid_mul" => vec!["sigmoid_mul_f32"],
-                "topk_logits" => vec!["topk_logits_f32"],
-                "scale_f32" => vec!["scale_f32"],
-                "gated_norm" => vec!["gated_norm_f32"],
-                "rope_partial_interleaved" => vec!["rope_partial_interleaved_f32"],
-                "deinterleave" => vec!["deinterleave_f32"],
-                "repeat_interleave_qk" => vec!["repeat_interleave_qk_f32"],
-                "gated_delta_net_q8" => vec!["gated_delta_net_q8"],
-                // MQ4 GEMV module exports both the main GEMV and the standalone
-                // x rotation kernel used by the prerotated dispatch path.
-                "gemv_mq4g256" => vec!["gemv_mq4g256", "mq_rotate_x"],
-                // Arch-variant HFQ4 GEMV modules all expose the same symbol.
-                n if n.starts_with("gemv_hfq4g256_rdna") => vec!["gemv_hfq4g256"],
-                n if n.starts_with("gemv_hfq4g256_gfx") => vec!["gemv_hfq4g256"],
-                "fused_qkvza_hfq4g256_k2048_gfx1100" => {
-                    vec!["fused_qkvza_hfq4g256_k2048"]
-                }
-                // Multi-row RDNA3 modules expose three entry points per .hsaco
-                "gemv_hfq4g256_multirow_rdna3" => vec![
-                    "gemv_hfq4g256_multirow_r2",
-                    "gemv_hfq4g256_multirow_r4",
-                    "gemv_hfq4g256_multirow_r8",
-                ],
-                "gemv_hfq4g256_residual_multirow_rdna3" => vec![
-                    "gemv_hfq4g256_residual_multirow_r2",
-                    "gemv_hfq4g256_residual_multirow_r4",
-                    "gemv_hfq4g256_residual_multirow_r8",
-                ],
-                "gemv_hfq4g256_moe_gate_up_indexed_wave64" => {
-                    vec!["gemv_hfq4g256_moe_gate_up_k8_indexed_wave64"]
-                }
-                "gemv_hfq4g256_moe_down_indexed_wave64" => {
-                    vec!["gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_wave64"]
-                }
-                "gemv_hfq4g256_moe_gate_up_indexed_batched_wave64" => {
-                    vec!["gemv_hfq4g256_moe_gate_up_k8_indexed_batched_wave64"]
-                }
-                "gemv_hfq4g256_moe_down_indexed_batched_wave64" => {
-                    vec!["gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_batched_wave64"]
-                }
-                "sample_top_p_parallel" => vec![
-                    "sample_apply_repeat_penalty",
-                    "sample_topk_partial",
-                    "sample_topk_finalize",
-                ],
-                "sample_top_p_parallel_w64" => vec![
-                    "sample_apply_repeat_penalty_w64",
-                    "sample_topk_partial_w64",
-                    "sample_topk_finalize_w64",
-                ],
-                "sample_top_p_parallel_fast21" => vec![
-                    "sample_apply_repeat_penalty_fast21",
-                    "sample_topk_partial_fast21",
-                    "sample_topk_finalize_fast21",
-                ],
-                "sample_top_p_parallel_fast65" => vec![
-                    "sample_apply_repeat_penalty_fast65",
-                    "sample_topk_partial_fast65",
-                    "sample_topk_finalize_fast65",
-                ],
-                other => vec![other],
-            }
-        }
-        // Batch each module once, authenticating its first exported symbol.
-        let batch: Vec<(&str, &str, &str)> = specs
-            .iter()
-            .map(|(name, src)| (*name, src.as_str(), precompile_symbols(name)[0]))
-            .collect();
-        self.compiler.compile_batch_for_symbols(&batch)?;
-
-        // Now load all modules + functions sequentially (GPU API).
-        for (name, src) in &specs {
-            let func_names = precompile_symbols(name);
-            // Compile and ensure the module is loaded once.
-            let obj_path = self.compiler.compile_for_symbol(name, src, func_names[0])?;
-            let obj_path_str = obj_path.to_str().unwrap().to_string();
-            if !self.modules.contains_key(*name) {
-                let module = crate::scratch::module_load_or_recompile(
-                    &self.hip,
-                    &mut self.compiler,
-                    name,
-                    src,
-                    func_names[0],
-                    &obj_path_str,
-                )?;
-                self.modules.insert(name.to_string(), module);
-            }
-            let module = &self.modules[*name];
-            for func_name in &func_names {
-                if self.functions.contains_key(*func_name) {
-                    continue;
-                }
-                self.compiler.compile_for_symbol(name, src, func_name)?;
-                let func = self.hip.module_get_function(module, func_name)?;
-                self.functions.insert(func_name.to_string(), func);
-            }
-        }
-
-        Ok(())
+    /// Compile this arch's registry inventory into the kernel cache with the
+    /// shared bounded executor, so [`Self::profile`] has every packaged
+    /// kernel to report. CPU-only: nothing is loaded on the GPU or bound into
+    /// the function cache, so a loaded model's route is untouched. Recipes
+    /// come from the one registry resolver the packager and route planner use.
+    pub fn precompile_registry(&mut self) -> HipResult<()> {
+        // bind_thread: skip — CPU-only compile into the kernel cache, no HIP call.
+        let entries = crate::kernel_registry::entries(&self.arch, &self.compiler.extra_flags)
+            .map_err(|e| hip_bridge::HipError::new(0, &format!("kernel registry: {e:?}")))?;
+        let jobs = crate::compile_jobs::host_compile_job_budget()
+            .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+        let batch = self.compiler.begin_batch(entries, jobs)?;
+        self.compiler.finish_batch(batch)
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -8723,5 +8587,368 @@ mod tests {
         })
         .expect_err("query errors must propagate");
         assert!(err.to_string().contains("boom"), "{err}");
+    }
+
+    // ---- S2 shared weight ownership -------------------------------------------------
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn weight_extents_accept_aligned_physical_with_tail_pad() {
+        let g = 4096usize;
+        let p = super::EXPORT_WEIGHT_TAIL_PAD_BYTES;
+        let mib = 1usize << 20;
+        assert_eq!(p, 64 * 1024);
+        assert!(super::validate_weight_extents(p + g, 1, g).is_ok());
+        assert!(super::validate_weight_extents(p + g, g, g).is_ok(), "exact logical + pad");
+        assert!(super::validate_weight_extents(p + 2 * g, g + 1, g).is_ok());
+        assert!(super::validate_weight_extents(64 * mib + p, 64 * mib, g).is_ok());
+        assert!(super::validate_weight_extents(2 * p + g, 1, g).is_ok(), "not exact ceil");
+        assert!(super::validate_weight_extents(2 * mib, 1, 2 * mib).is_ok());
+        assert!(super::validate_weight_extents(66 * mib, 64 * mib, 2 * mib).is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn weight_extents_reject_zero_values() {
+        let g = 4096usize;
+        let p = super::EXPORT_WEIGHT_TAIL_PAD_BYTES;
+        assert!(super::validate_weight_extents(0, 1, g).is_err());
+        assert!(super::validate_weight_extents(p + g, 0, g).is_err());
+        assert!(super::validate_weight_extents(p + g, 1, 0).is_err());
+        assert!(super::validate_weight_extents(0, 0, 0).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn weight_extents_reject_physical_without_full_tail_pad() {
+        let g = 4096usize;
+        let p = super::EXPORT_WEIGHT_TAIL_PAD_BYTES;
+        let mib = 1usize << 20;
+        assert!(super::validate_weight_extents(p, 1, g).is_err());
+        assert!(super::validate_weight_extents(p + g, g + 1, g).is_err());
+        assert!(super::validate_weight_extents(64 * mib, 64 * mib, g).is_err(), "no tail");
+        assert!(super::validate_weight_extents(g, g + 1, g).is_err(), "logical beyond physical");
+        assert!(super::validate_weight_extents(64 * mib, 64 * mib, 2 * mib).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn weight_extents_reject_unaligned_physical() {
+        let g = 4096usize;
+        let p = super::EXPORT_WEIGHT_TAIL_PAD_BYTES;
+        assert!(super::validate_weight_extents(p + g + 1, 1, g).is_err());
+        assert!(super::validate_weight_extents(p + g - 1, 1, g).is_err());
+        assert!(super::validate_weight_extents(3 * (2usize << 20) + 4096, 1, 2usize << 20).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn weight_extents_check_tail_pad_addition_overflow() {
+        let p = super::EXPORT_WEIGHT_TAIL_PAD_BYTES;
+        assert!(super::validate_weight_extents(usize::MAX, usize::MAX, 1).is_err());
+        assert!(super::validate_weight_extents(usize::MAX, usize::MAX - p + 1, 1).is_err());
+        assert!(super::validate_weight_extents(usize::MAX, usize::MAX - p, 1).is_ok());
+        assert!(super::validate_weight_extents(usize::MAX, usize::MAX - p, 2).is_err());
+        let half = 1usize << (usize::BITS - 1);
+        assert!(super::validate_weight_extents(half, half, half).is_err());
+        assert!(super::validate_weight_extents(half, half - p, half).is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn s2_pattern(len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|i| ((i.wrapping_mul(0x9E37_79B1) >> 13) ^ (i >> 7) ^ (i >> 21)) as u8)
+            .collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn s2_read(gpu: &super::Gpu, buf: &hip_bridge::DeviceBuffer, off: usize, len: usize) -> Vec<u8> {
+        let mut out = vec![0u8; len];
+        gpu.hip
+            .memcpy_dtoh_at(&mut out, buf, off)
+            .expect("bridge readback");
+        out
+    }
+
+    /// Every logical byte of `owner` equals the deterministic pattern.
+    #[cfg(target_os = "linux")]
+    fn s2_check_pattern(gpu: &super::Gpu, owner: &super::GpuTensor, logical: usize) {
+        let pattern = s2_pattern(logical);
+        let chunk = 4usize << 20;
+        let mut off = 0;
+        while off < logical {
+            let n = chunk.min(logical - off);
+            let got = s2_read(gpu, &owner.buf, off, n);
+            if let Some(i) = (0..n).find(|&i| got[i] != pattern[off + i]) {
+                panic!("byte {} differs: got {} want {}", off + i, got[i], pattern[off + i]);
+            }
+            off += n;
+        }
+    }
+
+    /// Padding in `[logical, physical)` reads back zero.
+    #[cfg(target_os = "linux")]
+    fn s2_check_tail_zero(gpu: &super::Gpu, owner: &super::GpuTensor, logical: usize, physical: usize) {
+        let tail = physical - logical;
+        if tail == 0 {
+            return;
+        }
+        // SAFETY: [base+logical, base+physical) is inside the published mapping.
+        let view = unsafe {
+            hip_bridge::DeviceBuffer::from_raw(
+                (owner.buf.as_ptr() as usize + logical) as *mut std::ffi::c_void,
+                tail,
+            )
+        };
+        let got = s2_read(gpu, &view, 0, tail);
+        assert!(got.iter().all(|&b| b == 0), "padding tail is not zero");
+    }
+
+    /// Real VMM owner: Raw `[logical]`, registered, read-only, owner access = read.
+    #[cfg(target_os = "linux")]
+    fn s2_assert_owner(gpu: &super::Gpu, owner: &super::GpuTensor, logical: usize) {
+        assert!(owner.buf.is_vmm_owner());
+        assert_eq!(owner.dtype, super::DType::Raw);
+        assert_eq!(owner.shape, vec![logical]);
+        assert_eq!(owner.buf.size(), logical);
+        let arena = gpu
+            .vmm_arenas
+            .get(&(owner.buf.as_ptr() as usize))
+            .expect("owner registered");
+        assert!(arena.is_read_only());
+        assert_eq!(arena.owner_access_flags(&gpu.hip).expect("access flags"), 1);
+    }
+
+    /// Freeing a borrowed view of a registered owner is refused and leaves the
+    /// registration (and the orphan table) untouched.
+    #[cfg(target_os = "linux")]
+    fn s2_assert_borrowed_free_rejected(gpu: &mut super::Gpu, owner: &super::GpuTensor, logical: usize) {
+        let key = owner.buf.as_ptr() as usize;
+        let before = (gpu.vmm_arenas.len(), gpu.orphan_vmm_arenas.len());
+        let view = || super::GpuTensor {
+            // SAFETY: non-owning alias of a live owner; only passed to a free that must refuse.
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(owner.buf.as_ptr(), logical) },
+            shape: vec![logical],
+            dtype: super::DType::Raw,
+        };
+        let err = gpu.free_tensor(view()).expect_err("borrowed free must fail");
+        assert!(err.to_string().contains("borrowed VMM view"), "{err}");
+        let err = gpu
+            .release_tensor_immediate(view())
+            .expect_err("immediate borrowed free must fail");
+        assert!(err.to_string().contains("borrowed VMM view"), "{err}");
+        assert_eq!((gpu.vmm_arenas.len(), gpu.orphan_vmm_arenas.len()), before);
+        assert!(gpu.vmm_arenas.contains_key(&key));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn s2_vram_used() -> i64 {
+        std::fs::read_to_string("/sys/bus/pci/devices/0000:13:00.0/mem_info_vram_used")
+            .expect("read mem_info_vram_used")
+            .trim()
+            .parse()
+            .expect("parse mem_info_vram_used")
+    }
+
+    #[cfg(target_os = "linux")]
+    extern "C" {
+        fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    }
+
+    #[cfg(target_os = "linux")]
+    const S2_F_GETFD: i32 = 1;
+    #[cfg(target_os = "linux")]
+    const S2_F_SETFD: i32 = 2;
+    #[cfg(target_os = "linux")]
+    const S2_FD_CLOEXEC: i32 = 1;
+
+    /// Bounded borrowed source: copy only its logical prefix, not owner capacity.
+    #[cfg(target_os = "linux")]
+    fn s2_small_nonaligned_case(gpu: &mut super::Gpu) {
+        let logical = (3usize << 20) + 12_345;
+        let mut pattern = s2_pattern(logical);
+        pattern.extend_from_slice(&[0xa5; 256]);
+        let mut src = gpu.upload_raw(&pattern, &[pattern.len()]).expect("upload small source");
+        let view = src.sub_offset(0, logical);
+        assert!(view.buf.is_borrowed());
+        let exp = gpu.create_exportable_weight_copy(&view).expect("export bounded small source");
+        drop(view);
+        assert_eq!(exp.logical_bytes, logical);
+        assert!(exp.physical_bytes - logical >= super::EXPORT_WEIGHT_TAIL_PAD_BYTES);
+        assert_eq!(
+            exp.physical_bytes,
+            (logical + super::EXPORT_WEIGHT_TAIL_PAD_BYTES).next_multiple_of(exp.granularity)
+        );
+        s2_assert_owner(gpu, &exp.owner, logical);
+        s2_check_pattern(gpu, &exp.owner, logical);
+        s2_check_tail_zero(gpu, &exp.owner, logical, exp.physical_bytes);
+        gpu.release_weight_source_immediate(&mut src).expect("release small source");
+        let super::ExportedWeightAllocation { owner, fd, .. } = exp;
+        gpu.free_tensor(owner).expect("free small owner");
+        drop(fd);
+        gpu.ensure_vmm_cleaned().expect("clean after small case");
+    }
+
+    /// Child role: import the inherited FD, verify, free, clean.
+    #[cfg(target_os = "linux")]
+    fn s2_importer(gpu: &mut super::Gpu) {
+        use std::os::fd::{AsFd, FromRawFd};
+        let env = |k: &str| -> usize {
+            std::env::var(k)
+                .unwrap_or_else(|_| panic!("{k} unset"))
+                .parse()
+                .unwrap_or_else(|_| panic!("{k} not an integer"))
+        };
+        let raw_fd = env("WH_S2_IMPORT_FD") as i32;
+        eprintln!("S2_IMPORTER pid={} fd={raw_fd}", std::process::id());
+        let desc = super::ImportedWeightAllocationDesc {
+            physical_bytes: env("WH_S2_PHYSICAL_BYTES"),
+            logical_bytes: env("WH_S2_LOGICAL_BYTES"),
+            granularity: env("WH_S2_GRANULARITY"),
+        };
+        // SAFETY: the exporter's pre_exec cleared CLOEXEC on this inherited FD, which
+        // nothing else in this process owns; this OwnedFd closes it.
+        let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw_fd) };
+        let vram_before = s2_vram_used();
+        let owner = gpu
+            .import_weight_allocation(fd.as_fd(), &desc)
+            .expect("import weight allocation");
+        let vram_imported = s2_vram_used();
+        s2_assert_owner(gpu, &owner, desc.logical_bytes);
+        s2_check_pattern(gpu, &owner, desc.logical_bytes);
+        s2_assert_borrowed_free_rejected(gpu, &owner, desc.logical_bytes);
+        assert_eq!((gpu.vmm_arenas.len(), gpu.orphan_vmm_arenas.len()), (1, 0));
+        gpu.free_tensor(owner).expect("free imported owner");
+        drop(fd);
+        eprintln!(
+            "S2_IMPORTER pid={} vram_used before_import={vram_before} after_import={vram_imported} after_free={}",
+            std::process::id(),
+            s2_vram_used()
+        );
+        assert_eq!((gpu.vmm_arenas.len(), gpu.orphan_vmm_arenas.len()), (0, 0));
+        gpu.ensure_vmm_cleaned().expect("importer clean");
+        println!(
+            "S2_IMPORTER_OK logical={} physical={} granularity={}",
+            desc.logical_bytes, desc.physical_bytes, desc.granularity
+        );
+    }
+
+    /// Cross-process shared weight ownership on real hardware (gfx1201, Linux).
+    ///
+    /// Run exactly (exporter role; it re-execs this binary as the importer, which
+    /// is selected by `WH_S2_IMPORT_FD`):
+    /// `cargo test --release -p rdna-compute --lib -- --ignored --exact
+    ///  dispatch::tests::shared_weight_owner_cross_process --nocapture`
+    ///
+    /// Raw FD inheritance through a child-only `pre_exec` is test-only; production
+    /// transfers FDs with SCM_RIGHTS (S1). GPU init failure fails the test.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs an idle gfx1201 at 0000:13:00.0 under the approved experiment lock"]
+    fn shared_weight_owner_cross_process() {
+        use std::os::fd::{AsFd, AsRawFd};
+        use std::os::unix::process::CommandExt;
+
+        let _guard = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut gpu = super::Gpu::init().expect("GPU initialization must succeed");
+        assert_eq!(gpu.arch, "gfx1201", "test is gated to gfx1201");
+        if std::env::var("WH_S2_IMPORT_FD").is_ok() {
+            s2_importer(&mut gpu);
+            return;
+        }
+
+        s2_small_nonaligned_case(&mut gpu);
+
+        let logical = 64usize << 20;
+        let mut src = gpu.upload_raw(&s2_pattern(logical), &[logical]).expect("upload source");
+        let exp = gpu.create_exportable_weight_copy(&src).expect("create exportable copy");
+        assert_eq!(exp.logical_bytes, logical);
+        assert_eq!(exp.granularity, 4096, "weight arenas use the minimum granularity");
+        assert_eq!(exp.physical_bytes, logical + super::EXPORT_WEIGHT_TAIL_PAD_BYTES);
+        assert!(exp.physical_bytes - logical >= super::EXPORT_WEIGHT_TAIL_PAD_BYTES);
+        eprintln!(
+            "S2_EXPORTER pid={} logical={} physical={} granularity={} vram_used={}",
+            std::process::id(),
+            exp.logical_bytes,
+            exp.physical_bytes,
+            exp.granularity,
+            s2_vram_used()
+        );
+        s2_assert_owner(&gpu, &exp.owner, logical);
+        s2_check_pattern(&gpu, &exp.owner, logical);
+        s2_check_tail_zero(&gpu, &exp.owner, logical, exp.physical_bytes);
+        s2_assert_borrowed_free_rejected(&mut gpu, &exp.owner, logical);
+
+        // A descriptor failing pure validation must be refused before any HIP import.
+        let arenas = (gpu.vmm_arenas.len(), gpu.orphan_vmm_arenas.len());
+        // No tail pad: refused by pure validation before any HIP import.
+        let bad = super::ImportedWeightAllocationDesc {
+            physical_bytes: logical,
+            logical_bytes: logical,
+            granularity: exp.granularity,
+        };
+        gpu.import_weight_allocation(exp.fd.as_fd(), &bad)
+            .err()
+            .expect("physical without tail pad must be rejected");
+        assert_eq!((gpu.vmm_arenas.len(), gpu.orphan_vmm_arenas.len()), arenas);
+
+        // Old hipMalloc owner is physically released, not parked.
+        let before = s2_vram_used();
+        gpu.release_weight_source_immediate(&mut src).expect("release old owner");
+        assert!(src.buf.is_borrowed() && src.buf.size() == 0 && src.shape == vec![0]);
+        gpu.release_weight_source_immediate(&mut src)
+            .expect_err("emptied source is not a hipMalloc owner");
+        // One fixed settle for driver accounting after the synchronized HIP free; no polling.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let after = s2_vram_used();
+        println!(
+            "S2_VRAM_USED before_release={before} after_release={after} drop={}",
+            before - after
+        );
+        assert!(
+            before - after >= logical as i64,
+            "old owner release must return >= 64 MiB (before {before}, after {after})"
+        );
+        s2_check_pattern(&gpu, &exp.owner, logical);
+
+        // Child-only FD inheritance; the exporter's own FD stays CLOEXEC.
+        let raw = exp.fd.as_raw_fd();
+        // SAFETY: F_GETFD on an FD this process owns.
+        let flags = unsafe { fcntl(raw, S2_F_GETFD) };
+        assert!(flags >= 0 && flags & S2_FD_CLOEXEC != 0, "exported FD must be CLOEXEC");
+        let mut cmd = std::process::Command::new(std::env::current_exe().expect("current_exe"));
+        cmd.args([
+            "--exact",
+            "dispatch::tests::shared_weight_owner_cross_process",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("WH_S2_IMPORT_FD", raw.to_string())
+        .env("WH_S2_PHYSICAL_BYTES", exp.physical_bytes.to_string())
+        .env("WH_S2_LOGICAL_BYTES", exp.logical_bytes.to_string())
+        .env("WH_S2_GRANULARITY", exp.granularity.to_string());
+        // SAFETY: runs in the forked child before exec; only async-signal-safe fcntl.
+        unsafe {
+            cmd.pre_exec(move || {
+                if fcntl(raw, S2_F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let status = cmd.status().expect("spawn importer");
+        assert!(status.success(), "importer failed: {status:?}");
+        // SAFETY: as above; the child's pre_exec cannot change the parent's descriptor flags.
+        let flags = unsafe { fcntl(raw, S2_F_GETFD) };
+        assert!(flags >= 0 && flags & S2_FD_CLOEXEC != 0, "exporter FD lost CLOEXEC");
+
+        let super::ExportedWeightAllocation { owner, fd, .. } = exp;
+        assert_eq!((gpu.vmm_arenas.len(), gpu.orphan_vmm_arenas.len()), (1, 0));
+        gpu.free_tensor(owner).expect("free exported owner");
+        drop(fd);
+        assert_eq!((gpu.vmm_arenas.len(), gpu.orphan_vmm_arenas.len()), (0, 0));
+        gpu.ensure_vmm_cleaned().expect("exporter clean");
     }
 }

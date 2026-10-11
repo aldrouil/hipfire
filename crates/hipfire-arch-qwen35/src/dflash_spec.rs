@@ -13,14 +13,17 @@
 use crate::dflash_verify_pm4::{DflashVerifyPm4, DFLASH_VERIFY_PM4_BLOCK};
 use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Weights, StateQuant};
 use crate::speculative::{
-    apply_eviction_retain_to_draft, apply_host_nucleus, apply_host_topk, sample_categorical,
+    apply_eviction_retain_to_draft, apply_host_ar_trunc, sample_categorical,
     scatter_hidden_block_to_interleaved, seed_target_hidden_dense_tp2_abortable,
-    seed_target_hidden_from_prompt_abortable, seed_target_hidden_suffix_abortable,
+    seed_target_hidden_from_prompt_abortable, seed_target_hidden_from_prompt_abortable_parts,
+    seed_target_hidden_suffix_abortable, seed_target_hidden_suffix_abortable_parts,
     softmax_temp_into, spec_step_ddtree_batched, spec_step_dflash, spec_step_dflash_dense_tp2,
-    xorshift_next_unit, DdtreeScratch, DeltaNetSnapshot, DenseTpTargetView, GdnTape,
-    HiddenStateRingBuffer, ModelSlot, SpecStepResult, VerifyScratch,
+    xorshift_next_unit, DdtreeScratch, DeltaNetSnapshot, DenseTpTargetView, DflashTargetParts,
+    GdnTape, HiddenStateRingBuffer, ModelSlot, SpecStepResult, VerifyScratch,
 };
-use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights, TargetHiddenLogMark};
+use hipfire_runtime::dflash::{
+    DflashConfig, DflashScratch, DflashWeights, DraftCtxMode, TargetHiddenLogMark,
+};
 use hipfire_runtime::dflash_adaptive_block::DflashAdaptiveBlock;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::multi_gpu::Gpus;
@@ -30,6 +33,7 @@ use hipfire_runtime::spec::{
 };
 use rdna_compute::{Gpu, GpuTensor};
 use std::path::Path;
+use std::sync::Arc;
 
 /// Extract layers the retained B=16 DFlash2 verify route admits.
 const DFLASH_VERIFY_PM4_EXTRACT_LAYERS: [usize; 5] = [5, 19, 33, 47, 61];
@@ -49,7 +53,10 @@ pub struct DdtreeState {
 /// Optional DFlash speculative-decoding state.
 pub struct DflashState {
     pub draft_config: DflashConfig,
-    pub draft_weights: DflashWeights,
+    /// Shared draft weights: the singleton and VMM engine lanes hold
+    /// references to the SAME resident GPU weights; only the final owner frees
+    /// them ([`release_shared_dflash_weights`]).
+    pub draft_weights: Arc<DflashWeights>,
     pub draft_scratch: DflashScratch,
     pub hidden_rb: HiddenStateRingBuffer,
     pub verify_scratch: VerifyScratch,
@@ -101,7 +108,7 @@ impl DflashState {
             return;
         }
         drop(verify_pm4);
-        draft_weights.free_gpu(gpu);
+        release_shared_dflash_weights(gpu, draft_weights);
         draft_scratch.free_gpu(gpu);
         hidden_rb.free_gpu(gpu);
         verify_scratch.free_gpu(gpu);
@@ -112,6 +119,201 @@ impl DflashState {
             dd.scratch.free_gpu(gpu);
         }
     }
+
+    /// Free the scratch a VMM lane never needs and that a promoted singleton
+    /// owner still carries: the draft scratch's FWHT rotation buffers
+    /// (`mq_x_rot`/`mq_x_rot_f16`, borrowed from the engine's shared draft
+    /// scratch instead) and `verify_scratch.prefill_batch` (a lane's target
+    /// forward runs on the shared trunk scratch). Idempotent.
+    ///
+    /// Synchronizes first so no queued kernel still reads a buffer being
+    /// freed. A captured draft-FFN graph would bake the freed pointers, so
+    /// any is destroyed exactly as [`DflashScratch::free_gpu`] does and the
+    /// warmed-up sets are cleared (the draft then re-warms on its next use;
+    /// VMM lanes never capture).
+    pub fn shed_vmm_lane_scratch(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        gpu.hip
+            .device_synchronize()
+            .map_err(|e| format!("dflash lane scratch shed: {e}"))?;
+        let ds = &mut self.draft_scratch;
+        for per_layer in ds.draft_ffn_graphs.iter_mut() {
+            for (_, (graph, exec, _blobs)) in per_layer.drain() {
+                let _ = gpu.hip.graph_exec_destroy(exec);
+                let _ = gpu.hip.graph_destroy(graph);
+            }
+        }
+        for warmed in ds.draft_ffn_warmed_up.iter_mut() {
+            warmed.clear();
+        }
+        if let Some(t) = ds.mq_x_rot.take() {
+            let _ = gpu.free_tensor(t);
+        }
+        if let Some(t) = ds.mq_x_rot_f16.take() {
+            let _ = gpu.free_tensor(t);
+        }
+        if let Some(pbs) = self.verify_scratch.prefill_batch.take() {
+            let _ = pbs.free_gpu(gpu);
+        }
+        Ok(())
+    }
+}
+
+/// The per-lane mutable DFlash owners (everything but the shared weights and
+/// config). One allocation recipe for the singleton load and VMM lanes.
+struct DflashOwners {
+    draft_scratch: DflashScratch,
+    hidden_rb: HiddenStateRingBuffer,
+    verify_scratch: VerifyScratch,
+    target_snap: DeltaNetSnapshot,
+    gdn_tape: GdnTape,
+    target_hidden_host: Vec<f32>,
+}
+
+impl DflashOwners {
+    fn free_gpu(self, gpu: &mut Gpu) {
+        let DflashOwners {
+            draft_scratch,
+            hidden_rb,
+            verify_scratch,
+            target_snap,
+            gdn_tape,
+            target_hidden_host: _,
+        } = self;
+        gdn_tape.free_gpu(gpu);
+        target_snap.free_gpu(gpu);
+        verify_scratch.free_gpu(gpu);
+        hidden_rb.free_gpu(gpu);
+        draft_scratch.free_gpu(gpu);
+    }
+}
+
+/// Which role a set of DFlash owners plays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DflashOwnerKind {
+    /// The singleton speculator: its draft scratch owns the FWHT rotation
+    /// buffers (`mq_x_rot`/`mq_x_rot_f16`) and its verify scratch owns a
+    /// persistent `PrefillBatchScratch` (the singleton runs the target
+    /// verify forward through it).
+    Singleton,
+    /// A VMM continuous-batching lane: no rotation buffers (the engine's
+    /// shared draft scratch lends them per call) and no `prefill_batch` (the
+    /// batched verify runs on the shared trunk scratch; the lane's own
+    /// `VerifyScratch` only holds its head rows). Every other owner, shape
+    /// and allocation order is the singleton's.
+    VmmLane,
+}
+
+/// Allocate the lane owners in the singleton's order, freeing everything
+/// already allocated on any failure. `max_ctx` is the draft scratch's logical
+/// context (`new_windowed`'s `max_ctx`; the Legacy scratch rows);
+/// `ring_positions` the hidden-ring rows (= host hidden log rows). `kind`
+/// selects the scratch the role needs ([`DflashOwnerKind`]).
+#[allow(clippy::too_many_arguments)]
+fn alloc_dflash_owners(
+    gpu: &mut Gpu,
+    draft_config: &DflashConfig,
+    has_mq: bool,
+    block_size: usize,
+    ctx_mode: DraftCtxMode,
+    max_ctx: usize,
+    ring_positions: usize,
+    staging_max_batch: usize,
+    verify_max_n: usize,
+    tape_max_n: usize,
+    target_config: &Qwen35Config,
+    target_dn: &DeltaNetState,
+    kind: DflashOwnerKind,
+) -> Result<DflashOwners, String> {
+    // `with_mq` allocates the FWHT rotation scratch (mq_x_rot) that
+    // `gemm_dispatch` requires for MQ4/MQ3/MQ6 draft weights. A VMM lane
+    // leaves it out: the engine's shared draft scratch lends its identically
+    // sized buffers for every lane draft call.
+    let has_mq = has_mq && kind == DflashOwnerKind::Singleton;
+    let draft_scratch = match ctx_mode {
+        DraftCtxMode::Windowed { w, w_full } => {
+            DflashScratch::new_windowed(gpu, draft_config, block_size, w, w_full, max_ctx, has_mq)
+        }
+        DraftCtxMode::Legacy => {
+            DflashScratch::new_with_mq(gpu, draft_config, block_size, max_ctx, has_mq)
+        }
+    }
+    .map_err(|e| format!("{e}"))?;
+    for &lid in &draft_config.target_layer_ids {
+        if lid >= target_config.n_layers {
+            draft_scratch.free_gpu(gpu);
+            return Err(format!(
+                "draft target_layer_ids contains {} >= num_target_layers {}",
+                lid, target_config.n_layers
+            ));
+        }
+    }
+    let hidden_rb = match HiddenStateRingBuffer::new_for_layers(
+        gpu,
+        &draft_config.target_layer_ids,
+        target_config.dim,
+        ring_positions,
+        staging_max_batch,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            draft_scratch.free_gpu(gpu);
+            return Err(format!("HiddenStateRingBuffer::new_for_layers: {e}"));
+        }
+    };
+    let hidden_k = target_config.dim.next_power_of_two();
+    let verify_scratch = match kind {
+        DflashOwnerKind::Singleton => VerifyScratch::with_prefill(
+            gpu,
+            verify_max_n,
+            target_config.dim,
+            target_config.vocab_size,
+            hidden_k,
+            target_config,
+        ),
+        DflashOwnerKind::VmmLane => VerifyScratch::new(
+            gpu,
+            verify_max_n,
+            target_config.dim,
+            target_config.vocab_size,
+            hidden_k,
+        ),
+    };
+    let verify_scratch = match verify_scratch {
+        Ok(v) => v,
+        Err(e) => {
+            hidden_rb.free_gpu(gpu);
+            draft_scratch.free_gpu(gpu);
+            return Err(format!("VerifyScratch alloc: {e}"));
+        }
+    };
+    let target_snap = match DeltaNetSnapshot::new_for(gpu, target_dn) {
+        Ok(v) => v,
+        Err(e) => {
+            verify_scratch.free_gpu(gpu);
+            hidden_rb.free_gpu(gpu);
+            draft_scratch.free_gpu(gpu);
+            return Err(format!("DeltaNetSnapshot::new_for: {e}"));
+        }
+    };
+    let gdn_tape = match GdnTape::new_for_dflash(gpu, target_config, tape_max_n) {
+        Ok(v) => v,
+        Err(e) => {
+            target_snap.free_gpu(gpu);
+            verify_scratch.free_gpu(gpu);
+            hidden_rb.free_gpu(gpu);
+            draft_scratch.free_gpu(gpu);
+            return Err(format!("GdnTape::new_for_dflash: {e}"));
+        }
+    };
+    let target_hidden_host = vec![0.0f32; ring_positions * target_config.dim];
+    Ok(DflashOwners {
+        draft_scratch,
+        hidden_rb,
+        verify_scratch,
+        target_snap,
+        gdn_tape,
+        target_hidden_host,
+    })
 }
 
 // ─── DFlash state load ────────────────────────────────────────────────
@@ -168,7 +370,15 @@ pub fn load_dflash_state(
     // True when adaptive KV is engaged for this load (tier-switching cache).
     // Must be false for retained-PM4 admission.
     adaptive_kv: bool,
+    // `speculation.dflash_block`, resolved per serving configuration
+    // (`DflashBlockPolicy::resolve`). Fixes the proposal width of the
+    // singleton AND of every VMM lane built from this state.
+    dflash_block: usize,
 ) -> Result<DflashState, String> {
+    // The IU4 and PM FP8 verify opt-ins are two different verify arithmetics;
+    // both forced on has no defined route, so the load fails before any
+    // allocation (the final decision below uses the runtime block).
+    Gpu::iu4_verify_load_decision(&gpu.flags, dflash_block)?;
     let requested_ctx = ctx_capacity;
     // Open the draft container up-front: its declared SWA window is the
     // DEFAULT window (below), so the artifact must be parsed before the
@@ -282,13 +492,28 @@ pub fn load_dflash_state(
         };
     }
     let draft_weights = or_free!(DflashWeights::load(gpu, &draft_hfq, &draft_config), "");
-    let block_size = draft_config.runtime_block_size();
+    let block_size = draft_config.runtime_block_size(dflash_block);
     if block_size != draft_config.block_size {
         eprintln!(
-            "  DFlash2 runtime block: {} -> {} (selector/conv path is length-generic)",
+            "  DFlash2 runtime block: {} -> {} (speculation.dflash_block; selector/conv path is length-generic)",
             draft_config.block_size, block_size
         );
     }
+    // IU4 verify (numerics differ from the F16 verify; quality tied on task
+    // evals): on by default when this load's proposal width is 8 (a batching
+    // serve), `HIPFIRE_CB_VERIFY_IU4` forces/kills, FP8 opt-in wins the
+    // default. Batched == singleton stays byte-identical within the config.
+    // Only the both-forced case errs, refused above before any allocation.
+    gpu.iu4_verify_load = Gpu::iu4_verify_load_decision(&gpu.flags, block_size).unwrap_or(false);
+    eprintln!(
+        "  DFlash verify IU4: {} (block {block_size}, HIPFIRE_CB_VERIFY_IU4={})",
+        if gpu.iu4_verify_load { "on" } else { "off" },
+        match gpu.flags.cb_verify_iu4 {
+            None => "unset",
+            Some(true) => "1",
+            Some(false) => "0",
+        }
+    );
     // DDTree verify batches up to `budget + 1` slots (seed + budget nodes), which
     // can exceed the chain block_size+1. Size verify_scratch / GdnTape / hidden
     // staging for the larger of the two so ddtree-mode serve doesn't overflow
@@ -310,36 +535,6 @@ pub fn load_dflash_state(
         ddtree_budget = 0;
     }
     let max_n = (block_size + 1).max(ddtree_budget + 1);
-    // `with_mq` allocates the FWHT rotation scratch (mq_x_rot) that
-    // `gemm_dispatch` requires for MQ4/MQ3/MQ6 draft weights. The carrier
-    // refactor regressed this to the `with_mq=false` `::new` constructor →
-    // panic "MQ4 dispatch requires mq_x_rot scratch" on any MQ-quantized draft.
-    let draft_scratch = or_free!(
-        match window {
-            Some(w) => DflashScratch::new_windowed(
-                gpu,
-                &draft_config,
-                block_size,
-                w,
-                // Split drafts: last (full-attention) layer's ring spans the
-                // whole supported context. All-sliding DFlash2: `new_windowed`
-                // ignores w_full and pins every layer at W.
-                requested_ctx,
-                requested_ctx,
-                draft_weights.has_mq,
-            ),
-            None => DflashScratch::new_with_mq(
-                gpu,
-                &draft_config,
-                block_size,
-                ctx_capacity,
-                draft_weights.has_mq,
-            ),
-        },
-        "",
-        draft_weights,
-    );
-    let _ = draft_hfq;
     // The hidden-ring STAGING buffers must hold one staged chunk. Verify
     // cycles stage only `max_n` (= block_size+1) rows. The prompt seed
     // (`seed_target_hidden_from_prompt_abortable`) follows AR's chunk plan and
@@ -349,88 +544,61 @@ pub fn load_dflash_state(
     // `max_n` overflowed the d2d copy there on any prompt longer than
     // block_size+1 tokens. Size it to the larger of the two so both fit.
     let staging_max_batch = max_n.max(qwen35::PREFILL_MAX_BATCH);
-    // Hidden extraction must use checkpoint target_layer_ids exactly — validate
-    // against target layer range and allocate by the explicit list (not the
-    // evenly-spaced fallback). Checkpoint [5,19,33,47,61] is thus captured verbatim.
-    for &lid in &draft_config.target_layer_ids {
-        if lid >= target_config.n_layers {
-            // Free owned GPU state before returning; or_free! would have done
-            // this for the ring allocation failure path — do it manually here.
-            draft_scratch.free_gpu(gpu);
+    // `with_mq` (inside `alloc_dflash_owners`) allocates the FWHT rotation
+    // scratch (mq_x_rot) that `gemm_dispatch` requires for MQ4/MQ3/MQ6 draft
+    // weights. Hidden extraction uses checkpoint target_layer_ids exactly —
+    // validated against the target layer range and allocated by the explicit
+    // list (not the evenly-spaced fallback), so [5,19,33,47,61] is captured
+    // verbatim.
+    let (ctx_mode, draft_max_ctx) = match window {
+        // Split drafts: last (full-attention) layer's ring spans the whole
+        // supported context. All-sliding DFlash2: `new_windowed` ignores
+        // w_full and pins every layer at W.
+        Some(w) => (
+            DraftCtxMode::Windowed {
+                w,
+                w_full: requested_ctx,
+            },
+            requested_ctx,
+        ),
+        None => (DraftCtxMode::Legacy, ctx_capacity),
+    };
+    let owners = match alloc_dflash_owners(
+        gpu,
+        &draft_config,
+        draft_weights.has_mq,
+        block_size,
+        ctx_mode,
+        draft_max_ctx,
+        ctx_capacity,
+        staging_max_batch,
+        max_n,
+        max_n,
+        target_config,
+        target_dn,
+        DflashOwnerKind::Singleton,
+    ) {
+        Ok(owners) => owners,
+        Err(e) => {
             draft_weights.free_gpu(gpu);
-            return Err(format!(
-                "draft target_layer_ids contains {} >= num_target_layers {}",
-                lid, target_config.n_layers
-            ));
+            return Err(e);
         }
-    }
-    let hidden_rb = or_free!(
-        HiddenStateRingBuffer::new_for_layers(
-            gpu,
-            &draft_config.target_layer_ids,
-            target_config.dim,
-            ctx_capacity,
-            staging_max_batch,
-        ),
-        "HiddenStateRingBuffer::new_for_layers",
-        draft_scratch,
-        draft_weights,
-    );
-    let hidden_k = target_config.dim.next_power_of_two();
-    let verify_scratch = or_free!(
-        VerifyScratch::with_prefill(
-            gpu,
-            max_n,
-            target_config.dim,
-            target_config.vocab_size,
-            hidden_k,
-            target_config,
-        ),
-        "VerifyScratch::with_prefill",
-        hidden_rb,
-        draft_scratch,
-        draft_weights,
-    );
-    let target_snap = or_free!(
-        DeltaNetSnapshot::new_for(gpu, target_dn),
-        "DeltaNetSnapshot::new_for",
-        verify_scratch,
-        hidden_rb,
-        draft_scratch,
-        draft_weights,
-    );
-    let gdn_tape = or_free!(
-        GdnTape::new_for_config(gpu, target_config, max_n),
-        "GdnTape::new_for_config",
-        target_snap,
-        verify_scratch,
-        hidden_rb,
-        draft_scratch,
-        draft_weights,
-    );
-    let target_hidden_host = vec![0.0f32; ctx_capacity * target_config.dim];
+    };
+    let _ = draft_hfq;
     // DDTree (budget read once above, used for scratch sizing).
     let ddtree = if ddtree_budget > 0 {
         let topk: usize = gpu.flags.ddtree_topk.or(ddtree_topk_param).unwrap_or(4);
         let post_seed_snap = or_free!(
             DeltaNetSnapshot::new_for(gpu, target_dn),
             "",
-            gdn_tape,
-            target_snap,
-            verify_scratch,
-            hidden_rb,
-            draft_scratch,
+            owners,
             draft_weights,
         );
         let scratch = or_free!(
             DdtreeScratch::new(gpu, ddtree_budget),
             "DdtreeScratch::new",
             post_seed_snap,
-            gdn_tape,
-            target_snap,
-            verify_scratch,
-            hidden_rb,
-            draft_scratch,
+            owners,
             draft_weights,
         );
         Some(DdtreeState {
@@ -442,6 +610,14 @@ pub fn load_dflash_state(
     } else {
         None
     };
+    let DflashOwners {
+        draft_scratch,
+        hidden_rb,
+        verify_scratch,
+        target_snap,
+        gdn_tape,
+        target_hidden_host,
+    } = owners;
     // Retained-PM4 admission (default-off). Pure gates + env opt-in; Disabled
     // holds no controller so HIP behavior stays byte-identical when not armed.
     let env_opt_in = hipfire_config::developer_var("HIPFIRE_DFLASH_VERIFY_PM4")
@@ -491,6 +667,13 @@ pub fn load_dflash_state(
         hidden_rb.max_batch,
         gdn_tape.max_n,
     ) {
+        // The IU4 verify producers are eager-only; a recorded PM4 tape would
+        // refuse them, so an IU4-verify load keeps the HIP verify route.
+        Ok(()) if qwen35::prefill::multi::dflash_iu4_verify_admitted(gpu, target_weights, target_config) => {
+            let reason = "IU4 verify is on for this load (eager-only; HIPFIRE_CB_VERIFY_IU4=0 turns it off)";
+            eprintln!("  DFlash verify PM4: disabled ({reason})");
+            DflashVerifyPm4::disabled(reason)
+        }
         Ok(()) => {
             eprintln!(
                 "  DFlash verify PM4: armed (B={}, exact {})",
@@ -505,7 +688,9 @@ pub fn load_dflash_state(
     };
     Ok(DflashState {
         draft_config,
-        draft_weights,
+        // Wrapped at successful state construction only: every error path
+        // above frees the raw weights directly.
+        draft_weights: Arc::new(draft_weights),
         draft_scratch,
         hidden_rb,
         verify_scratch,
@@ -527,6 +712,110 @@ pub fn load_dflash_state(
     })
 }
 
+/// Cold/suffix DFlash prefill finishing steps shared by the singleton and the
+/// VMM lane prefill: scatter the seeded hidden rows into the draft's
+/// interleaved context (on a hit, only the suffix rows at `prefill_start`;
+/// on a miss, all prompt rows from 0), windowed backfill (cold only), thlog
+/// prompt seed / resume checkpoint, then the host copy of the post-prompt
+/// logits. Order is the singleton's.
+#[allow(clippy::too_many_arguments)]
+fn dflash_prefill_finish(
+    gpu: &mut Gpu,
+    df: &mut DflashState,
+    logits: &GpuTensor,
+    prompt_tokens: &[u32],
+    prefill_len: usize,
+    cache_hit: bool,
+    prefill_start: usize,
+    resume_from: Option<usize>,
+) -> Result<Vec<f32>, String> {
+    let (scatter_off, scatter_len) = if cache_hit {
+        (prefill_start, prefill_len)
+    } else {
+        (0, prompt_tokens.len())
+    };
+    if let Err(e) = scatter_hidden_block_to_interleaved(
+        gpu,
+        &df.hidden_rb,
+        &df.draft_scratch.target_hidden,
+        scatter_off,
+        scatter_len,
+        scatter_len,
+        df.draft_scratch.ctx_modulus(),
+    ) {
+        eprintln!("[dflash] scatter failed: {e} — falling back to per-cycle upload");
+    }
+    // Windowed cold prefill longer than W: the 4+1 split's last (full)
+    // layer still needs K/V for every prompt row. `draft_seed_backfill`
+    // is a no-op for all-sliding DFlash2 (every layer shares the W ring)
+    // and for prompt_len <= W. Keep the call — it is safe on both splits.
+    if !cache_hit {
+        hipfire_runtime::dflash::draft_seed_backfill(
+            gpu,
+            &df.draft_weights,
+            &df.draft_config,
+            &mut df.draft_scratch,
+            &df.target_hidden_host,
+            prompt_tokens.len(),
+        )
+        .map_err(|e| {
+            hipfire_runtime::reset_core::note_hip_error(&e, "qwen35::dflash_prefill::backfill");
+            e.to_string()
+        })?;
+    }
+    df.draft_scratch.thlog.seed_prompt(prompt_tokens.len());
+    if let Some(ckpt) = resume_from {
+        // Divergent rows [ckpt..len) were just overwritten; drop the draft's
+        // projection cursor so the first spec step re-projects from `ckpt`.
+        df.draft_scratch.thlog.set_resume_checkpoint(ckpt);
+    }
+    gpu.download_f32(logits).map_err(|e| {
+        hipfire_runtime::reset_core::note_hip_error(&e, "qwen35::dflash_prefill::logits");
+        e.to_string()
+    })
+}
+
+/// Prefill first-token policy shared by the singleton `prefill` and the VMM
+/// lane `dflash_prefill_lane_parts` (extracted verbatim from the singleton
+/// prefill body, originally dflash_spec.rs lines 890-913).
+///
+/// `cfg.temp <= 1e-6`: historical host argmax fold (first maximal index wins
+/// via strict `>`), no RNG draw. Otherwise: host softmax at `cfg.temp`, then
+/// `apply_host_ar_trunc(top_k, top_p)` ONLY when `chain` (DDTree SWOR honors
+/// temperature only; origin lines 905-910), then exactly one
+/// `xorshift_next_unit(rng)` draw and `sample_categorical` (origin lines
+/// 911-912). `cactus_delta` is not consulted. `scratch` holds the probability
+/// row (cleared/reserved by `softmax_temp_into`; identical to the singleton's
+/// former fresh `Vec`).
+pub(crate) fn dflash_first_token(
+    logits: &[f32],
+    chain: bool,
+    cfg: crate::speculative::DflashSampleCfg,
+    rng: &mut u64,
+    scratch: &mut Vec<f32>,
+) -> u32 {
+    if cfg.temp <= 1e-6 {
+        logits
+            .iter()
+            .enumerate()
+            .fold((0u32, f32::NEG_INFINITY), |(best, bv), (i, &v)| {
+                if v > bv {
+                    (i as u32, v)
+                } else {
+                    (best, bv)
+                }
+            })
+            .0
+    } else {
+        softmax_temp_into(logits, cfg.temp, scratch);
+        if chain {
+            apply_host_ar_trunc(scratch, cfg.top_k, cfg.top_p);
+        }
+        let u = xorshift_next_unit(rng);
+        sample_categorical(scratch, u)
+    }
+}
+
 // ─── DflashSpeculator ───────────────────────────────────────────────────
 
 /// Lower a qwen35 `SpecStepResult` onto the arch-generic `SpecStep`.
@@ -544,6 +833,10 @@ fn lower_qwen35(r: SpecStepResult) -> SpecStep {
     )
 }
 
+/// Error of every operation that needs the singleton's lane state while a VMM
+/// promotion has moved it out (see [`DflashSpeculator::take_vmm_lane`]).
+const SINGLETON_VACANT: &str = "DFlash singleton lane state is vacant; prefill first";
+
 /// DFlash / DDTree speculator: wraps the qwen35 `spec_step_*` chain/tree
 /// kernels behind the arch-generic [`Speculator`] trait. Chain-vs-tree is an
 /// internal detail resolved at build (`ddtree` presence comes from the loaded
@@ -551,8 +844,19 @@ fn lower_qwen35(r: SpecStepResult) -> SpecStep {
 ///
 /// Owns the `DflashState` moved out of `LoadedModel.dflash`, plus the divergent-
 /// render DeltaNet checkpoint ring folded in from `LoadedModel.dflash_checkpoints`.
+///
+/// The lane state is VACANT after [`Self::take_vmm_lane`] (a promoted request
+/// owns it): exactly one of `df` / `vacant` is `Some`. The speculator then
+/// holds only the shared-asset descriptor (a counted weights reference) and
+/// rebuilds a fresh state lazily on the next `prefill` ([`Self::ensure_live`]),
+/// or reinstalls the snapshot ([`Self::restore_vmm_lane`]); no replacement is
+/// allocated while the lane lives.
 pub struct DflashSpeculator {
-    df: DflashState,
+    /// Live singleton owners; `None` while vacant.
+    df: Option<DflashState>,
+    /// Shared assets while `df` is vacant (holds one `Arc` reference to the
+    /// draft weights, released when the state is rebuilt/restored/freed).
+    vacant: Option<DflashVmmAssets>,
     rng_state: u64,
     /// Per-request sampling, set via `set_sampling` before each step loop and
     /// applied in the chain-mode `spec_step_dflash` branch of `step`. Default
@@ -579,13 +883,17 @@ pub struct DflashSpeculator {
     /// was admitted (its replay is shape-frozen at B=16; see
     /// `build_dflash_speculator`). Reset to full at request start.
     adaptive: DflashAdaptiveBlock,
+    /// Resolved adaptive knob passed to `new` (the controller's `enabled` is
+    /// private); VMM lanes require it to be false (fixed block).
+    adaptive_enabled: bool,
 }
 
+/// Pre-window mark of the last completed window (terminal-prefix repair).
 #[derive(Clone, Copy, Debug)]
-struct DflashWindowMark {
-    position: usize,
-    seed: u32,
-    target_hidden: TargetHiddenLogMark,
+pub struct DflashWindowMark {
+    pub position: usize,
+    pub seed: u32,
+    pub target_hidden: TargetHiddenLogMark,
 }
 
 impl DflashSpeculator {
@@ -604,7 +912,8 @@ impl DflashSpeculator {
     ) -> Self {
         let adaptive = DflashAdaptiveBlock::new(df.block_size, adaptive_b);
         Self {
-            df,
+            df: Some(df),
+            vacant: None,
             // Same fixed seed the daemon's DFlash loop used. `set_sampling`
             // re-seeds it to this value per request (matching spec-graph's local
             // `let mut rng_state = 0x13579BDF` per `generate_dflash` call) so a
@@ -614,7 +923,7 @@ impl DflashSpeculator {
             // Greedy by default until a request calls `set_sampling`.
             sample_temp: 0.0,
             sample_top_p: 1.0,
-            sample_top_k: 0,
+            sample_top_k: hipfire_runtime::llama::ar_candidate_cap(None),
             sample_cactus: 0.0,
             checkpoints: Vec::new(),
             resume_enabled,
@@ -622,17 +931,26 @@ impl DflashSpeculator {
             ck_cap,
             last_window: None,
             adaptive,
+            adaptive_enabled: adaptive_b,
         }
     }
 
     /// Borrow the retained-PM4 verify route (report / phase inspection).
-    pub fn verify_pm4(&self) -> &DflashVerifyPm4 {
-        &self.df.verify_pm4
+    /// `None` while the lane state is vacant.
+    pub fn verify_pm4(&self) -> Option<&DflashVerifyPm4> {
+        self.df.as_ref().map(|df| &df.verify_pm4)
     }
 
-    /// Mutable borrow for the chain verify path (`Some(&mut self.df.verify_pm4)`).
-    pub fn verify_pm4_mut(&mut self) -> &mut DflashVerifyPm4 {
-        &mut self.df.verify_pm4
+    /// Mutable borrow for the chain verify path (`Some(&mut df.verify_pm4)`).
+    /// `None` while the lane state is vacant.
+    pub fn verify_pm4_mut(&mut self) -> Option<&mut DflashVerifyPm4> {
+        self.df.as_mut().map(|df| &mut df.verify_pm4)
+    }
+
+    /// The lane state is currently moved out ([`Self::take_vmm_lane`]); the
+    /// next `prefill` ([`Self::ensure_live`]) rebuilds it.
+    pub fn is_vacant(&self) -> bool {
+        self.df.is_none()
     }
 }
 
@@ -659,13 +977,21 @@ impl Speculator for DflashSpeculator {
             .downcast_mut::<ModelSlot>()
             .ok_or("DflashSpeculator: target is not a Qwen3.5 ModelSlot")?;
 
+        // Rebuild the lane state when a VMM promotion moved it out (the
+        // conversation caches were cleared with it, so this is a cold prefill).
+        self.ensure_live(gpu, &slot.config, &slot.dn_state)?;
+        let df = self
+            .df
+            .as_mut()
+            .ok_or_else(|| SINGLETON_VACANT.to_string())?;
+
         // Mirror the daemon's pre-seed drafter setup (generate_dflash 4064-4072):
         // always clear the host hidden buffer; on a full prefill drop the draft's
         // upload/projection tracking. On a cache HIT it is PRESERVED so the draft
         // reuses the cached [0..start_pos] projections and only projects the suffix.
-        self.df.target_hidden_host.clear();
+        df.target_hidden_host.clear();
         if !cache_hit {
-            self.df.draft_scratch.reset_upload_tracking();
+            df.draft_scratch.reset_upload_tracking();
         }
 
         // Seed the target's hidden state into the drafter ring (chunked prefill
@@ -682,7 +1008,7 @@ impl Speculator for DflashSpeculator {
             seed_target_hidden_suffix_abortable(
                 gpu,
                 slot,
-                &mut self.df.hidden_rb,
+                &mut df.hidden_rb,
                 prefill_tokens,
                 prefill_start,
                 abort,
@@ -694,8 +1020,8 @@ impl Speculator for DflashSpeculator {
             seed_target_hidden_from_prompt_abortable(
                 gpu,
                 slot,
-                &mut self.df.hidden_rb,
-                &mut self.df.target_hidden_host,
+                &mut df.hidden_rb,
+                &mut df.target_hidden_host,
                 prefill_tokens,
                 abort,
                 ckpt_sink,
@@ -713,89 +1039,38 @@ impl Speculator for DflashSpeculator {
             return Ok(PrefillOutcome::Aborted);
         }
 
-        // Prime/extend the draft's GPU target_hidden buffer. On a hit, scatter
-        // only the suffix rows at `prefill_start` (the prefix is preserved);
-        // on a miss, scatter all prompt rows from 0.
-        let (scatter_off, scatter_len) = if cache_hit {
-            (prefill_start, prefill_tokens.len())
-        } else {
-            (0, prompt_tokens.len())
-        };
-        if let Err(e) = scatter_hidden_block_to_interleaved(
-            gpu,
-            &self.df.hidden_rb,
-            &self.df.draft_scratch.target_hidden,
-            scatter_off,
-            scatter_len,
-            scatter_len,
-            self.df.draft_scratch.ctx_modulus(),
-        ) {
-            eprintln!("[dflash] scatter failed: {e} — falling back to per-cycle upload");
-        }
-        // Windowed cold prefill longer than W: the 4+1 split's last (full)
-        // layer still needs K/V for every prompt row. `draft_seed_backfill`
-        // is a no-op for all-sliding DFlash2 (every layer shares the W ring)
-        // and for prompt_len <= W. Keep the call — it is safe on both splits.
-        if !cache_hit {
-            hipfire_runtime::dflash::draft_seed_backfill(
-                gpu,
-                &self.df.draft_weights,
-                &self.df.draft_config,
-                &mut self.df.draft_scratch,
-                &self.df.target_hidden_host,
-                prompt_tokens.len(),
-            )
-            .map_err(|e| {
-                hipfire_runtime::reset_core::note_hip_error(&e, "qwen35::dflash_prefill::backfill");
-                e.to_string()
-            })?;
-        }
-        self.df.draft_scratch.thlog.seed_prompt(prompt_tokens.len());
-        if let Some(ckpt) = resume_from {
-            // Divergent rows [ckpt..len) were just overwritten; drop the draft's
-            // projection cursor so the first spec step re-projects from `ckpt`.
-            self.df.draft_scratch.thlog.set_resume_checkpoint(ckpt);
-        }
-
+        // Prime/extend the draft's GPU target_hidden buffer, backfill, seed the
+        // thlog and read the post-prompt logits (shared with the VMM lane
+        // prefill: `dflash_prefill_finish`).
+        //
         // First emit = target draw at the final prompt position (seed already
         // ran the per-token forward; scratch.logits holds the post-prompt logits).
         // temp≈0 stays the historical host argmax fold (byte-identical greedy).
         // temp>0 uses the same host nucleus sampler as chain DFlash verify so the
         // post-prefill seed is not a special greedy exception on distribution-
         // preserving requests.
-        let first_logits = gpu.download_f32(&slot.scratch.logits).map_err(|e| {
-            hipfire_runtime::reset_core::note_hip_error(&e, "qwen35::dflash_prefill::logits");
-            e.to_string()
-        })?;
-        let first_token = if self.sample_temp <= 1e-6 {
-            first_logits
-                .iter()
-                .enumerate()
-                .fold((0u32, f32::NEG_INFINITY), |(best, bv), (i, &v)| {
-                    if v > bv {
-                        (i as u32, v)
-                    } else {
-                        (best, bv)
-                    }
-                })
-                .0
-        } else {
-            let mut probs = Vec::with_capacity(first_logits.len());
-            softmax_temp_into(&first_logits, self.sample_temp, &mut probs);
-            // DDTree SWOR honors temperature only (matches step's tree arm).
-            // Chain mode applies the same host top_k + nucleus cuts as
-            // `spec_step_dflash` so the seed is AR-at-(top_k,top_p).
-            if self.df.ddtree.is_none() {
-                if self.sample_top_k > 0 && self.sample_top_k < probs.len() {
-                    apply_host_topk(&mut probs, self.sample_top_k);
-                }
-                if self.sample_top_p < 0.999 {
-                    apply_host_nucleus(&mut probs, self.sample_top_p);
-                }
-            }
-            let u = xorshift_next_unit(&mut self.rng_state);
-            sample_categorical(&probs, u)
-        };
+        let first_logits = dflash_prefill_finish(
+            gpu,
+            df,
+            &slot.scratch.logits,
+            prompt_tokens,
+            prefill_tokens.len(),
+            cache_hit,
+            prefill_start,
+            resume_from,
+        )?;
+        let first_token = dflash_first_token(
+            &first_logits,
+            df.ddtree.is_none(),
+            crate::speculative::DflashSampleCfg {
+                temp: self.sample_temp,
+                top_p: self.sample_top_p,
+                top_k: self.sample_top_k,
+                cactus_delta: self.sample_cactus,
+            },
+            &mut self.rng_state,
+            &mut Vec::new(),
+        );
         Ok(PrefillOutcome::Ready { first_token })
     }
 
@@ -823,10 +1098,14 @@ impl Speculator for DflashSpeculator {
             .as_any_mut()
             .downcast_mut::<ModelSlot>()
             .ok_or("DflashSpeculator: target is not a Qwen3.5 ModelSlot")?;
+        let df = self
+            .df
+            .as_mut()
+            .ok_or_else(|| SINGLETON_VACANT.to_string())?;
         let aborted = seed_target_hidden_suffix_abortable(
             gpu,
             slot,
-            &mut self.df.hidden_rb,
+            &mut df.hidden_rb,
             tokens,
             start_pos,
             abort,
@@ -842,17 +1121,16 @@ impl Speculator for DflashSpeculator {
         }
         scatter_hidden_block_to_interleaved(
             gpu,
-            &self.df.hidden_rb,
-            &self.df.draft_scratch.target_hidden,
+            &df.hidden_rb,
+            &df.draft_scratch.target_hidden,
             start_pos,
             tokens.len(),
             tokens.len(),
-            self.df.draft_scratch.ctx_modulus(),
+            df.draft_scratch.ctx_modulus(),
         )
         .map_err(|e| e.to_string())?;
         let co = slot.kv_cache_mut().map(|kv| kv.compact_offset).unwrap_or(0) as i32;
-        self.df
-            .draft_scratch
+        df.draft_scratch
             .thlog
             .append_committed(start_pos, tokens.len(), co);
         Ok(true)
@@ -862,14 +1140,23 @@ impl Speculator for DflashSpeculator {
     /// and on DFlash2 selector-chain rejection sampling. Legacy chain without
     /// a selector stays greedy-only at this gate.
     fn supports_temp_verify(&self) -> bool {
-        self.df.ddtree.is_some() || self.df.draft_weights.has_candidate_selector()
+        match (&self.df, &self.vacant) {
+            (Some(df), _) => df.ddtree.is_some() || df.draft_weights.has_candidate_selector(),
+            // A vacancy only exists for fixed-chain assets: no DDTree.
+            (None, Some(assets)) => assets.weights.has_candidate_selector(),
+            (None, None) => false,
+        }
     }
 
     /// Faithful top_p/top_k nucleus only on the DFlash2 candidate-selector chain.
     /// DDTree SWOR returns false so route selection still blocks user-explicit
     /// non-temperature controls for the tree path.
     fn supports_chain_nucleus_verify(&self) -> bool {
-        self.df.draft_weights.has_candidate_selector()
+        match (&self.df, &self.vacant) {
+            (Some(df), _) => df.draft_weights.has_candidate_selector(),
+            (None, Some(assets)) => assets.weights.has_candidate_selector(),
+            (None, None) => false,
+        }
     }
 
     fn step(
@@ -887,6 +1174,10 @@ impl Speculator for DflashSpeculator {
             .as_any_mut()
             .downcast_mut::<ModelSlot>()
             .ok_or("DflashSpeculator: target is not a Qwen3.5 ModelSlot")?;
+        let df = self
+            .df
+            .as_mut()
+            .ok_or_else(|| SINGLETON_VACANT.to_string())?;
 
         if max_emit == 0 {
             return Err("DflashSpeculator: max_emit=0 (no remaining output budget)".into());
@@ -909,10 +1200,10 @@ impl Speculator for DflashSpeculator {
                 .adaptive
                 .effective_at(position)
                 .max(2)
-                .min(self.df.block_size.max(2));
+                .min(df.block_size.max(2));
             let want = max_emit.max(2);
             let b = cfg_b.min(want);
-            if b < cfg_b || b != self.df.draft_config.block_size {
+            if b < cfg_b || b != df.draft_config.block_size {
                 Some(b)
             } else {
                 None
@@ -924,7 +1215,7 @@ impl Speculator for DflashSpeculator {
         let window_mark = DflashWindowMark {
             position,
             seed,
-            target_hidden: self.df.draft_scratch.thlog.mark(),
+            target_hidden: df.draft_scratch.thlog.mark(),
         };
 
         // Two-way dispatch: DDTree-batched (SWOR) when a tree is configured
@@ -932,7 +1223,7 @@ impl Speculator for DflashSpeculator {
         // chain-mode DFlash. Selector chain uses sparse-q rejection at temp>0.
         // The grammar arg is ignored — qwen35 enforces tool-call grammar post-hoc
         // in the daemon.
-        let result = if let Some(dd) = self.df.ddtree.as_mut() {
+        let result = if let Some(dd) = df.ddtree.as_mut() {
             // Tree node budget is structural; max_accept is the commit bound.
             // Keep at least 1 node so the tree builder stays well-formed; the
             // accept clamp drops to 0 drafts when max_emit == 1.
@@ -940,16 +1231,16 @@ impl Speculator for DflashSpeculator {
             spec_step_ddtree_batched(
                 gpu,
                 slot,
-                &self.df.draft_weights,
-                &self.df.draft_config,
-                &mut self.df.draft_scratch,
-                &mut self.df.hidden_rb,
-                &mut self.df.target_hidden_host,
-                &mut self.df.target_snap,
+                &df.draft_weights,
+                &df.draft_config,
+                &mut df.draft_scratch,
+                &mut df.hidden_rb,
+                &mut df.target_hidden_host,
+                &mut df.target_snap,
                 &mut dd.post_seed_snap,
-                &mut self.df.gdn_tape,
+                &mut df.gdn_tape,
                 &dd.scratch,
-                &self.df.verify_scratch,
+                &df.verify_scratch,
                 position,
                 seed,
                 None, // ctx_slice = full history
@@ -968,7 +1259,7 @@ impl Speculator for DflashSpeculator {
             // substituting 0/None — keep the CACTUS guard here (the other
             // rewrites are hard-wired to off/None in this path, but the direct
             // `spec_step_dflash` caller covers them).
-            if self.df.draft_weights.has_candidate_selector() && self.sample_cactus != 0.0 {
+            if df.draft_weights.has_candidate_selector() && self.sample_cactus != 0.0 {
                 return Err(
                     "selector mode: CACTUS is not supported with DFlash2 candidate selector".into(),
                 );
@@ -976,17 +1267,17 @@ impl Speculator for DflashSpeculator {
             spec_step_dflash(
                 gpu,
                 slot,
-                &self.df.draft_weights,
-                &self.df.draft_config,
-                &mut self.df.draft_scratch,
-                &mut self.df.hidden_rb,
-                &mut self.df.target_hidden_host,
-                &mut self.df.target_snap,
-                &self.df.verify_scratch,
+                &df.draft_weights,
+                &df.draft_config,
+                &mut df.draft_scratch,
+                &mut df.hidden_rb,
+                &mut df.target_hidden_host,
+                &mut df.target_snap,
+                &df.verify_scratch,
                 position,
                 seed,
                 None, // ctx_slice = full history
-                Some(&mut self.df.gdn_tape),
+                Some(&mut df.gdn_tape),
                 // Sampling threaded from the request via `set_sampling` (#477
                 // merge re-wire). These four positions reproduce spec-graph's old
                 // inline `generate_dflash` call verbatim: temp 0 ⇒ greedy/argmax;
@@ -1006,7 +1297,7 @@ impl Speculator for DflashSpeculator {
                 1.0_f32,            // repeat_penalty (off)
                 0,                  // repeat_window
                 max_accept,
-                Some(&mut self.df.verify_pm4),
+                Some(&mut df.verify_pm4),
             )
         };
 
@@ -1054,11 +1345,15 @@ impl Speculator for DflashSpeculator {
         self.last_window = None;
         // Compact the drafter's cached target-hidden rows to match the target KV
         // after the FlashCASK eviction the daemon already applied to the target.
-        let ne = self.df.draft_config.num_extract();
-        let h = self.df.draft_config.hidden;
+        let df = self
+            .df
+            .as_mut()
+            .ok_or_else(|| SINGLETON_VACANT.to_string())?;
+        let ne = df.draft_config.num_extract();
+        let h = df.draft_config.hidden;
         apply_eviction_retain_to_draft(
             gpu,
-            &mut self.df.draft_scratch,
+            &mut df.draft_scratch,
             &retain.retain_mask,
             ne,
             h,
@@ -1072,7 +1367,10 @@ impl Speculator for DflashSpeculator {
         // divergent-render checkpoint ring (the target KV/recurrent reset is the
         // daemon's job — it owns the bundle). The adaptive window reseeds to
         // full too — the fail-safe direction (today's fixed-B behaviour).
-        self.df.draft_scratch.reset_upload_tracking();
+        // (Vacant: the lane owns the draft scratch; nothing to reset here.)
+        if let Some(df) = self.df.as_mut() {
+            df.draft_scratch.reset_upload_tracking();
+        }
         self.last_window = None;
         self.adaptive.reset();
         for (_, snap) in self.checkpoints.drain(..) {
@@ -1089,6 +1387,9 @@ impl Speculator for DflashSpeculator {
         window_seed: u32,
         consumed: &[u32],
     ) -> Result<bool, String> {
+        if self.df.is_none() {
+            return Err(SINGLETON_VACANT.into());
+        }
         let mark = self
             .last_window
             .take()
@@ -1104,57 +1405,41 @@ impl Speculator for DflashSpeculator {
             .as_any_mut()
             .downcast_mut::<ModelSlot>()
             .ok_or("DflashSpeculator: target is not a Qwen3.5 ModelSlot")?;
-        self.df
-            .target_snap
-            .restore_to(&mut slot.dn_state, gpu)
-            .map_err(|e| format!("DeltaNetSnapshot::restore_to: {e}"))?;
-        self.df.draft_scratch.thlog.restore(mark.target_hidden)?;
-
-        // Before the ordinary terminal flush, target state must include the
-        // old pending seed and every consumed token except the new pending
-        // terminal token. For consumed=[] there is nothing to replay.
-        let replay = terminal_prefix_replay(window_seed, consumed);
-        if replay.is_empty() {
-            return Ok(true);
-        }
-
-        let aborted = seed_target_hidden_suffix_abortable(
+        let mut parts = DflashTargetParts::from_slot(slot);
+        let policy = DflashCheckpointPolicy {
+            resume_enabled: self.resume_enabled,
+            interval: self.ck_interval,
+            cap: self.ck_cap,
+        };
+        dflash_repair_terminal_prefix_parts(
             gpu,
-            slot,
-            &mut self.df.hidden_rb,
-            &replay,
+            &mut parts,
+            self.df
+                .as_mut()
+                .ok_or_else(|| SINGLETON_VACANT.to_string())?,
+            &mut self.checkpoints,
+            &policy,
+            mark.target_hidden,
             window_start,
-            &|| false,
-            self.resume_enabled.then_some(&mut self.checkpoints),
-            self.ck_interval,
-            self.ck_cap,
-        )
-        .map_err(|e| e.to_string())?;
-        debug_assert!(!aborted, "terminal repair uses a non-aborting callback");
-        scatter_hidden_block_to_interleaved(
-            gpu,
-            &self.df.hidden_rb,
-            &self.df.draft_scratch.target_hidden,
-            window_start,
-            replay.len(),
-            replay.len(),
-            self.df.draft_scratch.ctx_modulus(),
-        )
-        .map_err(|e| e.to_string())?;
-        let co = slot.kv_cache_mut().map(|kv| kv.compact_offset).unwrap_or(0) as i32;
-        self.df
-            .draft_scratch
-            .thlog
-            .append_committed(window_start, replay.len(), co);
+            window_seed,
+            consumed,
+        )?;
         Ok(true)
     }
 
     fn reset_state_evidence(&self) -> Option<hipfire_runtime::spec::SpecResetEvidence> {
-        let th = &self.df.draft_scratch.thlog;
+        // Vacant: no drafter state exists, i.e. it is trivially reset.
+        let drafter_reset = match self.df.as_ref() {
+            Some(df) => {
+                let th = &df.draft_scratch.thlog;
+                th.uploaded_rows() == 0
+                    && th.proj_cached_rows() == 0
+                    && th.full_cached_rows() == 0
+            }
+            None => true,
+        };
         Some(hipfire_runtime::spec::SpecResetEvidence {
-            drafter_reset: th.uploaded_rows() == 0
-                && th.proj_cached_rows() == 0
-                && th.full_cached_rows() == 0,
+            drafter_reset,
             checkpoint_empty: self.checkpoints.is_empty(),
         })
     }
@@ -1167,7 +1452,11 @@ impl Speculator for DflashSpeculator {
     }
 
     fn ctx_capacity(&self) -> usize {
-        self.df.ctx_capacity
+        match (&self.df, &self.vacant) {
+            (Some(df), _) => df.ctx_capacity,
+            (None, Some(assets)) => assets.ctx_capacity,
+            (None, None) => 0,
+        }
     }
 
     fn checkpoint_positions(&self) -> Vec<usize> {
@@ -1208,7 +1497,7 @@ impl Speculator for DflashSpeculator {
         // its draw sequence exactly).
         self.sample_temp = cfg.temp;
         self.sample_top_p = cfg.top_p;
-        self.sample_top_k = cfg.top_k_cut();
+        self.sample_top_k = cfg.ar_candidate_cap();
         self.sample_cactus = cfg.cactus_delta;
         self.rng_state = request_rng_state(cfg.rng_seed);
         self.last_window = None;
@@ -1229,18 +1518,36 @@ impl Speculator for DflashSpeculator {
     }
 
     fn quiesce(&mut self, _gpu: &mut Gpu) -> Result<(), String> {
-        self.df.verify_pm4.shutdown()
+        match self.df.as_mut() {
+            Some(df) => df.verify_pm4.shutdown(),
+            None => Ok(()),
+        }
     }
 
     fn verify_pm4_report(&self) -> Option<serde_json::Value> {
-        Some(self.df.verify_pm4.report_json())
+        Some(match self.df.as_ref() {
+            Some(df) => df.verify_pm4.report_json(),
+            None => DflashVerifyPm4::disabled("singleton lane state vacant").report_json(),
+        })
+    }
+
+    fn drafter_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
     }
 
     fn free(self: Box<Self>, gpu: &mut Gpu) {
         let DflashSpeculator {
-            df, checkpoints, ..
+            df,
+            vacant,
+            checkpoints,
+            ..
         } = *self;
-        df.free_gpu(gpu);
+        if let Some(df) = df {
+            df.free_gpu(gpu);
+        }
+        if let Some(assets) = vacant {
+            release_shared_dflash_weights(gpu, assets.weights);
+        }
         for (_, snap) in checkpoints {
             snap.free_gpu(gpu);
         }
@@ -1306,6 +1613,494 @@ pub fn build_dflash_speculator(
         ck_cap,
         adaptive_b,
     ))
+}
+
+// ─── Shared-asset VMM lanes (continuous batching) ───────────────────────
+
+/// Release one reference to the shared draft weights. Only the final owner
+/// frees the raw GPU weights (`Arc::into_inner` guarantees exactly one caller
+/// observes the last reference even under concurrent releases); every other
+/// call just drops its reference. There is deliberately no `Drop` impl: GPU
+/// frees need a bound `Gpu`.
+pub fn release_shared_dflash_weights(gpu: &mut Gpu, weights: Arc<DflashWeights>) {
+    if let Some(w) = Arc::into_inner(weights) {
+        w.free_gpu(gpu);
+    }
+}
+
+/// Request-local DeltaNet checkpoint cadence (`DflashSpeculator`'s resolved
+/// `resume_enabled` / `ck_interval` / `ck_cap`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DflashCheckpointPolicy {
+    pub resume_enabled: bool,
+    pub interval: usize,
+    pub cap: usize,
+}
+
+/// Read-only descriptor of the loaded DFlash draft a VMM engine shares:
+/// cloned config metadata, a clone of the SAME weights `Arc`, and the
+/// singleton's resolved context policy / sizing. Never reparses env.
+///
+/// NOTE: `weights` is a counted reference. Drop descriptors (or hand them to
+/// [`release_shared_dflash_weights`]) before expecting the final owner's free.
+#[derive(Clone)]
+pub struct DflashVmmAssets {
+    pub draft_config: DflashConfig,
+    pub weights: Arc<DflashWeights>,
+    /// Resolved draft context mode (Legacy / Windowed{w, w_full}).
+    pub ctx_mode: DraftCtxMode,
+    /// `draft_scratch.max_ctx_len` (logical target context for windowed mode).
+    pub draft_max_ctx: usize,
+    /// Logical context cap the singleton reports (`DflashState::ctx_capacity`).
+    pub ctx_capacity: usize,
+    /// Hidden-ring rows (`HiddenStateRingBuffer::max_positions`); also the
+    /// host hidden log row capacity.
+    pub ring_positions: usize,
+    /// Hidden-ring staging rows (`HiddenStateRingBuffer::max_batch`).
+    pub staging_rows: usize,
+    /// `VerifyScratch::max_n` (block_size + 1 for fixed chain).
+    pub verify_max_rows: usize,
+    /// `GdnTape::max_n`.
+    pub tape_max_rows: usize,
+    pub block_size: usize,
+    pub checkpoint: DflashCheckpointPolicy,
+    /// Proof of fixed-block chain eligibility: no DDTree, no admitted
+    /// retained-PM4 route, adaptive block controller disabled.
+    pub fixed_chain: bool,
+}
+
+impl DflashVmmAssets {
+    /// Same shared weights (pointer identity) and same resolved policy as
+    /// `df`, i.e. `df` was built from these assets (or the singleton they
+    /// describe).
+    pub fn matches_state(&self, df: &DflashState) -> bool {
+        Arc::ptr_eq(&self.weights, &df.draft_weights)
+            && self.ctx_mode == df.draft_scratch.ctx_mode
+            && self.draft_max_ctx == df.draft_scratch.max_ctx_len
+            && self.ctx_capacity == df.ctx_capacity
+            && self.block_size == df.block_size
+            && self.ring_positions == df.hidden_rb.max_positions
+            && self.staging_rows == df.hidden_rb.max_batch
+            && self.verify_max_rows == df.verify_scratch.max_n
+            && self.tape_max_rows == df.gdn_tape.max_n
+    }
+}
+
+/// Allocate a clean DFlash `DflashState` against the shared weights and
+/// resolved policy of `assets` (no weight load). Fixed-chain lanes have
+/// `ddtree = None` and an explicitly disabled retained verify route. `kind`
+/// selects the scratch footprint ([`DflashOwnerKind`]): `VmmLane` omits the
+/// draft FWHT rotation buffers and the verify `prefill_batch`; `Singleton` is
+/// the full owner set (the speculator's lazily rebuilt state).
+pub fn new_dflash_lane_state(
+    gpu: &mut Gpu,
+    assets: &DflashVmmAssets,
+    config: &Qwen35Config,
+    dn: &DeltaNetState,
+    kind: DflashOwnerKind,
+) -> Result<DflashState, String> {
+    if !assets.fixed_chain {
+        return Err("DFlash VMM lane requires fixed-block chain assets".into());
+    }
+    let owners = alloc_dflash_owners(
+        gpu,
+        &assets.draft_config,
+        assets.weights.has_mq,
+        assets.block_size,
+        assets.ctx_mode,
+        assets.draft_max_ctx,
+        assets.ring_positions,
+        assets.staging_rows,
+        assets.verify_max_rows,
+        assets.tape_max_rows,
+        config,
+        dn,
+        kind,
+    )?;
+    let DflashOwners {
+        draft_scratch,
+        hidden_rb,
+        verify_scratch,
+        target_snap,
+        gdn_tape,
+        target_hidden_host,
+    } = owners;
+    Ok(DflashState {
+        draft_config: assets.draft_config.clone(),
+        draft_weights: Arc::clone(&assets.weights),
+        draft_scratch,
+        hidden_rb,
+        verify_scratch,
+        target_snap,
+        gdn_tape,
+        target_hidden_host,
+        ctx_capacity: assets.ctx_capacity,
+        block_size: assets.block_size,
+        ddtree: None,
+        verify_pm4: DflashVerifyPm4::disabled("VMM continuous-batching lane is eager-only"),
+    })
+}
+
+/// Lossless owned transfer of a live singleton DFlash lane (mutable owners,
+/// committed position, request cursors). Fields are crate-visible so the VMM
+/// lane wrapper can destructure it; consume it with `free_gpu` or by moving
+/// the fields. Asset identity is carried by `df.draft_weights` (same `Arc`)
+/// plus the policy in `df` — see [`DflashVmmAssets::matches_state`].
+pub struct DflashLaneSnapshot {
+    pub(crate) df: DflashState,
+    /// Committed target position at capture.
+    pub(crate) position: usize,
+    pub(crate) rng_state: u64,
+    pub(crate) sample_temp: f32,
+    pub(crate) sample_top_p: f32,
+    pub(crate) sample_top_k: usize,
+    pub(crate) sample_cactus: f32,
+    pub(crate) checkpoints: Vec<(usize, DeltaNetSnapshot)>,
+    pub(crate) policy: DflashCheckpointPolicy,
+    pub(crate) last_window: Option<DflashWindowMark>,
+}
+
+impl DflashLaneSnapshot {
+    /// Committed rows (target position) the snapshot was taken at.
+    pub fn rows(&self) -> usize {
+        self.position
+    }
+
+    /// Free every owned GPU object exactly once (the shared weights are
+    /// released through [`release_shared_dflash_weights`]).
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let DflashLaneSnapshot {
+            df,
+            position: _,
+            rng_state: _,
+            sample_temp: _,
+            sample_top_p: _,
+            sample_top_k: _,
+            sample_cactus: _,
+            checkpoints,
+            policy: _,
+            last_window: _,
+        } = self;
+        df.free_gpu(gpu);
+        for (_, snap) in checkpoints {
+            snap.free_gpu(gpu);
+        }
+    }
+}
+
+/// Drain pointer-bearing execution and drop pointer-bound singleton verify
+/// graphs before lane owners change hands.
+fn quiesce_for_lane_move(gpu: &mut Gpu) -> Result<(), String> {
+    gpu.hip
+        .device_synchronize()
+        .map_err(|e| format!("dflash lane move quiesce: {e}"))?;
+    gpu.graphs.verify_graph_destroy_all(&gpu.hip, gpu.device_id);
+    Ok(())
+}
+
+impl DflashSpeculator {
+    /// Shared-asset descriptor for a VMM engine. `Err(reason)` when the loaded
+    /// speculator is not a fixed-block chain DFlash (DDTree, admitted retained
+    /// PM4, or adaptive block controller enabled). While the lane state is
+    /// vacant the descriptor it was taken with is returned (a clone of the
+    /// same weights `Arc`).
+    pub fn vmm_assets(&self) -> Result<DflashVmmAssets, String> {
+        let Some(df) = self.df.as_ref() else {
+            return self
+                .vacant
+                .clone()
+                .ok_or_else(|| SINGLETON_VACANT.to_string());
+        };
+        if df.ddtree.is_some() {
+            return Err("DFlash VMM lanes require chain mode (DDTree is loaded)".into());
+        }
+        if df.verify_pm4.admitted() {
+            return Err("DFlash VMM lanes refuse an admitted retained-PM4 verify route".into());
+        }
+        if self.adaptive_enabled {
+            return Err("DFlash VMM lanes require the fixed block (adaptive block enabled)".into());
+        }
+        let ds = &df.draft_scratch;
+        Ok(DflashVmmAssets {
+            draft_config: df.draft_config.clone(),
+            weights: Arc::clone(&df.draft_weights),
+            ctx_mode: ds.ctx_mode,
+            draft_max_ctx: ds.max_ctx_len,
+            ctx_capacity: df.ctx_capacity,
+            ring_positions: df.hidden_rb.max_positions,
+            staging_rows: df.hidden_rb.max_batch,
+            verify_max_rows: df.verify_scratch.max_n,
+            tape_max_rows: df.gdn_tape.max_n,
+            block_size: df.block_size,
+            checkpoint: DflashCheckpointPolicy {
+                resume_enabled: self.resume_enabled,
+                interval: self.ck_interval,
+                cap: self.ck_cap,
+            },
+            fixed_chain: true,
+        })
+    }
+
+    /// Move the live lane (draft K/V + hidden ring + verify/tape/snapshot
+    /// owners, host log, checkpoints, request cursors) into a snapshot. The
+    /// speculator is left VACANT, holding only the shared-asset descriptor:
+    /// no replacement state is allocated (a promoted lane lives for the whole
+    /// batch; the singleton rebuilds a fresh state on its next `prefill`,
+    /// [`Self::ensure_live`], or takes the lane back via
+    /// [`Self::restore_vmm_lane`]). A refused request (DDTree / PM4 /
+    /// adaptive, or already vacant) and a failed quiesce leave the speculator
+    /// untouched. No re-prefill, no projection-watermark reset.
+    /// Pointer-bound singleton verify graphs are destroyed.
+    pub fn take_vmm_lane(
+        &mut self,
+        gpu: &mut Gpu,
+        position: usize,
+    ) -> Result<DflashLaneSnapshot, String> {
+        if self.df.is_none() {
+            return Err("DFlash singleton lane state is already vacant (moved out)".into());
+        }
+        let assets = self.vmm_assets()?;
+        quiesce_for_lane_move(gpu)?;
+        let df = self
+            .df
+            .take()
+            .ok_or_else(|| SINGLETON_VACANT.to_string())?;
+        self.vacant = Some(assets);
+        Ok(DflashLaneSnapshot {
+            df,
+            position,
+            rng_state: self.rng_state,
+            sample_temp: self.sample_temp,
+            sample_top_p: self.sample_top_p,
+            sample_top_k: self.sample_top_k,
+            sample_cactus: self.sample_cactus,
+            checkpoints: std::mem::take(&mut self.checkpoints),
+            policy: DflashCheckpointPolicy {
+                resume_enabled: self.resume_enabled,
+                interval: self.ck_interval,
+                cap: self.ck_cap,
+            },
+            last_window: self.last_window.take(),
+        })
+    }
+
+    /// Undo [`Self::take_vmm_lane`]: move the snapshot's owners back. A
+    /// vacant speculator reinstalls them and releases the vacancy's asset
+    /// reference; a live one frees the state it holds (today's behaviour). A
+    /// snapshot that does not match this speculator's shared assets is freed
+    /// and refused (never installed).
+    pub fn restore_vmm_lane(
+        &mut self,
+        gpu: &mut Gpu,
+        snap: DflashLaneSnapshot,
+    ) -> Result<(), String> {
+        let matches = match self.vacant.as_ref() {
+            Some(assets) => Ok(assets.matches_state(&snap.df)),
+            None => self
+                .vmm_assets()
+                .map(|assets| assets.matches_state(&snap.df)),
+        };
+        match matches {
+            Ok(true) => {}
+            Ok(false) => {
+                snap.free_gpu(gpu);
+                return Err("DFlash lane snapshot does not match this speculator's assets".into());
+            }
+            Err(e) => {
+                snap.free_gpu(gpu);
+                return Err(e);
+            }
+        }
+        if let Err(e) = quiesce_for_lane_move(gpu) {
+            snap.free_gpu(gpu);
+            return Err(e);
+        }
+        let DflashLaneSnapshot {
+            df,
+            position: _,
+            rng_state,
+            sample_temp,
+            sample_top_p,
+            sample_top_k,
+            sample_cactus,
+            checkpoints,
+            policy: _,
+            last_window,
+        } = snap;
+        if let Some(clean) = self.df.replace(df) {
+            clean.free_gpu(gpu);
+        }
+        if let Some(assets) = self.vacant.take() {
+            release_shared_dflash_weights(gpu, assets.weights);
+        }
+        for (_, old) in self.checkpoints.drain(..) {
+            old.free_gpu(gpu);
+        }
+        self.checkpoints = checkpoints;
+        self.rng_state = rng_state;
+        self.sample_temp = sample_temp;
+        self.sample_top_p = sample_top_p;
+        self.sample_top_k = sample_top_k;
+        self.sample_cactus = sample_cactus;
+        self.last_window = last_window;
+        Ok(())
+    }
+
+    /// Rebuild the singleton's lane state if a promotion left it vacant: a
+    /// fresh full owner set ([`DflashOwnerKind::Singleton`]) sized from `dn`
+    /// (the resident target DeltaNet state), with the vacancy's asset
+    /// reference released once it is installed. No-op when live. On failure
+    /// the speculator stays vacant (nothing leaked) and the error is
+    /// returned. `prefill` calls this first; call it directly to rebuild
+    /// without prefilling.
+    pub fn ensure_live(
+        &mut self,
+        gpu: &mut Gpu,
+        config: &Qwen35Config,
+        dn: &DeltaNetState,
+    ) -> Result<(), String> {
+        let Some(assets) = self.vacant.as_ref() else {
+            return Ok(());
+        };
+        let df = new_dflash_lane_state(gpu, assets, config, dn, DflashOwnerKind::Singleton)?;
+        self.df = Some(df);
+        if let Some(assets) = self.vacant.take() {
+            release_shared_dflash_weights(gpu, assets.weights);
+        }
+        Ok(())
+    }
+}
+
+/// Cold DFlash prompt prefill over explicit trunk owners (a VMM lane): the
+/// singleton's seed → scatter → backfill → thlog seed → first-logits sequence
+/// with the same ring-piece scheduling. The returned first token is
+/// `dflash_first_token` (the singleton's prefill first-token policy, chain
+/// mode) over the last prompt logits (`target.scratch.logits`): host argmax at
+/// `cfg.temp <= 1e-6`, else host softmax + top-k/nucleus and exactly one
+/// xorshift draw advancing `rng` (the lane's `rng_state`). `rng` MUST be
+/// initialised from the request seed before this call and the advanced value
+/// kept; `scratch` is reusable probability scratch. `checkpoints` is only used
+/// when `policy.resume_enabled`; `policy` is the CALLER's checkpoint cadence (a
+/// lane's, which may take none while nothing reads its checkpoints), not
+/// necessarily `assets.checkpoint`. Request cursors other than `checkpoints`
+/// (last-window mark, adaptive state) are the caller's.
+#[allow(clippy::too_many_arguments)]
+pub fn dflash_prefill_lane_parts(
+    gpu: &mut Gpu,
+    target: &mut DflashTargetParts<'_>,
+    assets: &DflashVmmAssets,
+    policy: DflashCheckpointPolicy,
+    df: &mut DflashState,
+    checkpoints: &mut Vec<(usize, DeltaNetSnapshot)>,
+    prompt: &[u32],
+    cfg: crate::speculative::DflashSampleCfg,
+    rng: &mut u64,
+    scratch: &mut Vec<f32>,
+    abort: &dyn Fn() -> bool,
+) -> Result<PrefillOutcome, String> {
+    if !assets.matches_state(df) {
+        return Err("DFlash lane state does not match the shared assets".into());
+    }
+    df.target_hidden_host.clear();
+    df.draft_scratch.reset_upload_tracking();
+    let ckpt_sink = if policy.resume_enabled {
+        Some(checkpoints)
+    } else {
+        None
+    };
+    let aborted = seed_target_hidden_from_prompt_abortable_parts(
+        gpu,
+        target,
+        &mut df.hidden_rb,
+        &mut df.target_hidden_host,
+        prompt,
+        abort,
+        ckpt_sink,
+        policy.interval,
+        policy.cap,
+    )
+    .map_err(|e| {
+        hipfire_runtime::reset_core::note_hip_error(&e, "qwen35::dflash_prefill::seed");
+        e.to_string()
+    })?;
+    if aborted {
+        return Ok(PrefillOutcome::Aborted);
+    }
+    let first_logits = dflash_prefill_finish(
+        gpu,
+        df,
+        &target.scratch.logits,
+        prompt,
+        prompt.len(),
+        false,
+        0,
+        None,
+    )?;
+    // Shared with the singleton prefill (lines 890-913 originally):
+    // `chain = true`, the lane runs the selector chain route.
+    let first_token = dflash_first_token(&first_logits, true, cfg, rng, scratch);
+    Ok(PrefillOutcome::Ready { first_token })
+}
+
+/// Terminal-prefix repair over explicit trunk owners: restore the pre-window
+/// target snapshot and thlog mark, then re-seed the consumed prefix
+/// (`terminal_prefix_replay(seed, consumed)`) through the singleton suffix
+/// forward and scatter/append its hidden rows. `position`/`seed` are the
+/// window's start and seed; `thlog_mark` is the mark captured before the
+/// window's draft. Window identity validation is the caller's.
+#[allow(clippy::too_many_arguments)]
+pub fn dflash_repair_terminal_prefix_parts(
+    gpu: &mut Gpu,
+    target: &mut DflashTargetParts<'_>,
+    df: &mut DflashState,
+    checkpoints: &mut Vec<(usize, DeltaNetSnapshot)>,
+    policy: &DflashCheckpointPolicy,
+    thlog_mark: TargetHiddenLogMark,
+    position: usize,
+    seed: u32,
+    consumed: &[u32],
+) -> Result<(), String> {
+    df.target_snap
+        .restore_to(target.dn_state, gpu)
+        .map_err(|e| format!("DeltaNetSnapshot::restore_to: {e}"))?;
+    df.draft_scratch.thlog.restore(thlog_mark)?;
+
+    // Before the ordinary terminal flush, target state must include the
+    // old pending seed and every consumed token except the new pending
+    // terminal token. For consumed=[] there is nothing to replay.
+    let replay = terminal_prefix_replay(seed, consumed);
+    if replay.is_empty() {
+        return Ok(());
+    }
+
+    let aborted = seed_target_hidden_suffix_abortable_parts(
+        gpu,
+        target,
+        &mut df.hidden_rb,
+        &replay,
+        position,
+        &|| false,
+        policy.resume_enabled.then_some(checkpoints),
+        policy.interval,
+        policy.cap,
+    )
+    .map_err(|e| e.to_string())?;
+    debug_assert!(!aborted, "terminal repair uses a non-aborting callback");
+    scatter_hidden_block_to_interleaved(
+        gpu,
+        &df.hidden_rb,
+        &df.draft_scratch.target_hidden,
+        position,
+        replay.len(),
+        replay.len(),
+        df.draft_scratch.ctx_modulus(),
+    )
+    .map_err(|e| e.to_string())?;
+    let co = target.kv_cache.compact_offset as i32;
+    df.draft_scratch
+        .thlog
+        .append_committed(position, replay.len(), co);
+    Ok(())
 }
 
 // ─── Retained-PM4 admission (pure) ────────────────────────────────────
@@ -1476,10 +2271,10 @@ pub fn load_dflash_speculator_dense_tp2(
     if !draft_config.all_layers_sliding {
         return Err("dense TP DFlash requires a DFlash2 all-sliding draft".into());
     }
-    if draft_config.runtime_block_size() != 16 {
+    if draft_config.runtime_block_size(block_size) != 16 {
         return Err(format!(
             "dense TP DFlash requires runtime B=16 (draft runtime {})",
-            draft_config.runtime_block_size()
+            draft_config.runtime_block_size(block_size)
         ));
     }
     // Window posture mirrors `load_dflash_state` (declared window by default,
@@ -1650,7 +2445,7 @@ pub fn load_dflash_speculator_dense_tp2(
         ranks.push(DenseTpDflashRankState {
             dflash: DflashState {
                 draft_config: draft_config.clone(),
-                draft_weights,
+                draft_weights: Arc::new(draft_weights),
                 draft_scratch,
                 hidden_rb,
                 verify_scratch,

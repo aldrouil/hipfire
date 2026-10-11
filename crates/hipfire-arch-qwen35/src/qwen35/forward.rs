@@ -13,6 +13,7 @@ use super::config::MropeCtx;
 use super::config::Qwen35Config;
 use super::prefill::trace_finite_if_enabled;
 use super::prefill::BatchEpilogue;
+use super::prefill::DenseBatchMath;
 use super::prefill::PREFILL_MAX_BATCH;
 use super::weights::DeltaNetState;
 use super::weights::ExpertWeights;
@@ -662,6 +663,12 @@ fn moe_ffn_decode_impl<'a>(
     moe_params: hipfire_dispatch::families::moe::MoeParams<'a>,
 ) -> HipResult<()> {
     let hidden = config.dim;
+    // MoE bisection dump (HIPFIRE_MOE_DUMP_DIR): the single-device post-MoE
+    // residual; root-routed EP is captured after `residual_finish` instead.
+    let dump_final = moe_params.ep_mode == MoeEpMode::None
+        && hipfire_dispatch::pipeline::moe_dump::enabled();
+    let dump_deferred = moe_params.defer_routed_combine;
+    let dump_x = moe_params.x_residual;
     let k = config.num_experts_per_tok;
     #[cfg(feature = "moe-oracle")]
     let oracle_x_residual = moe_params.x_residual;
@@ -682,6 +689,23 @@ fn moe_ffn_decode_impl<'a>(
         &[hipfire_dispatch::pipeline::Step::Moe(sealed)],
     )
     .map_err(HipError::from)?;
+    if dump_final {
+        let dumped = if dump_deferred {
+            hipfire_dispatch::pipeline::moe_dump::final_residual_deferred(
+                gpu,
+                ffn.layer_idx as usize,
+            )
+        } else {
+            hipfire_dispatch::pipeline::moe_dump::final_residual(
+                gpu,
+                ffn.layer_idx as usize,
+                dump_x,
+                hidden,
+                "moe_ffn_decode_impl",
+            )
+        };
+        dumped.map_err(HipError::from)?;
+    }
     #[cfg(feature = "moe-oracle")]
     {
         let oracle_pos =
@@ -1693,6 +1717,9 @@ pub fn forward_scratch(
     }
     if gpu.replay.should_route_pm4() {
         let copy_started = rdna_compute::gap_timing::now();
+        // Load-bearing HIP -> PM4 fence: this synchronous legacy-NULL copy drains
+        // embedding/staging on NULL and blocking streams. Do not make it async
+        // or install non-blocking producers without an explicit queue dependency.
         gpu.hip
             .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
         rdna_compute::gap_timing::add_since(rdna_compute::gap_timing::Slot::PosCopy, copy_started);
@@ -5516,6 +5543,7 @@ fn forward_prefill_dense_tp_batched(
                                 q8_flags[rank],
                                 BatchEpilogue::Partial(partials[rank]),
                                 DflashFusionCtx::Off,
+                                DenseBatchMath::Product,
                             ) {
                                 process_res = Err(e);
                                 break;
@@ -5649,6 +5677,7 @@ fn forward_prefill_dense_tp_batched(
                                 q8_flags[rank],
                                 BatchEpilogue::Partial(partials[rank]),
                                 DflashFusionCtx::Off,
+                                DenseBatchMath::Product,
                             ) {
                                 process_res = Err(e);
                                 break;
@@ -6819,7 +6848,22 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
         // to every rank before the root-combined routed partial is added.
         let s = self.s;
         gpu.add_inplace_f32(&s.x, partial)
-            .map_err(|e| DispatchError::Hip(e.to_string()))
+            .map_err(|e| DispatchError::Hip(e.to_string()))?;
+        if hipfire_dispatch::pipeline::moe_dump::enabled() {
+            let layer = match self.layer {
+                LayerWeights::DeltaNetMoe(l) => l.ffn.layer_idx,
+                LayerWeights::FullAttnMoe(l) => l.ffn.layer_idx,
+                _ => return Err(DispatchError::Hip("MOE on dense layer".into())),
+            };
+            hipfire_dispatch::pipeline::moe_dump::final_residual(
+                gpu,
+                layer as usize,
+                &s.x,
+                self.config.dim,
+                "ep_add_into_residual",
+            )?;
+        }
+        Ok(())
     }
 
     fn ep_moe_combine_mode(&self) -> EpMoeCombineMode {
@@ -7055,7 +7099,7 @@ fn gdn_compact3_enabled(
         && super::config::qwen36_27b_dense_shape(config, n_v_heads)
 }
 
-fn gdn_compact_qk_div(
+pub(crate) fn gdn_compact_qk_div(
     gpu: &Gpu,
     config: &Qwen35Config,
     n_v_heads: usize,
@@ -7077,7 +7121,7 @@ fn gdn_compact_qk_div(
 /// exact gfx1201, each with its own k6144 entry symbol); on gfx1100 the latter
 /// measured +0.45% over a 512-token A/B/B/A and removes 48 dispatches/token.
 /// Set `HIPFIRE_GATED_NORM_MQ_ROTATE=0` to restore both explicit operations.
-fn gated_norm_mq_rotate_enabled(
+pub(crate) fn gated_norm_mq_rotate_enabled(
     gpu: &Gpu,
     config: &Qwen35Config,
     n_v_heads: usize,
@@ -7115,7 +7159,7 @@ fn gated_norm_mq_rotate_enabled(
 /// path.
 /// The legacy interleaved-RoPE compatibility mode and diagnostic tap retain
 /// the established multi-dispatch path.
-fn qwen35_fa_prep_enabled(gpu: &Gpu, config: &Qwen35Config) -> bool {
+pub(crate) fn qwen35_fa_prep_enabled(gpu: &Gpu, config: &Qwen35Config) -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let enabled = *ENABLED.get_or_init(|| {
         hipfire_config::developer_var("HIPFIRE_QWEN35_FA_PREP_FUSE")
@@ -7145,7 +7189,7 @@ fn qwen35_fa_prep_enabled(gpu: &Gpu, config: &Qwen35Config) -> bool {
 /// to Qwen3.6-27B's asym3 route measured +0.37% over a 512-token A/B/B/A and
 /// reduced 709 -> 677 dispatches/token; a 1025-token replay remained exact. Set
 /// `HIPFIRE_QWEN35_FA_EPILOGUE_FUSE=0` to retain the legacy path.
-fn qwen35_fa_epilogue_enabled(gpu: &Gpu, config: &Qwen35Config, wo: &WeightTensor) -> bool {
+pub(crate) fn qwen35_fa_epilogue_enabled(gpu: &Gpu, config: &Qwen35Config, wo: &WeightTensor) -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let enabled = *ENABLED.get_or_init(|| {
         hipfire_config::developer_var("HIPFIRE_QWEN35_FA_EPILOGUE_FUSE")
@@ -7182,7 +7226,7 @@ fn qwen36_27b_dense_shape(config: &Qwen35Config, n_v_heads: usize) -> bool {
 /// the fixed-K QKVZA producer. Keep the gate deliberately narrow until exact
 /// replay and stationary product certification justify a default flip.
 #[allow(clippy::too_many_arguments)]
-fn qkvza_scalar_prep_enabled(
+pub(crate) fn qkvza_scalar_prep_enabled(
     gpu: &Gpu,
     config: &Qwen35Config,
     n_v_heads: usize,
@@ -7218,7 +7262,7 @@ fn qkvza_scalar_prep_enabled(
 /// Schedule the independent beta/alpha transforms as one extra workgroup of
 /// the following conv/QK-normalization dispatch. This keeps the hot QKVZA
 /// projection unchanged while deleting the same boundary.
-fn conv_scalar_prep_enabled(
+pub(crate) fn conv_scalar_prep_enabled(
     gpu: &Gpu,
     config: &Qwen35Config,
     n_v_heads: usize,
@@ -7245,7 +7289,7 @@ fn conv_scalar_prep_enabled(
         && conv_qknorm_enabled(gpu, config, quant)
 }
 
-fn conv_qknorm_enabled(gpu: &Gpu, config: &Qwen35Config, quant: StateQuant) -> bool {
+pub(crate) fn conv_qknorm_enabled(gpu: &Gpu, config: &Qwen35Config, quant: StateQuant) -> bool {
     let mode = hipfire_config::developer_var("HIPFIRE_CONV_QKNORM").ok();
     let arch_enabled = (gpu.arch_caps.is_gfx1201()
         || gpu.arch_caps.arch() == "gfx1100"

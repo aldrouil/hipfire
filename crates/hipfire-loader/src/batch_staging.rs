@@ -40,6 +40,28 @@ pub struct BatchStaging {
     pub ep_slots: usize,
     /// EP lane capacity, mirrored for the receipt.
     pub ep_lane_cap: usize,
+    /// The VMM continuous-batching route was staged (per-request VMM KV in
+    /// `Qwen35Bundle::vmm_store`, no fixed lanes).
+    pub vmm: bool,
+    /// Admitted VMM step row budget (scratch-fitted `serve.max_batch_tokens`).
+    pub row_budget: usize,
+}
+
+/// Load-time request for the VMM continuous-batching route.
+#[derive(Debug, Clone, Copy)]
+pub struct VmmStagingRequest {
+    /// Global trunk-row budget per step (`serve.max_batch_tokens`).
+    pub row_budget: usize,
+    /// `Exact` (default; byte-identical to the singleton route) or
+    /// `Nonexact` (only under `HIPFIRE_SERVE_BATCH_NONEXACT=1`).
+    pub route: hipfire_arch_qwen35::forward_slots::vmm::VmmRoute,
+    /// Decode requests as cross-request batched MTP spec lanes when the
+    /// model serves MTP (`serve_vmm_batch.spec`, default on).
+    pub spec: bool,
+    /// Admit sampled (temperature>0) requests to the batch route for lane
+    /// modes proven byte-identical to the same-mode singleton
+    /// (`serve_vmm_batch.sampled`, `serve.batch_sampled`, default off).
+    pub sampled: bool,
 }
 
 /// True when embedding and lm_head formats admit the batched decode kernels.
@@ -77,8 +99,28 @@ pub fn stage_continuous_batch(
     m: &mut LoadedModel,
     gpu: &mut Gpu,
     requested: usize,
+    vmm: Option<VmmStagingRequest>,
 ) -> Result<BatchStaging, String> {
     let mut out = BatchStaging::default();
+    if let Some(req) = vmm {
+        if requested > 1 && m.pp == 1 && m.ep.is_none() {
+            match crate::continuous_batch_route(m.arch_id) {
+                Some(crate::ContinuousBatchRoute::Qwen35) => {
+                    return Ok(stage_qwen_vmm_batch(m, gpu, requested, req));
+                }
+                Some(crate::ContinuousBatchRoute::Qwen4) => {
+                    return Ok(stage_qwen4_lanes(m, gpu, requested, req));
+                }
+                _ => {}
+            }
+        }
+        eprintln!(
+            "[daemon] VMM continuous batch requested but unsupported (arch_id={} pp={} ep={}) — existing route",
+            m.arch_id,
+            m.pp,
+            m.ep.is_some()
+        );
+    }
     // ── Continuous batch staging (must be before `loaded` ack) ──
     // Stage Qwen35DecodeBatchState / hipfire_arch_lfm2moe::batch::Lfm2DecodeBatchState (single-GPU) or
     // Qwen35DecodeBatchEpState (EP TP=4 pure gfx1201) + host scheduler.
@@ -160,6 +202,12 @@ pub fn stage_continuous_batch(
                 } else {
                     eprintln!("[daemon] continuous batch requested but model state not Qwen35 — fallback to sequential");
                 }
+            }
+            Some(crate::ContinuousBatchRoute::Qwen4) => {
+                // The only qwen4 batch route is the exact fn-lanes store,
+                // staged through the VMM branch above; there is no
+                // fixed-lane qwen4 batch state.
+                eprintln!("[daemon] qwen4 lanes need serve.vmm_batch — fallback to sequential");
             }
             Some(crate::ContinuousBatchRoute::Lfm2Moe) => {
                 if m.lfm2moe().is_none() {
@@ -463,4 +511,327 @@ pub fn stage_continuous_batch(
         }
     }
     Ok(out)
+}
+
+/// Stage the exact Flash-Next (qwen4) lane store beside the resident
+/// bundle: native MTP lanes when `req.spec` (`serve.batch_spec`) is on and
+/// the loaded model carries the MTP head, AR lanes otherwise. Qwen4 has only
+/// the exact route: the non-exact `VmmRoute` and any
+/// non-VMM QSA backend are refused, as is a lane store that does not fit the
+/// free device memory. Every refusal logs the reason and keeps the singleton
+/// route (`capable == false`); nothing is staged.
+fn stage_qwen4_lanes(
+    m: &mut LoadedModel,
+    gpu: &mut Gpu,
+    requested: usize,
+    req: VmmStagingRequest,
+) -> BatchStaging {
+    use hipfire_arch_qwen4::lane::Qwen4LaneStore;
+    use hipfire_arch_qwen4::{Qwen4ContextCommit, Qwen4KvBackend};
+    let refuse = |reason: &str| {
+        eprintln!("[daemon] qwen4 lanes refused: {reason} — fallback to sequential");
+        BatchStaging::default()
+    };
+    if req.route == hipfire_arch_qwen35::forward_slots::vmm::VmmRoute::Nonexact {
+        return refuse("qwen4 has only the exact lane route");
+    }
+    let max_seq = m.max_seq;
+    let spec_off_reason = if !req.spec {
+        Some("serve.batch_spec off")
+    } else if !m.mtp_weights_present {
+        Some("no MTP head loaded")
+    } else if m.mtp_mode == "off" {
+        Some("MTP mode off")
+    } else {
+        None
+    };
+    // The lane ring is `K + 1` rows and a verify block is at most
+    // `LANE_MAX_ROWS` rows, so the lane draft depth is bounded by it.
+    let spec_k = m.mtp_k.min(hipfire_arch_qwen4::gpu_forward_lanes::LANE_MAX_ROWS - 1).max(1);
+    let end_of_turn = m.tokenizer.as_ref().and_then(|t| t.special_token_id("<|im_end|>"));
+    let Some(bundle) = m.qwen4_mut() else {
+        return refuse("model state not Qwen4");
+    };
+    let spec = spec_off_reason.is_none().then_some(hipfire_arch_qwen4::lane::LaneSpecConfig {
+        k: spec_k,
+        end_of_turn,
+    });
+    let spec_on_k = spec.as_ref().map(|s| s.k);
+    if bundle.state.qsa_backend() != Qwen4KvBackend::Vmm {
+        return refuse("QSA context backend is not VMM");
+    }
+    let row_budget = req.row_budget.max(requested);
+    let chunk = hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(&gpu.arch, max_seq);
+    let context = Qwen4ContextCommit::new(
+        Qwen4KvBackend::Vmm,
+        max_seq,
+        chunk,
+        gpu.vmm_recommended_granularity().unwrap_or(1),
+    );
+    let Some(need) = Qwen4LaneStore::device_bytes(
+        &bundle.config,
+        bundle.state_format(),
+        &context,
+        requested,
+        row_budget,
+        spec_on_k,
+    ) else {
+        return refuse("lane store device bytes overflow");
+    };
+    let free = match gpu.device_mem_info() {
+        Ok((free, _)) => free as u64,
+        Err(e) => return refuse(&format!("device memory query failed: {e}")),
+    };
+    if need > free {
+        return refuse(&format!(
+            "lane store needs {} MiB, {} MiB free (lanes={requested} row_budget={row_budget})",
+            need >> 20,
+            free >> 20
+        ));
+    }
+    if let Err(e) = bundle.stage_lanes(gpu, requested, row_budget, spec) {
+        return refuse(&format!("staging failed: {e}"));
+    }
+    let Some(store) = bundle.lanes() else {
+        return refuse("lane store missing after staging");
+    };
+    let spec_log = match (spec_on_k, spec_off_reason) {
+        (Some(k), _) => format!("mtp K={k}"),
+        (None, Some(reason)) => format!("off ({reason})"),
+        (None, None) => "off".to_string(),
+    };
+    eprintln!(
+        "[daemon] qwen4 fn-lanes staged: lanes={requested} row_budget={} spec={spec_log} policy={}",
+        store.row_budget(),
+        store.stage_policy().describe()
+    );
+    BatchStaging {
+        capable: true,
+        slots: requested,
+        vmm: true,
+        row_budget: store.row_budget(),
+        lane_capacity: max_seq,
+        ..Default::default()
+    }
+}
+
+/// Stage the VMM continuous-batching store beside the resident Qwen35
+/// bundle. No fixed-lane KV is allocated: request owners are created lazily
+/// at admission, shaped like the resident (VMM) singleton KV. Any failure
+/// keeps the existing singleton route (`capable == false`).
+fn stage_qwen_vmm_batch(
+    m: &mut LoadedModel,
+    gpu: &mut Gpu,
+    requested: usize,
+    req: VmmStagingRequest,
+) -> BatchStaging {
+    let mut out = BatchStaging::default();
+    let max_seq = m.max_seq;
+    let Some(b) = m.qwen35_mut() else {
+        eprintln!("[daemon] VMM continuous batch requested but model state not Qwen35 — existing route");
+        return out;
+    };
+    // The executor's own coverage predicate (embedding/lm_head dtypes,
+    // slots-body layer coverage, VMM KV route and flash plan) — not the
+    // fixed-lane `qwen_batch_weight_formats_supported` gate.
+    if let Err(e) = hipfire_arch_qwen35::forward_slots::vmm::vmm_executor_supports(
+        gpu,
+        &b.weights,
+        &b.config,
+        &b.kv_cache,
+        req.route,
+    ) {
+        eprintln!("[daemon] VMM continuous batch unsupported for this model: {e} — existing route");
+        return out;
+    }
+    // Requested trunk-row budget; when its stable scratch does not fit,
+    // halve (never below the width) and report the admitted value — the
+    // planner budget is the store's actual `row_budget()`.
+    let mut row_budget = req.row_budget.max(requested);
+    // Shared physical KV budget for every request owner: free VRAM after the
+    // resident model, minus fixed headroom for executor scratch and
+    // transient allocations. Admission/provision refuse past it.
+    const KV_HEADROOM: usize = 1 << 30;
+    loop {
+        let free = gpu.device_mem_info().map(|(f, _)| f).unwrap_or(0);
+        let kv_budget_bytes = free.saturating_sub(KV_HEADROOM);
+        match hipfire_arch_qwen35::forward_slots::vmm::Qwen35VmmStore::new(
+            gpu,
+            &b.config,
+            &b.kv_cache,
+            requested,
+            row_budget,
+            kv_budget_bytes,
+            req.route,
+        ) {
+            Ok(mut store) => {
+                store.set_sampled(req.sampled);
+                b.vmm_store = Some(store);
+                out.capable = true;
+                out.vmm = true;
+                out.slots = requested;
+                out.lane_capacity = max_seq;
+                out.row_budget = row_budget;
+                eprintln!(
+                    "[daemon] VMM continuous batch staged: width={requested} row_budget={row_budget} (requested {}) max_seq_bound={max_seq} free_vram_mb={}",
+                    req.row_budget,
+                    free >> 20
+                );
+                break;
+            }
+            Err(e) if e.contains("out of memory") && row_budget / 2 >= requested => {
+                eprintln!(
+                    "[daemon] VMM continuous batch scratch for row_budget={row_budget} does not fit ({e}); halving"
+                );
+                row_budget /= 2;
+            }
+            Err(e) => {
+                eprintln!(
+                    "[daemon] VMM continuous batch unavailable: {e} (row_budget={row_budget}, free_vram_mb={}) — existing route",
+                    free >> 20
+                );
+                break;
+            }
+        }
+    }
+    if out.vmm && req.spec {
+        stage_qwen_vmm_spec(m, gpu, requested, out.row_budget);
+    }
+    out
+}
+
+/// Per-lane context cap of VMM spec lanes: the MTP head KV is dense per
+/// lane, so the engine's head is loaded with this cap; longer requests
+/// decode as AR lanes.
+const VMM_SPEC_LANE_CAP: usize = 32768;
+
+/// Stage the VMM store's speculation engine from the **actually loaded**
+/// speculator (singleton load precedence DFlash > MTP > n-gram), never from
+/// weight presence alone: a loaded DFlash draft installs a `VmmDflashEngine`
+/// (shared draft weights, exact block-16 chain lanes) and never an MTP head;
+/// an MTP speculator (or none) keeps the MTP engine path. Any refusal logs a
+/// concrete reason and leaves AR lanes only.
+fn stage_qwen_vmm_spec(m: &mut LoadedModel, gpu: &mut Gpu, lanes: usize, row_budget: usize) {
+    if m.speculator.as_ref().is_some_and(|s| s.name() == "dflash") {
+        stage_qwen_vmm_dflash(m, gpu, row_budget);
+        return;
+    }
+    if !m.mtp_weights_present || m.mtp_mode == "off" {
+        return;
+    }
+    let cap = m.max_seq.min(VMM_SPEC_LANE_CAP);
+    let k = m.mtp_k;
+    let trunk_path = std::path::PathBuf::from(&m.model_path);
+    let Some(b) = m.qwen35_mut() else {
+        return;
+    };
+    let (head, errors) = crate::resolve_qwen35_mtp_head(
+        &trunk_path,
+        None,
+        (b.config.dim, b.config.vocab_size),
+        gpu,
+        cap,
+        None,
+    );
+    let Some(head) = head else {
+        eprintln!("[daemon] VMM spec lanes unavailable: MTP head not loaded ({}) — AR lanes", errors.join("; "));
+        return;
+    };
+    let route = hipfire_arch_qwen35::mtp_spec::MtpPromptRoute::from_own_prefill(hipfire_config::mtp_own_prefill());
+    // AR's penalty window bound: the resident scratch's `repeat_buf` (what
+    // `spec_prefill` passes every lane).
+    let ar_cap = b.scratch.repeat_buf.buf.size() / 4;
+    match hipfire_arch_qwen35::forward_slots::vmm::spec::VmmSpecEngine::new(
+        gpu,
+        &b.config,
+        &b.dn_state,
+        head,
+        k,
+        lanes,
+        route,
+        ar_cap,
+    ) {
+        Ok(engine) => {
+            let lane_bytes = engine.lane_bytes();
+            let store = b.vmm_store.as_mut().expect("staged above");
+            match store.install_spec(engine) {
+                Ok(()) => {
+                    eprintln!("[daemon] VMM MTP lane footprint: lane_state={lane_bytes} B");
+                    eprintln!("[daemon] VMM spec lanes staged: MTP K={k} lane_cap={cap}");
+                }
+                Err(engine) => engine.free_gpu(gpu),
+            }
+        }
+        Err(e) => eprintln!("[daemon] VMM spec lanes unavailable: {e} — AR lanes"),
+    }
+}
+
+/// Stage the VMM store's DFlash engine over the loaded singleton's resident
+/// draft weights (shared by reference count, never reloaded). Eligibility is
+/// derived from the resolved loaded speculator (`vmm_assets`: fixed-block
+/// chain, no DDTree, no admitted retained PM4, adaptive block off) and the
+/// store (Exact route, `max_rows >= block`), not from a second env parse.
+fn stage_qwen_vmm_dflash(m: &mut LoadedModel, gpu: &mut Gpu, row_budget: usize) {
+    let assets = match m
+        .speculator
+        .as_mut()
+        .and_then(|s| s.drafter_any_mut())
+        .and_then(|a| a.downcast_mut::<hipfire_arch_qwen35::dflash_spec::DflashSpeculator>())
+    {
+        Some(df) => df.vmm_assets(),
+        None => Err("loaded speculator is not a Qwen3.5 DFlashSpeculator".to_string()),
+    };
+    let assets = match assets {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("[daemon] VMM DFlash lanes unavailable: {e} — AR lanes (singleton DFlash unchanged)");
+            return;
+        }
+    };
+    let Some(b) = m.qwen35_mut() else {
+        hipfire_arch_qwen35::dflash_spec::release_shared_dflash_weights(gpu, assets.weights);
+        return;
+    };
+    let route = b.vmm_store.as_ref().map(|s| s.route());
+    if route != Some(hipfire_arch_qwen35::forward_slots::vmm::VmmRoute::Exact) {
+        eprintln!(
+            "[daemon] VMM DFlash lanes unavailable: store route {route:?} is not Exact (exactness is proven only on the Exact route) — AR lanes"
+        );
+        hipfire_arch_qwen35::dflash_spec::release_shared_dflash_weights(gpu, assets.weights);
+        return;
+    }
+    let engine = match hipfire_arch_qwen35::forward_slots::vmm::dflash::VmmDflashEngine::new(
+        gpu,
+        &b.weights,
+        &b.config,
+        &b.dn_state,
+        assets,
+        row_budget.min(hipfire_arch_qwen35::qwen35::prefill::multi::MULTI_CHUNK_MAX_ROWS),
+    ) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("[daemon] VMM DFlash lanes unavailable: {e} — AR lanes");
+            return;
+        }
+    };
+    let receipt = engine.receipt();
+    let (lane_bytes, snapshot_bytes) = (engine.lane_bytes(), engine.snapshot_bytes());
+    let store = b.vmm_store.as_mut().expect("route checked above");
+    match store.install_dflash(engine) {
+        Ok(()) => {
+            eprintln!(
+                "[daemon] VMM DFlash lanes staged: block={} chunk_row_limit={} ctx_capacity={} (shared draft weights)",
+                receipt.block_size, receipt.chunk_row_limit, receipt.ctx_capacity
+            );
+            eprintln!("[daemon] VMM DFlash lane footprint: lane_state={lane_bytes} B dn_snapshot={snapshot_bytes} B");
+        }
+        Err(engine) => {
+            eprintln!(
+                "[daemon] VMM DFlash lanes unavailable: store row budget {} cannot run a {}-row block — AR lanes",
+                store.row_budget(),
+                receipt.block_size
+            );
+            engine.free_gpu(gpu);
+        }
+    }
 }

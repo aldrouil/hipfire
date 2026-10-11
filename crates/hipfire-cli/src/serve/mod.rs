@@ -9,10 +9,11 @@
 //! shared across HTTP workers so transport changes stay isolated.
 
 use crate::{
-    apply_kv_axis_overrides, config_bool, config_f64, config_i64, config_string, config_u64,
-    find_daemon, find_model_path, http_get_json, list_local_models, load_params, probe_host,
-    pull_command, resolve_mtp_sidecar, resolved_for_model, resolved_global, ListArgs, Paths,
-    PullArgs, ServeArgs, StopArgs,
+    apply_kv_axis_overrides, apply_speculation_selector, config_bool, config_f64, config_i64,
+    config_string, config_u64, find_daemon, find_model_path, http_get_json, list_local_models,
+    load_params, port_in_use, probe_host, pull_command, reap_install_daemons,
+    resolve_dflash_sidecar, resolve_mtp_sidecar, resolved_for_model, resolved_global, ListArgs,
+    Paths, PullArgs, ServeArgs, StopArgs,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use hipfire_client::Engine;
@@ -33,10 +34,12 @@ use std::{
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
+pub(crate) mod anthropic;
 pub(crate) mod metrics;
 
 pub mod complete;
 pub mod http;
+pub(crate) mod responses;
 pub(crate) mod ui;
 
 #[derive(Debug)]
@@ -243,6 +246,49 @@ pub(crate) struct LoadedInfo {
     pub(crate) reasoning_efforts: Vec<String>,
 }
 
+/// Rollout switches for the VMM continuous-batching route (PLAN §6 Slice1C).
+/// `enabled=false` keeps the existing VMM singleton route; `spec=false`
+/// disables only cross-request speculation; `nonexact` admits labeled
+/// non-bit-exact batched arithmetic and is always default off.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct VmmBatchFlags {
+    pub(crate) enabled: bool,
+    pub(crate) spec: bool,
+    pub(crate) nonexact: bool,
+    pub(crate) sampled: bool,
+    /// `serve.prefill_min_tokens`: the VMM route's rotating prefill quantum.
+    pub(crate) prefill_min_tokens: u64,
+}
+
+impl VmmBatchFlags {
+    /// The `serve.vmm_batch` / `serve.batch_spec` / `serve.batch_nonexact`
+    /// / `serve.batch_sampled` / `serve.prefill_min_tokens` switches of a
+    /// resolved configuration.
+    pub(crate) fn from_config(resolved: &hipfire_config::ResolvedConfig) -> Result<Self> {
+        Ok(Self {
+            enabled: config_bool(resolved, "serve.vmm_batch")?,
+            spec: config_bool(resolved, "serve.batch_spec")?,
+            nonexact: config_bool(resolved, "serve.batch_nonexact")?,
+            sampled: config_bool(resolved, "serve.batch_sampled")?,
+            prefill_min_tokens: config_u64(resolved, "serve.prefill_min_tokens")?,
+        })
+    }
+
+    /// The `serve_vmm_batch` load parameter that stages the VMM
+    /// continuous-batching route (`parse_vmm_batch_params` in
+    /// `hipfire-engine`). `hipfire serve` sends it when `enabled`;
+    /// `hipfire bench --concurrency --backend batch` always does.
+    pub(crate) fn load_params(&self, max_batch_tokens: u64) -> serde_json::Value {
+        serde_json::json!({
+            "spec": self.spec,
+            "nonexact": self.nonexact,
+            "sampled": self.sampled,
+            "max_batch_tokens": max_batch_tokens,
+            "prefill_min_tokens": self.prefill_min_tokens,
+        })
+    }
+}
+
 pub(crate) struct ServeRuntime {
     pub(crate) engine: Engine,
     pub(crate) paths: Paths,
@@ -253,6 +299,10 @@ pub(crate) struct ServeRuntime {
     pub(crate) current_reasoning_effort_native: bool,
     pub(crate) current_reasoning_efforts: Vec<String>,
     pub(crate) continuous_batch_capable: bool,
+    /// Daemon load ack reported `continuous_batch_history_capable`: its exact
+    /// batch lanes render appended multi-turn text chats, so HTTP admission may
+    /// batch them. Typed capability; the route name is never consulted.
+    pub(crate) continuous_batch_history: bool,
     pub(crate) current_max_seq: u64,
     pub(crate) cache_capable: bool,
     pub(crate) kv_override: Option<String>,
@@ -265,7 +315,17 @@ pub(crate) struct ServeRuntime {
     /// `vision_mode=off`.
     pub(crate) vision_override: Option<PathBuf>,
     pub(crate) tp: Option<u64>,
+    /// `serve --spec`: the speculation selector applied to every model load
+    /// after the configured one, exactly as `run --spec` / `bench --spec`.
+    pub(crate) speculation_override: Option<String>,
+    /// `serve --max-seq`: `params["max_seq"]` for every ordinary model load,
+    /// exactly as `run --max-seq` / `bench --max-seq`.
+    pub(crate) max_seq_override: Option<u64>,
     pub(crate) continuous_batch_size: u64,
+    /// VMM continuous-batching route (`serve.vmm_batch` and its spec /
+    /// nonexact sub-switches). Projected on load only when enabled, so the
+    /// default-off wire is byte-identical to the pre-route daemon protocol.
+    pub(crate) vmm_batch: VmmBatchFlags,
     /// Experimental daemon multi-slot mode (`serve.multi_slot`). Default off.
     /// Projects load/generate wire markers only; CLI holds no GPU slot backend.
     pub(crate) multi_slot_enabled: bool,
@@ -824,7 +884,7 @@ impl Admission {
                 return Err(AdmissionError {
                     message: "cancelled".to_string(),
                     retry_after_seconds: self.retry_after_seconds(),
-                    });
+                });
             }
             {
                 let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
@@ -911,14 +971,19 @@ impl Drop for AdmissionGuard {
 /// and synchronous; model arch is taken from `current_arch` when available,
 /// otherwise inferred from the requested model name containing `qwen` or `lfm`.
 ///
-/// Message-shape gate matches daemon admission: absent/empty `messages` are
-/// eligible; otherwise only exactly one `user` message with plain string
-/// content (no tool_calls, no multipart/array content).
+/// Message-shape gate: absent/empty `messages` are eligible. Routes without
+/// history support (`history_capable == false`) admit exactly one `user`
+/// message with plain string content (no tool_calls, no multipart/array
+/// content) and no `stop`, matching daemon admission. Routes that advertise
+/// `continuous_batch_history_capable` (qwen35 `vmm`, qwen4 `fn-lanes`) admit
+/// multi-turn text chats via `batch_messages_are_text_chat`, with or without
+/// `stop` (their lanes run the singleton's stop matcher).
 pub(crate) fn is_batch_eligible_request(
     body: &serde_json::Value,
     tp: Option<u64>,
     current_arch: Option<&str>,
     daemon_batch_capable: bool,
+    history_capable: bool,
 ) -> bool {
     if !daemon_batch_capable {
         return false;
@@ -961,11 +1026,15 @@ pub(crate) fn is_batch_eligible_request(
     if body.get("image_base64").is_some() {
         return false;
     }
-    // Message history must match daemon single-user plain-string shape.
-    if !batch_messages_are_single_user(body) {
+    // Message history shape depends on the batch route.
+    if !(if history_capable {
+        batch_messages_are_text_chat(body)
+    } else {
+        batch_messages_are_single_user(body)
+    }) {
         return false;
     }
-    if body.get("stop").is_some() {
+    if !history_capable && body.get("stop").is_some() {
         return false;
     }
     // Speculation / adaptive / prefix behavior disqualifies.
@@ -983,6 +1052,19 @@ pub(crate) fn is_batch_eligible_request(
         }
     }
     true
+}
+
+/// Load-ack multi-turn capability: the daemon's typed
+/// `continuous_batch_history_capable` flag, valid only alongside
+/// `continuous_batch_capable`. Route names are not inspected.
+pub(crate) fn ack_history_capable(loaded: &serde_json::Value) -> bool {
+    let flag = |key: &str| {
+        loaded
+            .get(key)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    };
+    flag("continuous_batch_capable") && flag("continuous_batch_history_capable")
 }
 
 /// HTTP/OpenAI `messages` are batch-eligible only when absent/empty (prompt
@@ -1021,6 +1103,35 @@ pub(crate) fn batch_messages_are_single_user(body: &serde_json::Value) -> bool {
         // Arrays (multipart/text+image), objects, numbers, bool, null.
         Some(_) => false,
     }
+}
+
+/// VMM-route message shape: absent/empty `messages`, or every entry a
+/// `system`/`user`/`assistant` turn with plain string content and no non-empty
+/// `tool_calls`. Multi-turn text chats render through the same Jinja template
+/// on the VMM batch route. Tool turns/tool_calls (grammar-constrained sampling
+/// and the tool parser are not per-row in the batch executor) and
+/// multipart/image content (vision path) stay sequential.
+pub(crate) fn batch_messages_are_text_chat(body: &serde_json::Value) -> bool {
+    let Some(messages) = body.get("messages") else {
+        return true;
+    };
+    let Some(arr) = messages.as_array() else {
+        return false;
+    };
+    arr.iter().all(|m| {
+        if !matches!(
+            m.get("role").and_then(|v| v.as_str()),
+            Some("system" | "user" | "assistant")
+        ) {
+            return false;
+        }
+        if let Some(tc) = m.get("tool_calls") {
+            if tc.as_array().is_some_and(|a| !a.is_empty()) || tc.is_object() {
+                return false;
+            }
+        }
+        matches!(m.get("content"), Some(serde_json::Value::String(_)))
+    })
 }
 
 pub(crate) fn serve_command(paths: &Paths, mut args: ServeArgs) -> Result<()> {
@@ -1140,11 +1251,50 @@ pub(crate) fn parse_bind(
 pub(crate) fn detach_serve(paths: &Paths, args: &ServeArgs, host: &str, port: u16) -> Result<()> {
     fs::create_dir_all(&paths.root)?;
     let log_path = paths.root.join("serve.log");
+    let pid_path = paths.root.join("serve.pid");
+    let health_host = probe_host(host);
+    // An existing server must be reported, not raced: a second child would
+    // die on the GPU lock or the bind while the old server's /health made
+    // the readiness loop below report a false success.
+    if let Some(record) = fs::read_to_string(&pid_path)
+        .ok()
+        .and_then(|raw| parse_pid_record(&raw))
+    {
+        let tracked_port = record.port.unwrap_or(port);
+        if validate_serve_pid(&record, health_host, tracked_port).is_ok() {
+            if tracked_port == port {
+                println!(
+                    "hipfire serve already running (pid {}, port {port}, log {})",
+                    record.pid,
+                    log_path.display()
+                );
+                return Ok(());
+            }
+            bail!(
+                "hipfire serve already running (pid {}, port {tracked_port}); \
+                 run `hipfire stop` before serving on port {port}",
+                record.pid
+            );
+        }
+    }
+    if let Some(health) = http_get_json(health_host, port, "/health") {
+        match health.get("pid").and_then(serde_json::Value::as_u64) {
+            Some(pid) => bail!(
+                "port {port} is already served by hipfire (pid {pid}) not tracked by {}; \
+                 stop that server or choose another port",
+                pid_path.display()
+            ),
+            None => bail!("port {port} is in use by another process; choose another port"),
+        }
+    }
     let log = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&log_path)
         .with_context(|| format!("failed to open {}", log_path.display()))?;
+    // serve.log accumulates across runs; only this child's output may explain
+    // an early exit.
+    let log_start = log.metadata().map(|meta| meta.len()).unwrap_or(0);
     let executable = env::current_exe().context("failed to resolve native hipfire binary")?;
     let mut command = Command::new(executable);
     command
@@ -1184,25 +1334,39 @@ pub(crate) fn detach_serve(paths: &Paths, args: &ServeArgs, host: &str, port: u1
             .arg("--continuous-batch-size")
             .arg(batch.to_string());
     }
+    if let Some(selector) = &args.speculation {
+        command.arg("--spec").arg(selector);
+    }
+    if let Some(max_seq) = args.max_seq {
+        command.arg("--max-seq").arg(max_seq.to_string());
+    }
     if args.ui || args.open {
         // --open is a one-shot launcher action in the parent; the detached
         // child only needs the route enabled.
         command.arg("--ui");
     }
     let mut child = command.spawn().context("failed to detach native serve")?;
-    let probe_host = match host {
-        "0.0.0.0" => "127.0.0.1",
-        "::" => "::1",
-        other => other,
-    };
-    for _ in 0..600 {
+    let child_pid = u64::from(child.id());
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline {
         if let Some(status) = child.try_wait()? {
-            bail!(
-                "native serve exited before readiness ({status}); see {}",
-                log_path.display()
-            );
+            match last_failure_line(&log_path, log_start) {
+                Some(reason) => bail!(
+                    "native serve exited before readiness ({status}): {reason}\nsee {}",
+                    log_path.display()
+                ),
+                None => bail!(
+                    "native serve exited before readiness ({status}); see {}",
+                    log_path.display()
+                ),
+            }
         }
-        if health_ready(probe_host, port) {
+        // Only this child counts as ready: another responder on the port
+        // must not turn a failed spawn into a reported success.
+        let ours = http_get_json(health_host, port, "/health").is_some_and(|health| {
+            health.get("pid").and_then(serde_json::Value::as_u64) == Some(child_pid)
+        });
+        if ours {
             println!(
                 "hipfire serve running at http://{}:{} (PID {}, log {})",
                 host,
@@ -1239,21 +1403,21 @@ pub(crate) fn detach_serve(paths: &Paths, args: &ServeArgs, host: &str, port: u1
     )
 }
 
-pub(crate) fn health_ready(host: &str, port: u16) -> bool {
-    let url = if host.contains(':') {
-        format!("http://[{host}]:{port}/health")
-    } else {
-        format!("http://{host}:{port}/health")
-    };
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_millis(100)))
-        .http_status_as_error(false)
-        .build()
-        .into();
-    agent
-        .get(&url)
-        .call()
-        .is_ok_and(|response| response.status().is_success())
+/// Most specific failure reason this run wrote to serve.log after byte
+/// `start`: the last `FATAL` line (daemon), else the last `hipfire:` line
+/// (serve's own error exit).
+fn last_failure_line(log_path: &Path, start: u64) -> Option<String> {
+    let raw = fs::read(log_path).ok()?;
+    let tail = raw.get(usize::try_from(start).ok()?..)?;
+    failure_line_in(&String::from_utf8_lossy(tail))
+}
+
+fn failure_line_in(text: &str) -> Option<String> {
+    let lines = || text.lines().map(str::trim).rev();
+    lines()
+        .find(|line| line.starts_with("FATAL"))
+        .or_else(|| lines().find(|line| line.starts_with("hipfire:")))
+        .map(str::to_owned)
 }
 
 /// Browser-facing URL for the embedded chat UI. Wildcard binds are not
@@ -1338,15 +1502,17 @@ pub(crate) fn serve_foreground(
     if continuous_batch_size == 0 || continuous_batch_size > 256 {
         bail!("--continuous-batch-size must be between 1 and 256");
     }
+    let vmm_batch = VmmBatchFlags::from_config(&global)?;
     let multi_slot_enabled = config_bool(&global, "serve.multi_slot")?;
     let multi_slot_slots = config_u64(&global, "serve.multi_slot_slots").unwrap_or(4);
     let multi_slot_ctx = config_u64(&global, "serve.multi_slot_ctx").unwrap_or(8192);
     let multi_slot_prefill_chunk =
         config_u64(&global, "serve.multi_slot_prefill_chunk").unwrap_or(1024);
-    // Serving cache/scheduler contract keys (spec §9.1). Read here for
-    // startup validation only; the runtime does not yet consume them.
+    // Serving cache/scheduler contract keys (spec §9.1). The VMM batch route
+    // consumes both (row budget and prefill quantum); other standard routes
+    // read them for startup validation only.
     let max_batch_tokens = config_u64(&global, "serve.max_batch_tokens")?;
-    let prefill_min_tokens = config_u64(&global, "serve.prefill_min_tokens")?;
+    let prefill_min_tokens = vmm_batch.prefill_min_tokens;
     // Aggregate queue byte budget and stalled-stream deadline (spec §5.3,
     // §5.4). Both are multi-slot route contracts: the standard route keeps
     // its count-only queue and its unbounded streaming wait.
@@ -1479,6 +1645,7 @@ pub(crate) fn serve_foreground(
             current_reasoning_effort_native: false,
             current_reasoning_efforts: Vec::new(),
             continuous_batch_capable: false,
+            continuous_batch_history: false,
             current_max_seq: 0,
             cache_capable: false,
             kv_override: args.kv_mode.clone(),
@@ -1487,7 +1654,10 @@ pub(crate) fn serve_foreground(
             kv_backend_override: args.kv_backend.clone(),
             vision_override: args.vision.clone(),
             tp: args.tp,
+            speculation_override: args.speculation.clone(),
+            max_seq_override: args.max_seq,
             continuous_batch_size,
+            vmm_batch,
             multi_slot_enabled,
             multi_slot_slots,
             multi_slot_ctx,
@@ -1747,12 +1917,14 @@ impl ServeRuntime {
                 PullArgs {
                     model: model.to_owned(),
                     force: false,
+                    ple: crate::ple::PleSelection::Auto,
                 },
             )?;
             // pull has already verified the installed payload; avoid a second hash.
             path = find_model_path(&self.paths, &self.registry, model);
         }
-        let path = path.ok_or_else(|| ModelNotFound(format!("model not found locally: {model}")))?;
+        let path =
+            path.ok_or_else(|| ModelNotFound(format!("model not found locally: {model}")))?;
         let resolved = resolved_for_model(&self.paths, model, tag.as_deref(), entry)?;
         if self.current_path.as_ref() != Some(&path) {
             if origin == ModelOrigin::Request && !self.request_may_load(&path, entry) {
@@ -1762,6 +1934,14 @@ impl ServeRuntime {
                 ))
                 .into());
             }
+            crate::ple::ensure_ple_sidecar(
+                &self.registry,
+                entry,
+                tag.as_deref(),
+                &path,
+                crate::ple::request_from_config(&resolved),
+                origin != ModelOrigin::Request || self.request_policy.allow_pull,
+            )?;
             let max_tokens = config_u64(&resolved, "generation.max_tokens")?;
             let mut params = load_params(
                 &resolved,
@@ -1781,6 +1961,21 @@ impl ServeRuntime {
                 self.kv_k_override.as_deref(),
                 self.kv_v_override.as_deref(),
             )?;
+            if let Some(selector) = self.speculation_override.as_deref() {
+                apply_speculation_selector(&mut params, selector)?;
+                // Registry draft for a final dflash/auto selector the
+                // config-time load_params could not see (`serve --spec dflash`).
+                resolve_dflash_sidecar(
+                    &mut params,
+                    entry,
+                    &self.paths.models,
+                    &path,
+                    tag.as_deref(),
+                )?;
+            }
+            if let Some(max_seq) = self.max_seq_override {
+                params["max_seq"] = serde_json::json!(max_seq);
+            }
             resolve_mtp_sidecar(
                 &mut params,
                 entry,
@@ -1797,6 +1992,9 @@ impl ServeRuntime {
                 params["tp"] = serde_json::json!(tp);
             }
             params["continuous_batch_size"] = serde_json::json!(self.continuous_batch_size);
+            if self.vmm_batch.enabled {
+                params["serve_vmm_batch"] = self.vmm_batch.load_params(self.max_batch_tokens);
+            }
             // Experimental multi-slot: daemon owns SlotEngine instead of ordinary
             // LoadedModel. Future continuous-batch integration is deferred.
             if self.multi_slot_enabled {
@@ -1870,6 +2068,7 @@ impl ServeRuntime {
                 .get("continuous_batch_capable")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
+            self.continuous_batch_history = ack_history_capable(&loaded);
             self.current_max_seq = loaded
                 .get("max_seq")
                 .and_then(serde_json::Value::as_u64)
@@ -1963,6 +2162,7 @@ impl ServeRuntime {
         self.current_reasoning_effort_native = false;
         self.current_reasoning_efforts = Vec::new();
         self.continuous_batch_capable = false;
+        self.continuous_batch_history = false;
         self.current_max_seq = 0;
         self.cache_capable = false;
         self.resident_model = None;
@@ -1999,7 +2199,9 @@ impl ServeRuntime {
                     return Ok(resident);
                 }
                 Err(error) => {
-                    eprintln!("[hipfire] daemon restart attempt {attempt}/{attempts} failed: {error:#}");
+                    eprintln!(
+                        "[hipfire] daemon restart attempt {attempt}/{attempts} failed: {error:#}"
+                    );
                 }
             }
             if attempt < attempts {
@@ -2127,9 +2329,7 @@ pub(crate) fn validate_multi_slot_startup(
     // zero-byte pool is a guaranteed load failure, not a silently-disabled
     // cache). Catch it at startup rather than per-request HTTP 500.
     if prefix_cache && prefix_cache_max_bytes == 0 {
-        return Err(
-            "serve.prefix_cache requires serve.prefix_cache_max_bytes > 0".to_owned(),
-        );
+        return Err("serve.prefix_cache requires serve.prefix_cache_max_bytes > 0".to_owned());
     }
     if multi_slot_enabled {
         let scratch_rows = prefill_chunk
@@ -2374,16 +2574,30 @@ pub(crate) fn stop_command(paths: &Paths, args: StopArgs) -> Result<()> {
         let port = args
             .port
             .unwrap_or(config_u64(&resolved, "serve.port")? as u16);
-        let _ = Command::new("pkill").args(["-x", "daemon"]).status();
+        // Only this install's daemons (pidfile/GPU-lock PIDs whose cmdline is
+        // this install's daemon binary and whose HIPFIRE_HOME is this home);
+        // never `pkill -x daemon`, which hit every user's process named daemon.
+        let reaped = reap_install_daemons(paths)?;
         if args.all {
             let _ = Command::new("pkill")
                 .args(["-f", "target/release/hipfire-quantize"])
                 .status();
         }
-        let _ = Command::new("fuser")
-            .args(["-k", &format!("{port}/tcp")])
-            .status();
-        println!("reaped orphan daemon processes and freed port {port}");
+        if reaped.is_empty() {
+            println!("no orphan daemon processes for this install");
+        } else {
+            let pids = reaped.iter().map(u32::to_string).collect::<Vec<_>>();
+            println!("reaped orphan daemon processes (PID {})", pids.join(", "));
+        }
+        let host = config_string(&resolved, "serve.host").unwrap_or_else(|_| "127.0.0.1".into());
+        if port_in_use(probe_host(&host), port) {
+            println!(
+                "port {port} is still in use by a process that is not this install's hipfire; \
+                 not killing it"
+            );
+        } else {
+            println!("port {port} is free");
+        }
     }
     Ok(())
 }
@@ -2480,6 +2694,23 @@ mod tests {
         assert_eq!(json.pid, 43);
         assert_eq!(json.token.as_deref(), Some("old"));
         assert!(!json.legacy);
+    }
+
+    #[test]
+    fn detach_failure_line_prefers_fatal_then_hipfire() {
+        let gpu_lock = "[daemon] loading\n\
+                        FATAL: failed to install process configuration: GPU 1 reserved by holder PID 7\n\
+                        hipfire: daemon closed its output (status exit status: 1)\n";
+        assert_eq!(
+            failure_line_in(gpu_lock).as_deref(),
+            Some("FATAL: failed to install process configuration: GPU 1 reserved by holder PID 7")
+        );
+        let bind = "[hipfire] listening\n  hipfire: failed to bind 127.0.0.1:11537: Address already in use (os error 98)\n";
+        assert_eq!(
+            failure_line_in(bind).as_deref(),
+            Some("hipfire: failed to bind 127.0.0.1:11537: Address already in use (os error 98)")
+        );
+        assert_eq!(failure_line_in("[hipfire] starting\n"), None);
     }
 
     #[test]
@@ -2711,7 +2942,8 @@ mod tests {
             &body,
             Some(1),
             Some("qwen35"),
-            true
+            true,
+            false
         ));
         // Eligible: absent messages (prompt path) for Qwen.
         let body = serde_json::json!({"model":"qwen3.5:7b","prompt":"hi"});
@@ -2719,7 +2951,8 @@ mod tests {
             &body,
             Some(1),
             Some("qwen35"),
-            true
+            true,
+            false
         ));
         // Eligible: empty messages array for Qwen.
         let body = serde_json::json!({"model":"qwen3.5:7b","messages":[]});
@@ -2727,7 +2960,8 @@ mod tests {
             &body,
             Some(1),
             Some("qwen35"),
-            true
+            true,
+            false
         ));
         // Tools disqualify.
         let body = serde_json::json!({"model":"qwen3.5:7b","tools":[{"type":"function","function":{"name":"x"}}]});
@@ -2735,7 +2969,8 @@ mod tests {
             &body,
             Some(1),
             Some("qwen35"),
-            true
+            true,
+            false
         ));
         // Image / multipart content disqualifies.
         let body = serde_json::json!({"model":"qwen3.5:7b","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:"}}]}]});
@@ -2743,7 +2978,8 @@ mod tests {
             &body,
             Some(1),
             Some("qwen35"),
-            true
+            true,
+            false
         ));
         // Multipart text-only array content also disqualifies (must be plain string).
         let body = serde_json::json!({"model":"qwen3.5:7b","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]});
@@ -2751,7 +2987,8 @@ mod tests {
             &body,
             Some(1),
             Some("qwen35"),
-            true
+            true,
+            false
         ));
         // system+user history disqualifies.
         let body = serde_json::json!({"model":"qwen3.5:7b","messages":[
@@ -2762,7 +2999,8 @@ mod tests {
             &body,
             Some(1),
             Some("qwen35"),
-            true
+            true,
+            false
         ));
         // user+assistant multi-turn disqualifies.
         let body = serde_json::json!({"model":"qwen3.5:7b","messages":[
@@ -2773,7 +3011,8 @@ mod tests {
             &body,
             Some(1),
             Some("qwen35"),
-            true
+            true,
+            false
         ));
         // Tool-call content on the sole message disqualifies.
         let body = serde_json::json!({"model":"qwen3.5:7b","messages":[{
@@ -2785,7 +3024,8 @@ mod tests {
             &body,
             Some(1),
             Some("qwen35"),
-            true
+            true,
+            false
         ));
         // Qwen tp=4 pure EP is eligible when daemon admits batch.
         let body =
@@ -2794,7 +3034,8 @@ mod tests {
             &body,
             Some(4),
             Some("qwen35"),
-            true
+            true,
+            false
         ));
         // Qwen tp=2 (and any non-1/non-4) disqualifies.
         let body = serde_json::json!({"model":"qwen3.5:7b"});
@@ -2802,7 +3043,8 @@ mod tests {
             &body,
             Some(2),
             Some("qwen35"),
-            true
+            true,
+            false
         ));
         // Non-qwen disqualifies.
         let body = serde_json::json!({"model":"deepseek4:671b"});
@@ -2810,7 +3052,8 @@ mod tests {
             &body,
             Some(1),
             Some("deepseek4"),
-            true
+            true,
+            false
         ));
         // Daemon load says batch incapable: HTTP admission must not invent it.
         let body =
@@ -2819,6 +3062,7 @@ mod tests {
             &body,
             Some(1),
             Some("qwen35"),
+            false,
             false
         ));
         // Eligible: tp=1 LFM2 dense with one plain user string when daemon admits batch.
@@ -2828,7 +3072,8 @@ mod tests {
             &body,
             Some(1),
             Some("lfm2"),
-            true
+            true,
+            false
         ));
         // Eligible: absent messages for LFM.
         let body = serde_json::json!({"model":"lfm2.5:1.2b","prompt":"hi"});
@@ -2836,7 +3081,8 @@ mod tests {
             &body,
             Some(1),
             Some("lfm2"),
-            true
+            true,
+            false
         ));
         // Eligible: empty messages for LFM.
         let body = serde_json::json!({"model":"lfm2.5:1.2b","messages":[]});
@@ -2844,7 +3090,8 @@ mod tests {
             &body,
             Some(1),
             Some("lfm2"),
-            true
+            true,
+            false
         ));
         // LFM rejects system+user the same way.
         let body = serde_json::json!({"model":"lfm2.5:1.2b","messages":[
@@ -2855,7 +3102,8 @@ mod tests {
             &body,
             Some(1),
             Some("lfm2"),
-            true
+            true,
+            false
         ));
         // LFM rejects user+assistant.
         let body = serde_json::json!({"model":"lfm2.5:1.2b","messages":[
@@ -2866,7 +3114,8 @@ mod tests {
             &body,
             Some(1),
             Some("lfm2"),
-            true
+            true,
+            false
         ));
         // LFM rejects tool-call content.
         let body = serde_json::json!({"model":"lfm2.5:1.2b","messages":[{
@@ -2878,7 +3127,8 @@ mod tests {
             &body,
             Some(1),
             Some("lfm2"),
-            true
+            true,
+            false
         ));
         // LFM rejects image/multipart content.
         let body = serde_json::json!({"model":"lfm2.5:1.2b","messages":[{"role":"user","content":[
@@ -2889,7 +3139,8 @@ mod tests {
             &body,
             Some(1),
             Some("lfm2"),
-            true
+            true,
+            false
         ));
         // LFM tp=4 disqualifies (dense remains tp=1 only).
         let body =
@@ -2898,7 +3149,8 @@ mod tests {
             &body,
             Some(4),
             Some("lfm2"),
-            true
+            true,
+            false
         ));
         // Daemon load says batch incapable: LFM HTTP admission must not invent it.
         let body =
@@ -2907,8 +3159,104 @@ mod tests {
             &body,
             Some(1),
             Some("lfm2"),
+            false,
             false
         ));
+    }
+
+    #[test]
+    fn batch_eligibility_vmm_route_admits_text_chat() {
+        let body = serde_json::json!({"model":"qwen3.5:7b","messages":[
+            {"role":"system","content":"be brief"},
+            {"role":"user","content":"hi"},
+            {"role":"assistant","content":"hello"},
+            {"role":"user","content":"again"}
+        ]});
+        assert!(is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("qwen35"),
+            true,
+            true
+        ));
+        assert!(!is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("qwen35"),
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn ack_history_capability_is_typed_not_route_named() {
+        let fn_lanes = serde_json::json!({
+            "continuous_batch_capable": true,
+            "continuous_batch_route": "fn-lanes",
+            "continuous_batch_history_capable": true
+        });
+        assert!(ack_history_capable(&fn_lanes));
+        let multi_turn = serde_json::json!({"model":"qwen4:flash","messages":[
+            {"role":"user","content":"hi"},
+            {"role":"assistant","content":"hello"},
+            {"role":"user","content":"again"}
+        ]});
+        assert!(is_batch_eligible_request(
+            &multi_turn,
+            Some(1),
+            Some("qwen4"),
+            true,
+            ack_history_capable(&fn_lanes)
+        ));
+        // A route without the capability keeps the single-user-turn rule.
+        let unsupported = serde_json::json!({
+            "continuous_batch_capable": true,
+            "continuous_batch_route": "fn-lanes"
+        });
+        assert!(!ack_history_capable(&unsupported));
+        assert!(!is_batch_eligible_request(
+            &multi_turn,
+            Some(1),
+            Some("qwen4"),
+            true,
+            ack_history_capable(&unsupported)
+        ));
+        // Capability without batch capability never admits.
+        assert!(!ack_history_capable(&serde_json::json!({
+            "continuous_batch_capable": false,
+            "continuous_batch_history_capable": true
+        })));
+    }
+
+    #[test]
+    fn batch_messages_text_chat_shape() {
+        assert!(batch_messages_are_text_chat(&serde_json::json!({})));
+        assert!(batch_messages_are_text_chat(
+            &serde_json::json!({"messages":[]})
+        ));
+        assert!(batch_messages_are_text_chat(&serde_json::json!({
+            "messages":[
+                {"role":"system","content":"sys"},
+                {"role":"user","content":"hi"},
+                {"role":"assistant","content":"hello","tool_calls":[]},
+                {"role":"user","content":"again"}
+            ]
+        })));
+        assert!(!batch_messages_are_text_chat(&serde_json::json!({
+            "messages":[{"role":"user","content":"hi"},{"role":"tool","content":"r"}]
+        })));
+        assert!(!batch_messages_are_text_chat(&serde_json::json!({
+            "messages":[{"role":"assistant","content":"x","tool_calls":[{"id":"c0","type":"function","function":{"name":"x","arguments":"{}"}}]}]
+        })));
+        assert!(!batch_messages_are_text_chat(&serde_json::json!({
+            "messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]
+        })));
+        assert!(!batch_messages_are_text_chat(&serde_json::json!({
+            "messages":[{"role":"user"}]
+        })));
+        assert!(!batch_messages_are_text_chat(&serde_json::json!({
+            "messages":"hi"
+        })));
     }
 
     #[test]
@@ -3042,6 +3390,7 @@ mod tests {
             current_reasoning_effort_native: true,
             current_reasoning_efforts: vec!["xhigh".to_owned()],
             continuous_batch_capable: true,
+            continuous_batch_history: false,
             current_max_seq: 32768,
             cache_capable: true,
             kv_override: Some("q8".to_owned()),
@@ -3050,7 +3399,10 @@ mod tests {
             kv_backend_override: None,
             vision_override: None,
             tp: None,
+            speculation_override: None,
+            max_seq_override: None,
             continuous_batch_size: 1,
+            vmm_batch: VmmBatchFlags::default(),
             multi_slot_enabled: false,
             multi_slot_slots: 4,
             multi_slot_ctx: 8192,
@@ -3213,7 +3565,8 @@ mod tests {
         let err = validate_multi_slot_startup(true, 2, 64, 4096, 1, 1024, 4, false, 0).unwrap_err();
         assert!(err.contains("continuous_batch_size > 1"), "{err}");
         assert!(err.contains("deferred"), "{err}");
-        let err = validate_multi_slot_startup(true, 16, 64, 4096, 1, 1024, 4, false, 0).unwrap_err();
+        let err =
+            validate_multi_slot_startup(true, 16, 64, 4096, 1, 1024, 4, false, 0).unwrap_err();
         assert!(err.contains("serve.multi_slot"), "{err}");
     }
 
@@ -3241,7 +3594,8 @@ mod tests {
 
     #[test]
     fn multi_slot_startup_rejects_prefill_min_above_chunk() {
-        let err = validate_multi_slot_startup(true, 1, 64, 2048, 2048, 1024, 2, false, 0).unwrap_err();
+        let err =
+            validate_multi_slot_startup(true, 1, 64, 2048, 2048, 1024, 2, false, 0).unwrap_err();
         assert!(
             err.contains("must be <= serve.multi_slot_prefill_chunk"),
             "{err}"
@@ -3309,7 +3663,11 @@ mod tests {
             .acquire_for_with_bytes(true, Some("m"), 999_999_999)
             .unwrap_err();
         // Should be a timeout (queue wait), not a QueueFull byte error.
-        assert!(err.message.contains("queue wait exceeded"), "{}", err.message);
+        assert!(
+            err.message.contains("queue wait exceeded"),
+            "{}",
+            err.message
+        );
     }
 
     // ---- Permit released exactly once (spec §5.3) ----
@@ -3385,7 +3743,11 @@ mod tests {
         let err = admission
             .acquire_for_with_bytes(true, Some("m"), 300)
             .unwrap_err();
-        assert!(err.message.contains("queue wait exceeded"), "{}", err.message);
+        assert!(
+            err.message.contains("queue wait exceeded"),
+            "{}",
+            err.message
+        );
         // Queued bytes must be released on timeout.
         assert_eq!(admission.queued_bytes(), 0);
         assert_eq!(admission.inflight(), 1);
@@ -3469,7 +3831,11 @@ mod tests {
         ));
         let _holder = admission.acquire().unwrap();
         let err = admission.acquire().unwrap_err();
-        assert!(err.message.contains("queue wait exceeded"), "{}", err.message);
+        assert!(
+            err.message.contains("queue wait exceeded"),
+            "{}",
+            err.message
+        );
     }
 
     #[test]
@@ -3587,7 +3953,10 @@ mod capabilities_tests {
         assert!(caps["structured_output_subset"].is_null());
         assert_eq!(caps["prefix_cache"], false);
         let refused = caps["refused_request_fields"].as_array().unwrap();
-        assert!(refused.is_empty(), "the standard route refuses none of these fields");
+        assert!(
+            refused.is_empty(),
+            "the standard route refuses none of these fields"
+        );
         assert!(caps["stream_stall_timeout_ms"].is_null());
     }
 
@@ -3597,7 +3966,10 @@ mod capabilities_tests {
         assert_eq!(serve_ui_url("::", 11435), "http://[::1]:11435/ui");
         assert_eq!(serve_ui_url("::1", 8000), "http://[::1]:8000/ui");
         assert_eq!(serve_ui_url("192.168.1.5", 80), "http://192.168.1.5:80/ui");
-        assert_eq!(serve_ui_url("localhost", 11435), "http://localhost:11435/ui");
+        assert_eq!(
+            serve_ui_url("localhost", 11435),
+            "http://localhost:11435/ui"
+        );
     }
 
     #[test]

@@ -48,6 +48,65 @@ const MQ_X_ROT_CHUNK_ROWS: usize = 1024;
 
 // ─── Config ────────────────────────────────────────────────────────────────
 
+/// DFlash2 runtime proposal width without VMM batching: what `auto` (the
+/// `speculation.dflash_block` default) picks for a singleton-only load. 16
+/// removes the B=8 acceptance ceiling at C1 on gfx1201.
+pub const DFLASH_BLOCK_UNBATCHED: usize = 16;
+/// `speculation.dflash_block = "auto"` width on a batching serve
+/// (`serve.vmm_batch` with at least [`DFLASH_BLOCK_AUTO_MIN_LANES`] lanes):
+/// the draft's trained width, which keeps a full C8 verify step at 64 rows.
+pub const DFLASH_BLOCK_AUTO_BATCHED: usize = 8;
+/// Lane count from which `auto` picks [`DFLASH_BLOCK_AUTO_BATCHED`].
+pub const DFLASH_BLOCK_AUTO_MIN_LANES: usize = 4;
+/// Admitted fixed widths of `speculation.dflash_block`.
+pub const DFLASH_BLOCK_MIN: usize = 4;
+pub const DFLASH_BLOCK_MAX: usize = 16;
+
+/// `speculation.dflash_block`: the DFlash2 proposal width of one load.
+///
+/// The width is a property of the serving configuration, resolved once at
+/// load, never of the live batch: a load-dependent width would move window
+/// boundaries with server load and break batched == singleton output. Every
+/// request of a load (singleton or batched lane) runs the same width.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DflashBlockPolicy {
+    /// [`DFLASH_BLOCK_AUTO_BATCHED`] on a VMM batching serve with at least
+    /// [`DFLASH_BLOCK_AUTO_MIN_LANES`] lanes, else [`DFLASH_BLOCK_UNBATCHED`].
+    /// The default.
+    Auto,
+    /// A fixed width in `DFLASH_BLOCK_MIN..=DFLASH_BLOCK_MAX`.
+    Fixed(usize),
+}
+
+impl DflashBlockPolicy {
+    /// Parse the `dflash_block` load param: `"auto"` or an integer in range.
+    /// Absent = [`Self::Auto`], the schema default.
+    pub fn from_param(value: Option<&serde_json::Value>) -> Result<Self, String> {
+        let Some(value) = value else {
+            return Ok(Self::Auto);
+        };
+        if value.as_str() == Some("auto") {
+            return Ok(Self::Auto);
+        }
+        match value.as_u64().map(|v| v as usize) {
+            Some(b) if (DFLASH_BLOCK_MIN..=DFLASH_BLOCK_MAX).contains(&b) => Ok(Self::Fixed(b)),
+            _ => Err(format!(
+                "dflash_block must be \"auto\" or an integer {DFLASH_BLOCK_MIN}..={DFLASH_BLOCK_MAX} (got {value})"
+            )),
+        }
+    }
+
+    /// The width of a load: `vmm_batch` = the VMM continuous-batching route
+    /// is staged, `lanes` = its `continuous_batch_size`.
+    pub fn resolve(self, vmm_batch: bool, lanes: usize) -> usize {
+        match self {
+            Self::Fixed(b) => b,
+            Self::Auto if vmm_batch && lanes >= DFLASH_BLOCK_AUTO_MIN_LANES => DFLASH_BLOCK_AUTO_BATCHED,
+            Self::Auto => DFLASH_BLOCK_UNBATCHED,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DflashConfig {
     pub n_layers: usize,
@@ -103,14 +162,15 @@ impl DflashConfig {
         self.n_heads * self.head_dim
     }
 
-    /// Runtime proposal width. DFlash2's selector and dynamic convolutions are
-    /// length-generic even though the published checkpoint declares B=8.
-    /// B=16 removes the B=8 acceptance ceiling and wins on both the canonical
-    /// merge-sort and prose fixtures on gfx1201; legacy DFlash retains its
-    /// artifact-declared width.
-    pub fn runtime_block_size(&self) -> usize {
-        if self.selector_rank.is_some() && self.block_size == 8 {
-            16
+    /// Runtime proposal width for the configured `speculation.dflash_block`
+    /// width `requested` (already resolved by [`DflashBlockPolicy::resolve`]).
+    /// DFlash2's selector and dynamic convolutions are length-generic even
+    /// though the published checkpoint declares B=8, so a DFlash2 draft runs
+    /// at `requested` (8 or 16 under the `auto` default). Legacy DFlash is not
+    /// length-generic and always runs its artifact-declared width.
+    pub fn runtime_block_size(&self, requested: usize) -> usize {
+        if self.selector_rank.is_some() {
+            requested
         } else {
             self.block_size
         }
@@ -1455,6 +1515,9 @@ mod target_hidden_log {
 }
 pub use target_hidden_log::{TargetHiddenLog, TargetHiddenLogMark};
 
+mod lanes;
+pub use lanes::{draft_forward_lanes, DraftLane};
+
 // ─── Scratch ───────────────────────────────────────────────────────────────
 
 /// Draft context mode (HIPFIRE_DFLASH_WINDOW).
@@ -1534,6 +1597,11 @@ pub struct DflashScratch {
     // Positions (i32).
     pub positions_q: GpuTensor, // [B]       i32
     pub positions_k: GpuTensor, // [L + B]   i32
+    /// Host staging of the concatenated query positions of a batched lane
+    /// draft (`draft_forward_lanes` on the shared scratch). Capacity
+    /// `max_block_size`, reserved once and never grown, so the upload source
+    /// has a stable owned address (a captured upload bakes it).
+    pub lane_positions_q: Vec<i32>,
 
     // FWHT rotation scratch for MQ4 weight paths. Sized to the largest
     // single-call requirement: max(max_ctx × num_extract*hidden,
@@ -1943,6 +2011,7 @@ impl DflashScratch {
 
             positions_q: take!(i_positions_q),
             positions_k: take!(i_positions_k),
+            lane_positions_q: Vec::with_capacity(b),
 
             mq_x_rot: i_mq_x_rot.map(|j| take!(j)),
             mq_x_rot_f16: i_mq_x_rot_f16.map(|j| take!(j)),
@@ -2155,6 +2224,30 @@ fn gemm_dispatch_mq4_collapsed(
     chunked
 }
 
+/// Draft lm_head on FWHT-rotated draft rows (`rotated` `[rows, k]` → `logits`
+/// `[rows, m]`), routed through this draft-GEMM layer like [`gemm_dispatch`]'s
+/// MQ4G256V2 arm: on exact gfx1201 an MQ4G256V2 head runs the in-kernel-zeroing
+/// overwrite twin (`Gpu::gemm_mq4g256v2_overwrite_gfx12_dflash`, bit-identical to
+/// the `hipMemset` pre-zero + residual lm_head it replaces;
+/// `HIPFIRE_DRAFT_COLLAPSE_OFF=1` vetoes it). `Ok(false)` = not admitted and
+/// nothing launched: the caller runs its batched lm_head launcher unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn draft_lm_head_overwrite(
+    gpu: &mut Gpu,
+    dtype: DType,
+    w_buf: &GpuTensor,
+    rotated: &GpuTensor,
+    logits: &GpuTensor,
+    m: usize,
+    k: usize,
+    rows: usize,
+) -> HipResult<bool> {
+    if dtype != DType::MQ4G256V2 {
+        return Ok(false);
+    }
+    gpu.gemm_mq4g256v2_overwrite_gfx12_dflash(w_buf, rotated, logits, m, k, rows)
+}
+
 /// For MQ-G256, the kernel needs the input FWHT-rotated. We do that into
 /// `mq_x_rot` (sized to the per-call max in `DflashScratch`), then call the
 /// HFQ4-G256 GEMM kernel against the pre-rotated weights.
@@ -2290,9 +2383,11 @@ fn gemm_dispatch(
             // correct; rotation is identical FWHT path.
             // S7: per-chunk route — chunks that hit the gfx1100 ksplit tier
             // (batch 2..=16, default policy) rotate to F16 and run the
-            // overwrite ksplit GEMM; everything else (n==1 GEMV tails,
-            // chunked first-call prefixes, capture/replay, kill switch)
-            // keeps the legacy loop byte-for-byte.
+            // overwrite ksplit GEMM. On gfx1201 the `Off` branch first tries
+            // the in-kernel-zeroing overwrite WMMA twin (batch 2..=63, no
+            // memset); everything else (n==1 GEMV tails, chunked first-call
+            // prefixes, capture/replay, kill switch) keeps the legacy loop
+            // byte-for-byte.
             let scratch_f16 = mq_x_rot_f16;
             let max_chunk = (mq_x_rot
                 .expect("MQ4V2 dispatch requires mq_x_rot scratch")
@@ -2325,11 +2420,26 @@ fn gemm_dispatch(
                             chunked = Err(e);
                             break;
                         }
-                        if let Err(e) = gpu
-                            .gemm_mq4g256v2_batched_lmhead(&w.buf, &rot_view, &y_chunk, w.m, w.k, n)
-                        {
-                            chunked = Err(e);
-                            break;
+                        // gfx1201: overwrite twin of the one-tile / verify-tile
+                        // residual kernel (no pre-zero fill, byte-identical).
+                        // `Ok(false)` = not admitted, device untouched: run the
+                        // legacy memset + residual lm_head launcher unchanged.
+                        match gpu.gemm_mq4g256v2_overwrite_gfx12_dflash(
+                            &w.buf, &rot_view, &y_chunk, w.m, w.k, n,
+                        ) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                if let Err(e) = gpu.gemm_mq4g256v2_batched_lmhead(
+                                    &w.buf, &rot_view, &y_chunk, w.m, w.k, n,
+                                ) {
+                                    chunked = Err(e);
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                chunked = Err(e);
+                                break;
+                            }
                         }
                     } else {
                         let scratch =
@@ -2691,10 +2801,54 @@ fn upload_slice_f32(gpu: &Gpu, dst: &GpuTensor, data: &[f32]) -> HipResult<()> {
 }
 
 /// Upload i32 slice into a GPU tensor (interpreted as i32 by kernels).
+/// Synchronous outside hipGraph capture; while capturing it is enqueued on
+/// the capturing stream (`Gpu::memcpy_htod_auto`), which bakes `data`'s host
+/// address into the graph: a replaying owner keeps that storage alive and
+/// rewrites it in place before each launch.
 fn upload_slice_i32(gpu: &Gpu, dst: &GpuTensor, data: &[i32]) -> HipResult<()> {
     let bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
-    gpu.hip.memcpy_htod(&dst.buf, bytes)
+    gpu.memcpy_htod_auto(&dst.buf, bytes)
+}
+
+/// `HIPFIRE_DFLASH_ORDERED_DRAFT=0` (developer kill switch): the draft
+/// body's D2D copies (residual saves, context/noise K/V concatenation) go
+/// back to the synchronous `hipMemcpy` on the null stream, and the batched
+/// lane draft uploads its key positions between the lane fc GEMMs again.
+/// Default on: the copies are enqueued on the execution stream
+/// (`Gpu::memcpy_dtod_at_ordered_async`) ahead of their consumer kernels and
+/// the host no longer drains the queue per copy. Same bytes, same ranges,
+/// same order on the stream as every producer and consumer kernel.
+static ORDERED_DRAFT: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_DFLASH_ORDERED_DRAFT").map_or(true, |v| v.trim() != "0")
+});
+
+/// Whether the draft body runs its D2D copies stream-ordered
+/// ([`ORDERED_DRAFT`]); resolved once per process.
+pub(crate) fn ordered_draft() -> bool {
+    *ORDERED_DRAFT
+}
+
+/// One draft-body D2D copy. `ordered`: enqueued on the active stream (the
+/// null stream when none is set), where every producer of `src` and every
+/// consumer of `dst` in the draft body also runs, so no host wait is needed
+/// and the source cannot be rewritten before the copy executes. Otherwise
+/// the historical host-synchronous copy.
+#[track_caller]
+fn draft_dtod_at(
+    gpu: &Gpu,
+    ordered: bool,
+    dst: &DeviceBuffer,
+    dst_offset: usize,
+    src: &DeviceBuffer,
+    src_offset: usize,
+    bytes: usize,
+) -> HipResult<()> {
+    if ordered {
+        gpu.memcpy_dtod_at_ordered_async(dst, dst_offset, src, src_offset, bytes)
+    } else {
+        gpu.hip.memcpy_dtod_at(dst, dst_offset, src, src_offset, bytes)
+    }
 }
 
 /// Rows per chunk for the windowed-mode post-seed backfill.
@@ -3134,6 +3288,7 @@ pub fn draft_forward_opts(
     // ── 2. Per-layer decoder ─────────────────────────────────────────────
     // DFlash2 all-sliding detection for windowed mode branching.
     let is_all_sliding_windowed = windowed && cfg.all_layers_sliding;
+    let ordered = ordered_draft();
     for li in 0..cfg.n_layers {
         let layer = &weights.layers[li];
 
@@ -3151,8 +3306,7 @@ pub fn draft_forward_opts(
             )?;
         } else {
             // Residual.
-            gpu.hip
-                .memcpy_dtod(&scratch.residual.buf, &scratch.x.buf, (b * h) * 4)?;
+            draft_dtod_at(gpu, ordered, &scratch.residual.buf, 0, &scratch.x.buf, 0, (b * h) * 4)?;
             // attn_norm.
             gpu.rmsnorm_batched(&scratch.x, &layer.attn_norm, &scratch.x_norm, b, h, eps)?;
         }
@@ -3409,14 +3563,18 @@ pub fn draft_forward_opts(
         let mut cat_off = 0usize;
         for (_row0, slot0, len) in ring_segments(span_start, l, layer_w) {
             let seg_bytes = len * kvd * 4;
-            gpu.hip.memcpy_dtod_at(
+            draft_dtod_at(
+                gpu,
+                ordered,
                 &k_cat_l.buf,
                 cat_off,
                 &k_cache_layer.buf,
                 slot0 * kvd * 4,
                 seg_bytes,
             )?;
-            gpu.hip.memcpy_dtod_at(
+            draft_dtod_at(
+                gpu,
+                ordered,
                 &v_cat_l.buf,
                 cat_off,
                 &v_cache_layer.buf,
@@ -3425,10 +3583,8 @@ pub fn draft_forward_opts(
             )?;
             cat_off += seg_bytes;
         }
-        gpu.hip
-            .memcpy_dtod_at(&k_cat_l.buf, cat_off, &scratch.k_noise.buf, 0, noise_bytes)?;
-        gpu.hip
-            .memcpy_dtod_at(&v_cat_l.buf, cat_off, &scratch.v_noise.buf, 0, noise_bytes)?;
+        draft_dtod_at(gpu, ordered, &k_cat_l.buf, cat_off, &scratch.k_noise.buf, 0, noise_bytes)?;
+        draft_dtod_at(gpu, ordered, &v_cat_l.buf, cat_off, &scratch.v_noise.buf, 0, noise_bytes)?;
 
         if let Some(t) = t1 {
             gpu.hip.device_synchronize()?;
@@ -3598,8 +3754,7 @@ pub fn draft_forward_opts(
                     eps,
                 )?;
             } else {
-                gpu.hip
-                    .memcpy_dtod(&scratch.residual.buf, &scratch.x.buf, (b * h) * 4)?;
+                draft_dtod_at(gpu, ordered, &scratch.residual.buf, 0, &scratch.x.buf, 0, (b * h) * 4)?;
                 gpu.rmsnorm_batched(&scratch.x, &layer.ffn_norm, &scratch.x_norm, b, h, eps)?;
             }
             let k = cfg.conv_kernel_size.unwrap_or(2);
@@ -3798,6 +3953,61 @@ mod ring_tests {
         assert_eq!(log.abs_positions(), &[0, 1, 2, 3]);
         assert_eq!(log.proj_cached_rows(), 3);
         assert_eq!(log.full_cached_rows(), 4);
+    }
+}
+
+#[cfg(test)]
+mod block_policy_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn param_parses_auto_fixed_and_absent() {
+        assert_eq!(DflashBlockPolicy::from_param(None), Ok(DflashBlockPolicy::Auto));
+        assert_eq!(DflashBlockPolicy::from_param(Some(&json!("auto"))), Ok(DflashBlockPolicy::Auto));
+        assert_eq!(DflashBlockPolicy::from_param(Some(&json!(8))), Ok(DflashBlockPolicy::Fixed(8)));
+        for bad in [json!(3), json!(17), json!("8"), json!(true), json!(-1)] {
+            assert!(DflashBlockPolicy::from_param(Some(&bad)).is_err(), "{bad} must be refused");
+        }
+    }
+
+    #[test]
+    fn auto_depends_on_serving_configuration_only() {
+        assert_eq!(DflashBlockPolicy::Auto.resolve(true, 8), 8);
+        assert_eq!(DflashBlockPolicy::Auto.resolve(true, 4), 8);
+        assert_eq!(DflashBlockPolicy::Auto.resolve(true, 3), 16);
+        assert_eq!(DflashBlockPolicy::Auto.resolve(false, 8), 16);
+        assert_eq!(DflashBlockPolicy::Fixed(12).resolve(true, 8), 12);
+        assert_eq!(DflashBlockPolicy::Fixed(8).resolve(false, 1), 8);
+    }
+
+    #[test]
+    fn legacy_drafts_keep_their_declared_width() {
+        let mut cfg = DflashConfig {
+            n_layers: 1,
+            hidden: 8,
+            intermediate: 16,
+            n_heads: 1,
+            n_kv_heads: 1,
+            head_dim: 8,
+            vocab_size: 8,
+            norm_eps: 1e-6,
+            rope_theta: 1.0,
+            block_size: 8,
+            mask_token_id: 0,
+            target_layer_ids: vec![0],
+            num_target_layers: 1,
+            declared_window: None,
+            all_layers_sliding: true,
+            conv_group_size: Some(16),
+            conv_kernel_size: Some(2),
+            selector_rank: Some(256),
+            selector_top_k: Some(16),
+        };
+        assert_eq!(cfg.runtime_block_size(DFLASH_BLOCK_UNBATCHED), 16);
+        assert_eq!(cfg.runtime_block_size(8), 8);
+        cfg.selector_rank = None;
+        assert_eq!(cfg.runtime_block_size(DFLASH_BLOCK_UNBATCHED), 8);
     }
 }
 
@@ -4269,8 +4479,62 @@ fn softmax_sample(scores: &[f32], temp: f32, uniform: f32) -> (usize, Vec<f32>) 
     (last, q)
 }
 
+/// Borrowed-readback selector scorer: the arithmetic of the former
+/// `propose_inner` (runtime lines 4275-4372 before this factoring), exposed so
+/// packed multi-lane readbacks can score each lane's span without a device or
+/// a copy of the projection/IDs/unaries.
+///
+/// Inputs are the raw device readbacks for ONE chain: `projection`
+/// `[rows*rank]` (hidden projection GEMM output), `ids` `[rows*K]` (raw GPU
+/// top-K IDs) and `unaries` `[rows*K]` (raw top-K values); `rank`/`K`/vocab
+/// come from `weights`. Scoring is sequential: predecessor starts at `anchor`
+/// and becomes the selected ID of each row; candidates are scored in readback
+/// order with the sequential f32 `pred_cb*projection*succ_cb` dot. With
+/// `temperature>0` `uniforms` (>= `rows`, one per row) are required.
+pub fn propose_candidates_from_rows(
+    weights: &DflashWeights,
+    projection: &[f32],
+    ids: &[u32],
+    unaries: &[f32],
+    rows: usize,
+    anchor: u32,
+    temperature: f32,
+    uniforms: Option<&[f32]>,
+) -> HipResult<DflashCandidateProposal> {
+    if rows == 0 {
+        return Err(hip_bridge::HipError::new(0, "rows must be >0"));
+    }
+    if !weights.has_candidate_selector() {
+        return Err(hip_bridge::HipError::new(0, "selector weights not loaded"));
+    }
+    let rank = weights.selector_rank.unwrap_or(256);
+    let k = weights.selector_top_k.unwrap_or(16);
+    if k == 0 || k > 16 {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "selector_top_k must be in [1,16]",
+        ));
+    }
+    if projection.len() != rows * rank {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "projection length != rows*rank",
+        ));
+    }
+    if ids.len() != rows * k || unaries.len() != rows * k {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "ids/unaries length != rows*K",
+        ));
+    }
+    let vocab = weights.predecessor_codebook.as_ref().unwrap().vocab;
+    propose_inner(
+        vocab, weights, projection, ids, unaries, rows, k, rank, anchor, temperature, uniforms,
+    )
+}
+
 fn propose_inner(
-    cfg: &DflashConfig,
+    vocab_size: usize,
     weights: &DflashWeights,
     hidden_proj_host: &[f32], // [rows*rank] already projected, row-major
     top_ids: &[u32],          // [rows*K]
@@ -4316,7 +4580,7 @@ fn propose_inner(
         let mut scores = Vec::with_capacity(k);
         for j in 0..k {
             let cand = top_ids[id_off + j] as usize;
-            if cand >= cfg.vocab_size {
+            if cand >= vocab_size {
                 return Err(hip_bridge::HipError::new(
                     0,
                     "candidate id out of vocab range",
@@ -4454,35 +4718,12 @@ pub fn propose_candidates_host(
             top_vals.push(row[idxs[j]]);
         }
     }
-    propose_inner(
-        &DflashConfig {
-            n_layers: 0,
-            hidden: 0,
-            intermediate: 0,
-            n_heads: 0,
-            n_kv_heads: 0,
-            head_dim: 0,
-            vocab_size: vocab,
-            norm_eps: 0.0,
-            rope_theta: 0.0,
-            block_size: 0,
-            mask_token_id: 0,
-            target_layer_ids: vec![],
-            num_target_layers: 0,
-            declared_window: None,
-            all_layers_sliding: false,
-            conv_group_size: None,
-            conv_kernel_size: None,
-            selector_rank: Some(rank),
-            selector_top_k: Some(k),
-        },
+    propose_candidates_from_rows(
         weights,
         &host_proj,
         &top_ids,
         &top_vals,
         rows,
-        k,
-        rank,
         anchor,
         temperature,
         uniforms,
@@ -4574,35 +4815,12 @@ pub fn propose_candidates_device(
     for chunk in vals_bytes.chunks_exact(4) {
         top_vals.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
     }
-    propose_inner(
-        &DflashConfig {
-            n_layers: 0,
-            hidden: 0,
-            intermediate: 0,
-            n_heads: 0,
-            n_kv_heads: 0,
-            head_dim: 0,
-            vocab_size: vocab,
-            norm_eps: 0.0,
-            rope_theta: 0.0,
-            block_size: 0,
-            mask_token_id: 0,
-            target_layer_ids: vec![],
-            num_target_layers: 0,
-            declared_window: None,
-            all_layers_sliding: false,
-            conv_group_size: None,
-            conv_kernel_size: None,
-            selector_rank: Some(rank),
-            selector_top_k: Some(k),
-        },
+    propose_candidates_from_rows(
         weights,
         &host_proj,
         &top_ids,
         &top_vals,
         rows,
-        k,
-        rank,
         anchor,
         temperature,
         uniforms,

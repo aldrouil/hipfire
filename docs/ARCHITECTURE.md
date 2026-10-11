@@ -175,6 +175,18 @@ rdna-compute Gpu methods  ↔  hipfire-dispatch family tables
 Serve long-running path: same daemon binary, HTTP surface documented in
 [`SERVE.md`](SERVE.md); chat attach in [`CHAT.md`](CHAT.md).
 
+**Kernel readiness at load.** `load_admitted_with_gemma4_drafter` (the common
+single-GPU/PP loader) asks `kernel_registry::route_entries` for the load's
+kernel closure. A closed route (today: Qwen3.6-27B MQ4G256V2 XTS on exact
+gfx1201, AR or native MTP) begins its bounded batch compile
+(`Gpu::begin_route_kernel_load`) while weights upload; the first kernel
+request or launch drains it and loads every planned HIP and embedded
+PeaceMaker image (`ensure_route_modules_preloaded`); after the model loads,
+`finish_route_kernel_load` seals the route, so `loaded` implies no further
+compile or module load. Refused routes keep lazy per-kernel JIT; unload and
+the next load reset the route. Details and the worker budget:
+[`env-vars.md`](env-vars.md) (`HIPFIRE_JIT_JOBS`).
+
 ## Model sources (not “two model paths”)
 
 Load is **source × carrier**, not a two-file hard split.
@@ -313,12 +325,14 @@ hipcc is available; compiler-free loads fail closed. Packaged module names
 come from the exact Rust registry, never HIP source basenames.
 
 JIT and packaged objects share one core recipe: `--genco --offload-arch=<arch>
--O3 --no-offload-compress -fuse-cuid=none`, then the extra, per-module and
-per-kernel flags (`KernelCompiler::recipe_for_source`).
+-O3 --no-offload-compress -fuse-cuid=none -mcode-object-version=6`, then the
+extra, per-module and per-kernel flags (`KernelCompiler::recipe_for_source`).
 `-fuse-cuid=none` drops hipcc's `__hip_cuid_*` symbol, which is named after the
 input path and argv. On one host the object bytes therefore depend only on the
 source, the recipe and the resolved toolchain and headers, not on the cache root
-or temp name. The cache ABI is part of every hot key, packaging key and index.
+or temp name. `-mcode-object-version=6` pins the AMDGPU code-object version
+instead of inheriting the compiler default, so a newer LLVM cannot change it.
+The cache ABI is part of every hot key, packaging key and index.
 It changes whenever the core recipe does, so objects from an older recipe miss
 and are recompiled instead of being mixed in.
 
@@ -475,9 +489,15 @@ hipGraph route (Qwen4 replays prepared PM4, below).
   turn. Snapshots never depend on live state, so a reset does not drop them.
 - **Eviction and budget.** LRU over leaves; a snapshot with children is
   pinned. The budget is `memory.session_cache_bytes` /
-  `HIPFIRE_SESSION_CACHE_BYTES` (default 8 GiB, `0` = cache off). Copies live
-  in system RAM on unified memory and in VRAM on discrete cards, behind a
-  free-memory guard.
+  `HIPFIRE_SESSION_CACHE_BYTES` (default 8 GiB, `0` = cache off), a ceiling,
+  not a reservation. Snapshots live in device memory (VRAM, or a unified-memory
+  APU's GTT or carve-out) and yield to context growth. A capture is skipped,
+  or older snapshots are evicted, unless free device memory
+  (`Gpu::device_mem_info`: `hipMemGetInfo`, on a GTT-backed APU clamped to
+  `MemAvailable` plus TTM's page pool) still holds the live state's growth
+  through the prompt in flight plus headroom.
+  When a forward crosses a VMM growth boundary, snapshots are freed (LRU
+  leaves first, then the turn's pending captures) until that growth fits.
 - **Live continuation.** Inside one conversation, a turn whose canonical
   tokens strictly extend the previous turn's committed consumed history
   (same route; for native MTP the head is at the same position) prefills

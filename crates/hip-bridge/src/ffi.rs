@@ -216,6 +216,26 @@ fn fault_spec() -> Option<Option<String>> {
     hipfire_config::active_process_config().map(|config| config.legacy_value("HIPFIRE_FAULT_HIP"))
 }
 
+/// Developer-only module-load audit (`HIPFIRE_MODULE_LOAD_AUDIT=1`, default
+/// off): one stderr line per `hipModuleLoad`/`hipModuleLoadData`/
+/// `hipModuleGetFunction`, keyed by the opaque module handle, so an offline
+/// route-closure audit can attribute every resolved symbol to its loaded
+/// image. Read per call from the installed process config (module loads are
+/// cold-path); nothing is logged before the config is installed.
+fn module_load_audit_enabled() -> bool {
+    hipfire_config::active_process_config()
+        .and_then(|config| config.legacy_value("HIPFIRE_MODULE_LOAD_AUDIT"))
+        .as_deref()
+        == Some("1")
+}
+
+/// FNV-1a 64 over an embedded image; identifies the image in the audit line.
+fn module_image_fnv64(image: &[u8]) -> u64 {
+    image.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, &byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
 /// Arm `count` injected failures for one fault class (`upload`, `launch`,
 /// `sync`), or disarm with `count == 0`. This is the test-facing arming API:
 /// it writes the atomics directly, so no process-global environment state is
@@ -293,6 +313,10 @@ pub const HIP_MEM_LOCATION_TYPE_DEVICE: u32 = 1;
 pub const HIP_MEM_LOCATION_TYPE_HOST: u32 = 2;
 pub const HIP_MEM_ALLOCATION_TYPE_PINNED: u32 = 1;
 pub const HIP_MEM_ACCESS_FLAGS_PROT_READ_WRITE: u32 = 3;
+/// `hipMemAccessFlagsProtRead`: read-only mapping access.
+pub const HIP_MEM_ACCESS_FLAGS_PROT_READ: u32 = 1;
+/// `hipMemHandleTypePosixFileDescriptor`: shareable-handle type of a POSIX FD.
+pub const HIP_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR: u32 = 1;
 pub const HIP_MEM_ALLOCATION_GRANULARITY_MINIMUM: u32 = 0;
 pub const HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED: u32 = 1;
 /// Dependency event: omit profiling state and retain the default system fence.
@@ -386,6 +410,14 @@ impl HipMemAllocationProp {
             },
         }
     }
+
+    /// Device pinned allocation exportable as a POSIX file descriptor
+    /// (`requestedHandleTypes = hipMemHandleTypePosixFileDescriptor`).
+    pub fn device_pinned_posix_fd(device: i32) -> Self {
+        let mut prop = Self::device_pinned(device);
+        prop.requested_handle_types = HIP_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+        prop
+    }
 }
 
 #[repr(C)]
@@ -400,6 +432,14 @@ impl HipMemAccessDesc {
         Self {
             location: HipMemLocation::device(device),
             flags: HIP_MEM_ACCESS_FLAGS_PROT_READ_WRITE,
+        }
+    }
+
+    /// Read-only access for one device.
+    pub fn read_only_device(device: i32) -> Self {
+        Self {
+            location: HipMemLocation::device(device),
+            flags: HIP_MEM_ACCESS_FLAGS_PROT_READ,
         }
     }
 }
@@ -470,6 +510,17 @@ pub struct HipRuntime {
     fn_mem_set_access:
         Option<unsafe extern "C" fn(*mut c_void, usize, *const HipMemAccessDesc, usize) -> u32>,
     fn_mem_release: Option<unsafe extern "C" fn(HipMemGenericAllocationHandle) -> u32>,
+    /// `hipMemExportToShareableHandle(void *out, handle, type, flags)`.
+    fn_mem_export_to_shareable_handle: Option<
+        unsafe extern "C" fn(*mut c_void, HipMemGenericAllocationHandle, u32, u64) -> u32,
+    >,
+    /// `hipMemImportFromShareableHandle(handle *out, void *osHandle, type)`.
+    fn_mem_import_from_shareable_handle: Option<
+        unsafe extern "C" fn(*mut HipMemGenericAllocationHandle, *mut c_void, u32) -> u32,
+    >,
+    /// `hipMemGetAccess(unsigned long long *flags, const hipMemLocation *, void *ptr)`.
+    fn_mem_get_access:
+        Option<unsafe extern "C" fn(*mut u64, *const HipMemLocation, *mut c_void) -> u32>,
 
     // Streams
     fn_stream_create: unsafe extern "C" fn(*mut HipStream) -> u32,
@@ -917,6 +968,33 @@ impl HipRuntime {
                     lib,
                     "hipMemRelease",
                     unsafe extern "C" fn(HipMemGenericAllocationHandle) -> u32
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_mem_export_to_shareable_handle: unsafe { load_optional_fn!(
+                    lib,
+                    "hipMemExportToShareableHandle",
+                    unsafe extern "C" fn(
+                        *mut c_void,
+                        HipMemGenericAllocationHandle,
+                        u32,
+                        u64,
+                    ) -> u32
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_mem_import_from_shareable_handle: unsafe { load_optional_fn!(
+                    lib,
+                    "hipMemImportFromShareableHandle",
+                    unsafe extern "C" fn(
+                        *mut HipMemGenericAllocationHandle,
+                        *mut c_void,
+                        u32,
+                    ) -> u32
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_mem_get_access: unsafe { load_optional_fn!(
+                    lib,
+                    "hipMemGetAccess",
+                    unsafe extern "C" fn(*mut u64, *const HipMemLocation, *mut c_void) -> u32
                 ) },
                 // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
                 fn_stream_create: unsafe { load_fn!(
@@ -1588,6 +1666,90 @@ impl HipRuntime {
         self.check(code, "hipMemRelease")
     }
 
+    /// Export a live exportable (POSIX-FD) physical allocation handle as a new
+    /// file descriptor. The FD is an independent reference to the allocation:
+    /// the physical memory outlives `mem_release(handle)` until every FD and
+    /// importer reference is gone. The exporting runtime must have created
+    /// `handle` with `HipMemAllocationProp::device_pinned_posix_fd`.
+    ///
+    /// `handle` is an opaque HIP allocation handle; Rust never dereferences it.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn mem_export_posix(
+        &self,
+        handle: HipMemGenericAllocationHandle,
+    ) -> HipResult<std::os::fd::OwnedFd> {
+        use std::os::fd::FromRawFd;
+        let func = self.missing_vmm_symbol(
+            "hipMemExportToShareableHandle",
+            self.fn_mem_export_to_shareable_handle,
+        )?;
+        // The runtime writes an integer FD through the output address.
+        let mut fd: c_int = -1;
+        // SAFETY: `fd` is a live stack c_int receiving the descriptor; the
+        // handle is an opaque runtime handle; flags are zero per the HIP API.
+        let code = unsafe {
+            func(
+                &mut fd as *mut c_int as *mut c_void,
+                handle,
+                HIP_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
+                0,
+            )
+        };
+        self.check(code, "hipMemExportToShareableHandle")?;
+        if fd < 0 {
+            return Err(HipError::new(
+                0,
+                "hipMemExportToShareableHandle returned success with an invalid file descriptor",
+            ));
+        }
+        // SAFETY: on success the runtime transferred a fresh FD to this caller;
+        // nothing else owns it.
+        Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+    }
+
+    /// Import a POSIX-FD shareable handle exported by another process (or
+    /// this one). The FD is passed by value (`(void *)(intptr_t)fd`, the
+    /// convention G0 verified on the installed runtime) and is NOT consumed:
+    /// the caller keeps ownership and may close it after import. The returned
+    /// handle is owned by the caller and must be released with `mem_release`
+    /// after every mapping of it is unmapped.
+    pub fn mem_import_posix(
+        &self,
+        fd: std::os::fd::BorrowedFd<'_>,
+    ) -> HipResult<HipMemGenericAllocationHandle> {
+        use std::os::fd::AsRawFd;
+        let func = self.missing_vmm_symbol(
+            "hipMemImportFromShareableHandle",
+            self.fn_mem_import_from_shareable_handle,
+        )?;
+        let mut handle: HipMemGenericAllocationHandle = ptr::null_mut();
+        // SAFETY: `handle` is a stack out-param; the FD is encoded by value as
+        // the runtime expects and stays valid (borrowed) for the call.
+        let code = unsafe {
+            func(
+                &mut handle,
+                fd.as_raw_fd() as isize as *mut c_void,
+                HIP_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
+            )
+        };
+        self.check(code, "hipMemImportFromShareableHandle")?;
+        Ok(handle)
+    }
+
+    /// Query the access flags (`HIP_MEM_ACCESS_FLAGS_PROT_*`) `location` has
+    /// on the mapped VMM address `ptr` (`hipMemGetAccess`). Optional symbol:
+    /// errors when this runtime lacks it. `ptr` is an opaque GPU address.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn mem_get_access(&self, location: &HipMemLocation, ptr: *mut c_void) -> HipResult<u32> {
+        let func = self.missing_vmm_symbol("hipMemGetAccess", self.fn_mem_get_access)?;
+        let mut flags: u64 = 0;
+        // SAFETY: `flags` and `location` are valid for the call; `ptr` is an
+        // opaque GPU address the runtime validates.
+        let code = unsafe { func(&mut flags, location as *const HipMemLocation, ptr) };
+        self.check(code, "hipMemGetAccess")?;
+        Ok(flags as u32)
+    }
+
     /// Return the base and byte extent of the HIP allocation containing
     /// `device_ptr`. This is used by retained replay to conservatively treat
     /// distinct subviews of one allocation as aliasing resources.
@@ -1996,6 +2158,15 @@ impl HipRuntime {
         self.check(code, "hipStreamSynchronize")
     }
 
+    /// Synchronize the legacy default (NULL) stream: the stream HIP uses when a
+    /// caller passes no stream. Same fault injection and `stream_sync` counter as
+    /// [`Self::stream_synchronize`]. It waits on that one stream only, never the
+    /// whole device. `Stream` has no `Drop`, so the temporary NULL handle is never
+    /// destroyed.
+    pub fn stream_synchronize_default(&self) -> HipResult<()> {
+        self.stream_synchronize(&Stream(ptr::null_mut()))
+    }
+
     pub fn stream_destroy(&self, stream: Stream) -> HipResult<()> {
         // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
         // wrappers; out-params are stack locals. Destroy/sync require the caller
@@ -2015,6 +2186,9 @@ impl HipRuntime {
         // unsafe fn caller's contract when applicable.
         let code = unsafe { (self.fn_module_load)(&mut module, c_path.as_ptr()) };
         self.check(code, "hipModuleLoad")?;
+        if module_load_audit_enabled() {
+            eprintln!("HIPFIRE_MODULE_LOAD_AUDIT\tload\t{:p}\t{path}", module);
+        }
         Ok(Module(module))
     }
 
@@ -2026,6 +2200,14 @@ impl HipRuntime {
             // unsafe fn caller's contract when applicable.
             unsafe { (self.fn_module_load_data)(&mut module, image.as_ptr() as *const c_void) };
         self.check(code, "hipModuleLoadData")?;
+        if module_load_audit_enabled() {
+            eprintln!(
+                "HIPFIRE_MODULE_LOAD_AUDIT\tload_data\t{:p}\t{}\t{:016x}",
+                module,
+                image.len(),
+                module_image_fnv64(image)
+            );
+        }
         Ok(Module(module))
     }
 
@@ -2038,6 +2220,9 @@ impl HipRuntime {
         // unsafe fn caller's contract when applicable.
         let code = unsafe { (self.fn_module_get_function)(&mut func, module.0, c_name.as_ptr()) };
         self.check(code, "hipModuleGetFunction")?;
+        if module_load_audit_enabled() {
+            eprintln!("HIPFIRE_MODULE_LOAD_AUDIT\tget_function\t{:p}\t{name}", module.0);
+        }
         Ok(Function(func))
     }
 

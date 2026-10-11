@@ -920,6 +920,12 @@ pub trait Speculator {
     fn verify_pm4_report(&self) -> Option<serde_json::Value> {
         None
     }
+
+    /// The concrete drafter, for an arch-owned hand-off of its live state
+    /// (continuous-batching promotion of a running request). Default `None`.
+    fn drafter_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        None
+    }
 }
 
 // ─── Multi-token-prediction (MTP) drafter core ──────────────────────────────
@@ -948,8 +954,8 @@ pub struct SpecRequestConfig {
     pub top_p: f32,
     /// Request top-k as sent; `None` = absent. The host AR sampler
     /// distinguishes absent (20 candidates) from `Some(0)` (its 64-wide
-    /// pool), so a verifier that reproduces it reads this directly; chain
-    /// verifiers take [`Self::top_k_cut`].
+    /// pool); verifiers that reproduce it take [`Self::ar_candidate_cap`],
+    /// the remaining chain verifiers [`Self::top_k_cut`].
     pub top_k: Option<u32>,
     /// Min-p truncation floor. `0.0` disables.
     pub min_p: f32,
@@ -996,6 +1002,14 @@ impl SpecRequestConfig {
     /// `Some(0)` both disable.
     pub fn top_k_cut(&self) -> usize {
         self.top_k.map_or(0, |k| k as usize)
+    }
+
+    /// The AR sampler's candidate cap for this request
+    /// ([`crate::llama::ar_candidate_cap`]): absent → 20, `Some(0)` → 64,
+    /// `Some(k)` → `min(k, 64)`. Never 0, so a verifier taking it as its
+    /// top-k always truncates to AR's pool.
+    pub fn ar_candidate_cap(&self) -> usize {
+        crate::llama::ar_candidate_cap(self.top_k)
     }
 
     /// Whether the request's penalties move the target distribution: the
@@ -1281,7 +1295,7 @@ fn mtp_draft_k(arch_k: usize, max_emit: usize) -> usize {
     max_emit.saturating_sub(1).min(arch_k)
 }
 
-impl<A: MtpDrafter> Speculator for MtpSpeculator<A> {
+impl<A: MtpDrafter + 'static> Speculator for MtpSpeculator<A> {
     fn name(&self) -> &'static str {
         self.arch.name()
     }
@@ -1415,6 +1429,10 @@ impl<A: MtpDrafter> Speculator for MtpSpeculator<A> {
 
     fn free_multi(self: Box<Self>, gpus: &mut crate::multi_gpu::Gpus) {
         Box::new(self.arch).mtp_free_multi(gpus);
+    }
+
+    fn drafter_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(&mut self.arch)
     }
 
     fn requires_greedy(&self) -> bool {

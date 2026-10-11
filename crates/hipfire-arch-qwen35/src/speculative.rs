@@ -17,7 +17,7 @@
 //! speculative decode serializes draft-generate then target-verify).
 
 use crate::carrier::Qwen35Bundle;
-use crate::dflash_spec::DenseTpDflashRankState;
+use crate::dflash_spec::{DenseTpDflashRankState, DflashState};
 use crate::dflash_verify_pm4::{
     fingerprint_u64, DflashVerifyBinding, DflashVerifyPm4, DflashVerifyPm4Phase, DflashVerifyRoute,
     DflashVerifyWindow,
@@ -25,6 +25,7 @@ use crate::dflash_verify_pm4::{
 use crate::qwen35::forward::{
     forward_prefill_dense_tp, forward_prefill_dense_tp_verify_capture, DenseTpSpecCapture,
 };
+use crate::qwen35::prefill::{fp8_verify_target, verify_dense_math, DenseBatchMath};
 use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
 use hip_bridge::{DeviceBuffer, HipError, HipResult, Stream};
 use hipfire_dispatch::families::kv_tier::KTier;
@@ -35,7 +36,7 @@ use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::tokenizer::{Tokenizer, TokenizerError};
 use hipfire_runtime::tp_shard::ShardConfig;
 use rdna_compute::dflash_state_copy::{DflashStateCopyDesc, DFLASH_STATE_BULK_COPY_MAX_ITEMS};
-use rdna_compute::{DType, Gpu, GpuTensor};
+use rdna_compute::{DType, Fp8VerifyTarget, Gpu, GpuTensor};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -205,6 +206,29 @@ fn gemm_mq_batched_lmhead(
     }
 }
 
+/// [`gemm_mq_batched_lmhead`] for the DFlash **draft** head: first the draft
+/// GEMM layer's overwrite route ([`dflash::draft_lm_head_overwrite`], exact
+/// gfx1201 MQ4G256V2, byte-identical to the memset + residual pair it
+/// replaces; `HIPFIRE_DRAFT_COLLAPSE_OFF=1` vetoes it), else the shared
+/// launcher.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn gemm_mq_batched_lmhead_draft(
+    gpu: &mut Gpu,
+    dtype: rdna_compute::DType,
+    w_buf: &GpuTensor,
+    rotated: &GpuTensor,
+    logits: &GpuTensor,
+    m: usize,
+    k: usize,
+    batch: usize,
+) -> HipResult<()> {
+    if dflash::draft_lm_head_overwrite(gpu, dtype, w_buf, rotated, logits, m, k, batch)? {
+        return Ok(());
+    }
+    gemm_mq_batched_lmhead(gpu, dtype, w_buf, rotated, logits, m, k, batch)
+}
+
 fn dflash_moe_verify_graph_lmhead_enabled_from_env_value(value: Option<&str>) -> bool {
     match value {
         Some(v) => {
@@ -309,14 +333,24 @@ fn dflash_batched_lm_head_supported(dtype: rdna_compute::DType) -> bool {
     )
 }
 
-fn dflash_enqueue_verify_lm_head(
+pub(crate) fn dflash_enqueue_verify_lm_head(
     gpu: &mut Gpu,
     w_out: &llama::WeightTensor,
     final_hidden: &GpuTensor,
     verify_scratch: &VerifyScratch,
     b: usize,
     vocab: usize,
+    math: DenseBatchMath,
 ) -> HipResult<()> {
+    if math == DenseBatchMath::SingletonWmma && w_out.gpu_dtype != rdna_compute::DType::MQ4G256V2 {
+        return Err(HipError::new(
+            0,
+            &format!(
+                "DFlash verify lm_head: SingletonWmma verify math requires a dense MQ4G256V2 head, got {:?}",
+                w_out.gpu_dtype
+            ),
+        ));
+    }
     let logits_batch = verify_scratch.logits.sub_offset(0, b * vocab);
     match w_out.gpu_dtype {
         rdna_compute::DType::Q8_0 => {
@@ -369,16 +403,30 @@ fn dflash_enqueue_verify_lm_head(
             );
             let rot = verify_scratch.rot.sub_offset(0, b * w_out.k);
             llama::rotate_x_mq_batched_for(gpu, w_out, final_hidden, &rot, w_out.k, b)?;
-            gemm_mq_batched_lmhead(
-                gpu,
-                w_out.gpu_dtype,
-                &w_out.buf,
-                &rot,
-                &logits_batch,
-                w_out.m,
-                w_out.k,
-                b,
-            )?;
+            if math == DenseBatchMath::SingletonWmma {
+                run_spec_gemm_key(
+                    gpu,
+                    hipfire_dispatch::types::KernelKey::GemmMq4G256V2LmheadVerifyExact,
+                    &w_out.buf,
+                    w_out.gpu_dtype,
+                    &rot,
+                    &logits_batch,
+                    w_out.m,
+                    w_out.k,
+                    b,
+                )?;
+            } else {
+                gemm_mq_batched_lmhead(
+                    gpu,
+                    w_out.gpu_dtype,
+                    &w_out.buf,
+                    &rot,
+                    &logits_batch,
+                    w_out.m,
+                    w_out.k,
+                    b,
+                )?;
+            }
         }
         rdna_compute::DType::MQ3G256 => {
             assert!(
@@ -446,21 +494,22 @@ fn dflash_enqueue_verify_lm_head(
     Ok(())
 }
 
-fn dflash_enqueue_verify_lm_head_argmax(
+pub(crate) fn dflash_enqueue_verify_lm_head_argmax(
     gpu: &mut Gpu,
     w_out: &llama::WeightTensor,
     final_hidden: &GpuTensor,
     verify_scratch: &VerifyScratch,
     b: usize,
     vocab: usize,
+    math: DenseBatchMath,
 ) -> HipResult<()> {
-    dflash_enqueue_verify_lm_head(gpu, w_out, final_hidden, verify_scratch, b, vocab)?;
+    dflash_enqueue_verify_lm_head(gpu, w_out, final_hidden, verify_scratch, b, vocab, math)?;
     let logits_batch = verify_scratch.logits.sub_offset(0, b * vocab);
     let argmax_buf = verify_scratch.argmax.sub_offset(0, b);
     gpu.argmax_f32_batched(&logits_batch, &argmax_buf, vocab, b)
 }
 
-fn dflash_download_verify_argmax(
+pub(crate) fn dflash_download_verify_argmax(
     gpu: &Gpu,
     verify_scratch: &VerifyScratch,
     b: usize,
@@ -486,7 +535,7 @@ fn dflash_download_verify_argmax(
 /// top-K candidate row when temperature>0 (not raw unary logits); greedy may
 /// return `None` probabilities.
 fn apply_dflash2_selector_proposal(
-    proposal: dflash::DflashCandidateProposal,
+    proposal: &dflash::DflashCandidateProposal,
     vocab: usize,
     use_temp_sampling: bool,
     drafted: &mut Vec<u32>,
@@ -540,10 +589,15 @@ fn apply_dflash2_selector_proposal(
             ));
         }
         drafted.extend_from_slice(&proposal.tokens);
-        draft_softmaxes.reserve(rows);
+        if draft_softmaxes.len() < rows {
+            draft_softmaxes.resize_with(rows, Vec::new);
+        }
+        draft_probs_at_drafted.clear();
         draft_probs_at_drafted.reserve(rows);
         for i in 0..rows {
-            let mut row = vec![0f32; vocab];
+            let row = &mut draft_softmaxes[i];
+            row.clear();
+            row.resize(vocab, 0.0);
             let off = i * top_k;
             for j in 0..top_k {
                 let cand = proposal.candidates[off + j] as usize;
@@ -557,7 +611,7 @@ fn apply_dflash2_selector_proposal(
                     ));
                 }
             }
-            draft_softmaxes.push(row);
+            // Retain extra reserved rows for a later, wider window.
             draft_probs_at_drafted.push(sel[i]);
         }
         Ok(())
@@ -802,6 +856,26 @@ impl ModelSlot {
     /// `Qwen35Bundle` field knowledge the loader's guard previously inlined; it
     /// lives here so the loader never names the bundle's fields.
     pub fn from_bundle(bundle: Qwen35Bundle, path: &Path) -> Result<Self, (Qwen35Bundle, String)> {
+        // Batch owners (fixed-lane staging or the per-request VMM store) are
+        // outside the spec slot. Refuse WITHOUT loss rather than dropping
+        // them here: a dropped store would leak its request VMM leases and
+        // strand those requests' state. A request leaving the batch for the
+        // singleton spec route first swaps its owners into the bundle
+        // (`Qwen35RequestState::swap_with_bundle`) and the driver parks the
+        // store before entering this seam.
+        if bundle.qwen35_decode_batch.is_some() || bundle.vmm_store.is_some() {
+            return Err((
+                bundle,
+                "ModelSlot::from_bundle: batch state is staged on the bundle; park it before speculative takeover"
+                    .into(),
+            ));
+        }
+        if bundle.weight_lease.is_some() {
+            return Err((
+                bundle,
+                "ModelSlot::from_bundle: weight-host imported weights are not admitted to speculative decode".into(),
+            ));
+        }
         let hfq = match HfqFile::open(path) {
             Ok(h) => h,
             Err(e) => return Err((bundle, format!("reopen model: {e}"))),
@@ -816,18 +890,15 @@ impl ModelSlot {
             pp_scratch_set,
             vision_config,
             vision_weights,
-            qwen35_decode_batch,
+            qwen35_decode_batch: _,
+            vmm_store: _,
+            weight_lease: _,
         } = bundle;
         debug_assert!(
             pp_scratch_set.is_none(),
             "ModelSlot::from_bundle: pp_scratch_set must be None (pp>1 never enters spec slot)"
         );
         let _ = pp_scratch_set;
-        debug_assert!(
-            qwen35_decode_batch.is_none(),
-            "ModelSlot::from_bundle: qwen35_decode_batch must be None (batch staging is outside spec slot)"
-        );
-        let _ = qwen35_decode_batch;
         Ok(Self {
             name: String::from("target"),
             hfq,
@@ -860,6 +931,8 @@ impl ModelSlot {
             vision_config: self.vision_config,
             vision_weights: self.vision_weights,
             qwen35_decode_batch: None,
+            vmm_store: None,
+            weight_lease: None,
         }
     }
 }
@@ -1023,6 +1096,53 @@ impl ModelSlot {
         self.kv_cache.compact_offset = 0;
         Ok(())
     }
+}
+
+/// Borrow-only trunk owners a DFlash prompt seed / verify commit / terminal
+/// repair touches: a [`ModelSlot`]'s, or a continuous-batching request's own
+/// KV/DeltaNet over the shared weights. DFlash counterpart of
+/// [`crate::mtp_spec::MtpPrefillTarget`].
+pub struct DflashTargetParts<'a> {
+    pub weights: &'a Qwen35Weights,
+    pub config: &'a Qwen35Config,
+    pub kv_cache: &'a mut KvCache,
+    pub dn_state: &'a mut DeltaNetState,
+    pub scratch: &'a Qwen35Scratch,
+}
+
+impl<'a> DflashTargetParts<'a> {
+    /// Borrow a [`ModelSlot`]'s trunk owners.
+    pub fn from_slot(slot: &'a mut ModelSlot) -> Self {
+        Self {
+            weights: &slot.weights,
+            config: &slot.config,
+            kv_cache: &mut slot.kv_cache,
+            dn_state: &mut slot.dn_state,
+            scratch: &slot.scratch,
+        }
+    }
+
+    /// Same as [`ModelSlot::reset_state`]: zero the DeltaNet recurrent state
+    /// (incl. EF residual) and the KV compact offset.
+    pub fn reset_state(&mut self, gpu: &mut Gpu) -> HipResult<()> {
+        self.dn_state.reset(gpu)?;
+        self.kv_cache.compact_offset = 0;
+        Ok(())
+    }
+}
+
+/// One planned DFlash verify window handed to the batched verify/accept path.
+/// `verify_tokens = [seed, B-1 draft candidates]`; `position` is the absolute
+/// position of `verify_tokens[0]`; `max_accept` is the pre-commit clamp
+/// (`remaining_budget - 1`); `thlog_mark` is the draft target-hidden log mark
+/// captured before drafting (the singleton's window mark).
+#[derive(Clone, Debug)]
+pub struct DflashCbDraft {
+    pub position: usize,
+    pub seed: u32,
+    pub verify_tokens: Vec<u32>,
+    pub max_accept: usize,
+    pub thlog_mark: dflash::TargetHiddenLogMark,
 }
 
 /// A pair of target + draft slots sharing one `Gpu` and one tokenizer.
@@ -1325,23 +1445,30 @@ impl DeltaNetSnapshot {
     }
 
     /// Allocate backup buffers matching `state`'s shapes (incl. EF residual).
+    /// A mid-way allocation failure frees the buffers already allocated.
     pub fn new_for(gpu: &mut Gpu, state: &DeltaNetState) -> HipResult<Self> {
-        let mut s_matrix_bufs = Vec::with_capacity(state.s_matrices.len());
-        for t in &state.s_matrices {
-            s_matrix_bufs.push(gpu.hip.malloc(t.buf.size())?);
+        let families = [
+            &state.s_matrices,
+            &state.s_scales,
+            &state.conv_states,
+            &state.s_ef_residual,
+        ];
+        let mut bufs: [Vec<DeviceBuffer>; 4] = Default::default();
+        for (i, src) in families.into_iter().enumerate() {
+            bufs[i].reserve_exact(src.len());
+            for t in src {
+                match gpu.hip.malloc(t.buf.size()) {
+                    Ok(b) => bufs[i].push(b),
+                    Err(e) => {
+                        for b in bufs.into_iter().flatten() {
+                            let _ = gpu.hip.free(b);
+                        }
+                        return Err(e);
+                    }
+                }
+            }
         }
-        let mut s_scale_bufs = Vec::with_capacity(state.s_scales.len());
-        for t in &state.s_scales {
-            s_scale_bufs.push(gpu.hip.malloc(t.buf.size())?);
-        }
-        let mut conv_state_bufs = Vec::with_capacity(state.conv_states.len());
-        for t in &state.conv_states {
-            conv_state_bufs.push(gpu.hip.malloc(t.buf.size())?);
-        }
-        let mut s_ef_residual_bufs = Vec::with_capacity(state.s_ef_residual.len());
-        for t in &state.s_ef_residual {
-            s_ef_residual_bufs.push(gpu.hip.malloc(t.buf.size())?);
-        }
+        let [s_matrix_bufs, s_scale_bufs, conv_state_bufs, s_ef_residual_bufs] = bufs;
         let mut snap = Self {
             s_matrix_bufs,
             s_scale_bufs,
@@ -1443,21 +1570,26 @@ impl DeltaNetSnapshot {
             Self::bulk_sync(gpu)?;
             return Ok(());
         }
+        // Copy the common buffer extent: a snapshot may be restored into (or
+        // saved from) a DeltaNet state other than the one it was sized from
+        // (VMM prefix reuse moves conversations between owners); shapes match
+        // and pool rounding only pads, so the common extent covers every
+        // element and never overruns either side.
         for (dst, src) in self.s_matrix_bufs.iter().zip(state.s_matrices.iter()) {
-            gpu.hip.memcpy_dtod(dst, &src.buf, src.buf.size())?;
+            gpu.hip.memcpy_dtod(dst, &src.buf, src.buf.size().min(dst.size()))?;
         }
         for (dst, src) in self.s_scale_bufs.iter().zip(state.s_scales.iter()) {
-            gpu.hip.memcpy_dtod(dst, &src.buf, src.buf.size())?;
+            gpu.hip.memcpy_dtod(dst, &src.buf, src.buf.size().min(dst.size()))?;
         }
         for (dst, src) in self.conv_state_bufs.iter().zip(state.conv_states.iter()) {
-            gpu.hip.memcpy_dtod(dst, &src.buf, src.buf.size())?;
+            gpu.hip.memcpy_dtod(dst, &src.buf, src.buf.size().min(dst.size()))?;
         }
         for (dst, src) in self
             .s_ef_residual_bufs
             .iter()
             .zip(state.s_ef_residual.iter())
         {
-            gpu.hip.memcpy_dtod(dst, &src.buf, src.buf.size())?;
+            gpu.hip.memcpy_dtod(dst, &src.buf, src.buf.size().min(dst.size()))?;
         }
         Ok(())
     }
@@ -1518,21 +1650,22 @@ impl DeltaNetSnapshot {
             Self::bulk_sync(gpu)?;
             return Ok(());
         }
+        // Common extent (see `save_from`).
         for (src, dst) in self.s_matrix_bufs.iter().zip(state.s_matrices.iter()) {
-            gpu.hip.memcpy_dtod(&dst.buf, src, src.size())?;
+            gpu.hip.memcpy_dtod(&dst.buf, src, src.size().min(dst.buf.size()))?;
         }
         for (src, dst) in self.s_scale_bufs.iter().zip(state.s_scales.iter()) {
-            gpu.hip.memcpy_dtod(&dst.buf, src, src.size())?;
+            gpu.hip.memcpy_dtod(&dst.buf, src, src.size().min(dst.buf.size()))?;
         }
         for (src, dst) in self.conv_state_bufs.iter().zip(state.conv_states.iter()) {
-            gpu.hip.memcpy_dtod(&dst.buf, src, src.size())?;
+            gpu.hip.memcpy_dtod(&dst.buf, src, src.size().min(dst.buf.size()))?;
         }
         for (src, dst) in self
             .s_ef_residual_bufs
             .iter()
             .zip(state.s_ef_residual.iter())
         {
-            gpu.hip.memcpy_dtod(&dst.buf, src, src.size())?;
+            gpu.hip.memcpy_dtod(&dst.buf, src, src.size().min(dst.buf.size()))?;
         }
         Ok(())
     }
@@ -1659,14 +1792,78 @@ pub struct GdnTape {
     pub q_scratch: GpuTensor,     // [max_n × v_dim] (post repeat-interleave)
     pub k_scratch: GpuTensor,     // [max_n × v_dim]
     pub attn_scratch: GpuTensor,  // [max_n × v_dim]
-    /// Railgun E0 / L6c multi-layer replay state (gfx1201). `None` until the
-    /// first eligible replay arms it; `Some(None)` when arming failed (the
-    /// per-layer path then runs for the life of the tape).
-    replay_ml: std::sync::Mutex<Option<Option<GdnReplayMl>>>,
+    /// Railgun E0 / L6c multi-layer replay state (gfx1201). Armed by
+    /// [`Self::new_for_config`] whenever the process supports the route
+    /// (`Gpu::gdn_replay_ml_supported`); `None` for a capture-only tape or an
+    /// unsupported process. An admitted replay on an unarmed tape is an
+    /// error, never a silent switch to the per-layer route.
+    replay_ml: std::sync::Mutex<Option<GdnReplayMl>>,
 }
 
 impl GdnTape {
+    /// Replay tape: [`Self::new_capture_only`] plus the multi-layer replay
+    /// tables, armed here so an allocation failure refuses the tape at
+    /// provision/admission instead of changing the committed DeltaNet
+    /// numerics at a later accept. Any failure frees everything allocated
+    /// and returns the error.
     pub fn new_for_config(
+        gpu: &mut Gpu,
+        config: &qwen35::Qwen35Config,
+        max_n: usize,
+    ) -> HipResult<Self> {
+        Self::new_armed(gpu, config, max_n, false)
+    }
+
+    /// DFlash replay tape: [`Self::new_for_config`] plus, when
+    /// `HIPFIRE_DN_SNAPSHOT_FLIP` is on, the D8 snapshot-source tables that
+    /// [`Self::replay_gdn_from_snapshot`] needs.
+    pub fn new_for_dflash(
+        gpu: &mut Gpu,
+        config: &qwen35::Qwen35Config,
+        max_n: usize,
+    ) -> HipResult<Self> {
+        Self::new_armed(gpu, config, max_n, gpu.flags.dn_snapshot_flip)
+    }
+
+    fn new_armed(
+        gpu: &mut Gpu,
+        config: &qwen35::Qwen35Config,
+        max_n: usize,
+        with_from: bool,
+    ) -> HipResult<Self> {
+        let mut tape = Self::new_capture_only(gpu, config, max_n)?;
+        let n_la = tape.qkv_bufs.len();
+        if n_la != 0
+            && gpu.gdn_replay_ml_supported(
+                tape.n_v_heads,
+                tape.n_key_heads,
+                tape.key_head_dim,
+                tape.value_head_dim,
+            )
+        {
+            match GdnReplayMl::arm(gpu, n_la, max_n, tape.v_dim, with_from) {
+                Ok(ml) => *tape.replay_ml.get_mut().unwrap_or_else(|e| e.into_inner()) = Some(ml),
+                Err(e) => {
+                    eprintln!(
+                        "GdnTape: arming the multi-layer GDN replay failed ({e}); \
+                         refusing the tape (n_la={n_la} max_n={max_n} d8={with_from})"
+                    );
+                    tape.free_gpu(gpu);
+                    return Err(e);
+                }
+            }
+        }
+        Ok(tape)
+    }
+
+    /// Capture-only tape: the per-layer qkv/α/β capture buffers and the
+    /// per-layer replay scratch, without the multi-layer replay tables. For
+    /// tapes that are only written by a verify forward and read by an
+    /// explicit per-layer repair (the serve engine's batched verify tape);
+    /// [`Self::replay_gdn`] on it fails wherever the multi-layer route
+    /// would be admitted. A mid-way allocation failure frees what was
+    /// allocated.
+    pub fn new_capture_only(
         gpu: &mut Gpu,
         config: &qwen35::Qwen35Config,
         max_n: usize,
@@ -1682,13 +1879,41 @@ impl GdnTape {
             .filter(|t| **t == qwen35::LayerType::LinearAttention)
             .count();
 
+        // Per layer (qkv, α, β), then the six replay scratches, in the
+        // historical allocation order.
+        let mut sizes = Vec::with_capacity(3 * n_la_layers + 6);
+        for _ in 0..n_la_layers {
+            sizes.extend([max_n * qkv_dim, max_n * n_v_heads, max_n * n_v_heads]);
+        }
+        sizes.extend([
+            max_n * k_dim,
+            max_n * k_dim,
+            max_n * v_dim,
+            max_n * v_dim,
+            max_n * v_dim,
+            max_n * v_dim,
+        ]);
+        let mut bufs = Vec::with_capacity(sizes.len());
+        for n in sizes {
+            match gpu.alloc_tensor(&[n], rdna_compute::DType::F32) {
+                Ok(t) => bufs.push(t),
+                Err(e) => {
+                    for t in bufs {
+                        let _ = gpu.free_tensor(t);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        let mut bufs = bufs.into_iter();
+        let mut next = || bufs.next().expect("allocated above");
         let mut qkv_bufs = Vec::with_capacity(n_la_layers);
         let mut alpha_bufs = Vec::with_capacity(n_la_layers);
         let mut beta_bufs = Vec::with_capacity(n_la_layers);
         for _ in 0..n_la_layers {
-            qkv_bufs.push(gpu.alloc_tensor(&[max_n * qkv_dim], rdna_compute::DType::F32)?);
-            alpha_bufs.push(gpu.alloc_tensor(&[max_n * n_v_heads], rdna_compute::DType::F32)?);
-            beta_bufs.push(gpu.alloc_tensor(&[max_n * n_v_heads], rdna_compute::DType::F32)?);
+            qkv_bufs.push(next());
+            alpha_bufs.push(next());
+            beta_bufs.push(next());
         }
 
         Ok(Self {
@@ -1703,12 +1928,12 @@ impl GdnTape {
             qkv_bufs,
             alpha_bufs,
             beta_bufs,
-            q_raw_scratch: gpu.alloc_tensor(&[max_n * k_dim], rdna_compute::DType::F32)?,
-            k_raw_scratch: gpu.alloc_tensor(&[max_n * k_dim], rdna_compute::DType::F32)?,
-            v_scratch: gpu.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?,
-            q_scratch: gpu.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?,
-            k_scratch: gpu.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?,
-            attn_scratch: gpu.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?,
+            q_raw_scratch: next(),
+            k_raw_scratch: next(),
+            v_scratch: next(),
+            q_scratch: next(),
+            k_scratch: next(),
+            attn_scratch: next(),
             replay_ml: std::sync::Mutex::new(None),
         })
     }
@@ -1728,7 +1953,7 @@ impl GdnTape {
         let _ = gpu.free_tensor(self.q_scratch);
         let _ = gpu.free_tensor(self.k_scratch);
         let _ = gpu.free_tensor(self.attn_scratch);
-        if let Some(Some(ml)) = self
+        if let Some(ml) = self
             .replay_ml
             .into_inner()
             .unwrap_or_else(|e| e.into_inner())
@@ -1811,7 +2036,7 @@ impl GdnTape {
         Vec<rdna_compute::dflash_gdn_replay::GdnLayerTable>,
     ) {
         let n_la = self.qkv_bufs.len();
-        let row = self.max_n * self.v_dim * 4;
+        let row = ml.shape.rows * self.v_dim * 4;
         let mut pre = Vec::with_capacity(n_la);
         let mut gdn = Vec::with_capacity(n_la);
         let mut la_idx = 0usize;
@@ -1825,9 +2050,10 @@ impl GdnTape {
                 _ => unreachable!("LA layer type mismatch in replay_gdn"),
             };
             let off = (la_idx * row) as u64;
-            let q = ml.q.buf.as_ptr() as u64 + off;
-            let k = ml.k.buf.as_ptr() as u64 + off;
-            let v = ml.v.buf.as_ptr() as u64 + off;
+            let region = ml.shape.region_bytes() as u64;
+            let q = ml.base + off;
+            let k = ml.base + region + off;
+            let v = ml.base + 2 * region + off;
             pre.push(rdna_compute::dflash_gdn_replay::DflashReplayPreLayer {
                 qkv_tape: self.qkv_bufs[la_idx].buf.as_ptr() as u64,
                 conv_w: conv_weight.buf.as_ptr() as u64,
@@ -1844,7 +2070,7 @@ impl GdnTape {
                 beta: self.beta_bufs[la_idx].buf.as_ptr() as u64,
                 s_q8: dn_state.s_matrices[la_idx].buf.as_ptr() as u64,
                 s_scales: dn_state.s_scales[la_idx].buf.as_ptr() as u64,
-                output: ml.out.buf.as_ptr() as u64 + off,
+                output: ml.base + 3 * region + off,
                 ef: dn_state
                     .ef_residual(la_idx)
                     .map_or(0, |t| t.buf.as_ptr() as u64),
@@ -1856,10 +2082,12 @@ impl GdnTape {
 
     /// Railgun E0 / L6c: two-launch replay of every LA layer (preamble, then
     /// recurrence) over device pointer tables. Returns `Ok(false)` — the
-    /// caller then runs the per-layer launches — when the route is
+    /// caller then runs the per-layer launches — only when the route is
     /// ineligible (arch, opt-out, open Redline recording, quant/requant mode,
-    /// dims, step count) or arming failed. Byte parity with the per-layer
-    /// path is gated by `test_dflash_replay_ml`.
+    /// dims, step count). An admitted replay on a tape whose tables were not
+    /// armed at construction (a capture-only tape) is an error: the
+    /// per-layer route is not byte-identical to this one on the production
+    /// model, so it is never a silent fallback.
     fn replay_gdn_ml(
         &self,
         gpu: &mut Gpu,
@@ -1873,11 +2101,8 @@ impl GdnTape {
         }
         let n_la = self.qkv_bufs.len();
         let mut guard = self.replay_ml.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.is_none() {
-            *guard = Some(GdnReplayMl::arm(gpu, n_la, self.max_n, self.v_dim));
-        }
-        let Some(Some(ml)) = guard.as_mut() else {
-            return Ok(false);
+        let Some(ml) = guard.as_mut() else {
+            return Err(Self::unarmed_error("multi-layer"));
         };
         let fp = Self::replay_ml_fingerprint(weights, config, dn_state);
         if ml.fingerprint != Some(fp) {
@@ -1896,6 +2121,7 @@ impl GdnTape {
             )?;
             ml.fingerprint = Some(fp);
         }
+        ml.order(gpu)?;
         let hd = self.key_head_dim;
         gpu.dflash_gdn_replay_pre_ml(
             ml.pre_table.as_ptr() as *const _,
@@ -1944,8 +2170,9 @@ impl GdnTape {
     /// load addresses changed), without the restore copy, and `snap` is not
     /// written, so it stays the pre-window state that terminal repair
     /// restores. Returns `Ok(false)` without touching any state when
-    /// [`Self::replay_from_snapshot_admits`] is false or arming failed; the
-    /// caller then restores and replays in place.
+    /// [`Self::replay_from_snapshot_admits`] is false; the caller then
+    /// restores and replays in place. An admitted call on a tape without
+    /// armed snapshot-source tables is an error and touches no state.
     #[allow(clippy::too_many_arguments)]
     pub fn replay_gdn_from_snapshot(
         &self,
@@ -1961,18 +2188,9 @@ impl GdnTape {
         }
         let n_la = self.qkv_bufs.len();
         let mut guard = self.replay_ml.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.is_none() {
-            *guard = Some(GdnReplayMl::arm(gpu, n_la, self.max_n, self.v_dim));
-        }
-        let Some(Some(ml)) = guard.as_mut() else {
-            return Ok(false);
+        let Some(ml) = guard.as_mut().filter(|ml| ml.from.is_some()) else {
+            return Err(Self::unarmed_error("snapshot-source (D8)"));
         };
-        if ml.from.is_none() {
-            ml.from = Some(GdnReplayMlFrom::arm(gpu, n_la));
-        }
-        if !matches!(ml.from, Some(Some(_))) {
-            return Ok(false);
-        }
         let fp = {
             let mut h = Self::replay_ml_fingerprint(weights, config, dn_state);
             for buf in snap.backup_buffers() {
@@ -1981,7 +2199,7 @@ impl GdnTape {
             }
             h
         };
-        let stale = ml.from.as_ref().and_then(|f| f.as_ref()).map(|f| f.fingerprint) != Some(Some(fp));
+        let stale = ml.from.as_ref().map(|f| f.fingerprint) != Some(Some(fp));
         if stale {
             let (pre, gdn) = self.replay_ml_rows(ml, weights, config, dn_state);
             let pre: Vec<_> = pre
@@ -2005,8 +2223,8 @@ impl GdnTape {
                         .map_or(0, |b| b.as_ptr() as u64),
                 })
                 .collect();
-            let Some(Some(from)) = ml.from.as_mut() else {
-                unreachable!("armed above")
+            let Some(from) = ml.from.as_mut() else {
+                unreachable!("armed at construction")
             };
             // Tables may still be read by an in-flight replay: drain first.
             if from.fingerprint.is_some() {
@@ -2022,8 +2240,9 @@ impl GdnTape {
             )?;
             from.fingerprint = Some(fp);
         }
-        let Some(Some(from)) = ml.from.as_ref() else {
-            unreachable!("armed above")
+        ml.order(gpu)?;
+        let Some(from) = ml.from.as_ref() else {
+            unreachable!("armed at construction")
         };
         let hd = self.key_head_dim;
         gpu.dflash_gdn_replay_pre_ml_from(
@@ -2082,6 +2301,9 @@ impl GdnTape {
         let can_graph = graph_enabled && gpu.active_stream.is_some();
 
         if can_graph && gpu.graphs.replay_has_graph(n_steps) {
+            if let Some(ml) = self.replay_ml.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                ml.order(gpu)?;
+            }
             return gpu.graphs.replay_graph_launch(
                 &gpu.hip,
                 gpu.device_id,
@@ -2304,25 +2526,36 @@ impl GdnTape {
         }
         Ok(())
     }
+
+    fn unarmed_error(route: &str) -> HipError {
+        HipError::new(
+            0,
+            &format!(
+                "GdnTape: the {route} GDN replay is admitted but its tables were not armed at \
+                 construction (capture-only tape); refusing to commit DeltaNet state through \
+                 the per-layer route"
+            ),
+        )
+    }
 }
 
-/// Railgun E0 / L6c: device state of the multi-layer replay. Each LA layer
-/// owns rows `[la * max_n * v_dim, (la + 1) * max_n * v_dim)` of the q/k/v
-/// preamble outputs and of the (dead) recurrence output, so all layers run
-/// concurrently without sharing scratch. `fingerprint` is `None` until the
-/// tables are first written.
+/// Railgun E0 / L6c: device state of the multi-layer replay. The q, k, v and
+/// (dead) recurrence-output scratch are the four regions of the `Gpu`'s
+/// shared replay scratch for `shape`
+/// (`rdna_compute::dflash_gdn_replay::GdnReplaySharedScratch`, which states
+/// why sharing is sound), based at `base`. Within a region each LA layer owns
+/// rows `[la * rows * v_dim, (la + 1) * rows * v_dim)`, so all layers run
+/// concurrently; `rows` is the tape's `max_n` capped at the route's step
+/// ceiling. `fingerprint` is `None` until the tables are first written.
 struct GdnReplayMl {
-    q: GpuTensor,
-    k: GpuTensor,
-    v: GpuTensor,
-    out: GpuTensor,
+    shape: rdna_compute::dflash_gdn_replay::GdnReplayScratchShape,
+    base: u64,
     pre_table: DeviceBuffer,
     gdn_table: DeviceBuffer,
     fingerprint: Option<u64>,
-    /// Railgun D8 snapshot-source tables. `None` until the first D8 replay
-    /// arms them; `Some(None)` when arming failed (D8 then restores and
-    /// replays in place for the life of the tape).
-    from: Option<Option<GdnReplayMlFrom>>,
+    /// Railgun D8 snapshot-source tables; armed by
+    /// [`GdnTape::new_for_dflash`] when `HIPFIRE_DN_SNAPSHOT_FLIP` is on.
+    from: Option<GdnReplayMlFrom>,
 }
 
 /// Railgun D8: device tables of [`GdnTape::replay_gdn_from_snapshot`]
@@ -2337,21 +2570,22 @@ struct GdnReplayMlFrom {
 
 impl GdnReplayMlFrom {
     /// JIT both snapshot-source kernels and allocate the two tables. Any
-    /// failure frees what was allocated and returns `None`.
-    fn arm(gpu: &mut Gpu, n_la: usize) -> Option<Self> {
-        if gpu.ensure_dflash_gdn_replay_ml_from().is_err() {
-            return None;
-        }
+    /// failure frees what was allocated and returns the error.
+    fn arm(gpu: &mut Gpu, n_la: usize) -> HipResult<Self> {
+        gpu.ensure_dflash_gdn_replay_ml_from()?;
         let pre_bytes = n_la
             * std::mem::size_of::<rdna_compute::dflash_gdn_replay::DflashReplayPreLayerFrom>();
         let gdn_bytes =
             n_la * std::mem::size_of::<rdna_compute::dflash_gdn_replay::GdnLayerTableFrom>();
-        let pre_table = gpu.hip.malloc(pre_bytes).ok()?;
-        let Ok(gdn_table) = gpu.hip.malloc(gdn_bytes) else {
-            let _ = gpu.hip.free(pre_table);
-            return None;
+        let pre_table = gpu.hip.malloc(pre_bytes)?;
+        let gdn_table = match gpu.hip.malloc(gdn_bytes) {
+            Ok(g) => g,
+            Err(e) => {
+                let _ = gpu.hip.free(pre_table);
+                return Err(e);
+            }
         };
-        Some(Self {
+        Ok(Self {
             pre_table,
             gdn_table,
             fingerprint: None,
@@ -2365,25 +2599,23 @@ impl GdnReplayMlFrom {
 }
 
 impl GdnReplayMl {
-    /// Allocate scratch + tables and JIT both kernels. Any failure frees what
-    /// was allocated and returns `None`: the tape stays on the per-layer path.
-    fn arm(gpu: &mut Gpu, n_la: usize, max_n: usize, v_dim: usize) -> Option<Self> {
-        if gpu.ensure_dflash_gdn_replay_ml().is_err() {
-            return None;
-        }
-        let n = n_la * max_n * v_dim;
-        let mut tensors = Vec::with_capacity(4);
-        for _ in 0..4 {
-            match gpu.alloc_tensor(&[n], DType::F32) {
-                Ok(t) => tensors.push(t),
-                Err(_) => {
-                    for t in tensors {
-                        let _ = gpu.free_tensor(t);
-                    }
-                    return None;
-                }
-            }
-        }
+    /// JIT both kernels, acquire the shared replay scratch and allocate the
+    /// tables, plus the D8 snapshot-source tables when `with_from`. Any
+    /// failure releases what was acquired and returns the error.
+    fn arm(
+        gpu: &mut Gpu,
+        n_la: usize,
+        max_n: usize,
+        v_dim: usize,
+        with_from: bool,
+    ) -> HipResult<Self> {
+        gpu.ensure_dflash_gdn_replay_ml()?;
+        let shape = rdna_compute::dflash_gdn_replay::GdnReplayScratchShape {
+            n_layers: n_la,
+            rows: max_n.min(rdna_compute::dflash_gdn_replay::DFLASH_GDN_REPLAY_MAX_STEPS),
+            v_dim,
+        };
+        let base = gpu.dflash_gdn_replay_scratch_acquire(shape)?;
         let pre_bytes =
             n_la * std::mem::size_of::<rdna_compute::dflash_gdn_replay::DflashReplayPreLayer>();
         let gdn_bytes =
@@ -2398,35 +2630,43 @@ impl GdnReplayMl {
                     Err(e)
                 }
             });
-        let Ok((pre_table, gdn_table)) = tables else {
-            for t in tensors {
-                let _ = gpu.free_tensor(t);
+        let (pre_table, gdn_table) = match tables {
+            Ok(t) => t,
+            Err(e) => {
+                gpu.dflash_gdn_replay_scratch_release(shape, base);
+                return Err(e);
             }
-            return None;
         };
-        let out = tensors.pop()?;
-        let v = tensors.pop()?;
-        let k = tensors.pop()?;
-        let q = tensors.pop()?;
-        Some(Self {
-            q,
-            k,
-            v,
-            out,
+        let mut ml = Self {
+            shape,
+            base: base as u64,
             pre_table,
             gdn_table,
             fingerprint: None,
             from: None,
-        })
+        };
+        if with_from {
+            match GdnReplayMlFrom::arm(gpu, n_la) {
+                Ok(from) => ml.from = Some(from),
+                Err(e) => {
+                    ml.free_gpu(gpu);
+                    return Err(e);
+                }
+            }
+        }
+        Ok(ml)
+    }
+
+    /// Check and stream-order the shared scratch before a replay.
+    fn order(&self, gpu: &mut Gpu) -> HipResult<()> {
+        gpu.dflash_gdn_replay_scratch_order(self.shape, self.base as *mut _)
     }
 
     fn free_gpu(self, gpu: &mut Gpu) {
-        for t in [self.q, self.k, self.v, self.out] {
-            let _ = gpu.free_tensor(t);
-        }
+        gpu.dflash_gdn_replay_scratch_release(self.shape, self.base as *mut _);
         let _ = gpu.hip.free(self.pre_table);
         let _ = gpu.hip.free(self.gdn_table);
-        if let Some(Some(from)) = self.from {
+        if let Some(from) = self.from {
             from.free_gpu(gpu);
         }
     }
@@ -3205,6 +3445,265 @@ pub(crate) fn sample_categorical(probs: &[f32], u: f32) -> u32 {
     (probs.len() - 1) as u32
 }
 
+/// The AR sampler's truncation (`llama::sample_top_k_p`, min_p off) of a
+/// normalized softmax row, IN PLACE: keep the `cap` most probable tokens
+/// (`cap` from `llama::ar_candidate_cap`; like the kernel, 0 or > 64 → 64),
+/// then the nucleus over their own mass, renormalized. The host twin of
+/// `softmax_temp_topp_batched_f32`'s `tau`/`Z`.
+pub(crate) fn apply_host_ar_trunc(row: &mut [f32], cap: usize, top_p: f32) {
+    const MAX_CAP: usize = 64;
+    let cap = if cap == 0 { MAX_CAP } else { cap.min(MAX_CAP) };
+    apply_host_topk(row, cap);
+    apply_host_nucleus(row, top_p);
+}
+
+/// Request controls used by the singleton sampled DFlash chain (formerly
+/// `spec_step_dflash` lines 5905–5921 and prefill lines 890–913).
+#[doc(hidden)]
+#[derive(Clone, Copy)]
+pub struct DflashSampleCfg {
+    pub temp: f32,
+    pub top_p: f32,
+    pub top_k: usize,
+    pub cactus_delta: f32,
+}
+
+/// Reusable selector receipt from singleton lines 6136–6346 / 6460–6500.
+/// `block` includes the seed; q row i proposes `block[i + 1]`. Extra dense
+/// rows may be retained across short windows but are not part of this receipt.
+#[doc(hidden)]
+#[derive(Default)]
+pub struct DflashSampledDraft {
+    pub block: Vec<u32>,
+    pub selected_q: Vec<f32>,
+    pub dense_q: Vec<Vec<f32>>,
+    pub proposal: Option<dflash::DflashCandidateProposal>,
+    pub uniforms: Vec<f32>,
+}
+
+impl DflashSampledDraft {
+    /// Reserve a request's maximum window without changing the selector law.
+    pub fn new(b: usize, vocab: usize) -> Self {
+        Self {
+            block: Vec::with_capacity(b),
+            selected_q: Vec::with_capacity(b.saturating_sub(1)),
+            dense_q: (0..b.saturating_sub(1))
+                .map(|_| Vec::with_capacity(vocab))
+                .collect(),
+            proposal: None,
+            uniforms: Vec::with_capacity(b.saturating_sub(1)),
+        }
+    }
+}
+
+/// Host acceptance result from singleton lines 6832–6907. The committed
+/// sequence includes the already-emitted seed and the new pending bonus.
+#[doc(hidden)]
+#[derive(Clone, Copy)]
+pub struct SampledWindowDecision {
+    pub accepted_drafts: usize,
+    pub bonus_token: u32,
+    pub committed_len: usize,
+}
+
+/// FAST_SAMPLE target rows of a sampled DFlash window, downloaded from the
+/// GPU: the temperature softmax of every verify row (`probs`, row-major
+/// `[rows * vocab]`) and the per-row AR cutoff `tau` and kept mass `z` from
+/// `softmax_temp_topp_batched_into_f32`.
+#[doc(hidden)]
+#[derive(Default)]
+pub struct FastTargetRows {
+    pub probs: Vec<f32>,
+    pub tau: Vec<f32>,
+    pub z: Vec<f32>,
+}
+
+/// FAST_SAMPLE materialization lifted from singleton lines 6802–6826:
+/// normalize all verify rows, then download tau, Z and probabilities in that
+/// order. `logits` may be a lane-owned view but must contain exactly its rows.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn dflash_target_rows_into(
+    gpu: &mut Gpu,
+    logits: &GpuTensor,
+    b: usize,
+    vocab: usize,
+    cfg: DflashSampleCfg,
+    out: &mut FastTargetRows,
+) -> HipResult<()> {
+    let probs_gpu = gpu.alloc_tensor(&[b * vocab], rdna_compute::DType::F32)?;
+    let tau_gpu = gpu.alloc_tensor(&[b], rdna_compute::DType::F32)?;
+    let z_gpu = gpu.alloc_tensor(&[b], rdna_compute::DType::F32)?;
+    gpu.softmax_temp_topp_batched_into_f32(
+        logits,
+        &probs_gpu,
+        &tau_gpu,
+        &z_gpu,
+        vocab,
+        b,
+        cfg.temp,
+        cfg.top_p,
+        cfg.top_k,
+        0.0,
+    )?;
+    gpu.download_f32_into(&tau_gpu, &mut out.tau)?;
+    gpu.download_f32_into(&z_gpu, &mut out.z)?;
+    gpu.download_f32_into(&probs_gpu, &mut out.probs)?;
+    let _ = gpu.free_tensor(tau_gpu);
+    let _ = gpu.free_tensor(z_gpu);
+    let _ = gpu.free_tensor(probs_gpu);
+    Ok(())
+}
+
+/// Selector host rejection/bonus loop from singleton lines 6832–6907.
+/// Proposal uniforms have already been drawn; budget checks precede each
+/// acceptance draw, rejection draws one residual, and bonus draws only when
+/// there was no rejection. Dense q retains vocab-order residual arithmetic.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn dflash_sampled_accept_rows(
+    block: &[u32],
+    q: &DflashSampledDraft,
+    fast: Option<&FastTargetRows>,
+    logits: &[f32],
+    vocab: usize,
+    cfg: DflashSampleCfg,
+    max_accept: usize,
+    rng: &mut u64,
+    scratch: &mut Vec<f32>,
+) -> SampledWindowDecision {
+    dflash_sampled_accept_q_rows(
+        block, &q.selected_q, &q.dense_q, fast, logits, vocab, cfg,
+        max_accept, rng, scratch,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dflash_sampled_accept_q_rows(
+    block: &[u32],
+    selected_q: &[f32],
+    dense_q: &[Vec<f32>],
+    fast: Option<&FastTargetRows>,
+    logits: &[f32],
+    vocab: usize,
+    cfg: DflashSampleCfg,
+    max_accept: usize,
+    rng: &mut u64,
+    scratch: &mut Vec<f32>,
+) -> SampledWindowDecision {
+    let b = block.len();
+    let mut accept_len = 0;
+    let mut rejected_bonus = None;
+    let use_cactus = cfg.cactus_delta > 0.0;
+    for i in 0..b - 1 {
+        if accept_len >= max_accept {
+            break;
+        }
+        sampled_target_row_into(
+            scratch, i, vocab, fast, logits, cfg.temp, cfg.top_k, cfg.top_p,
+        );
+        let t = block[i + 1] as usize;
+        let p_d = selected_q[i].max(f32::MIN_POSITIVE);
+        let p_t = scratch[t];
+        let accept_prob = if use_cactus {
+            let bump = (2.0 * cfg.cactus_delta * p_t * (1.0 - p_t)).max(0.0).sqrt();
+            (p_t + bump).min(1.0)
+        } else {
+            p_t
+        };
+        let u = xorshift_next_unit(rng);
+        if u * p_d <= accept_prob {
+            accept_len += 1;
+        } else {
+            if use_cactus {
+                let qn = p_t.clamp(0.0, 1.0);
+                let gamma_star = accept_prob;
+                if qn >= 1.0 - 1e-6 {
+                    for v in scratch.iter_mut() {
+                        *v = 0.0;
+                    }
+                    scratch[t] = 1.0;
+                } else {
+                    let scale = (1.0 - gamma_star) / (1.0 - qn);
+                    for (j, v) in scratch.iter_mut().enumerate() {
+                        *v = if j == t { gamma_star } else { scale * *v };
+                    }
+                }
+            }
+            let u2 = xorshift_next_unit(rng);
+            rejected_bonus = Some(sample_residual(scratch, &dense_q[i], u2));
+            break;
+        }
+    }
+    let bonus_token = if let Some(b) = rejected_bonus {
+        b
+    } else {
+        let i = accept_len.min(b - 1);
+        let u = xorshift_next_unit(rng);
+        sampled_target_bonus(
+            scratch, i, vocab, fast, logits, cfg.temp, cfg.top_k, cfg.top_p, u,
+        )
+    };
+    SampledWindowDecision {
+        accepted_drafts: accept_len,
+        bonus_token,
+        committed_len: accept_len + 2,
+    }
+}
+
+/// Target distribution of verify row `row` in a sampled DFlash window, written
+/// into `out`: AR's law (`llama::sample_top_k_p`) — temperature softmax, the
+/// `top_k` most probable tokens (`top_k` is the AR candidate cap,
+/// `llama::ar_candidate_cap`), then the nucleus over their mass — from the GPU
+/// rows (`fast`, truncated by their `tau`/`z`) or, without FAST_SAMPLE, from
+/// the host `logits` (`[rows * vocab]`). Every sampled target read of the host
+/// accept loop goes through here — the accept test, the rejection residual
+/// and the full-accept / budget bonus — so they share one law.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn sampled_target_row_into(
+    out: &mut Vec<f32>,
+    row: usize,
+    vocab: usize,
+    fast: Option<&FastTargetRows>,
+    logits: &[f32],
+    temp: f32,
+    top_k: usize,
+    top_p: f32,
+) {
+    match fast {
+        Some(fast) => {
+            out.clear();
+            out.extend_from_slice(&fast.probs[row * vocab..(row + 1) * vocab]);
+            apply_topp_trunc(out, fast.tau[row], fast.z[row]);
+        }
+        None => {
+            softmax_temp_into(&logits[row * vocab..(row + 1) * vocab], temp, out);
+            apply_host_ar_trunc(out, top_k, top_p);
+        }
+    }
+}
+
+/// Full-accept / budget-bound bonus of a sampled DFlash window: one draw with
+/// uniform `u` from [`sampled_target_row_into`]'s row `row`. `scratch` is
+/// reused as the row buffer.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn sampled_target_bonus(
+    scratch: &mut Vec<f32>,
+    row: usize,
+    vocab: usize,
+    fast: Option<&FastTargetRows>,
+    logits: &[f32],
+    temp: f32,
+    top_k: usize,
+    top_p: f32,
+    u: f32,
+) -> u32 {
+    sampled_target_row_into(scratch, row, vocab, fast, logits, temp, top_k, top_p);
+    sample_categorical(scratch, u)
+}
+
 /// Draw from (p_target − p_draft)₊, renormalized. Used on rejection to
 /// sample the "corrective" bonus token in speculative rejection sampling
 /// (Chen & Leviathan 2023, algorithm 1).
@@ -3471,6 +3970,402 @@ fn dflash_use_gdn_tape_replay(caller_supplied_tape: bool, verify_populates_tape:
     caller_supplied_tape && verify_populates_tape
 }
 
+/// Actual verify-route facts the decision→commit body needs. These are
+/// measured by whoever ran the verify forward, never assumed by the commit.
+///
+/// * `verify_on_hip`: the verify ran the ordinary HIP/HipGraph body (no
+///   retained-PM4 route, or a PM4 route that planned this window as an ordinary
+///   HIP window). Only then may a full accept keep the verify-advanced DeltaNet
+///   state (pre-factor singleton `spec_step_dflash` lines 7174-7180).
+/// * `tape_populated`: the verify actually captured the GDN tape into the
+///   state's `gdn_tape` at offset 0 (caller supplied a tape AND
+///   `prefill_batch_pbs_eligible` held; the singleton's
+///   `gdn_tape_opt.is_some()`). `false` selects the committed-token batched
+///   forward fallback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DflashVerifyReceipt {
+    pub verify_on_hip: bool,
+    pub tape_populated: bool,
+}
+
+/// Receipt for a window whose verify ran the shared eager HIP route
+/// (`forward_prefill_batch` + tape capture) over `b` rows on explicit trunk
+/// owners: `verify_on_hip = true`, `tape_populated` = the actual
+/// `prefill_batch_pbs_eligible` decision the verify used (pre-factor greedy
+/// lines 3839-3853).
+pub fn dflash_eager_hip_verify_receipt(
+    gpu: &Gpu,
+    target: &DflashTargetParts<'_>,
+    df: &crate::dflash_spec::DflashState,
+    b: usize,
+) -> DflashVerifyReceipt {
+    let moe_router_logits_present = df
+        .verify_scratch
+        .prefill_batch
+        .as_ref()
+        .map(|pbs| pbs.moe_router_logits_batch.is_some())
+        .unwrap_or(true);
+    let verify_populates_tape = qwen35::prefill_batch_pbs_eligible(
+        target.weights,
+        target.config,
+        &*target.dn_state,
+        b,
+        gpu.arch.as_str(),
+        moe_router_logits_present,
+    );
+    DflashVerifyReceipt {
+        verify_on_hip: true,
+        tape_populated: dflash_use_gdn_tape_replay(true, verify_populates_tape),
+    }
+}
+
+/// CPU-shadow (`ctx_slice = Some`) hidden mirror the commit must extend:
+/// `host` receives the first `accept+1` rows of the verify's `b` hidden rows,
+/// `ne * h` f32 per row.
+struct DflashCpuShadow<'a> {
+    host: &'a mut Vec<f32>,
+    ne: usize,
+    h: usize,
+}
+
+/// Borrowed DFlash state the decision→commit body touches. The singleton owns
+/// these as separate parameters (not a `DflashState`), the lane as
+/// `DflashState` fields; both build this view so the repair logic exists once.
+/// `gdn_tape` is `Some` iff the verify populated the tape.
+struct DflashBorrowedCommit<'a> {
+    hidden_rb: &'a HiddenStateRingBuffer,
+    draft_scratch: &'a mut DflashScratch,
+    target_snap: &'a DeltaNetSnapshot,
+    gdn_tape: Option<&'a GdnTape>,
+    cpu_shadow: Option<DflashCpuShadow<'a>>,
+}
+
+/// Window facts for the shared commit body. `decision` is already budgeted
+/// (greedy: clamped to `max_accept`; sampled: drawn under the budget).
+struct DflashCommitWindow<'a> {
+    position: usize,
+    seed_token: u32,
+    block: &'a [u32],
+    decision: SampledWindowDecision,
+    verify_on_hip: bool,
+    phase_on: bool,
+}
+
+/// Phase-diagnostic instants captured by the commit body (the singleton's
+/// `[phase]` line consumes them; every other caller ignores them). When
+/// `phase_on`, each is preceded by a `device_synchronize`, exactly as in the
+/// pre-factor singleton.
+struct DflashCommitPhaseTimes {
+    accept_end: std::time::Instant,
+    scatter_end: std::time::Instant,
+    restore_end: std::time::Instant,
+}
+
+/// The single decision→commit body shared by the greedy lane commit, the
+/// public sampled-decision commit and the singleton `spec_step_dflash`:
+/// committed assembly → hidden ring → interleaved draft context scatter +
+/// thlog append (or CPU-shadow extend) → DeltaNet rewind/replay (snapshot-source
+/// tape replay, full-accept keep-verified skip, restore + tape replay, or the
+/// batched-forward fallback). Statement order is the pre-factor singleton's
+/// (`spec_step_dflash` lines 7057-7240) and greedy's (lines 3813-3908).
+/// Returns `committed = [seed, accepted drafts.., bonus]`.
+fn dflash_commit_decision_borrowed(
+    gpu: &mut Gpu,
+    target: &mut DflashTargetParts<'_>,
+    parts: DflashBorrowedCommit<'_>,
+    window: DflashCommitWindow<'_>,
+) -> HipResult<(Vec<u32>, DflashCommitPhaseTimes)> {
+    let DflashBorrowedCommit {
+        hidden_rb,
+        draft_scratch,
+        target_snap,
+        gdn_tape,
+        cpu_shadow,
+    } = parts;
+    let DflashCommitWindow {
+        position,
+        seed_token,
+        block,
+        decision,
+        verify_on_hip,
+        phase_on,
+    } = window;
+    let b = block.len();
+    let accept_len = decision.accepted_drafts;
+    if b < 2 || accept_len + 1 > b || decision.committed_len != accept_len + 2 {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "dflash commit: inconsistent decision (b={b}, accepted={accept_len}, committed_len={})",
+                decision.committed_len
+            ),
+        ));
+    }
+
+    // ── 8. Committed sequence ───────────────────────────────────────────
+    // committed[0] is the seed_token (already emitted by prev iter). The
+    // caller's output stream appends committed[1..].
+    let mut committed: Vec<u32> = Vec::with_capacity(accept_len + 2);
+    committed.push(seed_token);
+    for i in 0..accept_len {
+        committed.push(block[i + 1]);
+    }
+    committed.push(decision.bonus_token);
+    debug_assert_eq!(committed.len(), accept_len + 2);
+
+    if phase_on {
+        gpu.hip.device_synchronize()?;
+    }
+    let t_accept_end = std::time::Instant::now();
+
+    // ── 9. Append accepted target hidden rows (accept_len + 1) ──────────
+    // The bonus token's hidden is NOT appended: its slot holds the rejected
+    // draft's forward; the next verify forwards the bonus as block[0].
+    let rows_to_keep = accept_len + 1;
+    if let Some(shadow) = cpu_shadow {
+        // ctx_slice path: CPU shadow still required for the window slice.
+        let hidden_block = download_hidden_block(gpu, hidden_rb, b)?;
+        shadow
+            .host
+            .extend_from_slice(&hidden_block[..rows_to_keep * shadow.ne * shadow.h]);
+    } else {
+        // Fast path: scatter straight from hidden_rb into draft scratch on GPU
+        // (block_size = b aligns to the verify-block origin, not the ring
+        // tail), then track the appended absolute positions for the next
+        // cycle's `positions_k` construction.
+        scatter_hidden_block_to_interleaved(
+            gpu,
+            hidden_rb,
+            &draft_scratch.target_hidden,
+            position,
+            b,
+            rows_to_keep,
+            draft_scratch.ctx_modulus(),
+        )?;
+        let co = target.kv_cache.compact_offset as i32;
+        draft_scratch
+            .thlog
+            .append_committed(position, rows_to_keep, co);
+    }
+
+    if phase_on {
+        gpu.hip.device_synchronize()?;
+    }
+    let t_scatter_end = std::time::Instant::now();
+
+    // ── 10. Rewind DeltaNet + replay committed tokens ───────────────────
+    // Railgun D8: `target_snap` stays the pre-window state; a full accept on
+    // the HIP/HipGraph verify with EF on keeps the verify-advanced live
+    // buffers, any shorter accept replays from the snapshot source, any other
+    // decline restores then replays (tape) or re-forwards (no tape).
+    let replay_from_snapshot = gdn_tape.is_some_and(|tape| {
+        tape.replay_from_snapshot_admits(gpu, &*target.dn_state, target_snap, accept_len + 1)
+    });
+    let keep_verified = replay_from_snapshot
+        && verify_on_hip
+        && accept_len + 1 == b
+        && !target.dn_state.s_ef_residual.is_empty();
+    if !replay_from_snapshot {
+        target_snap.restore_to(target.dn_state, gpu)?;
+    }
+
+    if phase_on {
+        gpu.hip.device_synchronize()?;
+    }
+    let t_restore_end = std::time::Instant::now();
+    if let Some(tape) = gdn_tape {
+        // The tables are armed with the tape, so an admitted snapshot-source
+        // replay runs or errors; it never falls back to another route.
+        if replay_from_snapshot {
+            if !keep_verified {
+                let replayed = tape.replay_gdn_from_snapshot(
+                    gpu,
+                    target.weights,
+                    target.config,
+                    target.dn_state,
+                    target_snap,
+                    accept_len + 1,
+                )?;
+                debug_assert!(replayed, "admitted above");
+            }
+        } else {
+            tape.replay_gdn(
+                gpu,
+                target.weights,
+                target.config,
+                target.dn_state,
+                accept_len + 1,
+            )?;
+        }
+    } else {
+        let replay_tokens = &committed[..accept_len + 1];
+        // Batched-forward rollback replay: inside the PM FP8 / IU4 verify scope
+        // so the rewritten KV/DeltaNet rows are the verify's FP8 / IU4 rows
+        // (n >= 2; the per-token n == 1 fallback inside is the decode GEMV).
+        let fp8 = fp8_verify_target(target.weights, target.config, target.kv_cache);
+        let iu4 = qwen35::prefill::multi::dflash_iu4_verify_admitted(gpu, target.weights, target.config);
+        fp8_verify_scoped(gpu, fp8, |gpu| {
+            iu4_verify_scoped(gpu, iu4, |gpu| {
+                qwen35::forward_prefill_batch(
+                    gpu,
+                    target.weights,
+                    target.config,
+                    replay_tokens,
+                    position,
+                    target.kv_cache,
+                    target.dn_state,
+                    target.scratch,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            })
+        })?;
+    }
+    Ok((
+        committed,
+        DflashCommitPhaseTimes {
+            accept_end: t_accept_end,
+            scatter_end: t_scatter_end,
+            restore_end: t_restore_end,
+        },
+    ))
+}
+
+/// Decision→commit consumer for one already-decided DFlash window over
+/// explicit trunk owners (continuous-batching lanes). `decision` MUST already
+/// respect `draft.max_accept` (greedy clamps before calling; sampled draws
+/// under the budget): no argmax, clamp or re-draw happens here, and a decision
+/// over budget is an error rather than silently clamped.
+///
+/// Caller contract: the pre-window `df.target_snap` was saved from
+/// `target.dn_state` before the verify trunk ran, the verify captured its tape
+/// (iff `verify.tape_populated`) into `df.gdn_tape` at offset 0 and its
+/// `draft.verify_tokens.len()` hidden rows into `df.hidden_rb`, and `verify`
+/// reports the actual route. Lane windows use ctx_slice=None (no CPU shadow);
+/// the singleton's CPU-shadow variant goes through the same private body.
+pub fn dflash_commit_decision_parts(
+    gpu: &mut Gpu,
+    target: &mut DflashTargetParts<'_>,
+    df: &mut crate::dflash_spec::DflashState,
+    draft: &DflashCbDraft,
+    decision: SampledWindowDecision,
+    verify: DflashVerifyReceipt,
+) -> HipResult<SpecStepResult> {
+    let block: &[u32] = &draft.verify_tokens;
+    if block.len() < 2 {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "dflash commit: block size must be >= 2",
+        ));
+    }
+    if decision.accepted_drafts > draft.max_accept {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "dflash commit: decision accepts {} drafts over the pre-commit budget {}",
+                decision.accepted_drafts, draft.max_accept
+            ),
+        ));
+    }
+    let tape = verify.tape_populated.then_some(&df.gdn_tape);
+    let (committed, _times) = dflash_commit_decision_borrowed(
+        gpu,
+        target,
+        DflashBorrowedCommit {
+            hidden_rb: &df.hidden_rb,
+            draft_scratch: &mut df.draft_scratch,
+            target_snap: &df.target_snap,
+            gdn_tape: tape,
+            cpu_shadow: None,
+        },
+        DflashCommitWindow {
+            position: draft.position,
+            seed_token: draft.seed,
+            block,
+            decision,
+            verify_on_hip: verify.verify_on_hip,
+            phase_on: false,
+        },
+    )?;
+    Ok(SpecStepResult {
+        accepted: decision.accepted_drafts,
+        bonus_token: decision.bonus_token,
+        drafted: block.to_vec(),
+        committed,
+    })
+}
+
+/// Greedy accept + committed-state consumer for one precomputed DFlash verify
+/// window over explicit trunk owners (continuous-batching lanes).
+///
+/// This is the fast greedy chain arm of [`spec_step_dflash`] (ctx_slice=None,
+/// no host-shaped penalties, no PLD/ngram/CACTUS) lifted over a precomputed
+/// [`DflashVerifyOutput`]: `eos=None` greedy accept prefix, pre-commit
+/// `max_accept` clamp with bonus re-pick (pre-factor lines 3802-3811), then the
+/// shared [`dflash_commit_decision_parts`] body (pre-factor lines 3813-3908).
+///
+/// Caller contract: the pre-window `df.target_snap` was saved from
+/// `target.dn_state` before the verify trunk ran, the verify captured its tape
+/// into `df.gdn_tape` at offset 0 and its `draft.verify_tokens.len()` hidden
+/// rows into `df.hidden_rb`, and the verify ran the eager HIP route (so the
+/// full-accept keep-verified skip is admissible exactly as on the singleton
+/// HIP/HipGraph route). Seed-oracle statistics and phase timing diagnostics
+/// stay on the singleton path.
+pub fn dflash_greedy_accept_commit_parts(
+    gpu: &mut Gpu,
+    target: &mut DflashTargetParts<'_>,
+    df: &mut crate::dflash_spec::DflashState,
+    draft: &DflashCbDraft,
+    verified: &DflashVerifyOutput,
+) -> HipResult<SpecStepResult> {
+    let block: &[u32] = &draft.verify_tokens;
+    let b = block.len();
+    if b < 2 {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "dflash greedy accept: block size must be >= 2",
+        ));
+    }
+    if verified.argmax_per_pos.len() != b {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "dflash greedy accept: {} target picks for a {b}-row window",
+                verified.argmax_per_pos.len()
+            ),
+        ));
+    }
+    let argmax_per_pos: &[u32] = &verified.argmax_per_pos;
+
+    // Shared greedy accept-prefix (eos=None: DFlash never early-stops on EOS).
+    let acc = hipfire_runtime::spec::accept_greedy_prefix(&block[1..b], argmax_per_pos, None);
+    let mut accept_len = acc.accepted;
+    let mut bonus_token = *acc.committed.last().expect("eos=None yields a bonus");
+    // Pre-commit budget: clamp drafts so emit (= accept + 1) <= max_emit, then
+    // re-pick bonus = argmax at the clamped boundary.
+    if accept_len > draft.max_accept {
+        accept_len = draft.max_accept;
+        bonus_token = argmax_per_pos[accept_len];
+    }
+
+    let receipt = dflash_eager_hip_verify_receipt(gpu, target, df, b);
+    dflash_commit_decision_parts(
+        gpu,
+        target,
+        df,
+        draft,
+        SampledWindowDecision {
+            accepted_drafts: accept_len,
+            bonus_token,
+            committed_len: accept_len + 2,
+        },
+        receipt,
+    )
+}
+
+
 /// Run the target on `draft_tokens` (length B) positions starting at
 /// `start_pos`. Advances `target.kv_cache` and `target.dn_state` by B
 /// positions. Writes B hidden-state rows into `hidden_rb` (ring head
@@ -3555,7 +4450,96 @@ pub fn verify_dflash_block_tree(
     )
 }
 
+/// Run `f` inside the PM FP8 verify scope opened for `target`
+/// (`Gpu::fp8_verify_enter`; closed unless the forward qualifies), closing it
+/// on every path. For target forwards that re-commit state after a verify, so
+/// they reproduce the verify's FP8 rows.
+pub(crate) fn fp8_verify_scoped<T>(
+    gpu: &mut Gpu,
+    target: Fp8VerifyTarget,
+    f: impl FnOnce(&mut Gpu) -> HipResult<T>,
+) -> HipResult<T> {
+    let prev = gpu.fp8_verify_enter(target)?;
+    let r = f(gpu);
+    gpu.fp8_verify_exit(prev);
+    r
+}
+
+/// Run `f` inside the IU4 verify scope when `admitted`
+/// ([`qwen35::prefill::multi::dflash_iu4_verify_admitted`]), closing it on
+/// every path. For DFlash target forwards that re-commit state after a verify,
+/// so they reproduce the verify's IU4 rows.
+pub(crate) fn iu4_verify_scoped<T>(
+    gpu: &mut Gpu,
+    admitted: bool,
+    f: impl FnOnce(&mut Gpu) -> HipResult<T>,
+) -> HipResult<T> {
+    let prev = gpu.iu4_verify_enter(admitted);
+    let r = f(gpu);
+    gpu.iu4_verify_exit(prev);
+    r
+}
+
+/// Target verify trunk + verify lm_head/argmax inside the PM FP8 verify GEMM
+/// scope (`HIPFIRE_CB_VERIFY_FP8`, see `qwen35::prefill::fp8_verify_target`):
+/// one MQ4G256V2 -> E4M3 arithmetic for every row count, so this singleton ==
+/// the batched continuous-batching verify byte-for-byte. The scope covers the
+/// HIP-graph capture/replay and eager arms and the lm_head enqueue, and is
+/// closed on every path. A tree verify never opens it.
+///
+/// DFlash IU4 verify (the load's decision: default on at `dflash_block` 8,
+/// `HIPFIRE_CB_VERIFY_IU4` forces/kills; never with `HIPFIRE_CB_VERIFY_FP8`): a chain verify
+/// of an admitted target runs inside the IU4 verify scope (see
+/// `Gpu::iu4_verify_enter`), the same A4 producers + IU4 GEMMs as the
+/// multi-request verify trunk; lm_head stays F16. The scope is eager-only:
+/// the body takes no HipGraph route while it is set, and the retained PM4
+/// route is never armed with it (`dflash_spec`).
+#[allow(clippy::too_many_arguments)]
 fn verify_dflash_block_inner(
+    gpu: &mut Gpu,
+    target: &mut ModelSlot,
+    draft_tokens: &[u32],
+    start_pos: usize,
+    hidden_rb: &mut HiddenStateRingBuffer,
+    gdn_tape: Option<&mut GdnTape>,
+    want_full_logits: bool,
+    tree_verify: Option<qwen35::TreeVerifyCtx<'_>>,
+    verify_scratch: &VerifyScratch,
+    skip_argmax_d2h: bool,
+    retained: Option<&mut RetainedCtx<'_>>,
+) -> HipResult<DflashVerifyOutput> {
+    let fp8 = if tree_verify.is_some() {
+        Fp8VerifyTarget::Ineligible
+    } else {
+        fp8_verify_target(&target.weights, &target.config, &target.kv_cache)
+    };
+    // A retained route that stands down (`HipAuto`, e.g. PM4 disabled) runs
+    // the ordinary HIP body; prime/capture/PM4 windows are never IU4-scoped.
+    let iu4 = tree_verify.is_none()
+        && retained.as_ref().is_none_or(|c| c.selected == DflashVerifyRoute::HipAuto)
+        && qwen35::prefill::multi::dflash_iu4_verify_admitted(gpu, &target.weights, &target.config);
+    let prev = gpu.fp8_verify_enter(fp8)?;
+    let prev_iu4 = gpu.iu4_verify_enter(iu4);
+    let r = verify_dflash_block_inner_body(
+        gpu,
+        target,
+        draft_tokens,
+        start_pos,
+        hidden_rb,
+        gdn_tape,
+        want_full_logits,
+        tree_verify,
+        verify_scratch,
+        skip_argmax_d2h,
+        retained,
+    );
+    gpu.iu4_verify_exit(prev_iu4);
+    gpu.fp8_verify_exit(prev);
+    r
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_dflash_block_inner_body(
     gpu: &mut Gpu,
     target: &mut ModelSlot,
     draft_tokens: &[u32],
@@ -3717,7 +4701,10 @@ fn verify_dflash_block_inner(
                 | hipfire_runtime::llama::EmbeddingFormat::Q8_0,
         )
         && verify_scratch.prefill_batch.is_some()
-        && pbs_eligible;
+        && pbs_eligible
+        // IU4 verify: the gfx1201 A4 producers are eager-only (their gates
+        // refuse capture), so the scoped verify always runs eager.
+        && !gpu.iu4_verify_scope;
 
     // Per-cycle timing for verify-graph A/B diagnostic
     // (HIPFIRE_VERIFY_GRAPH_TIMING=1). Two device-sync points bracket the
@@ -3864,6 +4851,7 @@ fn verify_dflash_block_inner(
             );
             let r = if r.is_ok() && capture_lmhead_argmax {
                 r.and_then(|_| {
+                    let math = verify_dense_math(gpu);
                     dflash_enqueue_verify_lm_head_argmax(
                         gpu,
                         &target.weights.output,
@@ -3871,6 +4859,7 @@ fn verify_dflash_block_inner(
                         verify_scratch,
                         b,
                         vocab,
+                        math,
                     )
                 })
             } else {
@@ -3999,11 +4988,74 @@ fn verify_dflash_block_inner(
     //   MQ4G256   → batched rotate + gemm_hfq4g256 (one launch + one D2H).
     //   HFQ4G256  → batched gemm_hfq4g256 directly.
     //   else      → B sequential weight_gemv calls + B downloads (legacy).
-    let w_out = &target.weights.output;
+    let DflashVerifyOutput {
+        argmax_per_pos,
+        logits_per_pos,
+    } = dflash_verify_head(
+        gpu,
+        &target.weights,
+        &target.scratch,
+        &final_hidden,
+        verify_scratch,
+        b,
+        want_full_logits,
+        skip_argmax_d2h,
+        graph_includes_lmhead_argmax,
+    )?;
+
+    if let Some(t0) = vg_t0 {
+        gpu.hip.device_synchronize()?;
+        eprintln!(
+            "[vg-time] B={} mode={} elapsed_us={}",
+            b,
+            vg_mode,
+            t0.elapsed().as_micros()
+        );
+    }
+
+    Ok(DflashVerifyOutput {
+        argmax_per_pos,
+        logits_per_pos,
+    })
+}
+
+/// Head / materialization half of a DFlash verify window: the target lm_head
+/// over the `b` post-norm rows in `final_hidden`, GPU argmax, and the small
+/// argmax (or full-logit) download. Shared verbatim by the singleton verify
+/// ([`verify_dflash_block_inner`]) and the batched continuous-batching path.
+///
+/// Per-position lm_head. Fast paths in priority order:
+///   Q8_0      → DFlash-scoped Q8 lm_head dispatcher (gfx12 WMMA by default).
+///   MQ4G256   → batched rotate + gemm_hfq4g256 (one launch + one D2H).
+///   HFQ4G256  → batched gemm_hfq4g256 directly.
+///   else      → B sequential weight_gemv calls + B downloads (legacy).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dflash_verify_head(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    scratch: &Qwen35Scratch,
+    final_hidden: &GpuTensor,
+    verify_scratch: &VerifyScratch,
+    b: usize,
+    want_full_logits: bool,
+    skip_argmax_d2h: bool,
+    // The MoE-only extended verify graph already enqueued lm_head+argmax.
+    graph_includes_lmhead_argmax: bool,
+) -> HipResult<DflashVerifyOutput> {
+    let vocab = verify_scratch.vocab;
+    let dim = verify_scratch.dim;
+    let w_out = &weights.output;
     let mut logits_per_pos: Vec<f32> = Vec::with_capacity(b * vocab);
     let mut argmax_per_pos: Vec<u32> = Vec::with_capacity(b);
 
     let try_batched = dflash_batched_lm_head_supported(w_out.gpu_dtype);
+    if gpu.fp8_verify_scope && !try_batched && !graph_includes_lmhead_argmax {
+        // Fail closed: the per-row GEMV fallback is not an FP8-verify arm.
+        return Err(HipError::new(
+            0,
+            "dflash_verify_head: fp8 verify scope needs a batched MQ4G256V2 lm_head",
+        ));
+    }
 
     if graph_includes_lmhead_argmax {
         debug_assert!(!want_full_logits);
@@ -4018,7 +5070,16 @@ fn verify_dflash_block_inner(
         // HIPFIRE_DFLASH_Q8_LMHEAD_WMMA=0 to force the legacy scalar chunks.
         // MQ4/HFQ4/HFQ6/MQ6 kernels have no 64-row cap and take the
         // single-shot path.
-        dflash_enqueue_verify_lm_head(gpu, w_out, &final_hidden, verify_scratch, b, vocab)?;
+        let math = verify_dense_math(gpu);
+        dflash_enqueue_verify_lm_head(
+            gpu,
+            w_out,
+            final_hidden,
+            verify_scratch,
+            b,
+            vocab,
+            math,
+        )?;
         if want_full_logits {
             // Rejection-sampling path needs full target distribution.
             // Cost: B × vocab × 4 bytes D2H per verify (~15 MB at B=16 × 248K).
@@ -4051,27 +5112,12 @@ fn verify_dflash_block_inner(
         // Fallback: B sequential GEMVs.
         for i in 0..b {
             let hidden_row = final_hidden.sub_offset(i * dim, dim);
-            llama::weight_gemv(
-                gpu,
-                &target.weights.output,
-                &hidden_row,
-                &target.scratch.logits,
-            )?;
-            let row = gpu.download_f32(&target.scratch.logits)?;
+            llama::weight_gemv(gpu, &weights.output, &hidden_row, &scratch.logits)?;
+            let row = gpu.download_f32(&scratch.logits)?;
             debug_assert_eq!(row.len(), vocab);
             argmax_per_pos.push(argmax_u32(&row));
             logits_per_pos.extend_from_slice(&row);
         }
-    }
-
-    if let Some(t0) = vg_t0 {
-        gpu.hip.device_synchronize()?;
-        eprintln!(
-            "[vg-time] B={} mode={} elapsed_us={}",
-            b,
-            vg_mode,
-            t0.elapsed().as_micros()
-        );
     }
 
     Ok(DflashVerifyOutput {
@@ -4775,6 +5821,111 @@ pub fn build_dflash_noise_embeddings(
     build_dflash_noise_embeddings_weights(gpu, &target.weights, block, h, draft_scratch)
 }
 
+/// Sampled selector draft from singleton lines 6136–6346 / 6460–6500.
+/// The shared parts body runs the identical forward and Product head, draws
+/// all b-1 host uniforms before scoring, then materializes actual selector q.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn dflash_sampled_selector_draft_into(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    df: &mut DflashState,
+    position: usize,
+    compact_offset: i32,
+    seed: u32,
+    b: usize,
+    vocab: usize,
+    cfg: DflashSampleCfg,
+    rng: &mut u64,
+    out: &mut DflashSampledDraft,
+) -> HipResult<()> {
+    dflash_sampled_selector_draft_parts_into(
+        gpu, weights, &df.draft_weights, &df.draft_config,
+        &mut df.draft_scratch, &df.verify_scratch, &df.target_hidden_host,
+        &df.verify_scratch.logits.sub_offset(0, vocab),
+        position, compact_offset, seed, b, vocab, None, false, cfg, rng, out,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dflash_sampled_selector_draft_parts_into(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    draft_weights: &DflashWeights,
+    draft_cfg: &DflashConfig,
+    draft_scratch: &mut DflashScratch,
+    verify_scratch: &VerifyScratch,
+    target_hidden_host: &[f32],
+    single_logits: &GpuTensor,
+    position: usize,
+    compact_offset: i32,
+    seed: u32,
+    b: usize,
+    vocab: usize,
+    ctx_slice: Option<usize>,
+    draft_ffn_graph: bool,
+    cfg: DflashSampleCfg,
+    rng: &mut u64,
+    out: &mut DflashSampledDraft,
+) -> HipResult<()> {
+    if b < 2 || cfg.temp <= 0.0 || !draft_weights.has_candidate_selector() {
+        return Err(HipError::new(0, "sampled DFlash draft requires b>=2, temp>0 and selector"));
+    }
+    if gpu.active_stream.is_none() {
+        gpu.active_stream = Some(gpu.hip.stream_create()?);
+    }
+    out.block.clear();
+    out.block.resize(b, draft_cfg.mask_token_id);
+    out.block[0] = seed;
+    draft_dflash_forward_rank(
+        gpu, weights, draft_weights, draft_cfg, draft_scratch,
+        target_hidden_host, &out.block, position, compact_offset,
+        ctx_slice, draft_ffn_graph,
+    )?;
+    let batch = b - 1;
+    let h = draft_cfg.hidden;
+    let hidden_rows = draft_scratch.x.sub_offset(h, batch * h);
+    out.uniforms.clear();
+    let proposal = if dflash_batched_lm_head_supported(weights.output.gpu_dtype) {
+        assert!(
+            batch <= verify_scratch.max_n,
+            "verify_scratch max_n {} < draft batch {}",
+            verify_scratch.max_n, batch,
+        );
+        dflash_enqueue_verify_lm_head(
+            gpu, &weights.output, &hidden_rows, verify_scratch,
+            batch, vocab, DenseBatchMath::Product,
+        )?;
+        let logits_batch = verify_scratch.logits.sub_offset(0, batch * vocab);
+        out.uniforms.extend((0..batch).map(|_| xorshift_next_unit(rng)));
+        dflash::propose_candidates_device(
+            gpu, draft_weights, draft_scratch, &hidden_rows,
+            &logits_batch, batch, seed, cfg.temp, Some(&out.uniforms),
+        )?
+    } else {
+        let mut host_logits = Vec::with_capacity(batch * vocab);
+        for i in 1..b {
+            let hidden_row = draft_scratch.x.sub_offset(i * h, h);
+            llama::weight_gemv(gpu, &weights.output, &hidden_row, single_logits)?;
+            let logits = gpu.download_f32(single_logits)?;
+            debug_assert_eq!(logits.len(), vocab);
+            host_logits.extend_from_slice(&logits);
+        }
+        out.uniforms.extend((0..batch).map(|_| xorshift_next_unit(rng)));
+        dflash::propose_candidates_host(
+            gpu, draft_weights, draft_scratch, &hidden_rows,
+            &host_logits, batch, seed, cfg.temp, Some(&out.uniforms),
+        )?
+    };
+    out.block.truncate(1);
+    apply_dflash2_selector_proposal(
+        &proposal, vocab, true, &mut out.block, &mut out.dense_q,
+        &mut out.selected_q,
+    )?;
+    out.proposal = Some(proposal);
+    Ok(())
+}
+
 /// Rank-local DFlash draft forward prefix shared by the single-GPU step and
 /// the dense-TP mesh: embeds `block` into `draft_scratch.x` (S7 batched Q8
 /// path or the scalar per-token loop, bit-identical), builds absolute Q/K
@@ -4870,7 +6021,7 @@ fn draft_dflash_forward_rank(
 /// stay inline in `spec_step_dflash`. Called by the single-GPU greedy fast
 /// path and by every dense-TP mesh rank.
 #[allow(clippy::too_many_arguments)]
-fn draft_dflash_block_rank(
+pub(crate) fn draft_dflash_block_rank(
     gpu: &mut Gpu,
     target_weights: &Qwen35Weights,
     draft_weights: &DflashWeights,
@@ -4976,7 +6127,7 @@ fn draft_dflash_block_rank(
                 );
                 let rotated = verify_scratch.rot.sub_offset(0, batch * h);
                 llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
-                gemm_mq_batched_lmhead(
+                gemm_mq_batched_lmhead_draft(
                     gpu,
                     w_out.gpu_dtype,
                     &w_out.buf,
@@ -5053,7 +6204,7 @@ fn draft_dflash_block_rank(
                 None,
             )?;
             apply_dflash2_selector_proposal(
-                proposal,
+                &proposal,
                 vocab,
                 false,
                 &mut drafted,
@@ -5100,7 +6251,7 @@ fn draft_dflash_block_rank(
             None,
         )?;
         apply_dflash2_selector_proposal(
-            proposal,
+            &proposal,
             vocab,
             false,
             &mut drafted,
@@ -5119,6 +6270,247 @@ fn draft_dflash_block_rank(
         }
     }
     Ok(drafted)
+}
+
+/// Rows one batched draft forward holds. The draft projections / FFN / head
+/// GEMMs are row-count independent on gfx1201 below the 64-row route
+/// boundary (the exact-trunk ceiling is 63); 48 keeps the draft on the rungs
+/// the exact trunk and the oracle already cover (three full 16-row lanes).
+pub const DFLASH_DRAFT_BATCH_MAX_ROWS: usize = 48;
+
+/// One lane of [`draft_dflash_blocks_batched`].
+pub struct DflashDraftLane<'a> {
+    pub df: &'a mut DflashState,
+    /// Committed target position (`position` of the singleton step).
+    pub position: usize,
+    /// Pending seed (`block[0]`).
+    pub seed: u32,
+    /// Block rows `b` (`3..`: one-row heads are GEMVs, a different kernel).
+    pub b: usize,
+    /// The lane's `kv_cache.compact_offset`.
+    pub compact_offset: i32,
+}
+
+/// Whether the batched draft is exact for this machine / draft / target head:
+/// the non-fused (non-gfx1100) draft route, MoE-free target, every draft
+/// matmul an MQ4 v2 (or, for the DFlash2 convolution kernel projections,
+/// F16/F32) weight and the target head MQ4 v2 — the families whose WMMA GEMMs
+/// are row-independent below 64 rows on gfx1201 (verified per lane against
+/// the singleton by the CB state oracle).
+pub fn dflash_draft_batch_eligible(
+    gpu: &Gpu,
+    target_weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    draft_weights: &DflashWeights,
+) -> bool {
+    use rdna_compute::DType::{MQ4G256V2, F16, F32};
+    if config.num_experts > 0 || gpu.draft_collapse_fused_enabled() || !gpu.arch.starts_with("gfx12") {
+        return false;
+    }
+    if target_weights.output.gpu_dtype != MQ4G256V2 {
+        return false;
+    }
+    let main_ok = |w: &llama::WeightTensor| w.gpu_dtype == MQ4G256V2;
+    let conv_ok = |w: &llama::WeightTensor| matches!(w.gpu_dtype, MQ4G256V2 | F16 | F32);
+    main_ok(&draft_weights.fc)
+        && draft_weights.layers.iter().all(|l| {
+            main_ok(&l.wq)
+                && main_ok(&l.wk)
+                && main_ok(&l.wv)
+                && main_ok(&l.wo)
+                && main_ok(&l.w_gate)
+                && main_ok(&l.w_up)
+                && main_ok(&l.w_down)
+                && l.attn_conv_proj.as_ref().is_none_or(conv_ok)
+                && l.mlp_conv_proj.as_ref().is_none_or(conv_ok)
+        })
+}
+
+/// Greedy chain drafts of several lanes through ONE draft-model forward
+/// (`dflash::draft_forward_lanes`) and ONE shared target lm-head GEMM, each
+/// lane keeping its own draft context rings, positions and hidden context:
+/// the batched counterpart of per-lane `draft_dflash_block_rank` calls (the
+/// singleton path is untouched). `shared` is the row scratch of the batched
+/// forward (`>= sum b` rows), `head` the head scratch (`max_n >= sum b`).
+/// Returns each lane's `[seed, candidates..]`. Preconditions:
+/// [`dflash_draft_batch_eligible`], `3 <= b` per lane, `sum b <=
+/// DFLASH_DRAFT_BATCH_MAX_ROWS`, one shared draft-weight asset.
+#[allow(clippy::too_many_arguments)]
+pub fn draft_dflash_blocks_batched(
+    gpu: &mut Gpu,
+    target_weights: &Qwen35Weights,
+    vocab: usize,
+    shared: &mut DflashScratch,
+    head: &VerifyScratch,
+    lanes: &mut [DflashDraftLane<'_>],
+) -> HipResult<Vec<Vec<u32>>> {
+    let err = |m: String| Err(HipError::new(0, &format!("draft_dflash_blocks_batched: {m}")));
+    if lanes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows: usize = lanes.iter().map(|l| l.b).sum();
+    if rows > DFLASH_DRAFT_BATCH_MAX_ROWS || rows > shared.max_block_size || rows > head.max_n {
+        return err(format!(
+            "{rows} rows exceed the batch capacity (cap {DFLASH_DRAFT_BATCH_MAX_ROWS}, scratch {}, head {})",
+            shared.max_block_size, head.max_n
+        ));
+    }
+    let draft_weights = std::sync::Arc::clone(&lanes[0].df.draft_weights);
+    let draft_cfg = lanes[0].df.draft_config.clone();
+    let h = draft_cfg.hidden;
+    debug_assert_eq!(vocab, draft_cfg.vocab_size);
+    for (i, l) in lanes.iter().enumerate() {
+        if l.b < 3 {
+            return err(format!("lane {i}: block {} < 3 rows", l.b));
+        }
+        if !std::sync::Arc::ptr_eq(&l.df.draft_weights, &draft_weights) {
+            return err(format!("lane {i}: draft weights are not the shared asset"));
+        }
+        if l.b > l.df.draft_scratch.max_block_size {
+            return err(format!("lane {i}: block {} > its draft scratch", l.b));
+        }
+    }
+    if gpu.active_stream.is_none() {
+        gpu.active_stream = Some(gpu.hip.stream_create()?);
+    }
+
+    // Noise embeddings of every lane's block into the shared rows (the
+    // singleton's non-fused per-token lookup loop, `draft_dflash_forward_rank`).
+    let mut off = 0usize;
+    for l in lanes.iter() {
+        for i in 0..l.b {
+            let tok = if i == 0 { l.seed } else { draft_cfg.mask_token_id };
+            let dst = shared.x.sub_offset((off + i) * h, h);
+            match target_weights.embd_format {
+                llama::EmbeddingFormat::HFQ4G256 => {
+                    gpu.embedding_lookup_hfq4g256(&target_weights.token_embd, &dst, tok, h)?
+                }
+                llama::EmbeddingFormat::HFQ4G128 => {
+                    gpu.embedding_lookup_hfq4g128(&target_weights.token_embd, &dst, tok, h)?
+                }
+                llama::EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&target_weights.token_embd, &dst, tok, h)?,
+                llama::EmbeddingFormat::F32 => gpu.embedding_lookup(&target_weights.token_embd, &dst, tok, h)?,
+                _ => return err("unsupported target embedding format for noise lookup".into()),
+            }
+        }
+        off += l.b;
+    }
+
+    // Per-lane positions (ctx_slice = None geometry of the singleton).
+    struct Geo {
+        ctx: usize,
+        pos_q: Vec<i32>,
+        pos_k: Vec<i32>,
+    }
+    let geos: Vec<Geo> = lanes
+        .iter()
+        .map(|l| {
+            let ctx = l.df.draft_scratch.thlog.abs_positions().len().min(l.position);
+            let co = l.compact_offset;
+            let pos_q: Vec<i32> = ((l.position as i32 + co)..(l.position as i32 + l.b as i32 + co)).collect();
+            let mut pos_k = Vec::with_capacity(ctx + l.b);
+            let th_abs = l.df.draft_scratch.thlog.abs_positions();
+            pos_k.extend_from_slice(&th_abs[th_abs.len().saturating_sub(ctx)..]);
+            for p in 0..l.b {
+                pos_k.push(l.position as i32 + p as i32 + co);
+            }
+            Geo { ctx, pos_q, pos_k }
+        })
+        .collect();
+    {
+        let mut dl: Vec<dflash::DraftLane<'_>> = lanes
+            .iter_mut()
+            .zip(&geos)
+            .map(|(l, g)| dflash::DraftLane {
+                b: l.b,
+                scratch: &mut l.df.draft_scratch,
+                ctx_len: g.ctx,
+                positions_q: &g.pos_q,
+                positions_k: &g.pos_k,
+            })
+            .collect();
+        dflash::draft_forward_lanes(gpu, &draft_weights, &draft_cfg, shared, &mut dl)?;
+    }
+
+    // One shared target lm-head over every lane's rows (seed rows included:
+    // they are discarded, the head is row-independent).
+    let w_out = &target_weights.output;
+    assert!(
+        rows * h <= head.max_n * head.hidden_k,
+        "head.rot undersized for the batched draft lm_head"
+    );
+    let hidden_all = shared.x.sub_offset(0, rows * h);
+    let logits_all = head.logits.sub_offset(0, rows * vocab);
+    let rotated = head.rot.sub_offset(0, rows * h);
+    llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_all, &rotated, h, rows)?;
+    gemm_mq_batched_lmhead_draft(gpu, w_out.gpu_dtype, &w_out.buf, &rotated, &logits_all, w_out.m, w_out.k, rows)?;
+
+    let mut out: Vec<Vec<u32>> = Vec::with_capacity(lanes.len());
+    if draft_weights.has_candidate_selector() {
+        let mut off = 0usize;
+        for l in lanes.iter_mut() {
+            let batch = l.b - 1;
+            let hidden_rows = shared.x.sub_offset((off + 1) * h, batch * h);
+            let logits_batch = head.logits.sub_offset((off + 1) * vocab, batch * vocab);
+            // The selector's hidden projection is a lane-scratch GEMM
+            // (`propose_candidates_device` rotates through the scratch's FWHT
+            // buffers). A VMM lane owns none: lend the shared scratch's for
+            // this call and hand them back before looking at the result
+            // (per-call temporary, identical element count, single stream).
+            let lent = l.df.draft_scratch.mq_x_rot.is_none();
+            if lent {
+                if shared.mq_x_rot.is_none() || shared.mq_x_rot_f16.is_none() {
+                    return err("the shared draft scratch has no FWHT rotation buffers for the lane selector".into());
+                }
+                l.df.draft_scratch.mq_x_rot = shared.mq_x_rot.take();
+                l.df.draft_scratch.mq_x_rot_f16 = shared.mq_x_rot_f16.take();
+            }
+            let proposal = dflash::propose_candidates_device(
+                gpu,
+                &draft_weights,
+                &l.df.draft_scratch,
+                &hidden_rows,
+                &logits_batch,
+                batch,
+                l.seed,
+                0.0,
+                None,
+            );
+            if lent {
+                shared.mq_x_rot = l.df.draft_scratch.mq_x_rot.take();
+                shared.mq_x_rot_f16 = l.df.draft_scratch.mq_x_rot_f16.take();
+            }
+            let proposal = proposal?;
+            let mut drafted = vec![l.seed];
+            apply_dflash2_selector_proposal(
+                &proposal,
+                vocab,
+                false,
+                &mut drafted,
+                &mut Vec::new(),
+                &mut Vec::new(),
+            )?;
+            out.push(drafted);
+            off += l.b;
+        }
+    } else {
+        let argmax_buf = head.argmax.sub_offset(0, rows);
+        gpu.argmax_f32_batched(&logits_all, &argmax_buf, vocab, rows)?;
+        let mut host_idx = vec![0i32; rows];
+        {
+            let bytes: &mut [u8] =
+                unsafe { std::slice::from_raw_parts_mut(host_idx.as_mut_ptr() as *mut u8, rows * 4) };
+            gpu.hip.memcpy_dtoh(bytes, &argmax_buf.buf)?;
+        }
+        let mut off = 0usize;
+        for l in lanes.iter() {
+            let mut drafted = vec![l.seed];
+            drafted.extend(host_idx[off + 1..off + l.b].iter().map(|&i| i as u32));
+            out.push(drafted);
+            off += l.b;
+        }
+    }
+    Ok(out)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -5173,17 +6565,16 @@ pub fn spec_step_dflash(
     ctx_slice: Option<usize>,
     gdn_tape: Option<&mut GdnTape>,
     temp: f32,
-    // Nucleus (top_p) cutoff applied IDENTICALLY to both the draft and target
-    // softmax rows on the temp sampling path. 1.0 (or >= 0.999) disables it →
-    // the path is byte-equivalent to plain temp-T full-vocab sampling. Lossless
-    // == AR-at-this-top_p holds via the TARGET truncation (Leviathan marginal
-    // preservation); the draft is truncated too for parity + acceptance
-    // efficiency. See apply_topp_trunc / apply_host_nucleus.
+    // Nucleus (top_p) mass on the temp sampling path, applied with `top_k`
+    // to both the draft and target softmax rows as AR does
+    // (`llama::sample_top_k_p`): the nucleus is taken over the top_k pool's
+    // own mass. Lossless == AR via the TARGET truncation (Leviathan marginal
+    // preservation); the draft is truncated too for acceptance efficiency.
+    // See apply_topp_trunc / apply_host_ar_trunc.
     top_p: f32,
-    // Top-k cutoff, applied identically to draft + target softmax rows on the
-    // sampled path (folded into tau by the GPU kernel: tau = max(tau_p, tau_k)).
-    // 0 = disabled (top_p-only). Lossless == AR-at-(top_k,top_p), same cut both
-    // sides.
+    // AR candidate cap (`llama::ar_candidate_cap`: absent top_k → 20, 0 → 64,
+    // k → min(k, 64)). The sampled path keeps the `top_k` most probable
+    // tokens before the nucleus, like AR's pool.
     top_k: usize,
     rng_state: &mut u64,
     block_size_override: Option<usize>,
@@ -5308,10 +6699,6 @@ pub fn spec_step_dflash(
     let mut draft_probs_at_drafted: Vec<f32> = Vec::new();
     let mut draft_softmaxes: Vec<Vec<f32>> = Vec::new();
     let use_temp_sampling = temp > 0.0;
-    // Truncation active when either top_p non-default OR top_k enabled (vocab-gated).
-    // Host applies top-k before nucleus; GPU uses combined softmax_temp_topp whenever active.
-    let trunc_active = use_temp_sampling && (top_p < 0.999 || (top_k > 0 && top_k < vocab));
-    let topp_active = trunc_active;
     let rp_active = repeat_penalty > 1.0 && !use_temp_sampling;
     // HIPFIRE_DFLASH_NGRAM_BLOCK=1: apply llama::apply_ngram_block to every
     // host-path row in BOTH draft and target argmax paths. Bans the next
@@ -5389,6 +6776,19 @@ pub fn spec_step_dflash(
                 draft_probs_at_drafted.push(1.0);
             }
         }
+    } else if use_temp_sampling && selector_mode {
+        let mut receipt = DflashSampledDraft::default();
+        dflash_sampled_selector_draft_parts_into(
+            gpu, &target.weights, draft_weights, draft_cfg, draft_scratch,
+            verify_scratch, target_hidden_host, &target.scratch.logits,
+            position, target.kv_cache.compact_offset as i32, seed_token,
+            b, vocab, ctx_slice, draft_ffn_graph,
+            DflashSampleCfg { temp, top_p, top_k, cactus_delta },
+            rng_state, &mut receipt,
+        )?;
+        drafted = receipt.block;
+        draft_softmaxes = receipt.dense_q;
+        draft_probs_at_drafted = receipt.selected_q;
     } else if !use_temp_sampling && !host_path_active {
         // Greedy fast path shared verbatim with the dense-TP mesh ranks
         // (byte-identical draft production through draft_dflash_block_rank).
@@ -5519,7 +6919,7 @@ pub fn spec_step_dflash(
                     );
                     let rotated = verify_scratch.rot.sub_offset(0, batch * h);
                     llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
-                    gemm_mq_batched_lmhead(
+                    gemm_mq_batched_lmhead_draft(
                         gpu,
                         w_out.gpu_dtype,
                         &w_out.buf,
@@ -5612,7 +7012,7 @@ pub fn spec_step_dflash(
                     uniforms.as_deref(),
                 )?;
                 apply_dflash2_selector_proposal(
-                    proposal,
+                    &proposal,
                     vocab,
                     use_temp_sampling,
                     &mut drafted,
@@ -5625,44 +7025,38 @@ pub fn spec_step_dflash(
                 // draft_probs_dev is kept alive in c8_draft_probs_dev until
                 // chain_accept_spec_f32 consumes it after verify.
                 let probs_dev = gpu.alloc_tensor(&[batch * vocab], rdna_compute::DType::F32)?;
-                let (tau_dev, z_dev) = if topp_active {
-                    let tau_d = gpu.alloc_tensor(&[batch], rdna_compute::DType::F32)?;
-                    let z_d = gpu.alloc_tensor(&[batch], rdna_compute::DType::F32)?;
-                    gpu.softmax_temp_topp_batched_into_f32(
-                        &logits_batch,
-                        &probs_dev,
-                        &tau_d,
-                        &z_d,
-                        vocab,
-                        batch,
-                        temp,
-                        top_p,
-                        top_k,
-                        0.0, // min_p: DFlash min_p parity is the follow-up; off here
-                    )?;
-                    (tau_d, z_d)
-                } else {
-                    gpu.softmax_temp_batched_into_f32(
-                        &logits_batch,
-                        &probs_dev,
-                        vocab,
-                        batch,
-                        temp,
-                    )?;
-                    // topp inactive: kernel expects tau=0 (no truncation) and z=1
-                    // (inv_z=1 → eff_prob returns p unchanged). Use zeros() for tau
-                    // (0.0 bit-pattern = 0x00000000) and fill_f32 for z.
-                    let tau_d = gpu.zeros(&[batch], rdna_compute::DType::F32)?;
-                    let z_d = gpu.alloc_tensor(&[batch], rdna_compute::DType::F32)?;
-                    gpu.fill_f32(&z_d, 1.0f32)?;
-                    (tau_d, z_d)
-                };
+                let tau_dev = gpu.alloc_tensor(&[batch], rdna_compute::DType::F32)?;
+                let z_dev = gpu.alloc_tensor(&[batch], rdna_compute::DType::F32)?;
+                gpu.softmax_temp_topp_batched_into_f32(
+                    &logits_batch,
+                    &probs_dev,
+                    &tau_dev,
+                    &z_dev,
+                    vocab,
+                    batch,
+                    temp,
+                    top_p,
+                    top_k,
+                    0.0, // min_p: DFlash min_p parity is the follow-up; off here
+                )?;
                 // GPU categorical sample per row: writes draft_tokens + draft_p_at_token.
                 let tok_dev = gpu.alloc_tensor(&[batch], rdna_compute::DType::F32)?; // i32 via f32 slot
                 let pat_dev = gpu.alloc_tensor(&[batch], rdna_compute::DType::F32)?;
-                let seed_u32 = (*rng_state >> 32) as u32 ^ (*rng_state as u32);
+                // Per-row seeds: hash of (stream state at window start,
+                // absolute position, row) — `spec_draft_row_seed`.
+                let seeds: Vec<u8> = (0..batch)
+                    .flat_map(|r| {
+                        rdna_compute::sampling::spec_draft_row_seed(
+                            *rng_state,
+                            position as u64,
+                            r as u32,
+                        )
+                        .to_ne_bytes()
+                    })
+                    .collect();
+                let seeds_dev = gpu.upload_raw(&seeds, &[seeds.len()])?;
                 gpu.batched_categorical_sample_f32(
-                    &probs_dev, &tau_dev, &z_dev, &tok_dev, &pat_dev, vocab, batch, seed_u32,
+                    &probs_dev, &tau_dev, &z_dev, &seeds_dev, &tok_dev, &pat_dev, vocab, batch,
                 )?;
                 // Download only tokens + probs: batch×8 bytes total.
                 let mut raw_tok = vec![0i32; batch];
@@ -5673,6 +7067,7 @@ pub fn spec_step_dflash(
                     gpu.hip.memcpy_dtoh(bytes, &tok_dev.buf)?;
                 }
                 let raw_pat = gpu.download_f32(&pat_dev)?;
+                let _ = gpu.free_tensor(seeds_dev);
                 // Keep pat_dev alive on device for chain_accept_spec_f32.
                 for i in 0..batch {
                     drafted.push(raw_tok[i] as u32);
@@ -5700,13 +7095,8 @@ pub fn spec_step_dflash(
                     let row = &host_logits[i * vocab..(i + 1) * vocab];
                     let mut probs = Vec::with_capacity(vocab);
                     softmax_temp_into(row, temp, &mut probs);
-                    // Host truncation: top-k before nucleus, matching GPU combined cut.
-                    if top_k > 0 && top_k < vocab {
-                        apply_host_topk(&mut probs, top_k);
-                    }
-                    if top_p < 0.999 {
-                        apply_host_nucleus(&mut probs, top_p);
-                    }
+                    // Host truncation: the same AR law as the GPU tau/Z cut.
+                    apply_host_ar_trunc(&mut probs, top_k, top_p);
                     let u = xorshift_next_unit(rng_state);
                     let t = sample_categorical(&probs, u);
                     draft_probs_at_drafted.push(probs[t as usize]);
@@ -5776,7 +7166,7 @@ pub fn spec_step_dflash(
                 uniforms.as_deref(),
             )?;
             apply_dflash2_selector_proposal(
-                proposal,
+                &proposal,
                 vocab,
                 use_temp_sampling,
                 &mut drafted,
@@ -5793,12 +7183,7 @@ pub fn spec_step_dflash(
                 if use_temp_sampling {
                     let mut probs = Vec::with_capacity(vocab);
                     softmax_temp_into(&logits, temp, &mut probs);
-                    if top_k > 0 && top_k < vocab {
-                        apply_host_topk(&mut probs, top_k);
-                    }
-                    if top_p < 0.999 {
-                        apply_host_nucleus(&mut probs, top_p);
-                    }
+                    apply_host_ar_trunc(&mut probs, top_k, top_p);
                     let u = xorshift_next_unit(rng_state);
                     let t = sample_categorical(&probs, u);
                     draft_probs_at_drafted.push(probs[t as usize]);
@@ -6021,29 +7406,20 @@ pub fn spec_step_dflash(
             // Softmax them into tgt_probs_dev (kept device-resident).
             let logits_batch = verify_scratch.logits.sub_offset(0, b * vocab);
             let tgt_probs_dev = gpu.alloc_tensor(&[b * vocab], rdna_compute::DType::F32)?;
-            let (tau_t_dev, z_t_dev) = if topp_active {
-                let tau_t = gpu.alloc_tensor(&[b], rdna_compute::DType::F32)?;
-                let z_t = gpu.alloc_tensor(&[b], rdna_compute::DType::F32)?;
-                gpu.softmax_temp_topp_batched_into_f32(
-                    &logits_batch,
-                    &tgt_probs_dev,
-                    &tau_t,
-                    &z_t,
-                    vocab,
-                    b,
-                    temp,
-                    top_p,
-                    top_k,
-                    0.0,
-                )?;
-                (tau_t, z_t)
-            } else {
-                gpu.softmax_temp_batched_into_f32(&logits_batch, &tgt_probs_dev, vocab, b, temp)?;
-                let tau_t = gpu.zeros(&[b], rdna_compute::DType::F32)?;
-                let z_t = gpu.alloc_tensor(&[b], rdna_compute::DType::F32)?;
-                gpu.fill_f32(&z_t, 1.0f32)?;
-                (tau_t, z_t)
-            };
+            let tau_t_dev = gpu.alloc_tensor(&[b], rdna_compute::DType::F32)?;
+            let z_t_dev = gpu.alloc_tensor(&[b], rdna_compute::DType::F32)?;
+            gpu.softmax_temp_topp_batched_into_f32(
+                &logits_batch,
+                &tgt_probs_dev,
+                &tau_t_dev,
+                &z_t_dev,
+                vocab,
+                b,
+                temp,
+                top_p,
+                top_k,
+                0.0,
+            )?;
 
             let dft_probs_dev = c8_draft_probs_dev.as_ref().unwrap();
             let dft_tok_dev = c8_draft_tokens_dev.as_ref().unwrap();
@@ -6098,132 +7474,32 @@ pub fn spec_step_dflash(
             // distribution-parity probs. The verify logits are still resident in
             // `verify_scratch.logits[0..b*vocab]` (verify enqueued lm_head into it
             // and only ran GPU-argmax afterwards, which does not overwrite it).
-            let mut fast_tgt_tau: Option<Vec<f32>> = None;
-            let mut fast_tgt_z: Option<Vec<f32>> = None;
-            let fast_tgt_probs: Option<Vec<f32>> = if fast_sample_active {
+            let fast_tgt: Option<FastTargetRows> = if fast_sample_active {
                 let logits_batch = verify_scratch.logits.sub_offset(0, b * vocab);
-                let probs_gpu = gpu.alloc_tensor(&[b * vocab], rdna_compute::DType::F32)?;
-                if topp_active {
-                    let tau_gpu = gpu.alloc_tensor(&[b], rdna_compute::DType::F32)?;
-                    let z_gpu = gpu.alloc_tensor(&[b], rdna_compute::DType::F32)?;
-                    gpu.softmax_temp_topp_batched_into_f32(
-                        &logits_batch,
-                        &probs_gpu,
-                        &tau_gpu,
-                        &z_gpu,
-                        vocab,
-                        b,
-                        temp,
-                        top_p,
-                        top_k,
-                        0.0,
-                    )?;
-                    fast_tgt_tau = Some(gpu.download_f32(&tau_gpu)?);
-                    fast_tgt_z = Some(gpu.download_f32(&z_gpu)?);
-                    let _ = gpu.free_tensor(tau_gpu);
-                    let _ = gpu.free_tensor(z_gpu);
-                } else {
-                    gpu.softmax_temp_batched_into_f32(&logits_batch, &probs_gpu, vocab, b, temp)?;
-                }
-                let host = gpu.download_f32(&probs_gpu)?;
-                let _ = gpu.free_tensor(probs_gpu);
-                debug_assert_eq!(host.len(), b * vocab);
-                Some(host)
+                let mut rows = FastTargetRows::default();
+                dflash_target_rows_into(
+                    gpu, &logits_batch, b, vocab,
+                    DflashSampleCfg { temp, top_p, top_k, cactus_delta },
+                    &mut rows,
+                )?;
+                Some(rows)
             } else {
                 debug_assert_eq!(verify_out.logits_per_pos.len(), b * vocab);
                 None
             };
-            let tgt_logits = &verify_out.logits_per_pos;
-            let mut target_probs = Vec::with_capacity(vocab);
-            let mut rejected_bonus: Option<u32> = None;
-            // CACTUS (Hao & Mou 2026, arXiv:2604.04987 Corollary 5).
-            let use_cactus = cactus_delta > 0.0;
-            for i in 0..b - 1 {
-                // Pre-commit budget: stop accepting drafts once emit would
-                // exceed max_emit (emit = accept_len + 1). Bonus is re-drawn
-                // from the target row at the clamped boundary below.
-                if let Some(m) = max_accept {
-                    if accept_len >= m {
-                        break;
-                    }
-                }
-                if let Some(fast) = &fast_tgt_probs {
-                    target_probs.clear();
-                    target_probs.extend_from_slice(&fast[i * vocab..(i + 1) * vocab]);
-                    if let (Some(tau), Some(z)) = (&fast_tgt_tau, &fast_tgt_z) {
-                        apply_topp_trunc(&mut target_probs, tau[i], z[i]);
-                    }
-                } else {
-                    softmax_temp_into(
-                        &tgt_logits[i * vocab..(i + 1) * vocab],
-                        temp,
-                        &mut target_probs,
-                    );
-                    if top_k > 0 && top_k < vocab {
-                        apply_host_topk(&mut target_probs, top_k);
-                    }
-                    if top_p < 0.999 {
-                        apply_host_nucleus(&mut target_probs, top_p);
-                    }
-                }
-                let t = block[i + 1] as usize;
-                let p_d = draft_probs_at_drafted[i].max(f32::MIN_POSITIVE);
-                let p_t = target_probs[t];
-                let accept_prob = if use_cactus {
-                    let bump = (2.0 * cactus_delta * p_t * (1.0 - p_t)).max(0.0).sqrt();
-                    (p_t + bump).min(1.0)
-                } else {
-                    p_t
-                };
-                let u = xorshift_next_unit(rng_state);
-                if u * p_d <= accept_prob {
-                    accept_len += 1;
-                } else {
-                    if use_cactus {
-                        let qn = p_t.clamp(0.0, 1.0);
-                        let gamma_star = accept_prob;
-                        if qn >= 1.0 - 1e-6 {
-                            for v in target_probs.iter_mut() {
-                                *v = 0.0;
-                            }
-                            target_probs[t] = 1.0;
-                        } else {
-                            let scale = (1.0 - gamma_star) / (1.0 - qn);
-                            for (j, v) in target_probs.iter_mut().enumerate() {
-                                *v = if j == t { gamma_star } else { scale * *v };
-                            }
-                        }
-                    }
-                    let u2 = xorshift_next_unit(rng_state);
-                    rejected_bonus = Some(sample_residual(&target_probs, &draft_softmaxes[i], u2));
-                    break;
-                }
-            }
-            bonus_token = if let Some(b) = rejected_bonus {
-                b
-            } else {
-                // Full-accept OR budget-bound: draw bonus from the target row
-                // at the boundary (accept_len). Never substitute argmax.
-                let i = accept_len.min(b - 1);
-                if let Some(fast) = &fast_tgt_probs {
-                    target_probs.clear();
-                    target_probs.extend_from_slice(&fast[i * vocab..(i + 1) * vocab]);
-                } else {
-                    softmax_temp_into(
-                        &tgt_logits[i * vocab..(i + 1) * vocab],
-                        temp,
-                        &mut target_probs,
-                    );
-                    if top_k > 0 && top_k < vocab {
-                        apply_host_topk(&mut target_probs, top_k);
-                    }
-                    if top_p < 0.999 {
-                        apply_host_nucleus(&mut target_probs, top_p);
-                    }
-                }
-                let u = xorshift_next_unit(rng_state);
-                sample_categorical(&target_probs, u)
+            let q = DflashSampledDraft {
+                selected_q: draft_probs_at_drafted,
+                dense_q: draft_softmaxes,
+                ..DflashSampledDraft::default()
             };
+            let mut target_probs = Vec::with_capacity(vocab);
+            let decision = dflash_sampled_accept_rows(
+                &block, &q, fast_tgt.as_ref(), &verify_out.logits_per_pos,
+                vocab, DflashSampleCfg { temp, top_p, top_k, cactus_delta },
+                max_accept.unwrap_or(usize::MAX), rng_state, &mut target_probs,
+            );
+            accept_len = decision.accepted_drafts;
+            bonus_token = decision.bonus_token;
         }
     } else {
         // Greedy path. If RP or n-gram-block is active, re-derive argmax per
@@ -6373,190 +7649,51 @@ pub fn spec_step_dflash(
         );
     }
 
-    // ── 8. Committed sequence ───────────────────────────────────────────
-    // committed[0] is the seed_token (already emitted by prev iter). The
-    // caller's output stream appends committed[1..]. We include seed in
-    // committed because target KV/state must be at position seed+accept_len+1
-    // after this step.
-    let mut committed: Vec<u32> = Vec::with_capacity(accept_len + 2);
-    committed.push(seed_token);
-    for i in 0..accept_len {
-        committed.push(drafted[i + 1]);
-    }
-    committed.push(bonus_token);
-    let committed_count = committed.len();
-    debug_assert_eq!(committed_count, accept_len + 2);
-
-    if phase_on {
-        gpu.hip.device_synchronize()?;
-    }
-    let t_accept_end = std::time::Instant::now();
-
-    // ── 9. Append accepted target hidden rows to target_hidden_host ─────
-    // Verify wrote B rows into hidden_rb. We keep the first accept_len+1
-    // (= committed_count - 1) because the last committed token (bonus) is
-    // ALREADY reflected in target state + will get its hidden captured on
-    // the NEXT verify when it's forwarded as block[0].
-    //
-    // Wait: bonus_token is placed at position `position + accept_len + 1`.
-    // Its hidden was captured at ring slot (verify start + accept_len),
-    // which corresponds to the B-th verify forward position = position +
-    // accept_len. That's the bonus position if we identify it correctly.
-    //
-    // Actually every verify position writes one hidden row. Position i of
-    // the B-verify corresponds to absolute position `position + i`, so:
-    //   block[0] hidden captured at ring slot (head - B + 0) → pos=position
-    //   block[1] hidden captured at ring slot (head - B + 1) → pos=position+1
-    //   ...
-    //   block[accept_len] hidden captured → pos=position+accept_len (THIS is the last committed before bonus)
-    //   block[accept_len+1] hidden captured → pos=position+accept_len+1 (this would be bonus; but target's prediction at that slot is what drove the bonus choice)
-    //
-    // The bonus token is what target WOULD predict at position+accept_len+1
-    // given the B-verify input. Its hidden was NOT captured at that
-    // position — the hidden at that slot is for `block[accept_len+1]`, a
-    // REJECTED draft token's target forward. We can't use that hidden for
-    // the committed bonus token.
-    //
-    // Resolution: DON'T append bonus-token hidden here. Next iter's
-    // verify will forward the bonus token at its position (position +
-    // committed_count - 1) as its new block[0], capturing proper hidden
-    // and target state there. Committed_count - 1 rows appended here
-    // covers positions [position..position + committed_count - 2] =
-    // [position..position + accept_len]. Bonus at position+accept_len+1
-    // sits in no-man's land — its hidden will materialize on next iter.
-    //
-    // This matches the reference's `target_hidden = ...[:, :accept_len+1, :]`
-    // pattern which slices the verify's hidden output to accept_len+1
-    // rows — NOT accept_len+2.
-    let rows_to_keep = accept_len + 1;
-    if ctx_slice.is_some() {
-        // ctx_slice path: CPU shadow still required for the window slice.
-        let hidden_block = download_hidden_block(gpu, hidden_rb, b)?;
-        target_hidden_host.extend_from_slice(&hidden_block[..rows_to_keep * ne * h]);
-    } else {
-        // Fast path: scatter straight from hidden_rb into draft scratch on GPU.
-        // No D2H, no CPU reshape, no next-cycle H2D.
-        //
-        // Verify just wrote B slots to hidden_rb; we want the first
-        // `rows_to_keep` (= accept+1) of those. Pass block_size=b so the
-        // scatter function aligns to the verify-block origin, not the
-        // ring tail.
-        scatter_hidden_block_to_interleaved(
+    // ── 8-10. Committed sequence → hidden scatter / CPU shadow → DeltaNet
+    // rewind + replay ────────────────────────────────────────────────────
+    // One shared body (`dflash_commit_decision_borrowed`, lifted verbatim from
+    // the pre-factor lines 7057-7240 of this function) serves greedy and
+    // sampled decisions here and the lane commits. `accept_len`/`bonus_token`
+    // are already budgeted by the arm above; nothing re-clamps or re-draws.
+    // The bonus token's hidden is deliberately NOT appended (its ring slot
+    // holds a rejected draft's forward); the next verify forwards it as
+    // block[0]. A CPU shadow (`ctx_slice`) extends `target_hidden_host`
+    // instead of scattering + thlog append.
+    let decision = SampledWindowDecision {
+        accepted_drafts: accept_len,
+        bonus_token,
+        committed_len: accept_len + 2,
+    };
+    let (committed, commit_times) = {
+        let mut target_parts = DflashTargetParts::from_slot(target);
+        dflash_commit_decision_borrowed(
             gpu,
-            hidden_rb,
-            &draft_scratch.target_hidden,
-            position,
-            b,
-            rows_to_keep,
-            draft_scratch.ctx_modulus(),
-        )?;
-        // Keep draft_forward's incremental-upload tracker in sync so any future
-        // ctx_slice=Some call in the same session doesn't try to re-upload what
-        // GPU already has, and track the absolute positions of the appended
-        // rows (logical `position..position+rows_to_keep` plus the current
-        // target KV compact_offset — zero pre-eviction, non-zero after) for the
-        // next cycle's `positions_k` construction.
-        let co = target.kv_cache.compact_offset as i32;
-        draft_scratch
-            .thlog
-            .append_committed(position, rows_to_keep, co);
-    }
-
-    if phase_on {
-        gpu.hip.device_synchronize()?;
-    }
-    let t_scatter_end = std::time::Instant::now();
-
-    // ── 10. Rewind DeltaNet + replay committed tokens ────────────────────
-    // After verify, target state reflects B forwards. We need it to reflect
-    // `committed_count - 1 = accept_len + 1` forwards (the seed + accepted
-    // draft tokens). The bonus token is NOT replayed — it will be
-    // block[0] of the next iter. This keeps the invariant that before each
-    // verify, target state is at position `start` (= pre-verify position).
-    //
-    // Railgun D8 (default on; `HIPFIRE_DN_SNAPSHOT_FLIP=0` opts out; exact gfx1201, tape path with
-    // the two-launch replay admitted) drops the restore copy. `target_snap`
-    // stays the pre-verify (pre-window) state throughout, so terminal repair
-    // is unaffected, and the live state ends byte-identical to restore +
-    // in-place replay on every rollback path:
-    // - full accept (`accept_len + 1 == b`, EF residual on, HIP/HipGraph
-    //   verify): keep the verify-advanced live buffers. The verify ran the
-    //   replay's arithmetic on the same b taped rows from the same state
-    //   (same conv1d, same two-multiply QK norm, repeat-interleave as a copy,
-    //   the same GDN kernel with deterministic EF requant), so restore +
-    //   replay(b) would rewrite the same bytes;
-    // - any shorter accept, including zero and the `max_accept` clamp: the
-    //   replay reads the pre-verify state from `target_snap` and writes the
-    //   live buffers;
-    // - no tape, EF off, a retained-PM4 verify, or any other decline: restore
-    //   and run exactly as before. (DFlash never stops on EOS here.)
-    let replay_from_snapshot = gdn_tape_opt.as_deref().is_some_and(|tape| {
-        tape.replay_from_snapshot_admits(gpu, &target.dn_state, target_snap, accept_len + 1)
-    });
-    let keep_verified = replay_from_snapshot
-        && verify_on_hip
-        && accept_len + 1 == b
-        && !target.dn_state.s_ef_residual.is_empty();
-    if !replay_from_snapshot {
-        target_snap.restore_to(&mut target.dn_state, gpu)?;
-    }
-
-    if phase_on {
-        gpu.hip.device_synchronize()?;
-    }
-    let t_restore_end = std::time::Instant::now();
-    // Tape-replay path (0.1.7 perf): if a GdnTape was captured during verify,
-    // replay the GatedDeltaNet recurrence for (accept+1) steps using the
-    // recorded (q, k, v, α, β) tuples — no full-target re-run needed. The
-    // FullAttention layers don't need explicit rewind because the next
-    // verify (starting at position + accept + 1) will overwrite their KV
-    // cache slots [position + accept + 1 .. position + accept + 1 + B),
-    // which subsumes the previously-written [position..position + B) range.
-    //
-    // Fallback (no tape): batched forward_prefill_batch over (accept+1)
-    // tokens, same as the prior version — re-runs the full target but one
-    // batched call instead of (accept+1) sequential decodes.
-    if let Some(tape) = gdn_tape_opt.as_deref() {
-        let done = keep_verified
-            || (replay_from_snapshot
-                && tape.replay_gdn_from_snapshot(
-                    gpu,
-                    &target.weights,
-                    &target.config,
-                    &mut target.dn_state,
-                    target_snap,
-                    accept_len + 1,
-                )?);
-        if !done {
-            if replay_from_snapshot {
-                // Arming the snapshot-source tables failed: restore after all.
-                target_snap.restore_to(&mut target.dn_state, gpu)?;
-            }
-            tape.replay_gdn(
-                gpu,
-                &target.weights,
-                &target.config,
-                &mut target.dn_state,
-                accept_len + 1,
-            )?;
-        }
-    } else {
-        let replay_tokens = &committed[..accept_len + 1];
-        qwen35::forward_prefill_batch(
-            gpu,
-            &target.weights,
-            &target.config,
-            replay_tokens,
-            position,
-            &mut target.kv_cache,
-            &mut target.dn_state,
-            &target.scratch,
-            None,
-            None,
-            None,
-            None,
-        )?;
-    }
+            &mut target_parts,
+            DflashBorrowedCommit {
+                hidden_rb: &*hidden_rb,
+                draft_scratch: &mut *draft_scratch,
+                target_snap: &*target_snap,
+                gdn_tape: gdn_tape_opt.as_deref(),
+                cpu_shadow: if ctx_slice.is_some() {
+                    Some(DflashCpuShadow {
+                        host: &mut *target_hidden_host,
+                        ne,
+                        h,
+                    })
+                } else {
+                    None
+                },
+            },
+            DflashCommitWindow {
+                position,
+                seed_token,
+                block: &block,
+                decision,
+                verify_on_hip,
+                phase_on,
+            },
+        )?
+    };
     // Target state is now at position + accept_len + 1. KV cache has
     // written K/V at positions [position..position+accept_len]. The bonus
     // token's K/V will be written on the next iter's verify (at position
@@ -6568,10 +7705,16 @@ pub fn spec_step_dflash(
         let us_draft = t_draft_end.duration_since(t_spec_start).as_micros();
         let us_ngram = t_verify_start.duration_since(t_draft_end).as_micros();
         let us_verify = t_verify_end.duration_since(t_verify_start).as_micros();
-        let us_accept = t_accept_end.duration_since(t_verify_end).as_micros();
-        let us_scatter = t_scatter_end.duration_since(t_accept_end).as_micros();
-        let us_restore = t_restore_end.duration_since(t_scatter_end).as_micros();
-        let us_replay = t_end.duration_since(t_restore_end).as_micros();
+        let us_accept = commit_times.accept_end.duration_since(t_verify_end).as_micros();
+        let us_scatter = commit_times
+            .scatter_end
+            .duration_since(commit_times.accept_end)
+            .as_micros();
+        let us_restore = commit_times
+            .restore_end
+            .duration_since(commit_times.scatter_end)
+            .as_micros();
+        let us_replay = t_end.duration_since(commit_times.restore_end).as_micros();
         let us_total = t_end.duration_since(t_spec_start).as_micros();
         eprintln!(
             "[phase] B={} accept={} draft={}µs ngram={}µs verify={}µs \
@@ -6593,9 +7736,6 @@ pub fn spec_step_dflash(
         t_draft_end,
         t_verify_start,
         t_verify_end,
-        t_accept_end,
-        t_scatter_end,
-        t_restore_end,
     );
 
     Ok(SpecStepResult {
@@ -7069,6 +8209,7 @@ pub fn verify_dflash_block_dense_tp2(
             &states[0].dflash.verify_scratch,
             b,
             vocab,
+            DenseBatchMath::Product,
         )?;
         let argmax_buf = states[0].dflash.verify_scratch.argmax.sub_offset(0, b);
         gpus.devices[0].argmax_f32_batched(
@@ -7517,7 +8658,7 @@ fn run_dflash_draft_for_logits(
                 let _ = gpu.free_tensor(logits_batch);
                 return Err(e);
             }
-            let r2 = gemm_mq_batched_lmhead(
+            let r2 = gemm_mq_batched_lmhead_draft(
                 gpu,
                 w_out.gpu_dtype,
                 &w_out.buf,
@@ -7870,7 +9011,7 @@ fn run_dflash_draft_for_topk_gpu(
                 let _ = gpu.free_tensor(logits_batch);
                 return Err(e);
             }
-            let r2 = gemm_mq_batched_lmhead(
+            let r2 = gemm_mq_batched_lmhead_draft(
                 gpu,
                 w_out.gpu_dtype,
                 &w_out.buf,
@@ -9152,13 +10293,100 @@ pub fn take_dn_checkpoint(
     } else {
         match DeltaNetSnapshot::new_for(gpu, dn) {
             Ok(s) => s,
-            Err(_) => return,
+            Err(e) => {
+                eprintln!("take_dn_checkpoint: pos={pos} skipped: snapshot allocation failed: {e}");
+                return;
+            }
         }
     };
-    if snap.save_from(dn, gpu).is_err() {
+    if let Err(e) = snap.save_from(dn, gpu) {
+        // A recycled slot is partially overwritten, so it cannot rejoin the
+        // ring either way: free it.
+        eprintln!("take_dn_checkpoint: pos={pos} skipped: snapshot save failed: {e}");
+        snap.free_gpu(gpu);
         return;
     }
     cks.push((pos, snap));
+}
+
+/// Outer chunk ceiling of the DFlash prompt seed ([`SeedPrefill::plan`]):
+/// the legacy 256 rows under `HIPFIRE_DFLASH_LEGACY_PREFILL=1`, else AR's
+/// memory-admitted `ordinary_prefill_chunk_limit` evaluated as if
+/// `free_deduction` more device bytes were already allocated (`0` = now; see
+/// `ordinary_prefill_chunk_limit_deducting`). Taken once per prompt. Shared
+/// by the seed itself and by VMM lane admission, which predicts the seed's
+/// chunk plan (and so its checkpoint count) before the lane exists.
+pub fn dflash_seed_ceiling(
+    gpu: &Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    dn_state: &DeltaNetState,
+    kv_cache: &KvCache,
+    free_deduction: usize,
+) -> HipResult<usize> {
+    if dflash_legacy_prefill() {
+        return Ok(qwen35::PREFILL_MAX_BATCH);
+    }
+    qwen35::prefill::ordinary_prefill_chunk_limit_deducting(
+        gpu,
+        weights,
+        config,
+        dn_state,
+        kv_cache,
+        free_deduction,
+    )
+}
+
+/// Rows of the next outer seed chunk with `remaining` prompt rows left under
+/// `ceiling`: AR's `ordinary_serve_prefill_chunk_len`.
+fn dflash_seed_outer_chunk_len(remaining: usize, ceiling: usize) -> usize {
+    qwen35::prefill::ordinary_serve_prefill_chunk_len(remaining, ceiling)
+        .unwrap_or(remaining.min(ceiling).max(1))
+}
+
+/// DeltaNet checkpoints a cold DFlash prompt seed of `prompt_len` rows takes
+/// under outer-chunk `ceiling` (the ring's final length): mirrors
+/// `seed_target_hidden_from_prompt_abortable_parts`, which runs outer chunks of
+/// [`dflash_seed_outer_chunk_len`] and calls [`take_dn_checkpoint`] at the end
+/// of each. That call skips `cap == 0`, skips a position below the last
+/// checkpoint plus `interval`, and at `cap` recycles the oldest, so the ring
+/// length never exceeds `cap`. (A failed snapshot allocation only lowers the
+/// real count.)
+pub fn dflash_seed_checkpoint_count(prompt_len: usize, ceiling: usize, interval: usize, cap: usize) -> usize {
+    if cap == 0 {
+        return 0;
+    }
+    let (mut pos, mut last, mut len) = (0usize, None::<usize>, 0usize);
+    while pos < prompt_len {
+        pos += dflash_seed_outer_chunk_len(prompt_len - pos, ceiling);
+        if last.is_some_and(|p| pos < p.saturating_add(interval)) {
+            continue;
+        }
+        len = (len + 1).min(cap);
+        last = Some(pos);
+    }
+    len
+}
+
+/// Upper bound on [`dflash_seed_checkpoint_count`] for every outer-chunk
+/// ceiling the seed can take at least `min_ceiling`: the maximum over
+/// `min_ceiling` and each staged rung `>= min_ceiling` (the count is not
+/// monotone in the ceiling, so every larger candidate is evaluated). Valid
+/// whenever the seed's actual ceiling is `>= min_ceiling` and a staged rung or
+/// `min_ceiling` itself, which holds for [`dflash_seed_ceiling`] evaluated
+/// with a free-byte deduction that covers everything allocated before the
+/// seed's own query (admission is monotone in free bytes, and a ceiling that
+/// does not depend on memory equals `min_ceiling`).
+pub fn dflash_seed_checkpoint_bound(prompt_len: usize, min_ceiling: usize, interval: usize, cap: usize) -> usize {
+    qwen35::prefill::WIDENED_RUNGS
+        .iter()
+        .copied()
+        .filter(|&r| r >= min_ceiling)
+        .chain(std::iter::once(min_ceiling))
+        .map(|ceiling| dflash_seed_checkpoint_count(prompt_len, ceiling, interval, cap))
+        .max()
+        .unwrap_or(0)
+        .min(cap)
 }
 
 pub fn seed_target_hidden_from_prompt(
@@ -9231,31 +10459,26 @@ struct SeedPrefill {
 }
 
 impl SeedPrefill {
-    fn plan(gpu: &Gpu, target: &ModelSlot) -> Self {
-        let ceiling = if dflash_legacy_prefill() {
-            qwen35::PREFILL_MAX_BATCH
-        } else {
-            match qwen35::ordinary_prefill_chunk_limit(
-                gpu,
-                &target.weights,
-                &target.config,
-                &target.dn_state,
-                &target.kv_cache,
-                None,
-            ) {
-                Ok(limit) => limit,
-                Err(e) => {
-                    eprintln!("dflash seed: chunk-limit query failed ({e}); keeping legacy ceiling");
-                    qwen35::prefill_max_batch(gpu)
-                }
+    fn plan(gpu: &Gpu, target: &DflashTargetParts<'_>) -> Self {
+        let ceiling = match dflash_seed_ceiling(
+            gpu,
+            target.weights,
+            target.config,
+            target.dn_state,
+            target.kv_cache,
+            0,
+        ) {
+            Ok(limit) => limit,
+            Err(e) => {
+                eprintln!("dflash seed: chunk-limit query failed ({e}); keeping legacy ceiling");
+                qwen35::prefill_max_batch(gpu)
             }
         };
         Self { ceiling, pbs: None }
     }
 
     fn next_len(&self, remaining: usize) -> usize {
-        qwen35::prefill::ordinary_serve_prefill_chunk_len(remaining, self.ceiling)
-            .unwrap_or(remaining.min(self.ceiling).max(1))
+        dflash_seed_outer_chunk_len(remaining, self.ceiling)
     }
 
     /// Rows of the next forward call inside an outer chunk with `remaining`
@@ -9280,7 +10503,7 @@ impl SeedPrefill {
     fn forward(
         &mut self,
         gpu: &mut Gpu,
-        target: &mut ModelSlot,
+        target: &mut DflashTargetParts<'_>,
         hidden_rb: &mut HiddenStateRingBuffer,
         chunk: &[u32],
         pos: usize,
@@ -9294,13 +10517,13 @@ impl SeedPrefill {
         {
             return qwen35::forward_prefill_batch(
                 gpu,
-                &target.weights,
-                &target.config,
+                target.weights,
+                target.config,
                 chunk,
                 pos,
-                &mut target.kv_cache,
-                &mut target.dn_state,
-                &target.scratch,
+                target.kv_cache,
+                target.dn_state,
+                target.scratch,
                 Some(hidden_rb),
                 None,
                 None,
@@ -9309,17 +10532,17 @@ impl SeedPrefill {
         }
         if self.pbs.is_none() {
             let rows = self.ceiling.min(total).max(2);
-            self.pbs = Some(qwen35::PrefillBatchScratch::new_opt(gpu, &target.config, rows, false)?);
+            self.pbs = Some(qwen35::PrefillBatchScratch::new_opt(gpu, target.config, rows, false)?);
         }
         qwen35::forward_prefill_batch_with_pbs(
             gpu,
-            &target.weights,
-            &target.config,
+            target.weights,
+            target.config,
             chunk,
             pos,
-            &mut target.kv_cache,
-            &mut target.dn_state,
-            &target.scratch,
+            target.kv_cache,
+            target.dn_state,
+            target.scratch,
             Some(hidden_rb),
             None,
             None,
@@ -9358,6 +10581,33 @@ pub fn seed_target_hidden_from_prompt_abortable(
     // Optional DeltaNet checkpoint ring for divergent-render resume. When
     // `Some`, the recurrent state is snapshotted every `ckpt_interval` tokens
     // (bounded at `ckpt_cap`). `None` ⇒ no checkpointing (zero overhead).
+    checkpoints: Option<&mut Vec<(usize, DeltaNetSnapshot)>>,
+    ckpt_interval: usize,
+    ckpt_cap: usize,
+) -> HipResult<bool> {
+    let mut parts = DflashTargetParts::from_slot(target);
+    seed_target_hidden_from_prompt_abortable_parts(
+        gpu,
+        &mut parts,
+        hidden_rb,
+        target_hidden_host,
+        prompt_tokens,
+        abort_check,
+        checkpoints,
+        ckpt_interval,
+        ckpt_cap,
+    )
+}
+
+/// [`seed_target_hidden_from_prompt_abortable`] over explicit trunk owners.
+#[allow(clippy::too_many_arguments)]
+pub fn seed_target_hidden_from_prompt_abortable_parts(
+    gpu: &mut Gpu,
+    target: &mut DflashTargetParts<'_>,
+    hidden_rb: &mut HiddenStateRingBuffer,
+    target_hidden_host: &mut Vec<f32>,
+    prompt_tokens: &[u32],
+    abort_check: &dyn Fn() -> bool,
     mut checkpoints: Option<&mut Vec<(usize, DeltaNetSnapshot)>>,
     ckpt_interval: usize,
     ckpt_cap: usize,
@@ -9394,7 +10644,7 @@ pub fn seed_target_hidden_from_prompt_abortable(
                 seq_pos += piece;
             }
             if let Some(cks) = checkpoints.as_deref_mut() {
-                take_dn_checkpoint(cks, &target.dn_state, gpu, seq_pos, ckpt_interval, ckpt_cap);
+                take_dn_checkpoint(cks, target.dn_state, gpu, seq_pos, ckpt_interval, ckpt_cap);
             }
         }
         Ok(false)
@@ -9432,6 +10682,33 @@ pub fn seed_target_hidden_suffix_abortable(
     // Optional DeltaNet checkpoint ring (see from_prompt variant). Lets a HIT
     // or a resume keep adding checkpoints as the conversation grows, so a later
     // divergence resumes from a recent point rather than the initial prefill.
+    checkpoints: Option<&mut Vec<(usize, DeltaNetSnapshot)>>,
+    ckpt_interval: usize,
+    ckpt_cap: usize,
+) -> HipResult<bool> {
+    let mut parts = DflashTargetParts::from_slot(target);
+    seed_target_hidden_suffix_abortable_parts(
+        gpu,
+        &mut parts,
+        hidden_rb,
+        suffix,
+        start_pos,
+        abort_check,
+        checkpoints,
+        ckpt_interval,
+        ckpt_cap,
+    )
+}
+
+/// [`seed_target_hidden_suffix_abortable`] over explicit trunk owners.
+#[allow(clippy::too_many_arguments)]
+pub fn seed_target_hidden_suffix_abortable_parts(
+    gpu: &mut Gpu,
+    target: &mut DflashTargetParts<'_>,
+    hidden_rb: &mut HiddenStateRingBuffer,
+    suffix: &[u32],
+    start_pos: usize,
+    abort_check: &dyn Fn() -> bool,
     mut checkpoints: Option<&mut Vec<(usize, DeltaNetSnapshot)>>,
     ckpt_interval: usize,
     ckpt_cap: usize,
@@ -9452,7 +10729,7 @@ pub fn seed_target_hidden_suffix_abortable(
                 off += piece;
             }
             if let Some(cks) = checkpoints.as_deref_mut() {
-                take_dn_checkpoint(cks, &target.dn_state, gpu, pos, ckpt_interval, ckpt_cap);
+                take_dn_checkpoint(cks, target.dn_state, gpu, pos, ckpt_interval, ckpt_cap);
             }
         }
         Ok(false)
@@ -9541,6 +10818,54 @@ pub fn apply_eviction_retain_to_draft(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seed_checkpoint_count_follows_the_outer_chunk_plan() {
+        // interval 2048, cap 8: a checkpoint at each outer chunk end at least
+        // `interval` past the previous one.
+        let count = |p, ceiling| dflash_seed_checkpoint_count(p, ceiling, 2048, 8);
+        assert_eq!(count(8316, 8192), 1);
+        assert_eq!(count(8316, 4096), 2);
+        assert_eq!(count(8316, 2048), 4);
+        assert_eq!(count(8316, 512), 4);
+        assert_eq!(count(4300, 2048), 2);
+        assert_eq!(count(4300, 4096), 1);
+        // A prompt inside one chunk checkpoints once, at its end.
+        assert_eq!(count(100, 8192), 1);
+        assert_eq!(count(0, 8192), 0);
+    }
+
+    #[test]
+    fn seed_checkpoint_count_respects_cap_and_policy() {
+        // Ring recycling never exceeds the cap.
+        assert_eq!(dflash_seed_checkpoint_count(8316, 512, 512, 3), 3);
+        assert_eq!(dflash_seed_checkpoint_count(8316, 512, 512, 100), 16);
+        // Resume off (cap 0) takes none.
+        assert_eq!(dflash_seed_checkpoint_count(8316, 512, 512, 0), 0);
+        // A tail chunk shorter than the interval does not add one.
+        assert_eq!(dflash_seed_checkpoint_count(4100, 2048, 2048, 8), 2);
+    }
+
+    #[test]
+    fn seed_checkpoint_bound_is_the_max_over_larger_ceilings() {
+        // Not monotone in the ceiling: P=4100, interval 2048. 2048-row chunks
+        // end at 2048 and 4096 (both taken): 2; a 4096-row ceiling ends at
+        // 4096 only: 1.
+        assert_eq!(dflash_seed_checkpoint_count(4100, 4096, 2048, 8), 1);
+        // Bound from min_ceiling 4096 covers 4096 and 8192 only.
+        assert_eq!(dflash_seed_checkpoint_bound(4100, 4096, 2048, 8), 1);
+        // From 512 every rung is a candidate: the worst is 2.
+        assert_eq!(dflash_seed_checkpoint_bound(4100, 512, 2048, 8), 2);
+        // A bound is never below the count at its own minimum and respects cap.
+        for p in [1, 511, 512, 2047, 2049, 4300, 8316, 20000] {
+            for min in [512, 1024, 2048, 4096, 8192] {
+                let b = dflash_seed_checkpoint_bound(p, min, 1024, 4);
+                assert!(b >= dflash_seed_checkpoint_count(p, min, 1024, 4));
+                assert!(b <= 4);
+            }
+        }
+        assert_eq!(dflash_seed_checkpoint_bound(8316, 512, 2048, 0), 0);
+    }
 
     /// `sample_residual_point_mass` must equal `sample_residual` against an
     /// explicit one-hot row, bit for bit, and never return the excluded token
@@ -9737,6 +11062,121 @@ mod tests {
         apply_topp_trunc(&mut row, tau, z);
         assert!((row[0] - 1.0).abs() < 1e-5, "single-token nucleus → 1.0");
         assert_eq!(&row[1..], &[0.0, 0.0, 0.0]);
+    }
+
+    /// Bucket frequencies of `sampled_target_bonus` over a uniform `u` grid
+    /// (each bucket exact to one grid step per kept token).
+    #[allow(clippy::too_many_arguments)]
+    fn bonus_grid_freq(
+        row: usize,
+        vocab: usize,
+        fast: Option<&FastTargetRows>,
+        logits: &[f32],
+        temp: f32,
+        top_k: usize,
+        top_p: f32,
+        grid: usize,
+    ) -> Vec<f64> {
+        let mut scratch = Vec::new();
+        let mut freq = vec![0.0f64; vocab];
+        for g in 0..grid {
+            let u = (g as f32 + 0.5) / grid as f32;
+            let t = sampled_target_bonus(
+                &mut scratch,
+                row,
+                vocab,
+                fast,
+                logits,
+                temp,
+                top_k,
+                top_p,
+                u,
+            );
+            freq[t as usize] += 1.0 / grid as f64;
+        }
+        freq
+    }
+
+    #[test]
+    fn sampled_bonus_draws_from_the_acceptance_row_law() {
+        // Two verify rows; the bonus sits at row 1. Logits are distinct, so
+        // nucleus boundaries carry no ties.
+        let vocab = 64usize;
+        let rows = 2usize;
+        let logits: Vec<f32> = (0..rows * vocab)
+            .map(|j| {
+                let (r, i) = (j / vocab, j % vocab);
+                let rank = (i * 37 + r * 11) % vocab;
+                6.0 - 1.1 * ((rank + 1) as f32).ln()
+            })
+            .collect();
+        let grid = 200_000usize;
+        for &(temp, top_p, top_k) in &[(0.7f32, 0.95f32, 20usize), (1.0, 0.8, 64), (0.6, 0.9, 5)] {
+            // FAST_SAMPLE rows: the per-row softmax plus the kernel's AR
+            // tau/Z (prob of the last kept token, kept mass).
+            let mut probs = Vec::with_capacity(rows * vocab);
+            let (mut tau, mut z) = (Vec::new(), Vec::new());
+            for r in 0..rows {
+                let mut row = Vec::new();
+                softmax_temp_into(&logits[r * vocab..(r + 1) * vocab], temp, &mut row);
+                let mut ar = row.clone();
+                apply_host_ar_trunc(&mut ar, top_k, top_p);
+                let t = (0..vocab)
+                    .filter(|&i| ar[i] > 0.0)
+                    .map(|i| row[i])
+                    .fold(f32::INFINITY, f32::min);
+                tau.push(t);
+                z.push(row.iter().filter(|&&p| p >= t).sum());
+                probs.extend_from_slice(&row);
+            }
+            let fast = FastTargetRows { probs, tau, z };
+            for (fast, label) in [(Some(&fast), "fast"), (None, "host")] {
+                let mut law = Vec::new();
+                sampled_target_row_into(&mut law, 1, vocab, fast, &logits, temp, top_k, top_p);
+                let freq = bonus_grid_freq(1, vocab, fast, &logits, temp, top_k, top_p, grid);
+                for i in 0..vocab {
+                    if law[i] == 0.0 {
+                        assert_eq!(
+                            freq[i], 0.0,
+                            "{label} T{temp}: bonus {i} outside the row law"
+                        );
+                    } else {
+                        assert!(
+                            (freq[i] - law[i] as f64).abs() < 2e-4,
+                            "{label} T{temp}: token {i} freq {} vs law {}",
+                            freq[i],
+                            law[i]
+                        );
+                    }
+                }
+                if top_k > 0 {
+                    let kept = law.iter().filter(|&&p| p > 0.0).count();
+                    assert!(kept <= top_k, "{label}: {kept} kept > top_k {top_k}");
+                }
+            }
+            // Negative control: the pre-fix bonus read the raw FAST_SAMPLE
+            // row and lands outside the truncated support.
+            let raw = &fast.probs[vocab..2 * vocab];
+            let mut truncated = Vec::new();
+            sampled_target_row_into(
+                &mut truncated,
+                1,
+                vocab,
+                Some(&fast),
+                &logits,
+                temp,
+                top_k,
+                top_p,
+            );
+            let outside = (0..grid)
+                .map(|g| sample_categorical(raw, (g as f32 + 0.5) / grid as f32) as usize)
+                .filter(|&t| truncated[t] == 0.0)
+                .count();
+            assert!(
+                outside > 0,
+                "T{temp}: legacy raw-row bonus stayed inside the nucleus"
+            );
+        }
     }
 
     #[test]
