@@ -2308,7 +2308,7 @@ mod tests {
         );
         assert_eq!(
             app.config.easy_rows()[idx].1,
-            "all on GPU",
+            "auto-fit (MoE) / GPU",
             "a cleared row must render as unset"
         );
         assert!(
@@ -2333,7 +2333,7 @@ mod tests {
         );
         assert_eq!(
             app.config.easy_rows()[idx].1,
-            "all on GPU",
+            "auto-fit (MoE) / GPU",
             "the null spelling clears to the same unset state"
         );
 

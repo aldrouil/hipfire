@@ -37,13 +37,14 @@ pub fn mq4r_redline_default(gpu_arch: &str, model_path: &str, pp: usize, tp: usi
 /// AR graph. Qwen4 (Flash-Next) on exact gfx1201 is admitted the same way:
 /// single GPU, no drafter (a native MTP head is a drafter, so only an
 /// MTP-off load replays), byte-identical greedy text to the HIP graph.
-/// `replay.backend = "hip"` opts out. A Qwen3.5 process configured
+/// `replay.backend = "hip"` opts out. A Qwen3.5-family process configured
 /// for CPU-executed partial offload (`memory.offload_exec = "cpu"` with a
-/// `memory.gpu_layer_budget` layer count) gets no retained default: its spilled
-/// layers' GEMVs run on the host between GPU launches, which a retained tape
-/// does not record. Expert parallelism (`ep` > 1, Flash-Next EP) runs one
-/// program per rank with a cross-device row gather between kernels, which a
-/// single-device retained tape cannot record, so it is never admitted.
+/// spill on either tier — an explicit layer or routed-expert count, or
+/// `auto`/unset on a MoE, which auto-fits) gets no retained default: its
+/// spilled layers' GEMVs run on the host between GPU launches, which a
+/// retained tape does not record. Expert parallelism (`ep` > 1, Flash-Next EP)
+/// runs one program per rank with a cross-device row gather between kernels,
+/// which a single-device retained tape cannot record, so it is never admitted.
 pub fn retained_redline_default(
     gpu_arch: &str,
     model_arch: &str,
@@ -59,7 +60,7 @@ pub fn retained_redline_default(
     if model_arch.eq_ignore_ascii_case("muse_glimmer") {
         return false;
     }
-    if model_arch.eq_ignore_ascii_case("qwen3_5") && cpu_offload_configured() {
+    if is_qwen35_family(model_arch) && cpu_offload_configured(model_arch) {
         return false;
     }
     if mq4r_redline_default(gpu_arch, model_path, pp, tp) {
@@ -85,9 +86,26 @@ pub fn retained_redline_default(
             .is_some_and(|extension| extension.eq_ignore_ascii_case("mq2r"))
 }
 
-fn cpu_offload_configured() -> bool {
-    use hipfire_config::memory::{gpu_layer_budget, offload_exec, OffloadBudget, OffloadExec};
-    offload_exec() == OffloadExec::Cpu && matches!(gpu_layer_budget(), OffloadBudget::Layers(_))
+fn is_qwen35_family(model_arch: &str) -> bool {
+    model_arch.eq_ignore_ascii_case("qwen3_5") || model_arch.eq_ignore_ascii_case("qwen3_5_moe")
+}
+
+fn cpu_offload_configured(model_arch: &str) -> bool {
+    use hipfire_config::memory::{offload_exec, OffloadBudget, OffloadExec};
+    if offload_exec() != OffloadExec::Cpu {
+        return false;
+    }
+    // Match the placement the loader resolves: a MoE auto-fits when both keys
+    // are unset, and `auto` is an explicit search on either tier. Asking only
+    // for `Layers(n)` on the layer tier missed both the expert tier and the
+    // `auto` spelling this branch added.
+    let (layer, expert) = hipfire_config::memory::effective_offload_budgets(
+        model_arch.eq_ignore_ascii_case("qwen3_5_moe"),
+    );
+    !matches!(
+        (layer, expert),
+        (OffloadBudget::Full, OffloadBudget::Full)
+    )
 }
 
 #[derive(Debug, Clone)]

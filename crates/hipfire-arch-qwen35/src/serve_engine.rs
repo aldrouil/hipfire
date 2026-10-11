@@ -627,8 +627,22 @@ impl Rig {
     ) -> Result<hipfire_runtime::offload::Placement, String> {
         use hipfire_config::memory::{effective_offload_budgets, OffloadBudget};
         use hipfire_runtime::offload;
-        // A Qwen MoE defaults to auto-fit; dense stays opt-in (all-resident).
-        let budgets = effective_offload_budgets(config.num_experts != 0);
+        // Same spillable-path scoping as the sequential carrier: auto-fit is a
+        // placement search, and the slots weight load below always reads the
+        // placement — except paged experts / REAP keep-maps, which own their
+        // expert buffers. An unset MoE there resolves resident so the early
+        // return below keeps the load byte-identical. (The VL tower shares the
+        // trunk placement; `is_vl` needs no carve-out here.)
+        let spillable = !config.paged_experts && config.reap_keep.is_none();
+        let budgets = if spillable {
+            // A Qwen MoE defaults to auto-fit; dense stays opt-in (all-resident).
+            effective_offload_budgets(config.num_experts != 0)
+        } else {
+            (
+                hipfire_config::memory::gpu_layer_budget(),
+                hipfire_config::memory::moe_expert_budget(),
+            )
+        };
         if budgets == (OffloadBudget::Full, OffloadBudget::Full) {
             return Ok(offload::Placement::all_device(config.n_layers));
         }

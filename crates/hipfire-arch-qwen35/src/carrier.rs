@@ -124,9 +124,25 @@ fn resolve_partial_offload(
     plan: &Qwen35KvPlan,
 ) -> Result<Option<offload::Placement>, String> {
     use hipfire_config::memory::{effective_offload_budgets, OffloadBudget};
-    // A Qwen MoE defaults to auto-fit (its experts usually do not fit); dense
-    // stays opt-in, where unset means all-resident.
-    let budgets = effective_offload_budgets(config.num_experts != 0);
+    // Auto-fit is a placement search, and a search that resolves a spill is
+    // only honoured on paths whose loaders read the placement: pp>1 bands own
+    // per-device layouts (`load_qwen35_pp` never calls this), and paged
+    // experts / REAP keep-maps own their expert buffers. An unset MoE on those
+    // paths resolves resident here so the early return below keeps the load
+    // byte-identical — the fail-closed refusals in `partial_offload_refusal`
+    // still fire for an explicit spill on a path that cannot honour it. (The
+    // VL tower shares the trunk placement; its own loader refusal is separate.)
+    let spillable = ctx.pp == 1 && !config.paged_experts && config.reap_keep.is_none();
+    let budgets = if spillable {
+        // A Qwen MoE defaults to auto-fit (its experts usually do not fit);
+        // dense stays opt-in, where unset means all-resident.
+        effective_offload_budgets(config.num_experts != 0)
+    } else {
+        (
+            hipfire_config::memory::gpu_layer_budget(),
+            hipfire_config::memory::moe_expert_budget(),
+        )
+    };
     if budgets == (OffloadBudget::Full, OffloadBudget::Full) {
         return Ok(None);
     }

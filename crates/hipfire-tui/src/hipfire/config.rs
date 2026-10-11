@@ -244,16 +244,18 @@ impl ConfigState {
                 // GPU, and an "Offload" label invites reading it as the inverse.
                 "GPU layers",
                 {
-                    // Unset = every layer on the GPU. The bare empty string would
+                    // Unset is the auto-fit default on a MoE (spills when it must)
+                    // and fully resident on dense. The bare empty string would
                     // read as "broken" in a value column, so name the state; the
                     // editor seeds its buffer from `values`, not from this label.
+                    // Short: the easy table's value column is 24 wide (ui.rs).
                     match self
                         .values
                         .get("gpu_layer_budget")
                         .map(String::as_str)
                         .unwrap_or("")
                     {
-                        "" => "all on GPU".into(),
+                        "" => "auto-fit (MoE) / GPU".into(),
                         // `-1` is the schema's reserved auto spelling, and the
                         // rule also accepts a literal `auto`; both mean fit-to-card
                         // and neither is a layer count.
@@ -275,9 +277,9 @@ impl ConfigState {
                         .map(String::as_str)
                         .unwrap_or("")
                     {
-                        // Unset keeps every routed expert on the card, and says so
-                        // rather than showing an empty cell.
-                        "" => "all on GPU".into(),
+                        // Same auto-fit default as the sibling row: unset spills a
+                        // MoE that needs it, keeps dense resident.
+                        "" => "auto-fit (MoE) / GPU".into(),
                         "-1" | "auto" => "auto (fits to card)".into(),
                         v => format!("{v} on GPU"),
                     }
@@ -500,7 +502,10 @@ mod tests {
                 .expect("GPU layers row present")
         };
 
-        assert_eq!(row(&[]), "all on GPU");
+        // Unset is the MoE auto-fit default (dense stays resident): the cell
+        // must not promise "all on GPU" for a model it will spill. Kept short:
+        // the easy table's value column is 24 wide (ui.rs).
+        assert_eq!(row(&[]), "auto-fit (MoE) / GPU");
         assert_eq!(row(&[("gpu_layer_budget", "32")]), "32 on GPU");
         assert_eq!(
             row(&[("gpu_layer_budget", "-1")]),
@@ -514,7 +519,7 @@ mod tests {
         );
         // A cleared key is unset, not the literal string the JSON layer produces
         // for null — the bug this replaced rendered "null on GPU".
-        assert_eq!(row(&[("gpu_layer_budget", "")]), "all on GPU");
+        assert_eq!(row(&[("gpu_layer_budget", "")]), "auto-fit (MoE) / GPU");
     }
 
     /// The routed-expert row: same cell grammar as its `GPU layers` sibling, and
@@ -529,11 +534,11 @@ mod tests {
                 .map(|(_, value, _)| value)
                 .expect("Expert layers row present")
         };
-        assert_eq!(row(&[]), "all on GPU");
+        assert_eq!(row(&[]), "auto-fit (MoE) / GPU");
         assert_eq!(row(&[("moe_expert_budget", "26")]), "26 on GPU");
         assert_eq!(row(&[("moe_expert_budget", "-1")]), "auto (fits to card)");
         assert_eq!(row(&[("moe_expert_budget", "auto")]), "auto (fits to card)");
-        assert_eq!(row(&[("moe_expert_budget", "")]), "all on GPU");
+        assert_eq!(row(&[("moe_expert_budget", "")]), "auto-fit (MoE) / GPU");
     }
 
     /// The exec row's two arms, in the same cell grammar as its sibling.
