@@ -228,11 +228,32 @@ static TAPE_COPY_BATCH: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| 
     hipfire_config::developer_var("HIPFIRE_CB_TAPE_COPY_BATCH").map_or(true, |v| v.trim() != "0")
 });
 
+/// `HIPFIRE_CB_LANE_GDN_BATCH=0` (developer kill switch): every request runs
+/// its own DeltaNet pre-GDN sequence + recurrence per layer (4 launches per
+/// lane) instead of one launch per stage per layer for all lanes of the chunk
+/// (see [`lane_gdn_chunk_admitted`]). Default on; every output and state byte
+/// is identical either way.
+static LANE_GDN_BATCH: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_CB_LANE_GDN_BATCH").map_or(true, |v| v.trim() != "0")
+});
+
+/// Bytes of one layer's device GDN lane table (`CONV_LANES_MAX` rows).
+const GDN_LANE_TABLE_LAYER_BYTES: usize =
+    rdna_compute::lane_gdn::CONV_LANES_MAX * std::mem::size_of::<rdna_compute::dflash_gdn_replay::GdnLayerTable>();
+
 /// Shared scratch of a multi-request chunk: the row scratch every request's
-/// rows live in, and the segment-twin tables (one per FullAttention layer).
+/// rows live in, the segment-twin tables (one per FullAttention layer) and the
+/// lane-batched GDN recurrence table (`CONV_LANES_MAX` rows per DeltaNet layer).
 pub struct MultiChunkScratch {
     pub pbs: PrefillBatchScratch,
     attn_segs: GpuTensor,
+    /// Device `GdnLayerTable` rows, `[delta_layer][lane]`, read by
+    /// `gated_delta_net_q8_fast_ml` (grid.z = lane).
+    gdn_lane_table: GpuTensor,
+    /// What `gdn_lane_table` currently holds (same layout); the forward takes
+    /// `&MultiChunkScratch`, hence the lock. The table is re-uploaded only
+    /// when a chunk's rows differ (lane membership / order change).
+    gdn_lane_table_host: std::sync::Mutex<Vec<rdna_compute::dflash_gdn_replay::GdnLayerTable>>,
 }
 
 impl MultiChunkScratch {
@@ -243,10 +264,25 @@ impl MultiChunkScratch {
         let rows = max_rows.clamp(MIN_BATCH, multi_chunk_row_cap(gpu));
         let pbs = PrefillBatchScratch::new(gpu, config, rows)?;
         let n_fa = config.layer_types.iter().filter(|t| **t == LayerType::FullAttention).count();
+        let n_delta = config.layer_types.iter().filter(|t| **t == LayerType::LinearAttention).count();
         let bytes = n_fa.max(1) * MULTI_CHUNK_MAX_SEGS * std::mem::size_of::<AttnFp8Seg>();
-        match gpu.zeros(&[bytes.div_ceil(4)], rdna_compute::DType::F32) {
-            Ok(attn_segs) => Ok(Self { pbs, attn_segs }),
+        let attn_segs = match gpu.zeros(&[bytes.div_ceil(4)], rdna_compute::DType::F32) {
+            Ok(t) => t,
             Err(e) => {
+                let _ = pbs.free_gpu(gpu);
+                return Err(e);
+            }
+        };
+        let gdn_bytes = n_delta.max(1) * GDN_LANE_TABLE_LAYER_BYTES;
+        match gpu.zeros(&[gdn_bytes.div_ceil(4)], rdna_compute::DType::F32) {
+            Ok(gdn_lane_table) => Ok(Self {
+                pbs,
+                attn_segs,
+                gdn_lane_table,
+                gdn_lane_table_host: std::sync::Mutex::new(Vec::new()),
+            }),
+            Err(e) => {
+                let _ = gpu.free_tensor(attn_segs);
                 let _ = pbs.free_gpu(gpu);
                 Err(e)
             }
@@ -259,8 +295,107 @@ impl MultiChunkScratch {
 
     pub fn free_gpu(self, gpu: &mut Gpu) -> HipResult<()> {
         self.pbs.free_gpu(gpu)?;
-        gpu.free_tensor(self.attn_segs)
+        gpu.free_tensor(self.attn_segs)?;
+        gpu.free_tensor(self.gdn_lane_table)
     }
+}
+
+/// May this chunk's DeltaNet layers run the lane-batched GDN route (one
+/// launch per stage per layer for all requests instead of 4 per request)?
+/// Process/device half: [`Gpu::lane_gdn_batch_admitted`] and the kill switch.
+/// Chunk half: at most `CONV_LANES_MAX` requests; every request a ChainVerify
+/// verify carrying a rollback tape that holds its rows at offset 0 (the
+/// per-request route is then the unfused sequence the batched stages
+/// reproduce: neither the gfx1100 capture fusion nor the gfx1201 Slice-P
+/// fusion, which needs `gdn_tape.is_none()`, applies); sequential batch
+/// semantics; and every request with the SAME row count (the recurrence's
+/// stochastic-rounding frames are `base + lane * n`, the per-request order
+/// only for equal `n`).
+fn lane_gdn_chunk_admitted(
+    gpu: &Gpu,
+    config: &Qwen35Config,
+    reqs: &[MultiChunkRequest<'_>],
+    sem: BatchSemantics<'_>,
+) -> bool {
+    let n0 = match reqs.first() {
+        Some(r) => r.tokens.len(),
+        None => return false,
+    };
+    *LANE_GDN_BATCH
+        && matches!(sem, BatchSemantics::Sequential)
+        && reqs.len() <= rdna_compute::lane_gdn::CONV_LANES_MAX
+        && gpu.lane_gdn_batch_admitted(
+            config.linear_num_value_heads,
+            config.linear_num_key_heads,
+            config.linear_key_head_dim,
+            config.linear_value_head_dim,
+        )
+        && reqs.iter().all(|r| {
+            r.fusion == DflashFusionCtx::ChainVerify
+                && r.tokens.len() == n0
+                && r.gdn_tape.is_some_and(|t| n0 <= t.max_n)
+        })
+}
+
+/// Make the device GDN lane table hold this chunk's recurrence rows: row
+/// `[delta_layer][lane]` is lane's row views of the shared scratch's
+/// q/k/v/alpha(gate)/beta/attn-out buffers and its Q8 state, scale and EF
+/// buffers for that DeltaNet layer (the exact tensors the per-request
+/// `gated_delta_net_q8_batch_seq` takes). Rows are compared with the host
+/// cache and the table is re-uploaded (stream-ordered on the active stream)
+/// only when one differs: in steady state the lanes keep their buffers, so a
+/// step uploads nothing.
+fn stage_gdn_lane_table(
+    gpu: &mut Gpu,
+    scratch: &MultiChunkScratch,
+    config: &Qwen35Config,
+    reqs: &[MultiChunkRequest<'_>],
+    views: &[std::mem::ManuallyDrop<PrefillBatchScratch>],
+) -> HipResult<()> {
+    use rdna_compute::dflash_gdn_replay::{table_bytes, GdnLayerTable};
+    use rdna_compute::lane_gdn::CONV_LANES_MAX;
+    let n_delta = config.layer_types.iter().filter(|t| **t == LayerType::LinearAttention).count();
+    let mut cache = scratch
+        .gdn_lane_table_host
+        .lock()
+        .map_err(|_| HipError::new(0, "gdn lane table cache poisoned"))?;
+    let mut dirty = false;
+    if cache.len() != n_delta * CONV_LANES_MAX {
+        let zero = GdnLayerTable { q: 0, k: 0, v: 0, gate: 0, beta: 0, s_q8: 0, s_scales: 0, output: 0, ef: 0 };
+        cache.clear();
+        cache.resize(n_delta * CONV_LANES_MAX, zero);
+        dirty = true;
+    }
+    let ptr = |t: &GpuTensor| t.buf.as_ptr() as u64;
+    for l in 0..n_delta {
+        for (i, (r, view)) in reqs.iter().zip(views).enumerate() {
+            let d = &*r.dn_state;
+            let row = GdnLayerTable {
+                q: ptr(&view.dn_q_batch),
+                k: ptr(&view.dn_k_batch),
+                v: ptr(&view.dn_v_batch),
+                gate: ptr(&view.dn_alpha_batch),
+                beta: ptr(&view.dn_beta_batch),
+                s_q8: ptr(&d.s_matrices[l]),
+                s_scales: ptr(&d.s_scales[l]),
+                output: ptr(&view.dn_attn_out_batch),
+                ef: d.ef_residual(l).map_or(0, ptr),
+            };
+            let slot = &mut cache[l * CONV_LANES_MAX + i];
+            if *slot != row {
+                *slot = row;
+                dirty = true;
+            }
+        }
+    }
+    if dirty {
+        if let Err(e) = gpu.upload_gdn_lane_table(&scratch.gdn_lane_table, table_bytes(&cache)) {
+            // The device table is in an unknown state: force a full re-stage.
+            cache.clear();
+            return Err(e);
+        }
+    }
+    Ok(())
 }
 
 /// Does this request's singleton attend run `attention_fp8_e4m3_kv_batched`
@@ -600,6 +735,15 @@ pub fn forward_prefill_batch_multi(
     // issued as one batched launch after the layer's per-request recurrence.
     let mut tape_copies: Vec<rdna_compute::tape_copy::TapeCopy> =
         Vec::with_capacity(if *TAPE_COPY_BATCH && tapes { 3 * reqs.len() } else { 0 });
+    // Lane-batched GDN route (see `lane_gdn_chunk_admitted`): decided once per
+    // chunk. Requires the batched tape copy (`TAPE_COPY_BATCH`), whose
+    // descriptors it queues, so each kill switch keeps its own A/B meaning.
+    let lane_gdn = *TAPE_COPY_BATCH && lane_gdn_chunk_admitted(gpu, config, reqs, sem);
+    let lane_n = reqs[0].tokens.len();
+    let mut lane_conv: Vec<(u64, usize, usize)> = Vec::with_capacity(if lane_gdn { reqs.len() } else { 0 });
+    if lane_gdn {
+        stage_gdn_lane_table(gpu, scratch, config, reqs, &views)?;
+    }
     for layer_idx in 0..config.n_layers {
         match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
             (LayerWeights::DeltaNet(layer), LayerType::LinearAttention) => {
@@ -616,31 +760,94 @@ pub fn forward_prefill_batch_multi(
                         gpu, layer, config, pbs, total, dim, q8_wmma_arch, shared_fusion, None, math,
                     )?;
                 }
-                for (r, view) in reqs.iter_mut().zip(&views) {
-                    let n = r.tokens.len();
-                    let sink = (*TAPE_COPY_BATCH).then_some(&mut tape_copies);
-                    let parents = batch_chunk_delta_net_pre_gdn(
-                        gpu, layer, config, view, r.dn_state, n, k_dim, v_dim, n_v_heads, hd, sem, None, r.gdn_tape, 0,
-                        delta_layer_idx, r.fusion, sink,
-                    )?;
-                    if parents.is_some() {
-                        return refuse("tree recurrence in a linear verify");
+                if lane_gdn {
+                    // Lane-batched pre-GDN + recurrence: one launch per stage
+                    // for all requests. Byte-identical to the per-request loop
+                    // below (admission: `lane_gdn_chunk_admitted`) because
+                    //  * the sigmoid/alpha-gate and the Q/K norm-interleave
+                    //    kernels are row-local (the row folds into grid.x and
+                    //    each row's arithmetic is independent of the row
+                    //    count), so one launch over all `total` rows equals a
+                    //    launch per request over its row view;
+                    //  * the conv launch runs each request's conv1d body
+                    //    verbatim over its own rows and its own conv ring
+                    //    (kernels/src/conv1d_silu_split_lanes.hip);
+                    //  * the multi-lane recurrence is the single-lane body
+                    //    per grid.z row, with stochastic-rounding frames
+                    //    `base + z * n`, which is the request-order frame
+                    //    sequence of per-request launches when every request
+                    //    has the same `n`;
+                    //  * requests own disjoint rows of the shared scratch and
+                    //    disjoint DeltaNet/tape state, so interleaving their
+                    //    work across launches changes no byte.
+                    gdn_sigmoid_alpha_gate(gpu, layer, pbs, n_v_heads, total)?;
+                    // DFlash tape capture (the pre-GDN sink branch's three
+                    // descriptors per request): nothing below writes the
+                    // source rows, and the next layer's producers have not
+                    // run yet.
+                    for (r, view) in reqs.iter().zip(&views) {
+                        if let Some(tape) = r.gdn_tape {
+                            push_gdn_tape_copies(
+                                &mut tape_copies, tape, view, n_v_heads, 0, r.tokens.len(), delta_layer_idx,
+                            );
+                        }
                     }
-                    let d = &*r.dn_state;
-                    gpu.gated_delta_net_q8_batch_seq(
-                        &view.dn_q_batch,
-                        &view.dn_k_batch,
-                        &view.dn_v_batch,
-                        &view.dn_alpha_batch,
-                        &view.dn_beta_batch,
-                        &d.s_matrices[delta_layer_idx],
-                        &d.s_scales[delta_layer_idx],
-                        &view.dn_attn_out_batch,
-                        n,
+                    if !tape_copies.is_empty() {
+                        gpu.tape_copy_batched(&tape_copies)?;
+                        tape_copies.clear();
+                    }
+                    lane_conv.clear();
+                    lane_conv.extend(reqs.iter().zip(&offs).map(|(r, &o)| {
+                        (r.dn_state.conv_states[delta_layer_idx].buf.as_ptr() as u64, o, r.tokens.len())
+                    }));
+                    gpu.conv1d_silu_split_f32_lanes(
+                        &pbs.dn_q_raw_batch,
+                        &pbs.dn_k_raw_batch,
+                        &pbs.dn_v_batch,
+                        &pbs.dn_qkv_batch,
+                        &layer.conv_weight,
+                        &lane_conv,
+                        k_dim,
+                        v_dim,
+                    )?;
+                    gdn_qk_norm_interleave(gpu, config, pbs, n_v_heads, hd, total)?;
+                    let table = (scratch.gdn_lane_table.buf.as_ptr() as *const u8)
+                        .wrapping_add(delta_layer_idx * GDN_LANE_TABLE_LAYER_BYTES)
+                        as *const std::ffi::c_void;
+                    gpu.gated_delta_net_q8_fast_ml(
+                        table,
+                        reqs.len(),
+                        lane_n,
                         n_v_heads,
                         config.linear_value_head_dim,
-                        d.ef_residual(delta_layer_idx),
                     )?;
+                } else {
+                    for (r, view) in reqs.iter_mut().zip(&views) {
+                        let n = r.tokens.len();
+                        let sink = (*TAPE_COPY_BATCH).then_some(&mut tape_copies);
+                        let parents = batch_chunk_delta_net_pre_gdn(
+                            gpu, layer, config, view, r.dn_state, n, k_dim, v_dim, n_v_heads, hd, sem, None, r.gdn_tape,
+                            0, delta_layer_idx, r.fusion, sink,
+                        )?;
+                        if parents.is_some() {
+                            return refuse("tree recurrence in a linear verify");
+                        }
+                        let d = &*r.dn_state;
+                        gpu.gated_delta_net_q8_batch_seq(
+                            &view.dn_q_batch,
+                            &view.dn_k_batch,
+                            &view.dn_v_batch,
+                            &view.dn_alpha_batch,
+                            &view.dn_beta_batch,
+                            &d.s_matrices[delta_layer_idx],
+                            &d.s_scales[delta_layer_idx],
+                            &view.dn_attn_out_batch,
+                            n,
+                            n_v_heads,
+                            config.linear_value_head_dim,
+                            d.ef_residual(delta_layer_idx),
+                        )?;
+                    }
                 }
                 // The deferred tape copies read rows of dn_qkv/alpha/beta that
                 // no kernel since each request's sigmoid has written; the next

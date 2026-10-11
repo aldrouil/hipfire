@@ -4336,10 +4336,11 @@ fn draft_batch_cases(gpu: &mut Gpu, slot: &mut ModelSlot, d: &mut Box<dyn Specul
     let n = fx.len();
     let fxl = |k: usize| -> Vec<usize> { (0..k).map(|i| i % n).collect() };
     // Full-block lanes pack in order into chunks of at most
-    // `min(DFLASH_DRAFT_BATCH_MAX_ROWS, cb rows)` rows; a chunk below
+    // `min(dflash_draft_batch_max_rows(gpu), cb draft rows)` rows (48, or 64
+    // where the scoped 64-row draft route is exact); a chunk below
     // `min_lanes` runs the singleton draft. Expected batched lanes at this
     // run's block (3 of 4 at B=16 / min 2; all 4 at B=8).
-    let cap = hipfire_arch_qwen35::speculative::DFLASH_DRAFT_BATCH_MAX_ROWS.min(cb.max_rows());
+    let cap = hipfire_arch_qwen35::speculative::dflash_draft_batch_max_rows(gpu).min(cb.draft_rows());
     let per_chunk = (cap / cfg.block).max(1);
     let batched = |k: usize, min_lanes: usize| -> usize {
         let rem = k % per_chunk;

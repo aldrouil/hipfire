@@ -6407,6 +6407,72 @@ fn batch_chunk_delta_net_input_projection(
     Ok(false)
 }
 
+/// Queue one DeltaNet layer's DFlash tape-capture copies (pre-conv1d qkv rows,
+/// post-sigmoid alpha and beta rows of `pbs`'s rows `[0, n)`, into the layer's
+/// tape slots at `tape_offset`) as three descriptors for
+/// `Gpu::tape_copy_batched`. `pbs` may be a row view of a shared scratch: the
+/// source is its first row. Shared by the per-request pre-GDN sink branch and
+/// the lane-batched multi-request route, so both queue identical descriptors.
+pub(crate) fn push_gdn_tape_copies(
+    sink: &mut Vec<rdna_compute::tape_copy::TapeCopy>,
+    tape: &crate::speculative::GdnTape,
+    pbs: &PrefillBatchScratch,
+    n_v_heads: usize,
+    tape_offset: usize,
+    n: usize,
+    delta_layer_idx: usize,
+) {
+    use rdna_compute::tape_copy::TapeCopy;
+    let qkv_row_bytes = tape.qkv_dim * 4;
+    let alpha_row_bytes = n_v_heads * 4;
+    let off_qkv = tape_offset * qkv_row_bytes;
+    let off_a = tape_offset * alpha_row_bytes;
+    let copy_qkv = n * qkv_row_bytes;
+    let copy_a = n * alpha_row_bytes;
+    sink.push(TapeCopy::new(&tape.qkv_bufs[delta_layer_idx].buf, off_qkv, &pbs.dn_qkv_batch.buf, 0, copy_qkv));
+    sink.push(TapeCopy::new(&tape.alpha_bufs[delta_layer_idx].buf, off_a, &pbs.dn_alpha_batch.buf, 0, copy_a));
+    sink.push(TapeCopy::new(&tape.beta_bufs[delta_layer_idx].buf, off_a, &pbs.dn_beta_batch.buf, 0, copy_a));
+}
+
+/// The pre-GDN fused sigmoid(beta) + alpha gate over rows `[0, n)` of `pbs`
+/// (row-local: each row's bytes are independent of `n`). Shared by the
+/// per-request pre-GDN and the lane-batched multi-request route.
+pub(crate) fn gdn_sigmoid_alpha_gate(
+    gpu: &mut Gpu,
+    layer: &DeltaNetLayerWeights,
+    pbs: &PrefillBatchScratch,
+    n_v_heads: usize,
+    n: usize,
+) -> HipResult<()> {
+    gpu.fused_sigmoid_alpha_gate_f32_batched(&pbs.dn_beta_batch, &pbs.dn_alpha_batch, &layer.dt_bias, &layer.a_log, n_v_heads, n)
+}
+
+/// The GQA (`n_key_heads < n_v_heads`) fused L2-norm(Q) + scale + L2-norm(K)
+/// + repeat-interleave over rows `[0, n)` of `pbs` (row-local). Shared by the
+/// per-request pre-GDN and the lane-batched multi-request route.
+pub(crate) fn gdn_qk_norm_interleave(
+    gpu: &mut Gpu,
+    config: &Qwen35Config,
+    pbs: &PrefillBatchScratch,
+    n_v_heads: usize,
+    hd: usize,
+    n: usize,
+) -> HipResult<()> {
+    let ratio = n_v_heads / config.linear_num_key_heads;
+    gpu.fused_qk_l2_norm_scale_interleave_f32_batched(
+        &pbs.dn_q_raw_batch,
+        &pbs.dn_k_raw_batch,
+        &pbs.dn_q_batch,
+        &pbs.dn_k_batch,
+        config.linear_num_key_heads,
+        ratio,
+        hd,
+        1.0 / (hd as f32).sqrt(),
+        config.norm_eps,
+        n,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 /// Prescaffold (behavior-only) extraction for S5-gdn-pre-tape-fusion.
 ///
@@ -6530,14 +6596,7 @@ fn batch_chunk_delta_net_pre_gdn<'a>(
         }
     }
     // Fused sigmoid(beta) + alpha_gate(alpha) — [N × n_v_heads] each.
-    gpu.fused_sigmoid_alpha_gate_f32_batched(
-        &pbs.dn_beta_batch,
-        &pbs.dn_alpha_batch,
-        &layer.dt_bias,
-        &layer.a_log,
-        n_v_heads,
-        n,
-    )?;
+    gdn_sigmoid_alpha_gate(gpu, layer, pbs, n_v_heads, n)?;
 
     // DFlash tape capture: snap pre-conv1d qkv + post-sigmoid α/β
     // for this layer into the per-layer tape slots. The next LA
@@ -6557,10 +6616,7 @@ fn batch_chunk_delta_net_pre_gdn<'a>(
         let copy_qkv = n * qkv_row_bytes;
         let copy_a = n * alpha_row_bytes;
         if let Some(sink) = tape_sink {
-            use rdna_compute::tape_copy::TapeCopy;
-            sink.push(TapeCopy::new(&tape.qkv_bufs[delta_layer_idx].buf, off_qkv, &pbs.dn_qkv_batch.buf, 0, copy_qkv));
-            sink.push(TapeCopy::new(&tape.alpha_bufs[delta_layer_idx].buf, off_a, &pbs.dn_alpha_batch.buf, 0, copy_a));
-            sink.push(TapeCopy::new(&tape.beta_bufs[delta_layer_idx].buf, off_a, &pbs.dn_beta_batch.buf, 0, copy_a));
+            push_gdn_tape_copies(sink, tape, pbs, n_v_heads, tape_offset, n, delta_layer_idx);
         } else {
             gpu.memcpy_dtod_at_auto(
                 &tape.qkv_bufs[delta_layer_idx].buf,
@@ -6658,19 +6714,7 @@ fn batch_chunk_delta_net_pre_gdn<'a>(
     // the conv1d output is preserved if downstream readers need it
     // (no current consumer reads _raw after this).
     if config.linear_num_key_heads < n_v_heads {
-        let ratio = n_v_heads / config.linear_num_key_heads;
-        gpu.fused_qk_l2_norm_scale_interleave_f32_batched(
-            &pbs.dn_q_raw_batch,
-            &pbs.dn_k_raw_batch,
-            &pbs.dn_q_batch,
-            &pbs.dn_k_batch,
-            config.linear_num_key_heads,
-            ratio,
-            hd,
-            1.0 / (hd as f32).sqrt(),
-            config.norm_eps,
-            n,
-        )?;
+        gdn_qk_norm_interleave(gpu, config, pbs, n_v_heads, hd, n)?;
     } else {
         // n_key_heads == n_v_heads → no replication; keep the
         // original sequence (norm in place, then memcpy).

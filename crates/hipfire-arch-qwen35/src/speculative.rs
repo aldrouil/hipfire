@@ -6272,11 +6272,48 @@ pub(crate) fn draft_dflash_block_rank(
     Ok(drafted)
 }
 
-/// Rows one batched draft forward holds. The draft projections / FFN / head
-/// GEMMs are row-count independent on gfx1201 below the 64-row route
-/// boundary (the exact-trunk ceiling is 63); 48 keeps the draft on the rungs
-/// the exact trunk and the oracle already cover (three full 16-row lanes).
+/// Rows one batched draft forward holds by default. The draft projections /
+/// FFN / head GEMMs are row-count independent on gfx1201 below the 64-row
+/// route boundary (the exact-trunk ceiling is 63); 48 keeps the draft on the
+/// rungs the exact trunk and the oracle already cover (three full 16-row
+/// lanes). [`dflash_draft_batch_max_rows`] widens it to
+/// [`DFLASH_DRAFT_BATCH_ROWS64`] where that stays exact.
 pub const DFLASH_DRAFT_BATCH_MAX_ROWS: usize = 48;
+
+/// One full 64-row draft chunk (C8 at 8-row lanes in a single forward).
+pub const DFLASH_DRAFT_BATCH_ROWS64: usize = 64;
+
+/// `HIPFIRE_CB_DRAFT_ROWS64=0` (developer kill switch): keep the batched
+/// draft at [`DFLASH_DRAFT_BATCH_MAX_ROWS`] rows per forward. Default on.
+static DRAFT_ROWS64_ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_CB_DRAFT_ROWS64").map_or(true, |v| v.trim() != "0")
+});
+
+/// Rows one batched draft forward holds on this GPU: 64 when the 64-row chunk
+/// is exact, else [`DFLASH_DRAFT_BATCH_MAX_ROWS`]. The 64-row chunk is exact
+/// only through the scoped overwrite route
+/// (`Gpu::gemm_mq4g256v2_overwrite_gfx12_dflash` inside
+/// `Gpu::draft_rows64_enter`), whose `_vt4` kernel is per-row identical to the
+/// one-tile kernel; the legacy `>= 64` arms (A8 / IU4 / bt-tile / fp8) are
+/// not. It therefore needs: kill switch unset, exact gfx1201, the draft
+/// collapse routes enabled, the batch-tile kernels, the F16 / WMMA lm_head
+/// chain with no LDS-staged arm (`mq4_verify_singleton_chain`) and no A8
+/// prefill route at 64 rows.
+pub fn dflash_draft_batch_max_rows(gpu: &Gpu) -> usize {
+    if *DRAFT_ROWS64_ON
+        && gpu.arch == "gfx1201"
+        && !gpu.flags.draft_collapse_off
+        && gpu.flags.wmma_batch_tiles
+        && !gpu.flags.fp16_disabled
+        && !gpu.flags.lm_head_wmma_disabled
+        && !gpu.flags.hfq4g256_ldsstage_wmma
+        && !gpu.a8_prefill_active(DFLASH_DRAFT_BATCH_ROWS64, 256)
+    {
+        DFLASH_DRAFT_BATCH_ROWS64
+    } else {
+        DFLASH_DRAFT_BATCH_MAX_ROWS
+    }
+}
 
 /// One lane of [`draft_dflash_blocks_batched`].
 pub struct DflashDraftLane<'a> {
@@ -6334,7 +6371,7 @@ pub fn dflash_draft_batch_eligible(
 /// forward (`>= sum b` rows), `head` the head scratch (`max_n >= sum b`).
 /// Returns each lane's `[seed, candidates..]`. Preconditions:
 /// [`dflash_draft_batch_eligible`], `3 <= b` per lane, `sum b <=
-/// DFLASH_DRAFT_BATCH_MAX_ROWS`, one shared draft-weight asset.
+/// dflash_draft_batch_max_rows(gpu)`, one shared draft-weight asset.
 #[allow(clippy::too_many_arguments)]
 pub fn draft_dflash_blocks_batched(
     gpu: &mut Gpu,
@@ -6349,9 +6386,10 @@ pub fn draft_dflash_blocks_batched(
         return Ok(Vec::new());
     }
     let rows: usize = lanes.iter().map(|l| l.b).sum();
-    if rows > DFLASH_DRAFT_BATCH_MAX_ROWS || rows > shared.max_block_size || rows > head.max_n {
+    let cap = dflash_draft_batch_max_rows(gpu);
+    if rows > cap || rows > shared.max_block_size || rows > head.max_n {
         return err(format!(
-            "{rows} rows exceed the batch capacity (cap {DFLASH_DRAFT_BATCH_MAX_ROWS}, scratch {}, head {})",
+            "{rows} rows exceed the batch capacity (cap {cap}, scratch {}, head {})",
             shared.max_block_size, head.max_n
         ));
     }
@@ -6417,21 +6455,6 @@ pub fn draft_dflash_blocks_batched(
             Geo { ctx, pos_q, pos_k }
         })
         .collect();
-    {
-        let mut dl: Vec<dflash::DraftLane<'_>> = lanes
-            .iter_mut()
-            .zip(&geos)
-            .map(|(l, g)| dflash::DraftLane {
-                b: l.b,
-                scratch: &mut l.df.draft_scratch,
-                ctx_len: g.ctx,
-                positions_q: &g.pos_q,
-                positions_k: &g.pos_k,
-            })
-            .collect();
-        dflash::draft_forward_lanes(gpu, &draft_weights, &draft_cfg, shared, &mut dl)?;
-    }
-
     // One shared target lm-head over every lane's rows (seed rows included:
     // they are discarded, the head is row-independent).
     let w_out = &target_weights.output;
@@ -6442,8 +6465,32 @@ pub fn draft_dflash_blocks_batched(
     let hidden_all = shared.x.sub_offset(0, rows * h);
     let logits_all = head.logits.sub_offset(0, rows * vocab);
     let rotated = head.rot.sub_offset(0, rows * h);
-    llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_all, &rotated, h, rows)?;
-    gemm_mq_batched_lmhead_draft(gpu, w_out.gpu_dtype, &w_out.buf, &rotated, &logits_all, w_out.m, w_out.k, rows)?;
+    // The forward and the head GEMM (and only they) run inside the 64-row
+    // scope: a full 64-row chunk takes the scoped `_vt4` overwrite route,
+    // per-row identical to the 48/16-row chunks. The scope is closed on every
+    // path before the result propagates.
+    let rows64 = rows == DFLASH_DRAFT_BATCH_ROWS64 && cap == DFLASH_DRAFT_BATCH_ROWS64;
+    let prev = gpu.draft_rows64_enter(rows64);
+    let scoped: HipResult<()> = (|| {
+        {
+            let mut dl: Vec<dflash::DraftLane<'_>> = lanes
+                .iter_mut()
+                .zip(&geos)
+                .map(|(l, g)| dflash::DraftLane {
+                    b: l.b,
+                    scratch: &mut l.df.draft_scratch,
+                    ctx_len: g.ctx,
+                    positions_q: &g.pos_q,
+                    positions_k: &g.pos_k,
+                })
+                .collect();
+            dflash::draft_forward_lanes(gpu, &draft_weights, &draft_cfg, shared, &mut dl)?;
+        }
+        llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_all, &rotated, h, rows)?;
+        gemm_mq_batched_lmhead_draft(gpu, w_out.gpu_dtype, &w_out.buf, &rotated, &logits_all, w_out.m, w_out.k, rows)
+    })();
+    gpu.draft_rows64_exit(prev);
+    scoped?;
 
     let mut out: Vec<Vec<u32>> = Vec::with_capacity(lanes.len());
     if draft_weights.has_candidate_selector() {

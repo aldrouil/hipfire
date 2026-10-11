@@ -59,7 +59,7 @@ use crate::speculative::{
     dflash_download_verify_argmax, dflash_draft_batch_eligible, dflash_enqueue_verify_lm_head_argmax,
     draft_dflash_block_rank, draft_dflash_blocks_batched, DeltaNetSnapshot, DflashCbDraft, DflashDraftLane,
     dflash_sampled_selector_draft_into, dflash_target_rows_into, DflashSampleCfg, DflashSampledDraft,
-    FastTargetRows, VerifyScratch, DFLASH_DRAFT_BATCH_MAX_ROWS,
+    dflash_draft_batch_max_rows, FastTargetRows, VerifyScratch,
 };
 use hipfire_runtime::dflash::DflashScratch;
 use hip_bridge::{HipError, HipResult};
@@ -334,12 +334,14 @@ pub fn dflash_cb_head_argmax(
 }
 
 /// Shared verify buffers of one DFlash CB engine: the trunk row scratch, ONE
-/// head scratch (`final_hidden`/`logits`/`rot`/`argmax`, `max_rows` rows,
+/// head scratch (`final_hidden`/`logits`/`rot`/`argmax`, `draft_rows` rows,
 /// `hidden_k = dim.next_power_of_two()` like a singleton lane's), and the
 /// reusable chunk tables. Allocated once; a cycle allocates no GPU memory.
 /// `max_rows` is the EFFECTIVE cap (63, or up to 128 on the wide verify route).
 pub struct DflashCbScratch {
     max_rows: usize,
+    /// Head-scratch rows (`>= max_rows`): see [`Self::draft_rows`].
+    draft_rows: usize,
     trunk: MultiChunkScratch,
     head: VerifyScratch,
     rows: Vec<usize>,
@@ -368,11 +370,15 @@ impl DflashCbScratch {
     /// `max_rows` is the planned rows; the scratch allocates this target's
     /// effective cap ([`multi_chunk_scratch_rows`]: `2..=63`, or up to 128
     /// only when the wide verify route is admitted for `weights`/`config`).
-    /// The scratch stores that cap ([`Self::max_rows`]).
-    pub fn new(gpu: &mut Gpu, weights: &Qwen35Weights, config: &Qwen35Config, max_rows: usize) -> HipResult<Self> {
-        let max_rows = multi_chunk_scratch_rows(gpu, weights, config, max_rows);
+    /// The scratch stores that cap ([`Self::max_rows`]). The head scratch holds
+    /// `max(cap, min(planned, dflash_draft_batch_max_rows(gpu)))` rows so a
+    /// 64-row batched draft chunk fits even when the verify cap is 63
+    /// ([`Self::draft_rows`]); with the 48-row draft cap this equals the cap.
+    pub fn new(gpu: &mut Gpu, weights: &Qwen35Weights, config: &Qwen35Config, planned_rows: usize) -> HipResult<Self> {
+        let max_rows = multi_chunk_scratch_rows(gpu, weights, config, planned_rows);
+        let draft_rows = max_rows.max(planned_rows.min(dflash_draft_batch_max_rows(gpu)));
         let trunk = MultiChunkScratch::new(gpu, config, max_rows)?;
-        let head = match VerifyScratch::new(gpu, max_rows, config.dim, config.vocab_size, config.dim.next_power_of_two()) {
+        let head = match VerifyScratch::new(gpu, draft_rows, config.dim, config.vocab_size, config.dim.next_power_of_two()) {
             Ok(h) => h,
             Err(e) => {
                 let _ = trunk.free_gpu(gpu);
@@ -381,6 +387,7 @@ impl DflashCbScratch {
         };
         Ok(Self {
             max_rows,
+            draft_rows,
             trunk,
             head,
             rows: Vec::with_capacity(max_rows),
@@ -398,7 +405,7 @@ impl DflashCbScratch {
     /// FWHT rotation buffers every lane borrows ([`Self::lend_mq`]).
     pub fn reserve_draft(&mut self, gpu: &mut Gpu, draft_config: &hipfire_runtime::dflash::DflashConfig) -> HipResult<()> {
         if self.draft.is_none() {
-            self.draft = Some(DflashScratch::new_with_mq(gpu, draft_config, DFLASH_DRAFT_BATCH_MAX_ROWS, 1, true)?);
+            self.draft = Some(DflashScratch::new_with_mq(gpu, draft_config, dflash_draft_batch_max_rows(gpu), 1, true)?);
         }
         Ok(())
     }
@@ -450,9 +457,18 @@ impl DflashCbScratch {
         self.max_rows
     }
 
+    /// Rows one batched draft chunk may hold: the head scratch's row count.
+    /// `max_rows` unless the planned rows exceed it and the 64-row draft
+    /// chunk ([`dflash_draft_batch_max_rows`]) is admitted, in which case
+    /// the head (and so this cap) is widened to hold it.
+    pub fn draft_rows(&self) -> usize {
+        self.draft_rows
+    }
+
     pub fn free_gpu(self, gpu: &mut Gpu) -> HipResult<()> {
         let DflashCbScratch {
             max_rows: _,
+            draft_rows: _,
             trunk,
             head,
             rows: _,
@@ -484,7 +500,8 @@ pub struct DflashCbDraftLane<'a> {
 /// Draft phase over lanes. With `batched` (and the exact-gfx1201 MQ4 v2
 /// eligibility of [`dflash_draft_batch_eligible`]), greedy full-block lanes are
 /// packed in order into chunks of at most
-/// `min(DFLASH_DRAFT_BATCH_MAX_ROWS, cb.max_rows())` rows; each chunk of at
+/// `min(dflash_draft_batch_max_rows(gpu), cb.draft_rows())` rows (48, or 64
+/// on exact gfx1201 where the scoped 64-row draft route is exact); each chunk of at
 /// least `cb.draft_min_lanes` lanes is ONE draft-model forward and ONE shared
 /// lm-head ([`draft_dflash_blocks_batched`]) with every lane keeping its own
 /// context rings, positions and hidden context. Every other lane (budget
@@ -506,7 +523,7 @@ pub fn dflash_cb_draft(
     let mut chunk_of: Vec<Option<usize>> = vec![None; n];
     let mut n_chunks = 0usize;
     if batched && n > 0 && dflash_draft_batch_eligible(gpu, weights, config, &lanes[0].state.df.draft_weights) {
-        let cap = DFLASH_DRAFT_BATCH_MAX_ROWS.min(cb.max_rows);
+        let cap = dflash_draft_batch_max_rows(gpu).min(cb.draft_rows);
         let mut rows = 0usize;
         let mut members: Vec<Vec<usize>> = Vec::new();
         for (i, l) in lanes.iter().enumerate() {
@@ -533,7 +550,7 @@ pub fn dflash_cb_draft(
     if n_chunks > 0 && cb.draft.is_none() {
         let cfg = lanes.iter().zip(&chunk_of).find(|(_, c)| c.is_some()).map(|(l, _)| l.state.df.draft_config.clone());
         if let Some(cfg) = cfg {
-            cb.draft = Some(DflashScratch::new_with_mq(gpu, &cfg, DFLASH_DRAFT_BATCH_MAX_ROWS, 1, true)?);
+            cb.draft = Some(DflashScratch::new_with_mq(gpu, &cfg, dflash_draft_batch_max_rows(gpu), 1, true)?);
         }
     }
     for c in 0..n_chunks {

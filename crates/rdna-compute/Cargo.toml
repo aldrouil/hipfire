@@ -897,6 +897,10 @@ name = "draft_overwrite_gfx12_oracle"
 required-features = ["lab"]
 
 [[example]]
+name = "lane_gdn_oracle"
+required-features = ["lab", "deltanet"]
+
+[[example]]
 name = "qwen4_mq4_x4_pm_oracle"
 required-features = ["lab"]
 

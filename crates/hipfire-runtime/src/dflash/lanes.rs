@@ -357,7 +357,10 @@ pub fn draft_forward_lanes(
             for (_row0, slot0, len) in ring_segments(fc_start, l, swa_w) {
                 let th_slice = ls.target_hidden.sub_offset(slot0 * ne * h, len * ne * h);
                 let thp_slice = ls.target_hidden_proj.sub_offset(slot0 * h, len * h);
-                gemm_dispatch(
+                // Per-lane fc projection (`len` rows): singleton route, outside
+                // the batched 64-row scope.
+                let scoped = gpu.draft_rows64_enter(false);
+                let fc = gemm_dispatch(
                     gpu,
                     &th_slice,
                     &weights.fc,
@@ -365,7 +368,9 @@ pub fn draft_forward_lanes(
                     len,
                     shared.mq_x_rot.as_ref(),
                     shared.mq_x_rot_f16.as_ref(),
-                )?;
+                );
+                gpu.draft_rows64_exit(scoped);
+                fc?;
                 gpu.rmsnorm_batched(&thp_slice, &weights.hidden_norm, &thp_slice, len, h, eps)?;
             }
         }
@@ -458,9 +463,18 @@ pub fn draft_forward_lanes(
         )?;
 
         // Context K/V of every lane into its own ring.
+        // Per-lane context fill is a lane-local GEMM of arbitrary row count: it
+        // keeps the singleton's route even inside the batched 64-row scope.
+        let scoped = gpu.draft_rows64_enter(false);
+        let mut filled = Ok(());
         for (lane, g_) in lanes.iter().zip(&geos) {
-            lane_ctx_fill(gpu, cfg, layer, lane.scratch, shared, &shared.q, li, g_)?;
+            filled = lane_ctx_fill(gpu, cfg, layer, lane.scratch, shared, &shared.q, li, g_);
+            if filled.is_err() {
+                break;
+            }
         }
+        gpu.draft_rows64_exit(scoped);
+        filled?;
 
         gpu.rmsnorm_batched(&shared.q, &layer.q_norm, &shared.q, rows * cfg.n_heads, hd, eps)?;
         gpu.rmsnorm_batched(&shared.k_noise, &layer.k_norm, &shared.k_noise, rows * cfg.n_kv_heads, hd, eps)?;

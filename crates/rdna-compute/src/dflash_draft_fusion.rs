@@ -139,6 +139,24 @@ impl Gpu {
         }
     }
 
+    /// Open (`on == true`) or close (`false`) the 64-row draft scope
+    /// ([`Gpu::draft_rows64_scope`]) and return the previous state for
+    /// [`Self::draft_rows64_exit`]. Only the batched DFlash draft forward
+    /// enters it with `true`; lets
+    /// [`Self::gemm_mq4g256v2_overwrite_gfx12_dflash`] admit exactly 64 rows.
+    pub fn draft_rows64_enter(&mut self, on: bool) -> bool {
+        // bind_thread: skip — updates a CPU-side scope flag, no device call.
+        let prev = self.draft_rows64_scope;
+        self.draft_rows64_scope = on;
+        prev
+    }
+
+    /// Restore the scope state returned by [`Self::draft_rows64_enter`].
+    pub fn draft_rows64_exit(&mut self, prev: bool) {
+        // bind_thread: skip — updates a CPU-side scope flag, no device call.
+        self.draft_rows64_scope = prev;
+    }
+
     /// gfx1201 DFlash-draft MQ4G256V2 overwrite GEMM: the pre-zero-free twin of
     /// `gemm_mq4g256v2_batched_lmhead` for the shapes whose legacy route ends
     /// in the one-tile (`gemm_mq4g256v2_residual_wmma_gfx12`) or 128-K verify-tile
@@ -149,9 +167,14 @@ impl Gpu {
     /// would not have ended in one of those two kernels (caller then runs
     /// `gemm_mq4g256v2_batched_lmhead` unchanged). Admission: exact gfx1201,
     /// `HIPFIRE_DRAFT_COLLAPSE_OFF` unset, no fp8/iu4 verify scope, no replay
-    /// recording / graph capture / G0 observation, `2 <= batch <= 63`,
-    /// `k % 256 == 0`, the `wmma_eligible` gate of the legacy lm_head, no A8
-    /// prefill, and not the `_ldsstage` arm.
+    /// recording / graph capture / G0 observation, `2 <= batch <= 63` (or
+    /// exactly 64 inside [`Self::draft_rows64_enter`]'s scope, which also
+    /// needs `HIPFIRE_WMMA_BATCH_TILES`), `k % 256 == 0`, the `wmma_eligible`
+    /// gate of the legacy lm_head, no A8 prefill, and not the `_ldsstage` arm.
+    ///
+    /// N = 64 is per-row identical to the one-tile kernel (the `_vt4` core's
+    /// arithmetic), NOT to the legacy `>= 64` arms (A8 / IU4 / bt-tile / fp8),
+    /// which is why it is admitted only inside the scope.
     ///
     /// Byte-exactness: legacy memsets `y` to +0.0f then does one `Y += acc` per
     /// output; the overwrite kernels store `acc + 0.0f` once per output, which
@@ -169,7 +192,8 @@ impl Gpu {
             || self.flags.draft_collapse_off
             || self.fp8_verify_scope
             || self.iu4_verify_scope
-            || !(2..=63).contains(&batch_size)
+            || (!(2..=63).contains(&batch_size)
+                && !(batch_size == 64 && self.draft_rows64_scope))
             || k % 256 != 0
             || !self.arch_caps.has_wmma_w32_gfx12()
             || self.flags.fp16_disabled
@@ -183,6 +207,20 @@ impl Gpu {
             || self.replay.is_g0_observing()
         {
             return Ok(false);
+        }
+        if batch_size == 64 {
+            // Scope-gated 64-row chunk: the batch-tile `_vt4` overwrite kernel
+            // (`bt = 4`, one grid-y block). The vt core keeps the one-tile
+            // kernel's per-output arithmetic, so every row matches the same row
+            // of a 48/16-row chunk. Needs the batch-tiles family.
+            if !self.flags.wmma_batch_tiles {
+                return Ok(false);
+            }
+            self.bind_thread()?;
+            self.iu4_verify_note_f16();
+            self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
+            self.gemm_mq4g256v2_overwrite_wmma_gfx12_vt(a_raw, x, y, m, k, batch_size)?;
+            return Ok(true);
         }
         self.bind_thread()?;
         self.iu4_verify_note_f16();

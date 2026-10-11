@@ -1196,6 +1196,11 @@ pub struct Gpu {
     /// A4 producers + IU4 GEMMs, whose output rows do not depend on the row
     /// count. lm_head is untouched (F16). See [`Gpu::iu4_verify_enter`].
     pub iu4_verify_scope: bool,
+    /// Set only around a batched DFlash draft forward (and its head GEMM):
+    /// lets `gemm_mq4g256v2_overwrite_gfx12_dflash` admit exactly 64 rows
+    /// (the batch-tile `_vt4` overwrite kernel, per-row identical to the
+    /// one-tile kernel). Default false. See [`Gpu::draft_rows64_enter`].
+    pub draft_rows64_scope: bool,
     /// The current DFlash load's IU4 verify decision (`load_dflash_state`):
     /// `HIPFIRE_CB_VERIFY_IU4` forced, or by default on when the load's
     /// `speculation.dflash_block` resolves to 8 and `HIPFIRE_CB_VERIFY_FP8`
@@ -2051,6 +2056,7 @@ impl Gpu {
             mq4v2_symmetric: false,
             fp8_verify_scope: false,
             iu4_verify_scope: false,
+            draft_rows64_scope: false,
             iu4_verify_load: false,
             qwen4_trunk_iu4: false,
             residual_fold_arm: None,

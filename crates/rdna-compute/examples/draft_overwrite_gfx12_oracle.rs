@@ -22,6 +22,10 @@
 //! - arm A: y zero-filled by `memset` then the legacy residual launcher;
 //!   arm B: y pre-filled with NaN bytes then the overwrite launcher (must
 //!   return `true`: a NaN left behind means a missed store).
+//! - N = 64 (per shape): inside `Gpu::draft_rows64_enter(true)` the overwrite
+//!   must be admitted (when `HIPFIRE_WMMA_BATCH_TILES` is on) and equal, bit
+//!   for bit, four N = 16 one-tile overwrite launches on 16-row slices; with
+//!   the scope closed N = 64 must be refused.
 //!
 //! Outputs are compared as `u32` bit patterns; +0.0 / -0.0 output counts are
 //! printed to show the signed-zero path is exercised. Requires exact gfx1201.
@@ -199,6 +203,80 @@ fn main() {
             }
             println!(
                 "{} m={m:<5} k={k:<5} batch={batch:<2} admitted={admitted} mismatches={mismatches} nan_left={nans} +0={pz} -0={nz}",
+                if ok { "PASS" } else { "FAIL" },
+            );
+        }
+
+        // N = 64: admitted ONLY inside the draft 64-row scope (the `_vt4`
+        // overwrite kernel, needs the batch-tile family); per-row identical to
+        // the one-tile kernel, so the reference is four N = 16 overwrite
+        // launches on 16-row slices. Outside the scope N = 64 is refused.
+        {
+            cases += 1;
+            let batch = 64usize;
+            let mut x: Vec<f32> = (0..batch * k)
+                .map(|_| (rng.unit() + rng.unit() - 1.0) * 1.5)
+                .collect();
+            for (i, v) in x.iter_mut().enumerate() {
+                if i % 5 == 0 {
+                    *v = 0.0;
+                }
+            }
+            for v in &mut x[(batch - 1) * k..] {
+                *v = 0.0;
+            }
+            let d_x = gpu.upload_f32(&x, &[x.len()]).expect("upload x64");
+            let d_ya = gpu.upload_f32(&vec![1.0; batch * m], &[batch * m]).expect("alloc ya64");
+            let d_yb = gpu.upload_f32(&vec![1.0; batch * m], &[batch * m]).expect("alloc yb64");
+            let want_admit = gpu.flags.wmma_batch_tiles;
+
+            // Scope closed: N = 64 must NOT be admitted (device untouched).
+            fill_nan(&gpu, &d_yb, batch * m);
+            gpu.scratch.fp16_x_source_ptr = std::ptr::null_mut();
+            let closed_admit = gpu
+                .gemm_mq4g256v2_overwrite_gfx12_dflash(&w, &d_x, &d_yb, m, k, batch)
+                .expect("overwrite launch (scope closed)");
+
+            // Reference: four N = 16 one-tile overwrite launches.
+            fill_nan(&gpu, &d_ya, batch * m);
+            let mut ref_admitted = true;
+            for q in 0..4 {
+                let xs = d_x.sub_offset(q * 16 * k, 16 * k);
+                let ys = d_ya.sub_offset(q * 16 * m, 16 * m);
+                gpu.scratch.fp16_x_source_ptr = std::ptr::null_mut();
+                ref_admitted &= gpu
+                    .gemm_mq4g256v2_overwrite_gfx12_dflash(&w, &xs, &ys, m, k, 16)
+                    .expect("N=16 reference launch");
+            }
+            let a = fetch(&gpu, &d_ya);
+
+            // Scoped N = 64 into NaN-prefilled y.
+            fill_nan(&gpu, &d_yb, batch * m);
+            gpu.scratch.fp16_x_source_ptr = std::ptr::null_mut();
+            let prev = gpu.draft_rows64_enter(true);
+            let scoped = gpu.gemm_mq4g256v2_overwrite_gfx12_dflash(&w, &d_x, &d_yb, m, k, batch);
+            gpu.draft_rows64_exit(prev);
+            let scoped_admit = scoped.expect("overwrite launch (scope open)");
+            let b = fetch(&gpu, &d_yb);
+
+            let mismatches = if scoped_admit { a.iter().zip(&b).filter(|(p, q)| p != q).count() } else { usize::MAX };
+            let pz = b.iter().filter(|&&v| v == 0x0000_0000).count();
+            let nz = b.iter().filter(|&&v| v == 0x8000_0000).count();
+            let nans = if scoped_admit { b.iter().filter(|&&v| f32::from_bits(v).is_nan()).count() } else { 0 };
+            let scope_restored = !gpu.draft_rows64_scope;
+            total_pz += pz;
+            total_nz += nz;
+            let ok = ref_admitted
+                && !closed_admit
+                && scoped_admit == want_admit
+                && scope_restored
+                && (!want_admit || (mismatches == 0 && nans == 0));
+            if !ok {
+                failures += 1;
+            }
+            let mismatches_txt = if scoped_admit { mismatches.to_string() } else { "n/a".into() };
+            println!(
+                "{} m={m:<5} k={k:<5} batch=64 scoped_admitted={scoped_admit} (want {want_admit}) closed_admitted={closed_admit} ref_admitted={ref_admitted} mismatches_vs_4xN16={mismatches_txt} nan_left={nans} +0={pz} -0={nz}",
                 if ok { "PASS" } else { "FAIL" },
             );
         }
