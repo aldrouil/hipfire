@@ -2268,31 +2268,35 @@ fn finish_qwen35_load(
     // Upstream candidates in between (unbisected): `3b3d2ab45` MQ6 shared
     // gate/up alias, graded host-expert offload. So the hard refusal is gone:
     // explicit `speculation.mtp = "on"` (`--spec mtp`) attaches the head over a
-    // spill. But `auto` still degrades to AR when routed experts are
-    // host-mapped — measured on ornith/gfx1201 (serve_harness battery, greedy,
-    // `--thinking off --sampling greedy --seed 7`): single merge_sort prompt
-    // (md5 `253c7ac50857fe6d0e10fb0d2c5e35c0`, daemon md5 `32c2495e`): MTP
-    // decode 10.7 vs AR 44.6 tok/s, prefill 147.2 vs 170.2 tok/s at tau=1.33;
-    // 9-prompt genre battery `benchmarks/prompts/mtp_genre_battery.json`
-    // (md5 `c6311934e3426ad0b64c7adf9e2c56be`, derived from `~/mtp-bench.py`
-    // PROMPTS, daemon md5 `0339b7c1`): avg decode 34.9 vs 45.1 tok/s, avg
-    // prefill 186.4 vs 262.3 tok/s. The verify re-reads
-    // host-mapped experts over PCIe, so each extra pass costs more than the
-    // accepted tokens return. Keyed on the *resolved*
-    // placement (host-mapped count from the loaded weights), not on MoE-ness,
-    // so a MoE that resolves fully resident keeps MTP under `auto`.
-    // CPU-deferred MoE experts (memory.offload_exec=cpu) recompute the routed FFN
-    // on the host with no device-side expert tables for the verify pass, so native
-    // MTP cannot be validated. Resolved from the loaded placement, not config.
+    // spill. But `auto` still degrades to AR on the PCIe one, where the verify
+    // re-reads host-mapped experts over the link and each extra pass can cost
+    // more than the accepted tokens return. That is the ornith-1.5-35b-a3b
+    // finding — `docs/perf-checkpoints/2026-10-04-mtp-over-trunk-expert-spill.md`
+    // (gfx1201, greedy 9-prompt genre battery: MTP 34.9 vs AR 45.1 tok/s avg;
+    // single merge_sort: 10.7 vs 44.6) and `…-moe-offload-ar-vs-mtp.md`
+    // (MTP 23.4 pcie / 23.5 cpu vs AR 64.2 / 50.5) — both on the pre-CPU-stack
+    // build, and both show the loss on *both* seams. Keyed on the *resolved*
+    // placement (host-mapped count from the loaded weights), not on MoE-ness, so
+    // a MoE that resolves fully resident keeps MTP under `auto`.
+    //
+    // The PCIe decline is therefore fixture-bound to those ornith records, and
+    // the newest same-box record points the other way even there: on
+    // `qwen3.6-35b-a3b.mq4p` (2026-10-11, 16 spilled expert layers) MTP led AR
+    // on 8/8 cells, +13.9-22.4% pcie and +33.4-43.8% cpu. Extending or dropping
+    // the decline needs a re-measure on the affected fixture, not this comment.
+    //
+    // CPU-deferred experts (memory.offload_exec=cpu) are excluded outright: the
+    // splice recomputes the routed FFN on the host instead of re-reading it over
+    // PCIe, so the cost argument does not transfer, and the CPU arms of that same
+    // 2026-10-11 record are the fastest MTP cells, so `auto` keeps the head
+    // there. Resolved from the loaded placement, not config.
     let cpu_deferred_moe = bundle.weights.has_cpu_deferred_experts();
     let mtp_spill_degrade = matches!(arch_id, 5 | 6)
         && ctx.spec.mtp.is_none()
-        && hipfire_arch_qwen35::qwen35::host_mapped_expert_accounting(&bundle.weights.layers).0
-            > 0;
-    if mtp_spill_degrade && !cpu_deferred_moe {
-        eprintln!(
-            "  qwen35 MTP: off by default with host-mapped experts; opt in with --spec mtp"
-        );
+        && !cpu_deferred_moe
+        && hipfire_arch_qwen35::qwen35::host_mapped_expert_accounting(&bundle.weights.layers).0 > 0;
+    if mtp_spill_degrade {
+        eprintln!("  qwen35 MTP: off by default with host-mapped experts; opt in with --spec mtp");
     }
     // ── qwen35 MTP head (single resolver: bundled .mq4-mtp trailer then .mtp sidecar) ──
     // Precedence: DSpark > DFlash > MTP > n-gram. Gate: only arch 5/6, no adaptive/eviction,

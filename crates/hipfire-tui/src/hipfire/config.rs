@@ -212,7 +212,7 @@ impl ConfigState {
                     .get("dflash_mode")
                     .cloned()
                     .unwrap_or_else(|| "off".into()),
-                "DFlash mode. Keep off unless intentionally testing drafts.",
+                "Spec decode: the model's attached drafter — its DFlash draft, else its MTP head.",
             ),
             (
                 "Prefill",

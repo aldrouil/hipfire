@@ -4003,6 +4003,15 @@ pub(crate) fn load_params(
 /// really lives, not the models directory the draft was pulled into — then
 /// next to the target. An explicit draft always wins; a final `off` never
 /// carries a draft (`project_dflash_draft` strips it) and returns early.
+///
+/// `dflash_mode` is the spec-decode knob, so `on` is resolved against every
+/// drafter the model can actually run, not DFlash alone: with no declared
+/// DFlash draft, an MTP head the loader would find ([`mtp_head_available`])
+/// serves the request instead of failing a load closed on a draft this model
+/// never declared (`qwen3.6:35b-a3b-mq4p` and every other MTP-only MoE tier).
+/// `on` still fails closed when nothing can spec — a declared DFlash draft
+/// that is not pulled, or no drafter at all — and when the operator turned
+/// the only available mechanism off (`speculation.mtp=off`).
 pub(crate) fn resolve_dflash_sidecar(
     params: &mut serde_json::Value,
     entry: Option<&ModelEntry>,
@@ -4010,7 +4019,8 @@ pub(crate) fn resolve_dflash_sidecar(
     model_path: &Path,
     tag: Option<&str>,
 ) -> Result<()> {
-    if !matches!(params["dflash_mode"].as_str(), Some("auto" | "on")) {
+    let mode = params["dflash_mode"].as_str().unwrap_or("off");
+    if !matches!(mode, "auto" | "on") {
         return Ok(());
     }
     if params
@@ -4020,14 +4030,43 @@ pub(crate) fn resolve_dflash_sidecar(
     {
         return Ok(());
     }
+    // `HIPFIRE_DFLASH_DRAFT` needs no branch: `load_env_layer` folds it into
+    // `developer.dflash_draft`, which `project_dflash_draft` already projected.
     let Some(sidecar) = entry.and_then(|entry| entry.dflash.as_ref()) else {
-        if params["dflash_mode"].as_str() == Some("on") && model_path.is_file() {
+        if mode != "on" || !model_path.is_file() {
+            return Ok(());
+        }
+        if mtp_head_available(entry, models_dir, model_path) {
+            if params["mtp_mode"].as_str() == Some("off") {
+                bail!(
+                    "dflash_mode=on: {} has no DFlash draft and MTP is off; \
+                     set speculation.mtp=auto/on, set speculation.dflash=off, or pass developer.dflash_draft",
+                    tag.unwrap_or("<model>")
+                );
+            }
+            // Arm it explicitly rather than leaning on the `auto` default: the
+            // loader degrades native qwen35 MTP to AR under `auto` as soon as
+            // any routed expert is host-mapped (`mtp_spill_degrade`), which is
+            // the normal state of an offloaded MoE (measured 10.7 vs AR 44.6
+            // tok/s). The knob is `on`, so this load must spec or refuse — not
+            // silently run AR.
+            params["mtp_mode"] = serde_json::json!("on");
+            eprintln!(
+                "[hipfire] dflash_mode=on: {} declares no DFlash draft; spec decode resolves to the MTP head",
+                tag.unwrap_or("<model>")
+            );
+            return Ok(());
+        }
+        if entry.is_some() {
             bail!(
-                "DFlash needs a draft model: {} is not a registry-managed artifact; add --model-draft <draft.hfq>, or run the model by its registry tag (which pairs its draft)",
-                model_path.display()
+                "DFlash draft required (dflash_mode=on) but registry entry {} declares no DFlash draft and no MTP head is present; set speculation.dflash=off/auto or pass developer.dflash_draft",
+                tag.unwrap_or("<model>")
             );
         }
-        return Ok(());
+        bail!(
+            "DFlash draft required (dflash_mode=on) but {} is not a registry-managed artifact; pass developer.dflash_draft or use the registry tag",
+            model_path.display()
+        );
     };
     let beside_target = model_path.parent().unwrap_or_else(|| Path::new("."));
     let candidate = [models_dir, beside_target]
@@ -4050,6 +4089,26 @@ pub(crate) fn resolve_dflash_sidecar(
         sidecar.file
     );
     Ok(())
+}
+
+/// Whether this load has an MTP head [`resolve_mtp_sidecar`] will wire.
+///
+/// Mirrors that resolver's candidate ladder minus its `requested`-as-typed
+/// slot (`load_params` sees only the canonical `model_path`): the registry
+/// `mtp` sidecar in `models_dir`, `<entry file>.mtp` in `models_dir`, then
+/// `<trunk>.mtp` beside the target. `find_model_path` canonicalizes, so a
+/// symlinked trunk's `.mtp` is a models-dir candidate either way. A head that
+/// only the loader's own `<trunk>.mtp` / bundled-trailer probe finds counts
+/// too — the daemon reaches the same bytes with `params["mtp"]` unset.
+fn mtp_head_available(entry: Option<&ModelEntry>, models_dir: &Path, model_path: &Path) -> bool {
+    let mut candidates = vec![model_path.with_extension("mtp")];
+    if let Some(entry) = entry {
+        candidates.push(models_dir.join(Path::new(&entry.file).with_extension("mtp")));
+        if let Some(sidecar) = entry.mtp.as_ref() {
+            candidates.push(models_dir.join(&sidecar.file));
+        }
+    }
+    candidates.into_iter().any(|candidate| candidate.is_file())
 }
 
 /// Resolve the Qwen MTP head sidecar into `params["mtp"]`.
@@ -10326,6 +10385,19 @@ mod tests {
         .unwrap()
     }
 
+    fn resolved_with_dflash_mtp(dflash: &str, mtp: &str) -> hipfire_config::ResolvedConfig {
+        let mut explicit = ConfigLayer::default();
+        explicit.set_cli("speculation.dflash", dflash).unwrap();
+        explicit.set_cli("speculation.mtp", mtp).unwrap();
+        resolve([NamedLayer {
+            source: ConfigSource::OneShot {
+                argument: format!("speculation.dflash={dflash}"),
+            },
+            layer: explicit,
+        }])
+        .unwrap()
+    }
+
     fn resolved_with_vision_mode(mode: &str) -> hipfire_config::ResolvedConfig {
         let mut explicit = ConfigLayer::default();
         explicit.set_cli("vision.mode", mode).unwrap();
@@ -11885,6 +11957,154 @@ mod tests {
         assert!(
             params.get("draft").is_none(),
             "auto on a bare artifact runs AR"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn dflash_on_engages_the_mtp_head_when_no_dflash_draft_is_declared() {
+        // `dflash_mode` is the spec-decode knob: on an MTP-only tier
+        // (`qwen3.6:35b-a3b-mq4p` declares a registry `mtp` slot and no
+        // `dflash`) `on` used to fail the load closed on a draft the model
+        // never declared, so serve pre-warm errored and every request failed
+        // the same way. It now resolves to the head the loader would wire.
+        let paths = test_paths("dflash-on-mtp-tie-in");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.6-35b-a3b.mq4p");
+        fs::write(&model_path, b"trunk").unwrap();
+        let head = paths.models.join("qwen3.6-35b-a3b.mtp");
+        fs::write(&head, b"head").unwrap();
+        let entry = ModelEntry {
+            repo: "hipfire-models/qwen3.6-35b-a3b".into(),
+            file: "qwen3.6-35b-a3b.mq4p".into(),
+            size_gb: 19.8,
+            min_vram_gb: 20.0,
+            desc: "mq4p MoE + mtp".into(),
+            mtp: Some(hipfire_registry::Sidecar {
+                file: "qwen3.6-35b-a3b.mtp".into(),
+                sha256: None,
+                size_bytes: None,
+            }),
+            ..Default::default()
+        };
+        let resolved = resolved_with_dflash_mode("on", None);
+        let tag = "qwen3.6:35b-a3b-mq4p";
+        let mut params = load_params(
+            &resolved,
+            Some(&entry),
+            &paths.models,
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some(tag),
+            false,
+            None,
+        )
+        .expect("on must resolve to the MTP head, not fail closed");
+        assert!(
+            params.get("draft").is_none(),
+            "an MTP-only model wires no DFlash draft"
+        );
+        assert_eq!(
+            params["mtp_mode"], "on",
+            "the knob is `on`, so MTP must be armed explicitly: `auto` degrades \
+             to AR as soon as a routed expert is host-mapped"
+        );
+        // The pairing is completed by the caller (serve/run), which wires the
+        // head after load_params returns.
+        resolve_mtp_sidecar(
+            &mut params,
+            Some(&entry),
+            &paths.models,
+            &model_path,
+            tag,
+            Some(tag),
+        );
+        assert_eq!(params["mtp"], head.display().to_string());
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn dflash_on_refuses_when_the_only_mechanism_is_turned_off() {
+        // Tie-in must not silently override `speculation.mtp=off`: nothing can
+        // serve the request, so `on` still fails the load closed.
+        let paths = test_paths("dflash-on-mtp-off");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.6-35b-a3b.mq4p");
+        fs::write(&model_path, b"trunk").unwrap();
+        fs::write(paths.models.join("qwen3.6-35b-a3b.mtp"), b"head").unwrap();
+        let entry = ModelEntry {
+            repo: "hipfire-models/qwen3.6-35b-a3b".into(),
+            file: "qwen3.6-35b-a3b.mq4p".into(),
+            size_gb: 19.8,
+            min_vram_gb: 20.0,
+            desc: "mq4p MoE + mtp".into(),
+            mtp: Some(hipfire_registry::Sidecar {
+                file: "qwen3.6-35b-a3b.mtp".into(),
+                sha256: None,
+                size_bytes: None,
+            }),
+            ..Default::default()
+        };
+        let resolved = resolved_with_dflash_mtp("on", "off");
+        let error = load_params(
+            &resolved,
+            Some(&entry),
+            &paths.models,
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.6:35b-a3b-mq4p"),
+            false,
+            None,
+        )
+        .expect_err("on with the MTP head disabled must refuse");
+        let message = format!("{error:#}");
+        assert!(message.contains("MTP is off"), "{message}");
+        assert!(message.contains("speculation.mtp"), "{message}");
+        assert!(message.contains("speculation.dflash"), "{message}");
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn dflash_on_names_the_registry_entry_when_it_declares_no_drafter() {
+        // The old message claimed the model "is not a registry-managed
+        // artifact" even when the operator used the registry tag; the entry
+        // simply declared no DFlash draft.
+        let paths = test_paths("dflash-on-no-drafter");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.5-4b.mq4");
+        fs::write(&model_path, b"trunk").unwrap();
+        let entry = ModelEntry {
+            repo: "hipfire-models/qwen3.5-4b".into(),
+            file: "qwen3.5-4b.mq4".into(),
+            size_gb: 2.6,
+            min_vram_gb: 3.4,
+            desc: "no drafter".into(),
+            ..Default::default()
+        };
+        let resolved = resolved_with_dflash_mode("on", None);
+        let error = load_params(
+            &resolved,
+            Some(&entry),
+            &paths.models,
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.5:4b"),
+            false,
+            None,
+        )
+        .expect_err("on with no drafter at all must fail closed");
+        let message = format!("{error:#}");
+        assert!(message.contains("registry entry qwen3.5:4b"), "{message}");
+        assert!(message.contains("declares no DFlash draft"), "{message}");
+        assert!(
+            !message.contains("not a registry-managed artifact"),
+            "a resolved entry is registry-managed: {message}"
         );
         fs::remove_dir_all(&paths.root).unwrap();
     }

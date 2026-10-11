@@ -95,6 +95,11 @@ Config and env owners for bind, idle, queue, and body limits:
 2. **Daemon.** Spawns the Rust `daemon` example over stdio JSON.
 3. **Pre-warm (default).** Loads the chosen model asynchronously. Failures log
    and leave the process serving; the model loads on the first real request.
+   A failure the config itself decides — a load-time refusal such as
+   `dflash_mode=on` with no DFlash draft and no MTP head — is not transient:
+   every later request reloads and is refused the same way, while `/health`
+   still answers `ok`. Fix the config (or pass `developer.dflash_draft`)
+   rather than retrying.
    Multi-slot serve (`serve.multi_slot = true`) fails closed instead: the slot
    engine is its only backend, so a failed pre-warm (for example, slot-engine
    allocations that do not fit beside another process on the card) logs the

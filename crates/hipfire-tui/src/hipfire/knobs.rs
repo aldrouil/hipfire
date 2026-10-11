@@ -139,11 +139,11 @@ pub const KNOBS: &[KnobInfo] = &[
     KnobInfo {
         key: "dflash_mode",
         title: "Spec decode (DFlash)",
-        summary: "Speculative decoding: a small drafter proposes tokens the target verifies in batches.",
+        summary: "Speculative decoding: a drafter the target verifies in batches — the model's DFlash draft when one is declared, else its MTP head.",
         effect: "Big decode speedup on predictable output (code, tool-calls, structured: ~4-5x). On free-form prose the acceptance rate is ~1, so it is a slight loss. Correctness is unchanged (the target verifies every token).",
         default: "off",
-        when: "Turn on for code/agentic workloads with a drafter attached; leave off for open-ended chat.",
-        note: Some("A thinking BUDGET routes DFlash to plain decode: the dispatch gate bails when max_think_tokens > 0 and the think block isn't closed (the default thinking-on path sets a budget). Turn thinking off — or set its budget to 0 — and use greedy to actually get spec-decode."),
+        when: "Turn on for code/agentic workloads with a drafter attached (a DFlash draft or the model's MTP head); a declared draft that is not pulled still refuses the load. Leave off for open-ended chat.",
+        note: Some("A thinking BUDGET routes a DFlash draft to plain decode: the dispatch gate bails when max_think_tokens > 0 and the think block isn't closed (the default thinking-on path sets a budget). Turn thinking off — or set its budget to 0 — and use greedy to actually get spec-decode."),
         options: &[
             ("off", "No speculative decoding (plain autoregressive)."),
             ("on", "Use the drafter whenever one is attached + the gate allows."),
@@ -405,6 +405,21 @@ mod tests {
         let dflash = knob_info("dflash_mode").expect("dflash entry");
         assert_eq!(dflash.title, "Spec decode (DFlash)");
         assert!(knob_info("does_not_exist").is_none());
+    }
+
+    #[test]
+    fn dflash_explainer_claims_the_mtp_head_as_a_drafter() {
+        // The row resolves `on` against the model's attached drafter, so the
+        // copy must not promise DFlash alone: an MTP-only tier
+        // (`qwen3.6:35b-a3b-mq4p`) spec-decodes through its head.
+        let dflash = knob_info("dflash_mode").expect("dflash entry");
+        for field in [dflash.summary, dflash.when] {
+            assert!(field.contains("MTP"), "{field}");
+        }
+        assert!(
+            dflash.when.contains("not pulled"),
+            "the declared-draft fail-closed case must stay in the copy"
+        );
     }
 
     #[test]
