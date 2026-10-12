@@ -4841,6 +4841,61 @@ struct PackedExpertSpec {
     down_name: String,
 }
 
+/// One routed expert's container facts — tensor names plus the quant type and
+/// byte stride of each projection — resolved before any packer commits to a
+/// layer layout.
+struct ResolvedExpert {
+    gate_up_name: String,
+    down_name: String,
+    gate_up_qt: u8,
+    down_qt: u8,
+    gate_up_bytes: usize,
+    down_bytes: usize,
+}
+
+/// The per-expert layout a routed-expert layer admits: one shared
+/// `(dtype, gate_up stride, down stride)` triple across every routed expert,
+/// or anything else ([`ExpertLayerLayout::Mixed`]).
+#[derive(Debug, PartialEq, Eq)]
+enum ExpertLayerLayout {
+    Uniform(DType),
+    Mixed,
+}
+
+/// Route one routed-expert layer to a packer, given its experts' container
+/// facts and the placement the layer is being loaded into.
+///
+/// `Uniform` is the only layout the uniform packer can serve. Everything else
+/// — an expert the uniform packer does not admit on this placement, an expert
+/// of a different dtype, or a different projection stride anywhere in the
+/// layer — is `Mixed`, which `try_load_graded_host_experts` serves on a host
+/// placement and the literal per-expert path serves on the device.
+///
+/// Conflating `Mixed` with "no packer applies" is a load failure, not a
+/// fallback: a host-placed graded layer (`.mq4p`, whose expert 0 can be MQ6
+/// ahead of an MQ4 expert 1) reaches the graded packer only through here.
+fn classify_expert_layer(experts: &[ResolvedExpert], target: MemoryTarget) -> ExpertLayerLayout {
+    let mut shape: Option<(DType, usize, usize)> = None;
+    for expert in experts {
+        let admitted = packable_expert_dtype(expert.gate_up_qt, target)
+            .zip(packable_expert_dtype(expert.down_qt, target))
+            .filter(|(gate_dt, down_dt)| gate_dt == down_dt)
+            .map(|(gate_dt, _)| (gate_dt, expert.gate_up_bytes, expert.down_bytes));
+        let Some(admitted) = admitted else {
+            return ExpertLayerLayout::Mixed;
+        };
+        match shape {
+            None => shape = Some(admitted),
+            Some(seen) if seen == admitted => {}
+            Some(_) => return ExpertLayerLayout::Mixed,
+        }
+    }
+    match shape {
+        Some((dtype, _, _)) => ExpertLayerLayout::Uniform(dtype),
+        None => ExpertLayerLayout::Mixed,
+    }
+}
+
 /// Restrict expert packing to the gfx11 family where both dGPU residency and
 /// gfx1151 retained-replay performance have been validated. On gfx12, placing
 /// every expert view inside two large layer allocations makes the HIP/graph
@@ -4911,10 +4966,7 @@ fn try_load_packed_experts(
         return Ok(None);
     }
 
-    let mut specs = Vec::with_capacity(expert_ids.len());
-    let mut gate_up_stride = None;
-    let mut down_stride = None;
-    let mut expert_dtype: Option<DType> = None;
+    let mut resolved = Vec::with_capacity(expert_ids.len());
     for &expert_id in expert_ids {
         let gate_up_bare = format!("{p}.mlp.experts.{expert_id}.gate_up_proj.weight");
         let down_bare = format!("{p}.mlp.experts.{expert_id}.down_proj.weight");
@@ -4937,42 +4989,31 @@ fn try_load_packed_experts(
         else {
             return Ok(None);
         };
-        // Every expert must share the admitted dtype and projection strides.
-        // Other layouts retain the graded host or literal device path.
-        let uniform_ok = packable_expert_dtype(gate_up_qt, target)
-            .zip(packable_expert_dtype(down_qt, target))
-            .is_some_and(|(gu_dt, dn_dt)| gu_dt == dn_dt);
-        if !uniform_ok {
-            return try_load_graded_host_experts(hfq, gpu, p, expert_ids, mi, dim, target);
-        }
-        let gu_dt =
-            packable_expert_dtype(gate_up_qt, target).expect("graded fallback checked packable");
-        let dn_dt =
-            packable_expert_dtype(down_qt, target).expect("graded fallback checked packable");
-        debug_assert_eq!(gu_dt, dn_dt, "uniform gate must equal uniform down dtype");
-        match expert_dtype {
-            None => expert_dtype = Some(gu_dt),
-            Some(dt) if dt == gu_dt => {}
-            Some(_) => return Ok(None),
-        }
-        match gate_up_stride {
-            None => gate_up_stride = Some(gate_up_bytes),
-            Some(stride) if stride == gate_up_bytes => {}
-            Some(_) => return Ok(None),
-        }
-        match down_stride {
-            None => down_stride = Some(down_bytes),
-            Some(stride) if stride == down_bytes => {}
-            Some(_) => return Ok(None),
-        }
-        specs.push(PackedExpertSpec {
+        resolved.push(ResolvedExpert {
             gate_up_name,
             down_name,
+            gate_up_qt,
+            down_qt,
+            gate_up_bytes,
+            down_bytes,
         });
     }
-
-    let gate_up_stride = gate_up_stride.expect("non-empty packed expert list");
-    let down_stride = down_stride.expect("non-empty packed expert list");
+    let ExpertLayerLayout::Uniform(expert_dtype) = classify_expert_layer(&resolved, target) else {
+        // A layer that is not uniform belongs to the graded host packer, which
+        // declines a device placement (that placement keeps its literal
+        // per-expert tensors). Never one host tensor per expert — each pays
+        // `HOST_TAIL_PAD_BYTES` (see the caller's refusal).
+        return try_load_graded_host_experts(hfq, gpu, p, expert_ids, mi, dim, target);
+    };
+    let gate_up_stride = resolved[0].gate_up_bytes;
+    let down_stride = resolved[0].down_bytes;
+    let specs: Vec<PackedExpertSpec> = resolved
+        .into_iter()
+        .map(|expert| PackedExpertSpec {
+            gate_up_name: expert.gate_up_name,
+            down_name: expert.down_name,
+        })
+        .collect();
     // Zero-copy fast path: when every expert's tensor lies contiguous in-file
     // (expert 0's gate_up ends exactly where expert 1's begins, etc.) and the
     // mmap is alive (dGPU, no overlay), upload both blobs straight from the
@@ -5100,7 +5141,6 @@ fn try_load_packed_experts(
         );
     }
 
-    let expert_dtype = expert_dtype.expect("non-empty packed expert list");
     let mut experts = Vec::with_capacity(specs.len());
     for (slot, spec) in specs.iter().enumerate() {
         let mut gate_up = WeightTensor {
@@ -8122,6 +8162,64 @@ mod packed_host_expert_tests {
     use hipfire_dispatch::cpu_exec::{cpu_quant_for, moe_cpu_experts, CpuMoeExpert};
     use hipfire_dispatch::families::gemv::{GemvFamily, WeightRef};
     use hipfire_dispatch::types::DispatchError;
+
+    fn resolved(gu_qt: u8, dn_qt: u8, gate_up_bytes: usize, down_bytes: usize) -> ResolvedExpert {
+        ResolvedExpert {
+            gate_up_name: format!("layers.0.mlp.experts.0.gate_up_proj.weight.{gu_qt}"),
+            down_name: format!("layers.0.mlp.experts.0.down_proj.weight.{dn_qt}"),
+            gate_up_qt: gu_qt,
+            down_qt: dn_qt,
+            gate_up_bytes,
+            down_bytes,
+        }
+    }
+
+    /// The shipped `.mq4p` graded tiers must reach the graded host packer.
+    /// Layer 8 of `qwen3.6-35b-a3b.mq4p` leads with an MQ6 expert (qt 15)
+    /// followed by an MQ4 expert (qt 13); with the uniform packer admitting
+    /// qt 15 for host placements, an in-loop `Ok(None)` on the second expert
+    /// skipped the graded packer and the caller failed the whole load closed.
+    #[test]
+    fn mixed_admitted_tiers_route_to_the_graded_packer() {
+        let host = MemoryTarget::HostMapped;
+        let device = MemoryTarget::Device;
+        let mq4 = || resolved(13, 13, 8 << 20, 4 << 20);
+        let mq6 = || resolved(15, 15, 12 << 20, 6 << 20);
+
+        // The regression: expert 0 admitted-and-different from expert 1.
+        assert_eq!(
+            classify_expert_layer(&[mq6(), mq4()], host),
+            ExpertLayerLayout::Mixed
+        );
+        assert_eq!(
+            classify_expert_layer(&[mq6(), mq4()], device),
+            ExpertLayerLayout::Mixed
+        );
+        // MQ3-Lloyd cold tiers were already Mixed on both placements.
+        assert_eq!(
+            classify_expert_layer(&[resolved(20, 20, 7 << 20, 7 << 20), mq4()], host),
+            ExpertLayerLayout::Mixed
+        );
+        // One shared stride as well as one shared dtype.
+        assert_eq!(
+            classify_expert_layer(&[mq4(), resolved(13, 13, 8 << 20, 5 << 20)], host),
+            ExpertLayerLayout::Mixed
+        );
+        // A layer that is uniform in an admitted dtype keeps the uniform packer.
+        assert_eq!(
+            classify_expert_layer(&[mq6(), mq6()], host),
+            ExpertLayerLayout::Uniform(DType::MQ6G256)
+        );
+        assert_eq!(
+            classify_expert_layer(&[mq4(), mq4(), mq4()], device),
+            ExpertLayerLayout::Uniform(DType::MQ4G256)
+        );
+        // qt 15 is host-only: the same uniform layer on the device is not.
+        assert_eq!(
+            classify_expert_layer(&[mq6(), mq6()], device),
+            ExpertLayerLayout::Mixed
+        );
+    }
 
     /// Real loader views must preserve numerical output at nonzero offsets,
     /// repeated expert selections, and accepted-prefix replay widths.
