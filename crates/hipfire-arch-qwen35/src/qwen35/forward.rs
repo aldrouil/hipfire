@@ -2328,10 +2328,10 @@ fn forward_scratch_layers(
     hidden_rb: Option<&mut HiddenStateRingBuffer>,
     mrope: Option<&MropeCtx>,
 ) -> HipResult<()> {
-    // #397 Ship 6 — forward-as-pipeline. When HIPFIRE_FORWARD_LOWERED=1, route
-    // single-GPU decode through the lowered super-op executor. Skipped when a
-    // hidden-state ring buffer is active (spec-decode capture engages only the
-    // hand path for now). Default off → the hand arms below run unchanged.
+    // #397 Ship 6 — forward-as-pipeline. When the lowered toggle is on (default
+    // on; `HIPFIRE_FORWARD_LOWERED=0` opts out), route single-GPU decode through
+    // the lowered super-op executor. Skipped when a hidden-state ring buffer is
+    // active (spec-decode capture engages only the hand path for now).
     //
     // Also skipped when a 3D mrope context is present: the lowered executor's
     // ATTEND_FULL binding (`Qwen35Bindings::run_attend`) still issues the 1D
@@ -2339,7 +2339,18 @@ fn forward_scratch_layers(
     // channel for the (t,h,w) buffer, so routing a VL request through it would
     // silently reinstate sequential positions. VL therefore always takes the
     // hand arms below, which DO branch on `mrope`.
-    if forward_lowered_enabled() && hidden_rb.is_none() && mrope.is_none() {
+    //
+    // Also skipped when the model owns host CPU weights
+    // (`memory.offload_exec=cpu` over a spilled prefix): the lowered executor
+    // bypasses the `execute_steps` seam that routes host-mapped weights to the
+    // CPU splice and refuses them instead, while the hand arms below keep the
+    // splice. Device-resident and PCIe-spilled models report false here, so
+    // their lowered routing is unchanged.
+    if forward_lowered_enabled()
+        && hidden_rb.is_none()
+        && mrope.is_none()
+        && !gpu.owns_host_cpu_weights()
+    {
         return forward_scratch_layers_lowered(gpu, weights, config, pos, kv_cache, dn_state, s);
     }
 
@@ -6119,14 +6130,14 @@ pub fn forward_prefill_dense_tp_with_hidden(
 }
 // #397 Ship 6 — forward-as-pipeline: qwen35 DECODE lowered path (ADDITIVE).
 //
-// `HIPFIRE_FORWARD_LOWERED=1` routes the single-GPU decode layer loop through
-// the dispatch substrate's `run_layer_program` executor (one pre-resolved
-// `LayerProgram` of coarse super-ops per layer) instead of the hand-written
-// arms in `forward_scratch_layers`. The hand arms are left UNTOUCHED, so the
-// default (flag off) is byte-identical to master by construction; the lowered
-// path is validated byte-identical via the external committed-token md5 gate
-// (`FORWARD_LOWERED=0` vs `=1`, same prompt) on the fleet before the default is
-// flipped per arch. See [[project_ship6_forward_pipeline_design_2026_06_07]].
+// `HIPFIRE_FORWARD_LOWERED=0` opts back out to the hand-written arms in
+// `forward_scratch_layers`. The hand arms are left UNTOUCHED, so the opt-out
+// is byte-identical to master by construction; the lowered path is validated
+// byte-identical via the external committed-token md5 gate (`FORWARD_LOWERED=0`
+// vs default, same prompt) on the fleet before the default is flipped per arch.
+// `forward_scratch_layers` additionally keeps CPU-spilled models
+// (`memory.offload_exec=cpu` over host-mapped weights) on the hand arms, whose
+// `execute_steps` seam routes to the CPU splice the lowered executor bypasses.
 //
 // The super-op handlers call the SAME helper fns the hand path uses
 // (`qkv/qkvza/gate_up_via_execute_steps`, `kv_cache_attention_dispatch`,
