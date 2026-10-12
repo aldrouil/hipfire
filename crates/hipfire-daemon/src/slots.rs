@@ -122,6 +122,10 @@ fn spawn_slot_engine(
 /// sequential arm keeps its own parsing; this owns the multi-slot route's.
 pub struct SlotLoadParams {
     pub mtp_k: usize,
+    /// The `params.mtp_mode` tri-state. `mtp_k > 0` cannot distinguish `auto`
+    /// from an explicit `on`, so this rides beside it into `EngineConfig`
+    /// for the host-spill decline.
+    pub mtp_mode: hipfire_config::MtpMode,
     /// Raw `params.kv_mode` (empty = env/config), resolved engine-side
     /// through `QWEN35_SLOTS_POLICY`.
     pub kv_mode_raw: String,
@@ -149,8 +153,13 @@ impl SlotLoadParams {
         // mtp_mode "on"/"auto" enables MTP; mtp_k sets depth. An integer param
         // is explicit; the CLI's `"auto"` resolves to HIPFIRE_MTP_K/config, else
         // MTP_K_DEFAULT (3); an absent param (non-CLI client) means 4.
-        let mtp_mode = param_str("mtp_mode").unwrap_or("off");
-        let mtp_k = if mtp_mode.is_empty() || mtp_mode == "off" {
+        // The tri-state survives beside mtp_k: the engine's host-spill
+        // decline reads the mode, not the depth. Absent normalizes to
+        // "off" (default Off); the mtp_k rule below (empty/off -> 0) is
+        // verbatim.
+        let mtp_mode_raw = param_str("mtp_mode").unwrap_or("off");
+        let mtp_mode = hipfire_config::MtpMode::parse(mtp_mode_raw);
+        let mtp_k = if mtp_mode_raw.is_empty() || mtp_mode_raw == "off" {
             0
         } else {
             match param("mtp_k") {
@@ -202,6 +211,7 @@ impl SlotLoadParams {
         };
         Self {
             mtp_k,
+            mtp_mode,
             kv_mode_raw,
             kv_backend,
             kv_mode_resolved,
@@ -383,6 +393,7 @@ impl SlotBackend {
         cap_tokens: usize,
         prefill_chunk: usize,
         mtp_k: usize,
+        mtp_mode: hipfire_config::MtpMode,
         kv_mode_raw: &str,
         kv_backend: &str,
         dflash_draft: Option<PathBuf>,
@@ -543,6 +554,7 @@ impl SlotBackend {
                 host_budget_bytes: 16 * 1024 * 1024 * 1024,
                 swap_dir: std::env::temp_dir().join("hipfire-serve-swap"),
                 mtp_k,
+                mtp_mode,
                 is_vl,
                 vl_path,
                 kv_mode_raw: kv_mode_raw.to_string(),
@@ -2858,6 +2870,39 @@ mod tests {
         assert!(validate_arch_id(6).is_ok());
         assert!(validate_arch_id(7).is_err());
         assert!(validate_arch_id(9).is_err());
+    }
+    #[test]
+    fn slot_mtp_parse_preserves_tri_state_and_k_default() {
+        // The tri-state must survive beside mtp_k: auto and an explicit on
+        // are indistinguishable downstream when only mtp_k travels, and a
+        // check alone cannot restore the distinction.
+        let parse = |params: serde_json::Value| {
+            SlotLoadParams::from_load_msg(&serde_json::json!({ "params": params }))
+        };
+        // Absent and off: Off with k forced to 0 (verbatim rule).
+        for params in [
+            serde_json::json!({}),
+            serde_json::json!({ "mtp_mode": "off", "mtp_k": 7 }),
+            serde_json::json!({ "mtp_mode": "", "mtp_k": 7 }),
+        ] {
+            let p = parse(params);
+            assert_eq!(p.mtp_mode, hipfire_config::MtpMode::Off);
+            assert_eq!(p.mtp_k, 0);
+        }
+        // auto and on keep the existing k default-4 rule verbatim.
+        let auto = parse(serde_json::json!({ "mtp_mode": "auto" }));
+        assert_eq!(auto.mtp_mode, hipfire_config::MtpMode::Auto);
+        assert_eq!(auto.mtp_k, 4);
+        let on = parse(serde_json::json!({ "mtp_mode": "on" }));
+        assert_eq!(on.mtp_mode, hipfire_config::MtpMode::On);
+        assert_eq!(on.mtp_k, 4);
+        // Explicit k still wins on both armed modes.
+        let auto_k = parse(serde_json::json!({ "mtp_mode": "auto", "mtp_k": 2 }));
+        assert_eq!(auto_k.mtp_mode, hipfire_config::MtpMode::Auto);
+        assert_eq!(auto_k.mtp_k, 2);
+        let on_k = parse(serde_json::json!({ "mtp_mode": "on", "mtp_k": 2 }));
+        assert_eq!(on_k.mtp_mode, hipfire_config::MtpMode::On);
+        assert_eq!(on_k.mtp_k, 2);
     }
 
     /// P10: a generate with no sampling fields resolves on the multi-slot

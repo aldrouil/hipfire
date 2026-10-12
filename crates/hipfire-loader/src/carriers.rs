@@ -1780,8 +1780,13 @@ pub fn load_qwen4_rank(
             {
                 native_mtp = false;
                 eprintln!(
-                    "  qwen4 native MTP: off by default with host-mapped experts on {}; opt in with --spec mtp (speculation.mtp = \"on\")",
-                    ctx.gpu.arch
+                    "{}",
+                    hipfire_config::mtp_host_spill_decline_line(
+                        "qwen4 native",
+                        moved,
+                        host_bytes,
+                        &format!("on {}", ctx.gpu.arch),
+                    )
                 );
             }
         }
@@ -2923,6 +2928,7 @@ impl Carrier for Qwen35Carrier {
             is_vl: cfg.is_vl,
             vl_path: cfg.vl_path,
             mtp_k: cfg.mtp_k,
+            mtp_mode: cfg.mtp_mode,
             kv_mode_raw: cfg.kv_mode_raw,
             kv_backend: cfg.kv_backend,
             prefix_cache: cfg.prefix_cache,

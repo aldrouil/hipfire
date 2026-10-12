@@ -1419,6 +1419,7 @@ fn main() {
                         cap_tokens,
                         prefill_chunk,
                         slot_params.mtp_k,
+                        slot_params.mtp_mode,
                         &slot_params.kv_mode_raw,
                         &slot_params.kv_backend,
                         slot_params.dflash_draft,

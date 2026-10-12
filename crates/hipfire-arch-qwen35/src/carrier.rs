@@ -385,7 +385,7 @@ fn fail_closed_or_resident(
     plan: &Qwen35KvPlan,
     refusal: hipfire_config::memory::SpillRefusal,
 ) -> Result<Option<offload::Placement>, String> {
-    use hipfire_config::memory::{OffloadBudget, SpillRefusal};
+    use hipfire_config::memory::OffloadBudget;
     let capacity = placement_capacity_inputs(hfq, config, ctx, plan)?;
     let weight_room = offload::weight_capacity(
         capacity.inputs.free_vram,

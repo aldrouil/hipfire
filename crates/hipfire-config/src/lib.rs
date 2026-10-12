@@ -4246,6 +4246,115 @@ pub fn parse_tri_state(mode: &str) -> Option<bool> {
         _ => None,
     }
 }
+/// The `on`/`off`/`auto` MTP selector the CLI lowers into `params.mtp_mode`.
+/// `Off` keeps AR, `On` arms the head wherever one exists, `Auto` arms it
+/// except over a host-mapped expert spill (the shared [`mtp_host_spill_policy`]
+/// decline). `Default = Off`: the slots `mtp_mode` param defaults to `"off"`
+/// unless the operator opted in, and the daemon parse keeps that default
+/// verbatim — only the `auto`-vs-`on` distinction now survives beside `mtp_k`.
+/// Exact, lower-case; anything unrecognized (including `auto` and the empty
+/// string, which the slots `mtp_k` rule already treats as off) resolves as
+/// documented on [`MtpMode::parse`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MtpMode {
+    /// Never arm the head (today's behaviour, unchanged).
+    #[default]
+    Off,
+    /// Arm unless the host-spill policy declines (today's `auto`).
+    Auto,
+    /// Arm even over a host-mapped expert spill (explicit opt-in).
+    On,
+}
+
+impl MtpMode {
+    /// Parse a `params.mtp_mode` value. Absent normalizes to `"off"` at the
+    /// call site (so the default stays `Off`); an explicit empty string maps
+    /// to `Off` too, matching the slots `mtp_k` rule that already treats an
+    /// empty name as off. Any other unrecognized spelling defers to `Auto`,
+    /// matching the schema default the CLI sends.
+    pub fn parse(raw: &str) -> Self {
+        match raw {
+            "off" | "" => Self::Off,
+            "on" => Self::On,
+            _ => Self::Auto,
+        }
+    }
+}
+
+/// One MTP-over-host-spill verdict, shared by the qwen35 and qwen4 arming
+/// sites. `attach` decides whether the head loads; `reason` is the shared
+/// static sentence both arches print inside their one decline line (the
+/// per-arch line adds its own counts via [`mtp_host_spill_decline_line`]).
+pub struct MtpHostSpillPolicy {
+    pub attach: bool,
+    pub reason: &'static str,
+}
+
+/// Whether an MTP head stays attached once `host_mapped_expert_blobs` routed
+/// experts sit in host RAM. The arch's admitted list is data: an arch that
+/// keeps `auto` armed on a measured GPU names it (qwen4's `&["gfx1201"]`),
+/// one with no such measurement passes none (qwen35's `&[]`). `On` always
+/// attaches (explicit opt-in); `Off` never does; a fully resident placement
+/// (`blobs == 0`) always attaches.
+///
+/// Folds in the qwen4 spelling it replaces
+/// (`host == 0 || mtp == Some(true) || arch == "gfx1201"`): same table, with
+/// the `gfx1201` clause as the admitted list instead of a second function.
+/// Worst-case pre-placement use passes the largest count the placement can
+/// still produce (never the literal `1` the old pre-copy pinned).
+pub fn mtp_host_spill_policy(
+    mode: MtpMode,
+    host_mapped_expert_blobs: usize,
+    arch: &str,
+    admitted_arm_arches: &[&str],
+) -> MtpHostSpillPolicy {
+    if host_mapped_expert_blobs == 0 {
+        return MtpHostSpillPolicy {
+            attach: !matches!(mode, MtpMode::Off),
+            reason: "",
+        };
+    }
+    if matches!(mode, MtpMode::Off) {
+        return MtpHostSpillPolicy {
+            attach: false,
+            reason: "",
+        };
+    }
+    if matches!(mode, MtpMode::On) || admitted_arm_arches.contains(&arch) {
+        return MtpHostSpillPolicy {
+            attach: true,
+            reason: "",
+        };
+    }
+    MtpHostSpillPolicy {
+        attach: false,
+        reason: "MTP: off by default with host-mapped experts; opt in with --spec mtp",
+    }
+}
+
+/// The one shared MTP-over-spill decline line, worded once here so the
+/// sequential and slots routes report the same decline. `model` is the arch
+/// label (`"qwen35"`, `"qwen4 native"`); `detail` is the placement fact that
+/// disambiguates the spill (`"offload_exec=cpu"` / `"offload_exec=pcie"` on
+/// qwen35, `"on <arch>"` on qwen4, which names the admitted-arch clause).
+pub fn mtp_host_spill_decline_line(
+    model: &str,
+    host_mapped_expert_blobs: usize,
+    host_mapped_expert_bytes: u64,
+    detail: &str,
+) -> String {
+    format!(
+        "  {model} {} ({host_mapped_expert_blobs} expert blobs, {:.2} GiB, {detail})",
+        mtp_host_spill_reason(),
+        host_mapped_expert_bytes as f64 / (1u64 << 30) as f64,
+    )
+}
+
+/// The shared static decline sentence inside [`mtp_host_spill_decline_line`]
+/// (and [`MtpHostSpillPolicy::reason`]).
+pub fn mtp_host_spill_reason() -> &'static str {
+    "MTP: off by default with host-mapped experts; opt in with --spec mtp"
+}
 /// MTP divergent-render checkpoint + strict-prefix terminal-repair policy.
 ///
 /// Resolved once at drafter construction from the documented process-snapshot
@@ -5701,6 +5810,53 @@ mod tests {
         for deferred in ["auto", "", "ON", "Off", "1", "0", "true", "false", "yes"] {
             assert_eq!(parse_tri_state(deferred), None, "{deferred:?}");
         }
+    }
+    #[test]
+    fn mtp_mode_parse_preserves_tri_state() {
+        // The daemon's slots parse must keep auto distinct from on: absent
+        // normalizes to "off" at the call site (default Off), while an
+        // explicit empty string matches the mtp_k rule (off, not auto).
+        assert_eq!(MtpMode::parse("off"), MtpMode::Off);
+        assert_eq!(MtpMode::parse(""), MtpMode::Off);
+        assert_eq!(MtpMode::parse("auto"), MtpMode::Auto);
+        assert_eq!(MtpMode::parse("on"), MtpMode::On);
+        assert_eq!(MtpMode::parse("anything-else"), MtpMode::Auto);
+        assert_eq!(MtpMode::default(), MtpMode::Off);
+    }
+
+    #[test]
+    fn mtp_host_spill_policy_truth_table() {
+        // (mode, blobs, arch, admitted) -> attach. qwen35 passes &[] (never
+        // attaches on a spill under auto); qwen4 passes &["gfx1201"].
+        let qwen35: &[&str] = &[];
+        let qwen4: &[&str] = &["gfx1201"];
+        // Fully resident: attaches unless explicitly off.
+        assert!(mtp_host_spill_policy(MtpMode::Auto, 0, "gfx1100", qwen35).attach);
+        assert!(mtp_host_spill_policy(MtpMode::On, 0, "gfx1100", qwen35).attach);
+        assert!(!mtp_host_spill_policy(MtpMode::Off, 0, "gfx1100", qwen35).attach);
+        // Off never attaches, even on a spill.
+        assert!(!mtp_host_spill_policy(MtpMode::Off, 21, "gfx1201", qwen4).attach);
+        assert!(!mtp_host_spill_policy(MtpMode::Off, 21, "gfx1100", qwen35).attach);
+        // On always attaches, even on a spill on an unmeasured arch.
+        assert!(mtp_host_spill_policy(MtpMode::On, 21, "gfx1100", qwen35).attach);
+        assert!(mtp_host_spill_policy(MtpMode::On, 21, "gfx1030", qwen4).attach);
+        // qwen35 under auto: never attaches on a spill, on any arch.
+        for arch in ["gfx1100", "gfx1151", "gfx1201", "gfx1030"] {
+            let policy = mtp_host_spill_policy(MtpMode::Auto, 21, arch, qwen35);
+            assert!(!policy.attach, "qwen35 auto on {arch}");
+            assert_eq!(policy.reason, mtp_host_spill_reason());
+        }
+        // qwen4 under auto: attaches only on the admitted arch.
+        assert!(mtp_host_spill_policy(MtpMode::Auto, 21, "gfx1201", qwen4).attach);
+        assert!(!mtp_host_spill_policy(MtpMode::Auto, 21, "gfx1100", qwen4).attach);
+        assert!(!mtp_host_spill_policy(MtpMode::Auto, 21, "gfx1151", qwen4).attach);
+        // Attached verdicts carry no reason; the decline line words it once.
+        assert_eq!(mtp_host_spill_policy(MtpMode::On, 21, "gfx1100", qwen35).reason, "");
+        assert_eq!(mtp_host_spill_policy(MtpMode::Auto, 0, "gfx1100", qwen35).reason, "");
+        let line = mtp_host_spill_decline_line("qwen35", 21, 3 << 30, "offload_exec=pcie");
+        assert!(line.contains(mtp_host_spill_reason()), "{line}");
+        assert!(line.contains("21 expert blobs"), "{line}");
+        assert!(line.contains("offload_exec=pcie"), "{line}");
     }
 
     #[test]

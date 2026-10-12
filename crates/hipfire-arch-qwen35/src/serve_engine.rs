@@ -98,6 +98,10 @@ pub struct EngineConfig {
     pub vl_path: Option<PathBuf>,
     /// MTP speculative decode depth (K candidates per cycle). 0 = MTP off.
     pub mtp_k: usize,
+    /// The `params.mtp_mode` tri-state (`off`/`auto`/`on`). `mtp_k > 0` alone
+    /// cannot distinguish `auto` from an explicit `on`, so the slots arming
+    /// site reads this (not `mtp_k`) for the host-spill decline.
+    pub mtp_mode: hipfire_config::MtpMode,
     /// Raw KV-mode string from the load request (`--kv-mode`). Empty = fall
     /// back to `HIPFIRE_KV_MODE` / config, resolved through the slots site
     /// policy (full static ladder; q8 default). Native fp8/bf16 KV and any
@@ -1091,7 +1095,41 @@ impl Rig {
         // step), and `mtp_verify_fits_cap` retires MTP before a verify's
         // k+1-row frontier could fail the paged provision closed.
         let mtp_k = cfg.mtp_k;
-        let mtp_head: Option<crate::mtp_head::Qwen35MtpHead> = if mtp_k > 0 {
+        // MTP over a host spill declines like the sequential route: the
+        // verify re-reads host-mapped experts over the link, and a head that
+        // is unverified there has garbled windows (`qwen3.6-35b-a3b.mq6` at
+        // tau 0.04-0.13 while its single-row AR is coherent). Counted from
+        // the built weights — the same `host_mapped_expert_accounting` the
+        // sequential route keys on — so the verdict belongs to the resolved
+        // placement, not MoE-ness. qwen35's admitted list is empty (never
+        // attaches on a spill under auto); `On` still arms (explicit
+        // opt-in); `Off` keeps today's behaviour. A decline skips the head
+        // load, prints the one shared line, and runs AR.
+        let (host_mapped_expert_blobs, host_mapped_expert_bytes) =
+            crate::qwen35::host_mapped_expert_accounting(&weights.layers);
+        let mtp_spill = hipfire_config::mtp_host_spill_policy(
+            cfg.mtp_mode,
+            host_mapped_expert_blobs,
+            &gpu.arch,
+            &[],
+        );
+        let mtp_armed = mtp_k > 0 && mtp_spill.attach;
+        if mtp_k > 0 && !mtp_spill.attach && !matches!(cfg.mtp_mode, hipfire_config::MtpMode::Off) {
+            eprintln!(
+                "{}",
+                hipfire_config::mtp_host_spill_decline_line(
+                    "qwen35",
+                    host_mapped_expert_blobs,
+                    host_mapped_expert_bytes,
+                    if weights.has_cpu_deferred_experts() {
+                        "offload_exec=cpu"
+                    } else {
+                        "offload_exec=pcie"
+                    },
+                )
+            );
+        }
+        let mtp_head: Option<crate::mtp_head::Qwen35MtpHead> = if mtp_armed {
             let trunk_path = &cfg.model_path;
             let mut head_opt: Option<crate::mtp_head::Qwen35MtpHead> = None;
             match crate::mtp_head::load_mtp_head_bundled(trunk_path, &mut gpu, cfg.cap_tokens) {
@@ -1150,7 +1188,7 @@ impl Rig {
         } else {
             None
         };
-        if mtp_k > 0 && mtp_head.is_none() {
+        if mtp_armed && mtp_head.is_none() {
             // Probe last-extension replacement *and* the stem sidecar
             // (foo.mq4v2.hfq → foo.mq4v2.mtp and foo.mtp). A miss must
             // not silently degrade to AR: that is the "draft pulled but
@@ -7703,5 +7741,40 @@ mod spill_agreement_tests {
         assert!(
             crate::carrier::unspillable_no_fit_refusal(SpillRefusal::Pp(3), 1, 0).contains("pp=3"),
         );
+    }
+}
+
+#[cfg(test)]
+mod mtp_spill_decline_tests {
+    use hipfire_config::{mtp_host_spill_policy, MtpMode};
+
+    /// There is no GPU-free seam for `Rig::build` itself (it opens the HFQ,
+    /// inits the GPU and loads weights before reaching the arming site), so
+    /// this pins the exact verdict the arming site computes from the built
+    /// weights: a host-mapped spill under `auto` declines (no head), while
+    /// `on` still arms. The parent's live bench covers the end-to-end load.
+    fn slots_arming_verdict(mode: MtpMode, host_mapped_expert_blobs: usize, arch: &str) -> bool {
+        // Mirrors the `Rig::build` arming site: `mtp_k > 0 && policy.attach`
+        // with qwen35's empty admitted list.
+        let mtp_k = 4;
+        mtp_k > 0 && mtp_host_spill_policy(mode, host_mapped_expert_blobs, arch, &[]).attach
+    }
+
+    #[test]
+    fn slots_arming_declines_spill_under_auto_and_arms_on_explicit_on() {
+        // Fully resident: auto arms (no decline).
+        assert!(slots_arming_verdict(MtpMode::Auto, 0, "gfx1201"));
+        // Host-mapped spill under auto: declines on every arch (no head, AR).
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+            assert!(
+                !slots_arming_verdict(MtpMode::Auto, 24, arch),
+                "slots must decline a spill under auto on {arch}"
+            );
+        }
+        // Explicit opt-in still arms over the same spill.
+        assert!(slots_arming_verdict(MtpMode::On, 24, "gfx1100"));
+        // Off never arms.
+        assert!(!slots_arming_verdict(MtpMode::Off, 0, "gfx1201"));
+        assert!(!slots_arming_verdict(MtpMode::Off, 24, "gfx1201"));
     }
 }

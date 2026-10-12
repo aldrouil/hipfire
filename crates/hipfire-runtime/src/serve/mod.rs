@@ -290,6 +290,10 @@ pub struct SlotEngineConfig {
     pub vl_path: Option<PathBuf>,
     /// MTP draft depth (K+1 verify rows per speculative cycle). 0 = off.
     pub mtp_k: usize,
+    /// The `params.mtp_mode` tri-state (`off`/`auto`/`on`). `mtp_k > 0` alone
+    /// cannot distinguish `auto` from an explicit `on`, so the slots arming
+    /// site reads this (not `mtp_k`) for the host-spill decline.
+    pub mtp_mode: hipfire_config::MtpMode,
     /// Raw KV-mode string from the load request (empty = resolve from
     /// env/config in the engine).
     pub kv_mode_raw: String,

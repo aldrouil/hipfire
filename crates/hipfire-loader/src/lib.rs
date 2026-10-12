@@ -2299,14 +2299,37 @@ fn finish_qwen35_load(
     let cpu_deferred_moe = bundle.weights.has_cpu_deferred_experts();
     let (host_mapped_expert_blobs, host_mapped_expert_bytes) =
         hipfire_arch_qwen35::qwen35::host_mapped_expert_accounting(&bundle.weights.layers);
-    let mtp_spill_degrade =
-        matches!(arch_id, 5 | 6) && ctx.spec.mtp.is_none() && host_mapped_expert_blobs > 0;
+    // Same shared policy as the slots arming site: `auto` (typed `None`)
+    // declines over a host-mapped spill, `on` (`Some(true)`) arms, `off`
+    // (`Some(false)`) stays AR via the gate below. qwen35's admitted list is
+    // empty. Worded once in `hipfire_config::mtp_host_spill_decline_line`.
+    let mtp_spill_mode = match ctx.spec.mtp {
+        Some(true) => hipfire_config::MtpMode::On,
+        Some(false) => hipfire_config::MtpMode::Off,
+        None => hipfire_config::MtpMode::Auto,
+    };
+    let mtp_spill_degrade = matches!(arch_id, 5 | 6)
+        && !hipfire_config::mtp_host_spill_policy(
+            mtp_spill_mode,
+            host_mapped_expert_blobs,
+            ctx.gpu.arch.as_str(),
+            &[],
+        )
+        .attach
+        && !matches!(mtp_spill_mode, hipfire_config::MtpMode::Off);
     if mtp_spill_degrade {
         eprintln!(
-            "  qwen35 MTP: off by default with host-mapped experts; opt in with --spec mtp \
-             ({host_mapped_expert_blobs} expert blobs, {:.2} GiB, offload_exec={})",
-            host_mapped_expert_bytes as f64 / (1u64 << 30) as f64,
-            if cpu_deferred_moe { "cpu" } else { "pcie" }
+            "{}",
+            hipfire_config::mtp_host_spill_decline_line(
+                "qwen35",
+                host_mapped_expert_blobs,
+                host_mapped_expert_bytes,
+                if cpu_deferred_moe {
+                    "offload_exec=cpu"
+                } else {
+                    "offload_exec=pcie"
+                },
+            )
         );
     }
     // ── qwen35 MTP head (single resolver: bundled .mq4-mtp trailer then .mtp sidecar) ──

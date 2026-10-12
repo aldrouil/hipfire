@@ -252,12 +252,22 @@ pub(crate) fn qwen4_developer_ple_policy(
 /// `auto` keeps AR there and only an explicit `speculation.mtp = "on"`
 /// (`--spec mtp`) attaches the head. `speculation.mtp = "off"` always keeps
 /// AR (the admitted head is never attached then).
+///
+/// Thin twin over the shared [`hipfire_config::mtp_host_spill_policy`]: the
+/// qwen4 admitted list is `&["gfx1201"]` (the arch clause is data, not a
+/// second function). Kept so the two policy call sites in `carriers.rs` keep
+/// their typed-`SpecLoadCfg` spelling.
 pub(crate) fn qwen4_mtp_with_host_mapped_experts(
     spec: SpecLoadCfg,
     gpu_arch: &str,
     host_mapped_experts: usize,
 ) -> bool {
-    host_mapped_experts == 0 || spec.mtp == Some(true) || gpu_arch == "gfx1201"
+    let mode = match spec.mtp {
+        Some(true) => hipfire_config::MtpMode::On,
+        Some(false) => hipfire_config::MtpMode::Off,
+        None => hipfire_config::MtpMode::Auto,
+    };
+    hipfire_config::mtp_host_spill_policy(mode, host_mapped_experts, gpu_arch, &["gfx1201"]).attach
 }
 
 /// Fail-closed list for partial GPU offload, raised where the arch is dispatched.
