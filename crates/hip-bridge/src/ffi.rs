@@ -808,6 +808,7 @@ fn host_maps_qwen4_experts() -> bool {
     }
 }
 
+
 /// clr's hardware-queue cap. RDNA4 (gfx1200/gfx1201) can randomly lose inference
 /// throughput with multiple hardware queues when MTP and PCIe offload are used.
 /// One hardware queue avoids that regression. Set the cap before the runtime

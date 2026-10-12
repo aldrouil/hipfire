@@ -2283,13 +2283,23 @@ fn main() {
                         // back only `m` and keeps the prior usable.
                         let arch = hipfire_loader::arch_label(m.arch_id);
                         let drafter = m.speculator.as_ref().map(|speculator| speculator.name());
-                        let redline_default = hipfire_runtime::config::retained_redline_default(
+                        // MoE-ness from the parsed fact, not the label: the
+                        // loaded bundle (or EP state) knows its expert count;
+                        // the string can only guess.
+                        let is_moe = m
+                            .qwen35()
+                            .is_some_and(|bundle| bundle.config.num_experts != 0)
+                            || m.ep.as_ref().is_some_and(|ep| {
+                                matches!(ep.inner, hipfire_loader::EpArch::Qwen35 { .. })
+                            });
+                        let redline_default = hipfire_runtime::config::retained_redline_default_for_moe(
                             &gpu.arch,
                             arch,
                             path,
                             pp,
                             tp, hipfire_loader::admission::effective_ep(m.arch_id),
                             drafter.is_some(),
+                            is_moe,
                         ) && hipfire_config::devices::redline_platform_refusal().map_or(true, |refusal| {
                             eprintln!("[redline] retained default refused: {refusal}; using the HIP graph");
                             false

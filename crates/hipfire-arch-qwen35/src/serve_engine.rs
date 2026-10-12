@@ -617,6 +617,16 @@ impl Rig {
     /// footprint, the prefill floor and any device-resident draft, and the pinned
     /// host bytes are admitted against host RAM and TTM's GTT cap before any
     /// allocation.
+    ///
+    /// Eligibility is the same `spill_support` call the sequential carrier
+    /// makes, over this route's own facts (arch 5|6, tp/pp 1 by the slot
+    /// capability gate, EP never, `cfg.is_vl` / `cfg.vl_path` for the tower,
+    /// `config.paged_experts`, `config.reap_keep`) — the two twins share one
+    /// truth table including the VL term, so VL no longer auto-fits here.
+    /// A configured spill on an unspillable path was already refused at
+    /// admission; an unspillable MoE unset-default that does not fit fails
+    /// closed through the shared `carrier::unspillable_no_fit_refusal`
+    /// sentence instead of OOMing mid-load, and stays resident when it fits.
     fn resolve_slot_offload(
         layer_bytes: &hipfire_runtime::offload::LayerBytes,
         config: &crate::qwen35::Qwen35Config,
@@ -624,17 +634,27 @@ impl Rig {
         gpu: &Gpu,
         free_vram: u64,
         kv: hipfire_runtime::offload::KvReserve,
+        arch_id: u32,
     ) -> Result<hipfire_runtime::offload::Placement, String> {
-        use hipfire_config::memory::{effective_offload_budgets, OffloadBudget};
+        use hipfire_config::memory::{effective_offload_budgets, spill_support, OffloadBudget};
         use hipfire_runtime::offload;
-        // Same spillable-path scoping as the sequential carrier: auto-fit is a
-        // placement search, and the slots weight load below always reads the
-        // placement — except paged experts / REAP keep-maps, which own their
-        // expert buffers. An unset MoE there resolves resident so the early
-        // return below keeps the load byte-identical. (The VL tower shares the
-        // trunk placement; `is_vl` needs no carve-out here.)
-        let spillable = !config.paged_experts && config.reap_keep.is_none();
-        let budgets = if spillable {
+        // The slots route is single-GPU by its capability gate (`tp != 1 ||
+        // pp != 1` refuses before spawn) and never expert-parallel; the only
+        // per-load facts are the tower (explicit flag or sidecar path — both
+        // mean the lowered VL loader owns the tower) and the parsed model
+        // flags. Identical in every dimension the predicate takes to the
+        // sequential twin's `spill_facts`.
+        let is_vl = cfg.is_vl || cfg.vl_path.is_some();
+        let support = spill_support(
+            arch_id,
+            1,
+            1,
+            None,
+            config.paged_experts,
+            config.reap_keep.is_some(),
+            is_vl,
+        );
+        let budgets = if support.is_supported() {
             // A Qwen MoE defaults to auto-fit; dense stays opt-in (all-resident).
             effective_offload_budgets(config.num_experts != 0)
         } else {
@@ -645,6 +665,48 @@ impl Rig {
         };
         if budgets == (OffloadBudget::Full, OffloadBudget::Full) {
             return Ok(offload::Placement::all_device(config.n_layers));
+        }
+        if let hipfire_config::memory::SpillSupport::Refused(refusal) = support {
+            // Same fail-closed arm as the sequential twin: the MoE
+            // unset-default on an unspillable path (a configured spill was
+            // already refused at admission). The slots capacity is this
+            // route's own KV footprint plus the shared prefill floor, draft
+            // reserve and slack; a pinned `Full`/`Full` plan that fits stays
+            // resident, one that does not refuses with the named reason —
+            // reusing `offload::plan`, never a second fit search.
+            let pbs_reservation =
+                crate::qwen35::prefill::minimum_prefill_reservation_bytes(config, &gpu.arch);
+            let mtp_head: Option<crate::carrier::MtpHeadLocation> = if cfg.mtp_k > 0 {
+                crate::carrier::resolve_mtp_head_file(&cfg.model_path)
+            } else {
+                None
+            };
+            let draft = crate::carrier::draft_device_reserve_bytes(
+                mtp_head.as_ref(),
+                cfg.dflash_draft.as_deref(),
+            );
+            let capacity = offload::weight_capacity(
+                free_vram,
+                kv.bytes,
+                pbs_reservation.unwrap_or(0) as u64,
+                draft,
+                128 << 20,
+            );
+            if offload::plan(
+                layer_bytes,
+                (OffloadBudget::Full, OffloadBudget::Full),
+                &capacity,
+                offload::Orientation::SuffixResident,
+            )
+            .is_ok()
+            {
+                return Ok(offload::Placement::all_device(config.n_layers));
+            }
+            return Err(crate::carrier::unspillable_no_fit_refusal(
+                refusal,
+                layer_bytes.weight_total(),
+                capacity.weight_bytes,
+            ));
         }
         let pbs_reservation =
             crate::qwen35::prefill::minimum_prefill_reservation_bytes(config, &gpu.arch);
@@ -688,7 +750,6 @@ impl Rig {
             offload::Orientation::SuffixResident,
         )
     }
-
     /// Build the GPU rig.
     ///
     /// CPU arch/tensor preflight precedes this loader — `SlotBackend::cpu_preflight`
@@ -913,6 +974,7 @@ impl Rig {
             &gpu,
             vram_free as u64,
             kv,
+            hfq.arch_id,
         )?;
 
         // Charge only what actually lands on the device. With partial offload the
@@ -7545,5 +7607,101 @@ mod tests {
             "const true must produce forced tokens"
         );
         assert_eq!(run.token_ids, vec![0, 1, 2, 3], "forced tokens are t,r,u,e");
+    }
+}
+
+#[cfg(test)]
+mod spill_agreement_tests {
+    use hipfire_config::memory::{spill_support, SpillRefusal, SpillSupport};
+
+    /// The sequential twin's fact construction for these inputs (tp 1 by
+    /// construction, EP never, pp/paged/REAP from the load, VL from the
+    /// probe): one predicate call, mirroring `carrier::spill_facts`.
+    fn sequential_verdict(pp: usize, paged_experts: bool, reap_keep: bool, is_vl: bool) -> SpillSupport {
+        spill_support(6, 1, pp, None, paged_experts, reap_keep, is_vl)
+    }
+
+    /// The slots twin's fact construction: single-GPU by the capability gate,
+    /// EP never, tower from `is_vl || vl_path`.
+    fn slots_verdict(paged_experts: bool, reap_keep: bool, is_vl: bool, vl_path: bool) -> SpillSupport {
+        spill_support(
+            6,
+            1,
+            1,
+            None,
+            paged_experts,
+            reap_keep,
+            is_vl || vl_path,
+        )
+    }
+
+    #[test]
+    fn spill_resolver_twins_agree_including_vl() {
+        // Supported shape: both resolve budgets normally.
+        assert_eq!(
+            sequential_verdict(1, false, false, false),
+            SpillSupport::Supported
+        );
+        assert_eq!(slots_verdict(false, false, false, false), SpillSupport::Supported);
+        // VL refuses on both routes now (the added term): inline tower on the
+        // sequential twin, flag or sidecar path on the slots twin.
+        assert_eq!(
+            sequential_verdict(1, false, false, true),
+            SpillSupport::Refused(SpillRefusal::VisionTower)
+        );
+        for (is_vl, vl_path) in [(true, false), (false, true), (true, true)] {
+            assert_eq!(
+                slots_verdict(false, false, is_vl, vl_path),
+                SpillSupport::Refused(SpillRefusal::VisionTower),
+                "is_vl={is_vl} vl_path={vl_path}"
+            );
+        }
+        // pp>1 refuses on the sequential twin (the slots gate refuses pp>1
+        // before spawn, so its twin never sees it — same verdict by
+        // construction, asserted here for the shared table).
+        assert_eq!(
+            sequential_verdict(2, false, false, false),
+            SpillSupport::Refused(SpillRefusal::Pp(2))
+        );
+        // Paged/REAP refuse identically on both twins.
+        for (paged, reap) in [(true, false), (false, true)] {
+            assert_eq!(
+                sequential_verdict(1, paged, reap, false),
+                slots_verdict(paged, reap, false, false),
+                "paged={paged} reap={reap}"
+            );
+        }
+    }
+
+    #[test]
+    fn unspillable_refusal_names_path_reason_and_knob() {
+        for refusal in [
+            SpillRefusal::Arch(9),
+            SpillRefusal::Tp(2),
+            SpillRefusal::Pp(2),
+            SpillRefusal::ExpertParallel(4),
+            SpillRefusal::VisionTower,
+            SpillRefusal::PagedExperts,
+            SpillRefusal::ReapKeepMap,
+        ] {
+            let msg = crate::carrier::unspillable_no_fit_refusal(refusal, 100 << 20, 10 << 20);
+            assert!(msg.starts_with("load refused"), "{refusal:?}: {msg}");
+            assert!(
+                msg.contains("memory.gpu_layer_budget / memory.moe_expert_budget"),
+                "{refusal:?} names the knob: {msg}"
+            );
+            assert!(
+                msg.contains("OOM mid-load"),
+                "{refusal:?} names the avoided fate: {msg}"
+            );
+        }
+        // VL names its tower, pp its bands.
+        assert!(
+            crate::carrier::unspillable_no_fit_refusal(SpillRefusal::VisionTower, 1, 0)
+                .contains("vision tower"),
+        );
+        assert!(
+            crate::carrier::unspillable_no_fit_refusal(SpillRefusal::Pp(3), 1, 0).contains("pp=3"),
+        );
     }
 }

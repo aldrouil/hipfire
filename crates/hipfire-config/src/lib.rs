@@ -7273,6 +7273,107 @@ pub mod memory {
         }
     }
 
+    /// Whether an explicit spill was configured on either tier: at least one of
+    /// `memory.gpu_layer_budget` / `memory.moe_expert_budget` resolved off
+    /// [`OffloadBudget::Full`]. The one trigger behind both the loader's
+    /// `partial_offload_refusal` gate and `hip-bridge`'s `requests_host_spill`
+    /// arming check, so the two cannot drift apart again. Reads the process
+    /// snapshot (not pure); the pure eligibility table is [`spill_support`].
+    pub fn spill_requested() -> bool {
+        gpu_layer_budget() != OffloadBudget::Full || moe_expert_budget() != OffloadBudget::Full
+    }
+
+    /// Whether a spill may be requested on this path, and whether this path
+    /// can honour it: the single policy behind the loader's
+    /// `partial_offload_refusal` gate and both Qwen3.5 placement resolvers
+    /// (sequential carrier, slots engine). Pure over caller-supplied facts —
+    /// GPU-free and dependency-free — so every spelling agrees by
+    /// construction. Each refusal has a stable name; callers own the wording.
+    ///
+    /// Priority matches the loader gate it replaces (arch, tp, pp, EP, VL,
+    /// paged, REAP): the first failing dimension wins, so a tp>1 MoE reports
+    /// the topology, never the expert pinning behind it.
+    /// [`effective_offload_budgets`] decides *what* the budgets resolve to;
+    /// this decides whether a resolved spill may *run* here.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum SpillSupport {
+        /// The path honours a spill; resolve budgets (and auto-fit) normally.
+        Supported,
+        /// The path cannot honour a spill; the payload names the dimension.
+        Refused(SpillRefusal),
+    }
+
+    impl SpillSupport {
+        /// True for [`SpillSupport::Supported`].
+        pub fn is_supported(&self) -> bool {
+            matches!(self, SpillSupport::Supported)
+        }
+    }
+
+    /// Why a path cannot honour a spill. Stable names for the refusal
+    /// dimension — callers map these to their own messages (the loader gate
+    /// keeps its existing sentences verbatim; the arch resolvers name the
+    /// same reason in their fail-closed refusal).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum SpillRefusal {
+        /// Neither Qwen3.5 dense (5) nor MoE (6); carries the arch id.
+        Arch(u32),
+        /// Tensor-parallel ranks each load every layer; carries tp.
+        Tp(usize),
+        /// Pipeline bands own per-device layouts; carries pp.
+        Pp(usize),
+        /// An expert is pinned to one rank; carries the expert count.
+        ExpertParallel(usize),
+        /// The Qwen3.5-VL vision tower loads through its own lowered loader.
+        VisionTower,
+        /// The weight pager owns the expert buffers.
+        PagedExperts,
+        /// The pruned (REAP keep-map) expert load has no host-placement path.
+        ReapKeepMap,
+    }
+
+    /// The spill-eligibility truth table. `ep_experts` is `Some(n)` with `n >
+    /// 0` on an expert-parallel route (`None`/zero is not expert-parallel);
+    /// `reap_keep` is whether a REAP keep-map is attached.
+    pub fn spill_support(
+        arch_id: u32,
+        tp: usize,
+        pp: usize,
+        ep_experts: Option<usize>,
+        paged_experts: bool,
+        reap_keep: bool,
+        is_vl: bool,
+    ) -> SpillSupport {
+        use SpillRefusal::*;
+        // Only the Qwen3.5 storage seam places a layer or a routed expert in
+        // host RAM. Qwen4 has its own expert-residency route and the other
+        // arches have none, so either knob is a request this loader cannot honour.
+        if !matches!(arch_id, 5 | 6) {
+            return SpillSupport::Refused(Arch(arch_id));
+        }
+        if tp > 1 {
+            return SpillSupport::Refused(Tp(tp));
+        }
+        if pp > 1 {
+            return SpillSupport::Refused(Pp(pp));
+        }
+        if let Some(experts) = ep_experts {
+            if experts > 0 {
+                return SpillSupport::Refused(ExpertParallel(experts));
+            }
+        }
+        if is_vl {
+            return SpillSupport::Refused(VisionTower);
+        }
+        if paged_experts {
+            return SpillSupport::Refused(PagedExperts);
+        }
+        if reap_keep {
+            return SpillSupport::Refused(ReapKeepMap);
+        }
+        SpillSupport::Supported
+    }
+
     /// Which engine executes the ops that read a spilled layer's weights
     /// (`memory.offload_exec`, compat env `HIPFIRE_OFFLOAD_EXEC`).
     ///
@@ -7677,6 +7778,57 @@ pub mod memory {
             assert_eq!(OffloadBudget::Full.to_string(), "full");
             assert_eq!(OffloadBudget::Auto.to_string(), "auto");
             assert_eq!(OffloadBudget::Layers(5).to_string(), "5");
+        }
+
+        #[test]
+        fn spill_support_truth_table() {
+            use SpillRefusal::*;
+            use SpillSupport::{Refused, Supported};
+            // Clean single-GPU non-VL non-paged non-REAP MoE: the only
+            // supported shape (dense included — the policy is MoE-blind).
+            for arch_id in [5u32, 6] {
+                assert_eq!(
+                    spill_support(arch_id, 1, 1, None, false, false, false),
+                    Supported,
+                    "arch {arch_id}"
+                );
+            }
+            // Each refusal dimension, in gate priority order.
+            assert_eq!(
+                spill_support(9, 1, 1, None, false, false, false),
+                Refused(Arch(9))
+            );
+            assert_eq!(
+                spill_support(6, 2, 1, Some(4), false, false, false),
+                Refused(Tp(2)),
+                "tp wins over the EP pinning behind it"
+            );
+            assert_eq!(
+                spill_support(6, 1, 2, None, false, false, false),
+                Refused(Pp(2))
+            );
+            assert_eq!(
+                spill_support(6, 1, 1, Some(4), false, false, false),
+                Refused(ExpertParallel(4))
+            );
+            assert_eq!(
+                spill_support(6, 1, 1, None, false, false, true),
+                Refused(VisionTower)
+            );
+            assert_eq!(
+                spill_support(6, 1, 1, None, true, false, false),
+                Refused(PagedExperts)
+            );
+            assert_eq!(
+                spill_support(6, 1, 1, None, false, true, false),
+                Refused(ReapKeepMap)
+            );
+            // `None`/zero experts is not expert-parallel — no other
+            // dimension failing means supported.
+            assert_eq!(
+                spill_support(6, 1, 1, Some(0), false, false, false),
+                Supported
+            );
         }
     }
 }

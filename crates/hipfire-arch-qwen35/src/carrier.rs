@@ -169,23 +169,36 @@ pub(crate) fn resolve_mtp_head_file(trunk: &std::path::Path) -> Option<MtpHeadLo
 /// With a knob set, the capacity is `free VRAM − KV reservation − prefill floor −
 /// 128 MiB`, the same KV footprint the post-weight path computes, so the
 /// placement and the KV admission cannot drift.
+///
+/// Eligibility is `hipfire_config::memory::spill_support` over this load's own
+/// facts (arch 5|6, `ctx.pp`, EP never on this route, the trunk tower-tensor
+/// probe, `config.paged_experts`, `config.reap_keep`) — the same call the
+/// slots twin makes, so the two cannot disagree. An unspillable path with a
+/// *configured* spill was already refused at admission
+/// (`partial_offload_refusal`); here an unspillable path whose effective
+/// budgets are `Auto` only through the MoE unset-default still fails closed
+/// when the model does not fit — `plan` with pinned `Full`/`Full` proves it —
+/// and stays resident when it does.
 fn resolve_partial_offload(
     hfq: &HfqFile,
     config: &Qwen35Config,
     ctx: &LoadCtx,
     plan: &Qwen35KvPlan,
 ) -> Result<Option<offload::Placement>, String> {
-    use hipfire_config::memory::{effective_offload_budgets, OffloadBudget};
-    // Auto-fit is a placement search, and a search that resolves a spill is
-    // only honoured on paths whose loaders read the placement: pp>1 bands own
-    // per-device layouts (`load_qwen35_pp` never calls this), and paged
-    // experts / REAP keep-maps own their expert buffers. An unset MoE on those
-    // paths resolves resident here so the early return below keeps the load
-    // byte-identical — the fail-closed refusals in `partial_offload_refusal`
-    // still fire for an explicit spill on a path that cannot honour it. (The
-    // VL tower shares the trunk placement; its own loader refusal is separate.)
-    let spillable = ctx.pp == 1 && !config.paged_experts && config.reap_keep.is_none();
-    let budgets = if spillable {
+    use hipfire_config::memory::{
+        effective_offload_budgets, spill_support, OffloadBudget, SpillSupport,
+    };
+    let spill_facts = spill_facts(hfq.arch_id, ctx, config);
+    let support = spill_support(
+        spill_facts.arch_id,
+        spill_facts.tp,
+        spill_facts.pp,
+        spill_facts.ep_experts,
+        spill_facts.paged_experts,
+        spill_facts.reap_keep,
+        spill_facts.is_vl,
+    );
+    let budgets = if support.is_supported() {
         // A Qwen MoE defaults to auto-fit (its experts usually do not fit);
         // dense stays opt-in, where unset means all-resident.
         effective_offload_budgets(config.num_experts != 0)
@@ -198,11 +211,112 @@ fn resolve_partial_offload(
     if budgets == (OffloadBudget::Full, OffloadBudget::Full) {
         return Ok(None);
     }
+    // A spill resolved on a path that cannot honour it: a configured spill
+    // was already refused at admission, so this is the MoE unset-default
+    // (`Auto` only because no key was pinned) on an unspillable path. Fail
+    // closed iff the model does not fit — a pinned `Full`/`Full` plan proves
+    // residency — and stay resident exactly as today when it does. Either
+    // way no second fit search: this reuses `offload::plan` against the same
+    // capacity the placement below would spend.
+    if let SpillSupport::Refused(refusal) = support {
+        return fail_closed_or_resident(hfq, config, ctx, plan, refusal);
+    }
     // `memory.offload_exec=cpu` with an `auto` budget is allowed: the capture
     // gate now reads the model-level host-weights flag the loader sets from the
     // resolved placement (`Gpu::set_host_cpu_weights`), so `auto` can no longer
     // leave hipGraph capture enabled over CPU-executed steps.
 
+    let placement_inputs = placement_capacity_inputs(hfq, config, ctx, plan)?;
+    // Every pinned host byte, not just the routed experts: a whole-layer spill
+    // hosts each layer's own weights too, and those are the largest host consumer
+    // a dense model has.
+    let placement = offload::resolve_placement(
+        &placement_inputs.layer_bytes,
+        &placement_inputs.inputs,
+        budgets,
+        offload::Orientation::SuffixResident,
+    )?;
+    Ok(Some(placement))
+}
+
+/// The single fact bundle behind both placement resolvers: every dimension
+/// `spill_support` takes, built identically by the sequential carrier and the
+/// slots engine, so a future arch copies one call, not a condition list.
+struct SpillFacts {
+    arch_id: u32,
+    tp: usize,
+    pp: usize,
+    ep_experts: Option<usize>,
+    paged_experts: bool,
+    reap_keep: bool,
+    is_vl: bool,
+}
+
+/// Build the fact bundle for the sequential single-GPU route: tp is 1 by
+/// construction (the tp>1 routes never call this), EP never applies, pp and
+/// the parsed model flags come from the load, and VL-ness is the trunk
+/// tower-tensor probe — the same index the loader's `probe_vision` asks, so
+/// the two cannot classify a tower differently (`config.is_vl_text` is the
+/// nested-name text wrapper, which a plain text checkpoint carries too).
+fn spill_facts(arch_id: u32, ctx: &LoadCtx, config: &Qwen35Config) -> SpillFacts {
+    SpillFacts {
+        arch_id,
+        tp: 1,
+        pp: ctx.pp,
+        ep_experts: None,
+        paged_experts: config.paged_experts,
+        reap_keep: config.reap_keep.is_some(),
+        is_vl: has_vision_tower(ctx, arch_id),
+    }
+}
+
+/// Whether this trunk carries the Qwen3.5-VL vision tower: the inline tower
+/// tensor in the trunk index, or a sidecar tower the carrier will load — the
+/// explicit `vision_path`, or the `<stem>.vl` sibling discovery unless
+/// `vision_mode=off` suppresses it (the same ladder the carrier's VL block
+/// applies when it resolves `vl_path`). Reads the index and the filesystem
+/// only; touches no GPU state. Named for what it answers (tower presence
+/// from any source), not just the inline probe that answers most of it.
+fn has_vision_tower(ctx: &LoadCtx, arch_id: u32) -> bool {
+    if !matches!(arch_id, 5 | 6) {
+        return false;
+    }
+    // `LoadCtx` borrows the trunk path, not the open HFQ, so re-open
+    // read-only for the single index probe (the loader gate probes the
+    // already-open source instead — same tensor, same answer).
+    let inline = hipfire_runtime::hfq::HfqFile::open(std::path::Path::new(ctx.path))
+        .ok()
+        .is_some_and(|hfq| {
+            hfq.tensor_data("model.visual.patch_embed.proj.weight")
+                .is_some()
+        });
+    if inline {
+        return true;
+    }
+    if ctx.vision_path.is_some() {
+        return true;
+    }
+    if ctx.vision_mode == "off" {
+        return false;
+    }
+    hipfire_runtime::sidecar::find_vl_sidecar(std::path::Path::new(ctx.path)).is_some()
+}
+
+/// Measured capacity inputs both the fail-closed check and the placement
+/// search spend: free VRAM minus the KV reservation, the prefill floor, any
+/// device-resident draft, and the fixed slack. One function so the check and
+/// the search cannot be charged different rooms.
+struct PlacementCapacity {
+    layer_bytes: offload::LayerBytes,
+    inputs: offload::CapacityInputs,
+}
+
+fn placement_capacity_inputs(
+    hfq: &HfqFile,
+    config: &Qwen35Config,
+    ctx: &LoadCtx,
+    plan: &Qwen35KvPlan,
+) -> Result<PlacementCapacity, String> {
     let free_vram = ctx
         .gpu
         .hip
@@ -254,16 +368,88 @@ fn resolve_partial_offload(
         draft_bytes: draft_reservation,
         slack: 128u64 << 20,
     };
-    // Every pinned host byte, not just the routed experts: a whole-layer spill
-    // hosts each layer's own weights too, and those are the largest host consumer
-    // a dense model has.
-    let placement = offload::resolve_placement(
-        &layer_bytes,
-        &inputs,
-        budgets,
+    Ok(PlacementCapacity { layer_bytes, inputs })
+}
+
+/// The fail-closed arm for an unspillable path whose effective budgets
+/// resolved off `Full`/`Full` (the MoE unset-default — a configured spill was
+/// already refused at admission). Runs the *pinned* `Full`/`Full` plan
+/// against the same capacity the placement would spend: it fits → stay
+/// resident (`None`, exactly today's load); it does not → refuse, naming the
+/// path that cannot spill, the reason, and the knob. Never a mid-load OOM,
+/// never a refusal of a load that fits.
+fn fail_closed_or_resident(
+    hfq: &HfqFile,
+    config: &Qwen35Config,
+    ctx: &LoadCtx,
+    plan: &Qwen35KvPlan,
+    refusal: hipfire_config::memory::SpillRefusal,
+) -> Result<Option<offload::Placement>, String> {
+    use hipfire_config::memory::{OffloadBudget, SpillRefusal};
+    let capacity = placement_capacity_inputs(hfq, config, ctx, plan)?;
+    let weight_room = offload::weight_capacity(
+        capacity.inputs.free_vram,
+        capacity.inputs.kv_bytes,
+        capacity.inputs.prefill_floor,
+        capacity.inputs.draft_bytes,
+        capacity.inputs.slack,
+    );
+    // The pinned plan is the residency proof: it errs exactly when even a
+    // fully resident load overruns the room — the shape that used to OOM
+    // mid-load. `plan`'s tier order and its own refusal text are untouched;
+    // only the `Ok` arm is read here.
+    if offload::plan(
+        &capacity.layer_bytes,
+        (OffloadBudget::Full, OffloadBudget::Full),
+        &weight_room,
         offload::Orientation::SuffixResident,
-    )?;
-    Ok(Some(placement))
+    )
+    .is_ok()
+    {
+        return Ok(None);
+    }
+    let device = capacity.layer_bytes.weight_total();
+    Err(unspillable_no_fit_refusal(
+        refusal,
+        device,
+        weight_room.weight_bytes,
+    ))
+}
+
+/// The shared fail-closed sentence for an unspillable path whose model does
+/// not fit: names the path that cannot spill, the reason, and the knob. Both
+/// placement resolvers refuse through this — the sequential twin after its
+/// pinned-residency proof, the slots twin after its own — so the wording
+/// cannot drift between routes. `pub(crate)`: the slots engine is the only
+/// other caller.
+pub(crate) fn unspillable_no_fit_refusal(
+    refusal: hipfire_config::memory::SpillRefusal,
+    device_bytes: u64,
+    room_bytes: u64,
+) -> String {
+    use hipfire_config::memory::SpillRefusal;
+    let reason = match refusal {
+        SpillRefusal::Arch(arch_id) => format!("arch id {arch_id} has no host-placement path"),
+        SpillRefusal::Tp(tp) => format!("tp={tp} loads every layer on every rank"),
+        SpillRefusal::Pp(pp) => format!("pp={pp} bands own per-device layouts"),
+        SpillRefusal::ExpertParallel(experts) => {
+            format!("expert parallelism pins each of {experts} experts to one rank")
+        }
+        SpillRefusal::VisionTower => {
+            "the Qwen3.5-VL vision tower loads through its own lowered loader".to_string()
+        }
+        SpillRefusal::PagedExperts => "the weight pager owns the expert buffers".to_string(),
+        SpillRefusal::ReapKeepMap => "the REAP keep-map has no host-placement path".to_string(),
+    };
+    format!(
+        "load refused: this Qwen3.5-MoE needs {} MiB of device weights but {reason}, so the \
+         auto-fit default cannot spill it — it would OOM mid-load instead. Lower memory.max_seq, \
+         use a smaller quantization, or load on a spillable path (single-GPU text trunk without \
+         paged experts or a REAP keep-map; memory.gpu_layer_budget / memory.moe_expert_budget) — \
+         only {} MiB is available after the KV reservation and the prefill floor",
+        device_bytes / (1 << 20),
+        room_bytes / (1 << 20),
+    )
 }
 
 /// Build the Qwen35 GPU bundle from an HFQ source.

@@ -54,13 +54,45 @@ pub fn retained_redline_default(
     ep: usize,
     has_drafter: bool,
 ) -> bool {
+    retained_redline_default_for_moe(
+        gpu_arch,
+        model_arch,
+        model_path,
+        pp,
+        tp,
+        ep,
+        has_drafter,
+        is_qwen35_moe_arch(model_arch),
+    )
+}
+
+/// The MoE-fact form of [`retained_redline_default`]: `is_moe` is whether the
+/// model is a Qwen3.5 MoE (parsed once by the caller from the arch id or the
+/// config — never re-derived from a string here). Split out so the MoE-ness
+/// fact is threaded, not guessed: the old string test
+/// (`model_arch == "qwen3_5_moe"`) could not see a MoE served under another
+/// label, while this takes the fact as an argument.
+///
+/// `ep` is carried through from the caller: expert parallelism runs one program
+/// per rank with a cross-device row gather between kernels, which a
+/// single-device retained tape cannot record, so an EP load is never admitted.
+pub fn retained_redline_default_for_moe(
+    gpu_arch: &str,
+    model_arch: &str,
+    model_path: &str,
+    pp: usize,
+    tp: usize,
+    ep: usize,
+    has_drafter: bool,
+    is_moe: bool,
+) -> bool {
     if ep != 1 {
         return false;
     }
     if model_arch.eq_ignore_ascii_case("muse_glimmer") {
         return false;
     }
-    if is_qwen35_family(model_arch) && cpu_offload_configured(model_arch) {
+    if is_qwen35_family(model_arch) && cpu_offload_configured(is_moe) {
         return false;
     }
     if mq4r_redline_default(gpu_arch, model_path, pp, tp) {
@@ -90,7 +122,14 @@ fn is_qwen35_family(model_arch: &str) -> bool {
     model_arch.eq_ignore_ascii_case("qwen3_5") || model_arch.eq_ignore_ascii_case("qwen3_5_moe")
 }
 
-fn cpu_offload_configured(model_arch: &str) -> bool {
+/// Whether the model is a Qwen3.5 MoE, from the caller's parsed arch label.
+/// Kept beside `is_qwen35_family` so the label table lives in one place; the
+/// daemon passes the stronger fact (arch id / parsed config) where it has it.
+fn is_qwen35_moe_arch(model_arch: &str) -> bool {
+    model_arch.eq_ignore_ascii_case("qwen3_5_moe")
+}
+
+fn cpu_offload_configured(is_moe: bool) -> bool {
     use hipfire_config::memory::{offload_exec, OffloadBudget, OffloadExec};
     if offload_exec() != OffloadExec::Cpu {
         return false;
@@ -99,9 +138,7 @@ fn cpu_offload_configured(model_arch: &str) -> bool {
     // are unset, and `auto` is an explicit search on either tier. Asking only
     // for `Layers(n)` on the layer tier missed both the expert tier and the
     // `auto` spelling this branch added.
-    let (layer, expert) = hipfire_config::memory::effective_offload_budgets(
-        model_arch.eq_ignore_ascii_case("qwen3_5_moe"),
-    );
+    let (layer, expert) = hipfire_config::memory::effective_offload_budgets(is_moe);
     !matches!(
         (layer, expert),
         (OffloadBudget::Full, OffloadBudget::Full)
@@ -585,5 +622,22 @@ mod tests {
         for gpu_arch in ["gfx1100", "gfx1151", "gfx1200"] {
             assert!(!retained_redline_default(gpu_arch, "qwen4", fn_xts, 1, 1, false));
         }
+    }
+
+    #[test]
+    fn cpu_offload_takes_the_threaded_moe_fact_not_a_label() {
+        // The `_for_moe` form threads MoE-ness instead of re-deriving it
+        // from the arch string: the compat wrapper derives the label fact
+        // exactly once, and the daemon passes the stronger parsed fact. (The
+        // budgets themselves need the process snapshot, so this pins the
+        // threading: without `offload_exec=cpu` both facts answer false,
+        // and the label table maps each spelling once.)
+        use super::{cpu_offload_configured, is_qwen35_moe_arch};
+        assert!(!cpu_offload_configured(true));
+        assert!(!cpu_offload_configured(false));
+        assert!(is_qwen35_moe_arch("qwen3_5_moe"));
+        assert!(is_qwen35_moe_arch("QWEN3_5_MOE"));
+        assert!(!is_qwen35_moe_arch("qwen3_5"));
+        assert!(!is_qwen35_moe_arch("qwen4"));
     }
 }
