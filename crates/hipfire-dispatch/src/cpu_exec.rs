@@ -196,6 +196,42 @@ static MOE_SHAPES: LazyLock<Mutex<BTreeMap<(u8, usize, usize, usize, usize, bool
 /// here, [`CpuQuant::is_fwht_g256`] agrees with [`dtype_rotation_plan`], so the
 /// seam and the launcher cannot disagree about whether a `Raw` activation
 /// arrives rotated.
+
+/// Every `DType` [`cpu_quant_for`] maps to `Some`: the declaration for
+/// consumers and tests (both `cpu_quant_for` pins iterate this). The match in
+/// [`cpu_quant_for`] keeps its explicit per-dtype arms; this lists the same set.
+pub const CPU_EXECUTED_DTYPES: &[DType] = &[
+    DType::MQ4G256,
+    DType::MQ4G256V2,
+    DType::MQ6G256,
+    DType::MQ6G256V2,
+    DType::MQ5G256,
+    DType::MQ5G256V2,
+    DType::MQ4CG256,
+    DType::MQ3G256,
+    DType::MQ3G256V2,
+    DType::MQ3G256Lloyd,
+    DType::MQ2G256,
+    DType::MQ2G256V2,
+    DType::MQ2G256Lloyd,
+    DType::MQ2G256LloydU,
+    DType::MQ4G256Lloyd,
+    DType::MFP4G32E8,
+    DType::HFQ6G256,
+    DType::HFQ4G256,
+    DType::HFQ4G128,
+    DType::HFQ3G256,
+    DType::HFQ3G128,
+    DType::HFQ2G256,
+    DType::HFQ2G128,
+    DType::TQ2G128,
+    DType::BQ1G128,
+    DType::Q8_0,
+    DType::F16,
+    DType::F32,
+    DType::BF16,
+];
+
 pub fn cpu_quant_for(dtype: DType) -> Option<CpuQuant> {
     match dtype {
         DType::MQ4G256 => Some(CpuQuant::Mq4G256),
@@ -1787,77 +1823,6 @@ fn moe_step_trace_inner(timing: MoeStepTime) {
         per_ms(stats.forward_ns),
         per_ms(stats.sample_ns),
         per_ms(stats.sync_readback_ns),
-        per_ms(stats.emit_ns),
-        per_ms(stats.total_ns),
-    );
-}
-/// One AR whole-token wall-time split on the single-token decode route
-/// (`hipfire-generate/ar.rs`), handed to [`moe_token_trace`]. Host wall around
-/// work the loop already does: `forward_ns` covers the whole forward
-/// (`qwen35::forward_scratch`, all layers including CPU splices), `sample_ns`
-/// the sampler (GPU or grammar-gated CPU path), and `emit_ns` the
-/// decode/commit/emit tail. Adjacent, not nested; `total_ns` is the outer
-/// loop-iteration span so the parts reconcile. The critical-path caveat
-/// stands: this is elapsed wall per token, not a proof that the parts are
-/// serial — the forward's own CPU splices already serialize on the host, but
-/// GPU work queued across the boundary still overlaps. No GPU events, no new
-/// sync, no order change.
-#[derive(Clone, Copy, Default, Debug)]
-pub struct MoeTokenTiming {
-    pub total_ns: u64,
-    pub forward_ns: u64,
-    pub sample_ns: u64,
-    pub emit_ns: u64,
-}
-
-/// Running totals for [`moe_token_trace`]: one line at the first token and at
-/// every doubling — same power-of-two schedule as the splice.
-#[derive(Clone, Copy, Default)]
-struct MoeTokenStats {
-    calls: u64,
-    total_ns: u64,
-    forward_ns: u64,
-    sample_ns: u64,
-    emit_ns: u64,
-}
-
-/// Process-wide AR token totals (single shape — no key).
-static MOE_TOKENS: LazyLock<Mutex<MoeTokenStats>> =
-    LazyLock::new(|| Mutex::new(MoeTokenStats::default()));
-
-/// Opt-in AR whole-token timing, under the same `HIPFIRE_CPU_EXEC_TRACE=1`
-/// gate. The generate loop records host wall around the forward, the sample,
-/// and the emit tail it already runs; summaries print outside the measured
-/// region. Disabled by default with a single snapshot-map read on the hot
-/// path. Against this the per-layer/per-splice critical path must reconcile
-/// (16 splices + sealed GPU work + sample/emit ≈ token wall).
-pub fn moe_token_trace(timing: MoeTokenTiming) {
-    if moe_trace_enabled() {
-        moe_token_trace_inner(timing);
-    }
-}
-
-fn moe_token_trace_inner(timing: MoeTokenTiming) {
-    let Ok(mut guard) = MOE_TOKENS.lock() else {
-        return;
-    };
-    guard.calls += 1;
-    guard.total_ns += timing.total_ns;
-    guard.forward_ns += timing.forward_ns;
-    guard.sample_ns += timing.sample_ns;
-    guard.emit_ns += timing.emit_ns;
-    let stats = *guard;
-    drop(guard);
-    if !stats.calls.is_power_of_two() {
-        return;
-    }
-    let per_ms = |ns: u64| ns as f64 / 1e6 / stats.calls as f64;
-    eprintln!(
-        "cpu exec: moe token | {} calls | \
-         mean per token: forward={:.2}ms sample={:.2}ms emit={:.2}ms total={:.2}ms",
-        stats.calls,
-        per_ms(stats.forward_ns),
-        per_ms(stats.sample_ns),
         per_ms(stats.emit_ns),
         per_ms(stats.total_ns),
     );
