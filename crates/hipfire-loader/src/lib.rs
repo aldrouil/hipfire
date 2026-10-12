@@ -2285,18 +2285,29 @@ fn finish_qwen35_load(
     // on 8/8 cells, +13.9-22.4% pcie and +33.4-43.8% cpu. Extending or dropping
     // the decline needs a re-measure on the affected fixture, not this comment.
     //
-    // CPU-deferred experts (memory.offload_exec=cpu) are excluded outright: the
+    // CPU-deferred experts (memory.offload_exec=cpu) were excluded outright — the
     // splice recomputes the routed FFN on the host instead of re-reading it over
-    // PCIe, so the cost argument does not transfer, and the CPU arms of that same
-    // 2026-10-11 record are the fastest MTP cells, so `auto` keeps the head
-    // there. Resolved from the loaded placement, not config.
+    // PCIe, and the CPU arms of that same 2026-10-11 record are its fastest MTP
+    // cells. That exception is withdrawn: it armed the head with no opt-in on the
+    // default state of an offloaded MoE, so a drafter that is unverified *on the
+    // loaded placement* — or wrong there, as measured on `qwen3.6-35b-a3b.mq6`
+    // (garbled verify windows at tau 0.04-0.13 while its single-row AR is
+    // coherent) — spec-decoded silently. MTP is a gain only where it works, so
+    // the CPU seam is opt-in like the PCIe one; those 2026-10-11 cells still
+    // exist under `--spec mtp` / `speculation.mtp = "on"`. Resolved from the
+    // loaded placement, not config.
     let cpu_deferred_moe = bundle.weights.has_cpu_deferred_experts();
-    let mtp_spill_degrade = matches!(arch_id, 5 | 6)
-        && ctx.spec.mtp.is_none()
-        && !cpu_deferred_moe
-        && hipfire_arch_qwen35::qwen35::host_mapped_expert_accounting(&bundle.weights.layers).0 > 0;
+    let (host_mapped_expert_blobs, host_mapped_expert_bytes) =
+        hipfire_arch_qwen35::qwen35::host_mapped_expert_accounting(&bundle.weights.layers);
+    let mtp_spill_degrade =
+        matches!(arch_id, 5 | 6) && ctx.spec.mtp.is_none() && host_mapped_expert_blobs > 0;
     if mtp_spill_degrade {
-        eprintln!("  qwen35 MTP: off by default with host-mapped experts; opt in with --spec mtp");
+        eprintln!(
+            "  qwen35 MTP: off by default with host-mapped experts; opt in with --spec mtp \
+             ({host_mapped_expert_blobs} expert blobs, {:.2} GiB, offload_exec={})",
+            host_mapped_expert_bytes as f64 / (1u64 << 30) as f64,
+            if cpu_deferred_moe { "cpu" } else { "pcie" }
+        );
     }
     // ── qwen35 MTP head (single resolver: bundled .mq4-mtp trailer then .mtp sidecar) ──
     // Precedence: DSpark > DFlash > MTP > n-gram. Gate: only arch 5/6, no adaptive/eviction,
@@ -2364,6 +2375,9 @@ fn finish_qwen35_load(
         ),
         _ => None,
     };
+    if mtp_present && ctx.spec.mtp == Some(true) {
+        eprintln!("  qwen35 MTP: armed explicitly (speculation.mtp=on / --spec mtp)");
+    }
     // Pick the arch-generic speculator: a loaded DFlash draft → DflashSpeculator,
     // else an MTP head → MtpSpeculator<Qwen35MtpDrafter>, else (opt-in) the
     // model-free n-gram drafter. `eviction` is borrowed (not moved) here so it is

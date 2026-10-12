@@ -142,7 +142,7 @@ pub const KNOBS: &[KnobInfo] = &[
         summary: "Speculative decoding: a drafter the target verifies in batches — the model's DFlash draft when one is declared, else its MTP head.",
         effect: "Big decode speedup on predictable output (code, tool-calls, structured: ~4-5x). On free-form prose the acceptance rate is ~1, so it is a slight loss. Correctness is unchanged (the target verifies every token).",
         default: "off",
-        when: "Turn on for code/agentic workloads with a drafter attached (a DFlash draft or the model's MTP head); a declared draft that is not pulled still refuses the load. Leave off for open-ended chat.",
+        when: "Turn on for code/agentic workloads with a drafter attached (a DFlash draft or the model's MTP head); a declared draft that is not pulled still refuses the load. `on` arms the head explicitly, which also overrides `auto`'s host-spill decline. Leave off for open-ended chat.",
         note: Some("A thinking BUDGET routes a DFlash draft to plain decode: the dispatch gate bails when max_think_tokens > 0 and the think block isn't closed (the default thinking-on path sets a budget). Turn thinking off — or set its budget to 0 — and use greedy to actually get spec-decode."),
         options: &[
             ("off", "No speculative decoding (plain autoregressive)."),
@@ -239,14 +239,14 @@ pub const KNOBS: &[KnobInfo] = &[
         key: "mtp_mode",
         title: "Multi-token prediction (MTP)",
         summary: "Uses a model's MTP head to predict several tokens per step where supported.",
-        effect: "Can raise decode throughput on MTP-capable models with no correctness cost; a no-op on models without an MTP head.",
+        effect: "Raises decode throughput on MTP-capable models when the head is usable at the loaded placement; a no-op on models without an MTP head.",
         default: "auto",
-        when: "Leave on auto; force on/off only when A/B-testing throughput.",
-        note: None,
+        when: "Leave on auto; force on/off only when A/B-testing throughput. A host-mapped routed-expert spill needs `on` to override `auto`'s decline.",
+        note: Some("`auto` declines a host-mapped routed-expert spill (memory.moe_expert_budget, either offload_exec seam): the verify re-reads or recomputes the experts, and a head that is unverified there has produced garbled windows (`qwen3.6-35b-a3b.mq6` — mtp windows at tau 0.04-0.13 while its single-row AR decodes coherently). The load prints one line and decodes AR; set on (or --spec mtp) to opt back in."),
         options: &[
             ("off", "No multi-token prediction."),
             ("on", "Force the MTP head where the model has one."),
-            ("auto", "Use MTP when supported, else single-token."),
+            ("auto", "Use MTP when supported and not host-spilled; else single-token."),
         ],
     },
     KnobInfo {
