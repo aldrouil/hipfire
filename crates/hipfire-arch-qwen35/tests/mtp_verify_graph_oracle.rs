@@ -807,7 +807,7 @@ fn mtp_verify_graph_eager_vs_replay() {
 //   wide prompt prefill must take zero CPU steps.
 //
 // Contract: llama.cpp-level, not bit-identity. Both arms run the SAME
-// per-(token, rank) CPU expert FFN (`qwen35::forward::run_cpu_moe_experts` ->
+// per-(token, rank) CPU expert FFN (the `CpuSplice` stage ->
 // `hipfire_dispatch::cpu_exec::moe_cpu_experts`), but the surrounding GPU kernels
 // run at width 1 vs width `k+1`, so a Q8 lane can flip by one code on a row's
 // max element (1/127 ≈ 7.9e-3). Two consequences are load-bearing:

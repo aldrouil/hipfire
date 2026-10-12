@@ -1431,6 +1431,11 @@ fn lower_prefill<'a>(
             if params.recipe.shared_after_combine() {
                 append_step(&mut steps, Step::MoeStage(op(state), MoeStage::SharedDown))?;
             }
+            // Last, exactly where the arch ran its splice: after every sealed
+            // stage of this program. The splice and `SharedDown` both accumulate
+            // into the same residual buffer, so this ordering keeps the fp
+            // accumulation sequence identical to the pre-stage arrangement.
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::CpuSplice))?;
             return Ok(steps);
         }
         if selection.resolution.use_path2 {
@@ -1523,6 +1528,13 @@ fn lower_prefill<'a>(
     }
     if params.recipe.shared_after_combine() {
         append_step(&mut steps, Step::MoeStage(op(state), MoeStage::SharedDown))?;
+    }
+    if selection.cpu_deferred_experts {
+        // Last, exactly where the arch ran its splice: after every sealed
+        // stage of this program. The splice and `SharedDown` both accumulate
+        // into the same residual buffer, so this ordering keeps the fp
+        // accumulation sequence identical to the pre-stage arrangement.
+        append_step(&mut steps, Step::MoeStage(op(state), MoeStage::CpuSplice))?;
     }
     Ok(steps)
 }

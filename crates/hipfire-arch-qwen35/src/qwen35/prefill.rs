@@ -5342,25 +5342,12 @@ pub(crate) fn prefill_moe_ffn_body_batched_with_route_layered<'a>(
         execute_steps(gpu, ctx, &[Step::Moe(sealed)])
             .map_err(|e| HipError::new(0, &e.to_string()))?;
         let sealed_ns = t_sealed.elapsed().as_nanos() as u64;
-        let t_splice = std::time::Instant::now();
+        // The sealed program above runs the CPU expert splice in place of the
+        // routed GPU stages for this call, so the splice's cost is inside
+        // `sealed_ns` and cannot be separated on this side; `cpu_splice_ns`
+        // therefore reports 0 and the stage-side trace is the authority for
+        // the splice's own timing.
         if cpu_deferred_experts {
-            // The sealed step above omitted the routed GPU stages, so the whole
-            // routed FFN is owed here: recompute it per (token, rank) on the CPU
-            // from the intact host blobs (per-expert dtype/stride, graded
-            // included) and accumulate into `pbs.x_batch` — the bus-ordered
-            // residual on every down path.
-            let topk_indices = pbs.moe_topk_indices_batch.as_ref().expect("moe scratch");
-            let topk_weights = pbs.moe_topk_weights_batch.as_ref().expect("moe scratch");
-            super::forward::run_cpu_moe_experts(
-                gpu,
-                ffn,
-                config,
-                &pbs.x_rot_batch,
-                topk_indices,
-                topk_weights,
-                &pbs.x_batch,
-                n,
-            )?;
             // The omitted GPU routed tail no longer changes the FP16 staging
             // cache key. The next layer reuses x_rot_batch with new contents.
             gpu.invalidate_fp16_cache();
@@ -5373,7 +5360,6 @@ pub(crate) fn prefill_moe_ffn_body_batched_with_route_layered<'a>(
             // per chunk). The CPU expert FFN is compute-bound and loses to that
             // by >10x at chunk sizes (measured 15x on ornith/gfx1201).
         }
-        let splice_ns = t_splice.elapsed().as_nanos() as u64;
         let total_ns = t_window.elapsed().as_nanos() as u64;
         if hipfire_dispatch::cpu_exec::moe_trace_enabled() {
             hipfire_dispatch::cpu_exec::moe_window_trace(
@@ -5381,12 +5367,10 @@ pub(crate) fn prefill_moe_ffn_body_batched_with_route_layered<'a>(
                 hipfire_dispatch::cpu_exec::MoeWindowTiming {
                     total_ns,
                     gpu_sealed_ns: sealed_ns,
-                    cpu_splice_ns: if cpu_deferred_experts { splice_ns } else { 0 },
-                    other_ns: total_ns.saturating_sub(sealed_ns).saturating_sub(if cpu_deferred_experts {
-                        splice_ns
-                    } else {
-                        0
-                    }),
+                    // The splice now runs inside the sealed program (stage-side), so
+                    // its cost is part of `gpu_sealed_ns`; see the comment above.
+                    cpu_splice_ns: 0,
+                    other_ns: total_ns.saturating_sub(sealed_ns),
                     rows: n,
                     top_k: config.num_experts_per_tok,
                 },

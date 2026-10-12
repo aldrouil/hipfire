@@ -755,101 +755,6 @@ fn packed_expert_host_bytes<'a>(
     )))
 }
 
-/// Run the routed-expert FFN on the CPU for `rows` tokens, from the intact
-/// host-mapped packed blobs, and accumulate the routing-weighted result into
-/// `residual`.
-///
-/// This is the single arch-side entry to the graded / multi-row CPU executor.
-/// It resolves each *selected* expert id — from `ffn.experts`, whose views carry
-/// the per-expert dtype — to its own bucket owner bytes and its own
-/// [`hipfire_dispatch::cpu_exec::CpuMoeExpert`] quant, so a graded layer decodes
-/// every tier at its own dtype/stride. `x_rot` is the already-FWHT-rotated
-/// activation the gate_up projection consumes (`[rows, dim]`), `indices` /
-/// `weights` are the per-token top-k (`[rows, top_k]`), and `residual` is the
-/// `[rows, dim]` batch the combine accumulates into.
-///
-/// No-op when the loader did not arm the splice on this layer
-/// (`cpu_deferred_experts` is `false`), which is every PCIe / resident load.
-/// Fail closed otherwise: a missing owner, an undecodable dtype or any
-/// out-of-range view is an error.
-/// The dispatch context is `rows`-agnostic here — the executor handles the batch
-/// and preserves per-token top-k rank order.
-pub(super) fn run_cpu_moe_experts(
-    gpu: &Gpu,
-    ffn: &MoeFfnWeights,
-    config: &Qwen35Config,
-    x_rot: &GpuTensor,
-    indices: &GpuTensor,
-    weights: &GpuTensor,
-    residual: &GpuTensor,
-    rows: usize,
-) -> HipResult<()> {
-    if !ffn.cpu_deferred_experts {
-        return Ok(());
-    }
-    let owners = ffn.packed_expert_owners.as_ref().ok_or_else(|| {
-        HipError::new(
-            0,
-            "moe cpu expert splice: layer has an expert sink but no packed owners",
-        )
-    })?;
-    let dim = config.dim;
-    let mi = config.moe_intermediate_size;
-    let top_k = config.num_experts_per_tok;
-    // Fail closed on any AWQ sidecar: a bare `gemv` would ignore the per-expert
-    // scale, on either projection. The loader refuses the splice arm entirely for
-    // AWQ host layers, so this is the belt-and-braces mirror for graded/metadata
-    // paths that could reach here.
-    let awq = ffn.expert_down_awq_ptrs.is_some()
-        || ffn
-            .experts
-            .iter()
-            .any(|e| e.gate_up.awq_scale.is_some() || e.down.awq_scale.is_some());
-    hipfire_dispatch::cpu_exec::moe_cpu_experts(
-        gpu,
-        dim,
-        mi,
-        rows,
-        top_k,
-        x_rot,
-        indices,
-        weights,
-        residual,
-        awq,
-        |expert_id| {
-            let expert = ffn.experts.get(expert_id).ok_or_else(|| {
-                DispatchError::Hip(format!(
-                    "moe cpu expert splice: selected expert id {expert_id} out of range"
-                ))
-            })?;
-            let gate_up =
-                packed_expert_host_bytes(gpu, &owners.gate_up, &expert.gate_up.buf, "gate_up")?;
-            let down = packed_expert_host_bytes(gpu, &owners.down, &expert.down.buf, "down")?;
-            let gate_up_quant = hipfire_dispatch::cpu_exec::cpu_quant_for(expert.gate_up.gpu_dtype)
-                .ok_or_else(|| {
-                    DispatchError::Hip(format!(
-                        "moe cpu expert splice: no CPU decoder for gate_up dtype {:?}",
-                        expert.gate_up.gpu_dtype
-                    ))
-                })?;
-            let down_quant = hipfire_dispatch::cpu_exec::cpu_quant_for(expert.down.gpu_dtype)
-                .ok_or_else(|| {
-                    DispatchError::Hip(format!(
-                        "moe cpu expert splice: no CPU decoder for down dtype {:?}",
-                        expert.down.gpu_dtype
-                    ))
-                })?;
-            Ok(hipfire_dispatch::cpu_exec::CpuMoeExpert {
-                gate_up_quant,
-                gate_up,
-                down_quant,
-                down,
-            })
-        },
-    )
-    .map_err(HipError::from)
-}
-
 /// Execute an already-built decode recipe and retain the existing observation
 /// and expert-statistics hooks around the shared sealed Step executor.
 fn moe_ffn_decode_impl<'a>(
@@ -8036,7 +7941,7 @@ mod tests {
         assert!(res.is_err());
     }
 
-    /// `run_cpu_moe_experts` resolves a selected expert's host bytes from the
+    /// The `CpuSplice` stage resolves a selected expert's host bytes from the
     /// packed bucket owners because per-expert views are `Borrowed` and invisible
     /// to `Gpu::host_bytes`. Pin that ownership walk: two graded buckets of
     /// different stride, each holding real byte patterns, and the exact

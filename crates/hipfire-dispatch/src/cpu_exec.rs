@@ -1564,11 +1564,22 @@ struct StepTiming {
 pub struct MoeWindowTiming {
     /// Whole window: sealed GPU program + CPU splice + caller-side gap.
     pub total_ns: u64,
-    /// Sealed GPU program (`execute_steps`): router/norm/shared GPU stages.
+    /// Sealed GPU program (`execute_steps`): router/norm/shared GPU stages — and,
+    /// since the CPU routed-expert splice became a stage of that program, the
+    /// splice's cost as well on the `cpu_deferred` path.
     pub gpu_sealed_ns: u64,
     /// CPU splice (`moe_cpu_experts`): whole routed FFN on the CPU.
+    ///
+    /// Reports **0** on the `cpu_deferred` path since the splice moved inside the
+    /// sealed program — its cost is part of `gpu_sealed_ns` there, and the seam's
+    /// own per-shape splice trace (`moe expert splice … steps on CPU …`) carries
+    /// the per-call figure. Kept for the non-deferred shape of this struct.
     pub cpu_splice_ns: u64,
     /// Caller-side gap: `total - sealed - splice` (scratch, flags, hooks).
+    /// The subtraction is exact only while `cpu_splice_ns` is 0 — which it is by
+    /// construction on the `cpu_deferred` path, since the splice's cost is already
+    /// inside `gpu_sealed_ns`; a producer that starts populating `cpu_splice_ns`
+    /// again must keep the two disjoint.
     pub other_ns: u64,
     /// Forward width that selected this route (1 = decode, ≤4 = narrow).
     pub rows: usize,

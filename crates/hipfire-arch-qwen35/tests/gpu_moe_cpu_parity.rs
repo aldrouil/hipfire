@@ -950,7 +950,7 @@ fn graded_cpu_moe_experts_multirow_parity() -> Result<(), Box<dyn std::error::Er
     let prefix_idx = gpu.upload_f32(&idx_bits[..ADVANCE * KTOP], &[ADVANCE * KTOP])?;
     let prefix_w = gpu.upload_f32(&w_host[..ADVANCE * KTOP], &[ADVANCE * KTOP])?;
     // Resolver: slice each expert's own bytes out of its bucket owner, exactly as
-    // `qwen35::forward::run_cpu_moe_experts` does through the view pointer walk.
+    // the `CpuSplice` stage does through the view pointer walk.
     let resolve = |gpu: &Gpu, e: usize| {
         let (gtag, goff, glen) = gu_pos[e];
         let (dtag, doff, dlen) = dn_pos[e];
