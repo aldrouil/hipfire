@@ -11938,7 +11938,11 @@ mod tests {
             message.contains("not a registry-managed artifact"),
             "{message}"
         );
-        assert!(message.contains("--model-draft"), "{message}");
+        // The override this message names is `developer.dflash_draft` (the
+        // branch reworded the copy away from the CLI flag alone): assert the
+        // message still points at the override it names, not just at the
+        // precondition asserted above.
+        assert!(message.contains("developer.dflash_draft"), "{message}");
         let resolved = resolved_with_dflash_mode("auto", None);
         let params = load_params(
             &resolved,
