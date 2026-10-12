@@ -306,6 +306,11 @@ PCIe link (27.1 GB/s measured, §7) instead of device DRAM: this is llama.cpp's
   activation scratch; the omitted GPU routed tail no longer changes that cache
   key. Shared GPU launchers, kernel arithmetic, CPU accumulation order, Rayon
   scheduling and placement/dispatch rules are unchanged.
+  Single-token forwards automatically select the CPU-splice-capable executor
+  from the loaded model's `owns_host_cpu_weights` flag, including MTP forced
+  advances, terminal pending-seed flushes and single-row rollback replay.
+  No `HIPFIRE_FORWARD_LOWERED=0` workaround is needed. Device-resident and
+  `pcie`-spilled models keep the lowered route; its CPU-host-read refusal remains.
 - **Two launcher properties the CPU path must reproduce exactly**, both of which
   fail *silently* rather than erroring, and both now pinned by parity arms in
   `crates/hipfire-arch-qwen35/tests/gpu_gemv_parity.rs`: the per-channel **AWQ**
