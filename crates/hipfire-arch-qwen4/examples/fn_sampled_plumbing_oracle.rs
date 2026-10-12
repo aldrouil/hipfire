@@ -732,7 +732,7 @@ fn d2h_async(gpu: &Gpu, t: &GpuTensor, out: &mut [u8]) -> R<()> {
     W_D2H_CALLS.fetch_add(1, Ordering::Relaxed);
     W_D2H_BYTES.fetch_add(out.len() as u64, Ordering::Relaxed);
     hip(
-        gpu.hip.memcpy_dtoh_async(out, &t.buf, stream_of(gpu)?),
+        gpu.hip.memcpy_dtoh_async(out, &t.buf, Some(stream_of(gpu)?)),
         "d2h_async",
     )
 }

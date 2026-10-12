@@ -1064,7 +1064,7 @@ mod prop_tests {
 
     /// Every `CpuQuant` variant (all are valid for `gemm`: `k % 256 == 0`
     /// satisfies each format's group size).
-    const ALL: [CpuQuant; 28] = [
+    const ALL: [CpuQuant; 29] = [
         CpuQuant::Mq4G256,
         CpuQuant::Mq4G256V2,
         CpuQuant::Mq6G256,
@@ -1093,6 +1093,7 @@ mod prop_tests {
         CpuQuant::F32,
         CpuQuant::Bf16,
         CpuQuant::Q8F16,
+        CpuQuant::Mfp4G32E8,
     ];
 
     /// Compile-time-ish guard: adding a `CpuQuant` variant without extending
@@ -1127,7 +1128,8 @@ mod prop_tests {
             | CpuQuant::F16
             | CpuQuant::F32
             | CpuQuant::Bf16
-            | CpuQuant::Q8F16 => {}
+            | CpuQuant::Q8F16
+            | CpuQuant::Mfp4G32E8 => {}
         }
     }
 

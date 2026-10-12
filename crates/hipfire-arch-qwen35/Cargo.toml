@@ -167,6 +167,8 @@ required-features = ["lab", "deltanet"]
 name = "prefill_ragged_oracle"
 path = "examples/prefill_ragged_oracle.rs"
 required-features = ["deltanet"]
+
+[[example]]
 name = "mq4v2_moe_down_parity"
 path = "examples/mq4v2_moe_down_parity.rs"
 required-features = ["lab"]

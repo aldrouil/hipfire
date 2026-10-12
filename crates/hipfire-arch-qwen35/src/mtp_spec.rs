@@ -2532,7 +2532,7 @@ fn mtp_verify_forward_graphed(
     config: &Qwen35Config,
     kv_cache: &mut KvCache,
     dn_state: &mut DeltaNetState,
-    scratch: &mut Qwen35Scratch,
+    scratch: &Qwen35Scratch,
     state: &mut MtpSpecState,
     verify_tokens: &[u32],
     cur_pos: usize,
@@ -2570,7 +2570,7 @@ fn mtp_verify_forward_graphed(
     // Shared eager Path-2 body (identical math to the non-graph path). Takes
     // only the live mutable handles and captures weights/config/inputs so the
     // argument list is written once and reused by warmup + capture fallback.
-    let run_eager = |gpu: &mut Gpu, kv_cache: &mut KvCache, dn_state: &mut DeltaNetState, scratch: &mut Qwen35Scratch, state: &mut MtpSpecState| -> HipResult<()> {
+    let run_eager = |gpu: &mut Gpu, kv_cache: &mut KvCache, dn_state: &mut DeltaNetState, scratch: &Qwen35Scratch, state: &mut MtpSpecState| -> HipResult<()> {
         qwen35::forward_prefill_batch_with_pbs_opts(
             gpu, weights, config, verify_tokens, cur_pos, kv_cache, dn_state, scratch,
             None, Some(&state.verify_hidden), Some(&mut state.trunk_gdn_tape), None, Some(&state.trunk_pbs), None, None, false,
@@ -2612,7 +2612,7 @@ fn mtp_verify_forward_graphed(
 
     // 4. Capture the forward: begin -> exact single-chunk captured body -> end
     //    in one IIFE so a single match handles every failure path.
-    let run_capture = |gpu: &mut Gpu, kv_cache: &mut KvCache, dn_state: &mut DeltaNetState, scratch: &mut Qwen35Scratch, state: &mut MtpSpecState| -> HipResult<(Graph, GraphExec, Vec<Vec<u8>>)> {
+    let run_capture = |gpu: &mut Gpu, kv_cache: &mut KvCache, dn_state: &mut DeltaNetState, scratch: &Qwen35Scratch, state: &mut MtpSpecState| -> HipResult<(Graph, GraphExec, Vec<Vec<u8>>)> {
         mtp_graph_begin_capture(gpu)?;
         qwen35::forward_prefill_batch_single_chunk_captured_opts(
             gpu, weights, config, verify_tokens, cur_pos, kv_cache, dn_state, scratch,

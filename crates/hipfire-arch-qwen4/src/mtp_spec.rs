@@ -2025,7 +2025,7 @@ impl DeviceAccept {
         match gpu.active_stream.as_ref() {
             Some(stream) => {
                 gpu.hip
-                    .memcpy_dtoh_async(&mut staging.result, &self.result.buf, stream)
+                    .memcpy_dtoh_async(&mut staging.result, &self.result.buf, Some(stream))
                     .map_err(|error| {
                         format!("Qwen4 sampled MTP device accept result queue: {error}")
                     })?;
