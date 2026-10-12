@@ -130,19 +130,27 @@ fn is_qwen35_moe_arch(model_arch: &str) -> bool {
 }
 
 fn cpu_offload_configured(is_moe: bool) -> bool {
-    use hipfire_config::memory::{offload_exec, OffloadBudget, OffloadExec};
-    if offload_exec() != OffloadExec::Cpu {
-        return false;
-    }
     // Match the placement the loader resolves: a MoE auto-fits when both keys
     // are unset, and `auto` is an explicit search on either tier. Asking only
     // for `Layers(n)` on the layer tier missed both the expert tier and the
     // `auto` spelling this branch added.
     let (layer, expert) = hipfire_config::memory::effective_offload_budgets(is_moe);
-    !matches!(
-        (layer, expert),
-        (OffloadBudget::Full, OffloadBudget::Full)
-    )
+    cpu_offload_configured_from(hipfire_config::memory::offload_exec(), layer, expert)
+}
+
+/// Pure form of [`cpu_offload_configured`] over already-resolved inputs, so the
+/// composition is testable without the process snapshot (which `process_value`
+/// caches once per process and a unit test therefore cannot control).
+fn cpu_offload_configured_from(
+    exec: hipfire_config::memory::OffloadExec,
+    layer: hipfire_config::memory::OffloadBudget,
+    expert: hipfire_config::memory::OffloadBudget,
+) -> bool {
+    use hipfire_config::memory::{OffloadBudget, OffloadExec};
+    if exec != OffloadExec::Cpu {
+        return false;
+    }
+    !matches!((layer, expert), (OffloadBudget::Full, OffloadBudget::Full))
 }
 
 #[derive(Debug, Clone)]
@@ -626,15 +634,42 @@ mod tests {
 
     #[test]
     fn cpu_offload_takes_the_threaded_moe_fact_not_a_label() {
-        // The `_for_moe` form threads MoE-ness instead of re-deriving it
-        // from the arch string: the compat wrapper derives the label fact
-        // exactly once, and the daemon passes the stronger parsed fact. (The
-        // budgets themselves need the process snapshot, so this pins the
-        // threading: without `offload_exec=cpu` both facts answer false,
-        // and the label table maps each spelling once.)
-        use super::{cpu_offload_configured, is_qwen35_moe_arch};
-        assert!(!cpu_offload_configured(true));
-        assert!(!cpu_offload_configured(false));
+        // Two things are pinned here. (1) The label table maps each accepted
+        // spelling of the MoE arch label exactly once — that is this module's
+        // own subject, and the daemon passes the stronger parsed fact where it
+        // has one. (2) The decision's *composition* is a pure function of the
+        // exec mode and the resolved budget pair; the live value is deliberately
+        // not asserted, because both of its inputs come from the process
+        // snapshot, which `process_value` caches once per process — on a machine
+        // that sets `memory.offload_exec=cpu` the function is true by design.
+        use super::{cpu_offload_configured_from, is_qwen35_moe_arch};
+        use hipfire_config::memory::{OffloadBudget, OffloadExec};
+
+        // Not cpu: never a cpu-offload model, whatever the budgets say.
+        for budget in [
+            OffloadBudget::Full,
+            OffloadBudget::Auto,
+            OffloadBudget::Layers(4),
+        ] {
+            assert!(!cpu_offload_configured_from(OffloadExec::Pcie, budget, budget));
+        }
+        // cpu with both tiers unset is still not configured (dense default).
+        assert!(!cpu_offload_configured_from(
+            OffloadExec::Cpu,
+            OffloadBudget::Full,
+            OffloadBudget::Full
+        ));
+        // cpu with either tier placed at all is configured — the expert tier and
+        // the `auto` spelling included, which the older layer-tier-only check
+        // missed.
+        for (layer, expert) in [
+            (OffloadBudget::Layers(4), OffloadBudget::Full),
+            (OffloadBudget::Full, OffloadBudget::Layers(4)),
+            (OffloadBudget::Auto, OffloadBudget::Auto),
+        ] {
+            assert!(cpu_offload_configured_from(OffloadExec::Cpu, layer, expert));
+        }
+
         assert!(is_qwen35_moe_arch("qwen3_5_moe"));
         assert!(is_qwen35_moe_arch("QWEN3_5_MOE"));
         assert!(!is_qwen35_moe_arch("qwen3_5"));
