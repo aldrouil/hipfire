@@ -344,7 +344,10 @@ pub(crate) fn trace_moe_arm(
     use std::sync::Once;
     static PREFILL: Once = Once::new();
     static DECODE: Once = Once::new();
-    if !rdna_compute::load_trace_enabled() {
+    // Gated on the developer env var directly: this used to call the load-trace
+    // helper that shipped with PR #814, which this branch no longer carries. The
+    // diagnostic itself is unchanged.
+    if hipfire_config::developer_var("HIPFIRE_LOAD_TRACE").is_err() {
         return;
     }
     let once = if stage == "prefill" {

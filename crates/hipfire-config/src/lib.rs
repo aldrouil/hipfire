@@ -7431,9 +7431,8 @@ pub mod memory {
 
     /// Whether an explicit spill was configured on either tier: at least one of
     /// `memory.gpu_layer_budget` / `memory.moe_expert_budget` resolved off
-    /// [`OffloadBudget::Full`]. The one trigger behind both the loader's
-    /// `partial_offload_refusal` gate and `hip-bridge`'s `requests_host_spill`
-    /// arming check, so the two cannot drift apart again. Reads the process
+    /// [`OffloadBudget::Full`]. The trigger behind the loader's
+    /// `partial_offload_refusal` gate. Reads the process
     /// snapshot (not pure); the pure eligibility table is [`spill_support`].
     pub fn spill_requested() -> bool {
         gpu_layer_budget() != OffloadBudget::Full || moe_expert_budget() != OffloadBudget::Full
