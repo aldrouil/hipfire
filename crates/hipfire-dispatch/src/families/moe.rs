@@ -1504,11 +1504,20 @@ pub fn gated_moe_prefill_admissible(
     gated_moe_prefill_admissible_for_dtypes(dtypes, admit_mq6, admit_paro, admit_e8, admit_codebook)
 }
 
+/// Upper extent (rows) of the shared narrow-window width: the MTP verify
+/// window (drafts + 1, capped at 4). Single declaration for every spelling of
+/// this width — the CPU-splice gate (`n <= MAX`) and the verify/coalesced
+/// gates (`2..=MAX`) below all read this. The verify lower bound of 2 is
+/// load-bearing (a 1-row window is decode, not verify) and lives at each
+/// verify use site, not here.
+pub const NARROW_VERIFY_MAX_ROWS: usize = 4;
+
 /// Resolved dispatch plan for the qwen35 batched MoE prefill routed block.
 ///
 /// Distinct from [`MoeResolution`] (decode) — prefill adds the Path 0/1/2
 /// grouped-vs-scalar down selection and the Paro i8/k8 levers.
 /// Pure function of [`MoeDtypes`] + arch + [`FeatureFlags`].
+
 pub struct MoePrefillResolution {
     /// Gate_up + down via grouped-GEMM scatter pipeline (Path 2).
     /// Requires WMMA-capable arch (gfx11/gfx12) + `moe_grouped_gemm` flag.
@@ -1563,14 +1572,16 @@ impl MoePrefillResolution {
         has_host_projection: bool,
     ) -> Self {
         let paro_mode = d.routed_gate_up == DType::ParoQ4G128 && d.has_paro_shared;
-        let narrow_verify = is_verify && batch != 0 && batch <= 4;
+        let narrow_verify = is_verify && batch != 0 && batch <= NARROW_VERIFY_MAX_ROWS;
         // Host-mapped uniform MQ4 gate_up+down on a narrow gfx1201 verify:
         // re-admit Path 2 (grouped-WMMA) for this one offloaded case. Only when
         // the caller reports host projections — resident-only weights or any
         // other format/arch keep the indexed Path 1 policy. The later mixed /
         // MQ6 / E8 logic below is unchanged and still governs every other path.
+        // Lower bound of 2 is load-bearing: a 1-row window is decode, not a
+        // verify window, so it must not take the coalesced/Path-2 re-admit.
         let offloaded_uniform_verify = narrow_verify
-            && (2..=4).contains(&batch)
+            && (2..=NARROW_VERIFY_MAX_ROWS).contains(&batch)
             && arch.is_gfx1201()
             && has_host_projection
             && !d.routed_has_mixed_experts
@@ -1956,5 +1967,25 @@ mod tests {
         let r = MoeResolution::resolve(&d, 6);
         assert!(r.routed_indexable_mq6v2);
         assert!(!r.use_gpu_topk);
+    }
+
+    #[test]
+    fn narrow_window_extent_lower_bound_is_two() {
+        // The shared narrow-window extent: bumping it is a deliberate edit.
+        assert_eq!(NARROW_VERIFY_MAX_ROWS, 4);
+        // The splice-width gate (`n <= MAX`) accepts the 1-row decode window.
+        for n in [1, 2, NARROW_VERIFY_MAX_ROWS] {
+            assert!(n <= NARROW_VERIFY_MAX_ROWS, "splice gate must accept {n}");
+        }
+        assert!(NARROW_VERIFY_MAX_ROWS + 1 > NARROW_VERIFY_MAX_ROWS);
+        // The verify/coalesced gates (`2..=MAX`) admit 2..=MAX but never the
+        // 1-row decode window — that lower bound of 2 is load-bearing for the
+        // gfx1201 Path-2 re-admit and must not be collapsed to `n <= MAX`.
+        assert!(!(2..=NARROW_VERIFY_MAX_ROWS).contains(&1));
+        assert!(!(2..=NARROW_VERIFY_MAX_ROWS).contains(&0));
+        for n in 2..=NARROW_VERIFY_MAX_ROWS {
+            assert!((2..=NARROW_VERIFY_MAX_ROWS).contains(&n), "verify range must admit {n}");
+        }
+        assert!(!(2..=NARROW_VERIFY_MAX_ROWS).contains(&(NARROW_VERIFY_MAX_ROWS + 1)));
     }
 }

@@ -43,7 +43,7 @@ use hipfire_dispatch::families::attention::AttnParams;
 use hipfire_dispatch::families::gemv::WeightRef;
 use hipfire_dispatch::families::kv_tier::KvTierInputs;
 use hipfire_dispatch::families::kv_tier::KvTierPlan;
-use hipfire_dispatch::families::moe::codebook_batched_admit_enabled;
+use hipfire_dispatch::families::moe::{NARROW_VERIFY_MAX_ROWS, codebook_batched_admit_enabled};
 #[cfg(test)]
 use hipfire_dispatch::families::moe::{
     codebook_batched_admit_enabled_from_env, mq6_batched_admit_enabled_from_env,
@@ -1666,7 +1666,7 @@ const MIN_BATCH: usize = 2;
 /// a `Standard` tape-disabled rollback replay and an ordinary very short prompt
 /// prefill take it too. Wider prompt prefill and wide verify keep the GPU
 /// grouped PCIe read, which beats the CPU expert FFN by >10x at chunk sizes.
-const MOE_CPU_SPLICE_MAX_ROWS: usize = 4;
+/// Single source is [`hipfire_dispatch::families::moe::NARROW_VERIFY_MAX_ROWS`].
 
 /// gfx1100-measured default prefill chunk size (Qwen3.8 / MQ4V2 gate-up BT path).
 /// Exact `gfx1100` only — not gfx1101/1102/1151 or other gfx11 variants.
@@ -5291,7 +5291,7 @@ pub(crate) fn prefill_moe_ffn_body_batched_with_route_layered<'a>(
     // prefill never defers: its routed partial is gathered and all-reduced, and
     // the CPU splice would fold the routed FFN into `x_batch` twice.
     let cpu_deferred_experts = ffn.cpu_deferred_experts
-        && n <= MOE_CPU_SPLICE_MAX_ROWS
+        && n <= NARROW_VERIFY_MAX_ROWS
         && routed_out.is_none()
         && !matches!(
             route,

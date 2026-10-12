@@ -36,7 +36,7 @@ use crate::mtp_head::{
 use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
 use crate::qwen35::prefill::{fp8_verify_open, fp8_verify_target};
 use crate::qwen35::{LayerType, LayerWeights, PrefillBatchScratch, StateQuant};
-use hipfire_dispatch::families::moe::RoutedExpertWeights;
+use hipfire_dispatch::families::moe::{NARROW_VERIFY_MAX_ROWS, RoutedExpertWeights};
 /// Debug tracing for the slot-engine MTP cycle (`HIPFIRE_MTP_TRACE=1`).
 /// Prints seed/candidates/argmax/advance per cycle to stderr.
 pub(crate) fn mtp_trace_enabled() -> bool {
@@ -1503,7 +1503,9 @@ fn mtp_verify_graph_eligible(
     if use_sampling || is_external || overlap_trunk_snap {
         return false;
     }
-    if !(2..=4).contains(&n_verify) {
+    // Lower bound of 2 is load-bearing: a 1-row window is decode, not a verify
+    // window, so it must not take the verify-graph route.
+    if !(2..=NARROW_VERIFY_MAX_ROWS).contains(&n_verify) {
         return false;
     }
     if gpu.arch.as_str() != "gfx1201" {

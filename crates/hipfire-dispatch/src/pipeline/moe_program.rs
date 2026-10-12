@@ -15,7 +15,7 @@ use crate::context::DispatchCtx;
 use crate::cpu_exec;
 use crate::families::moe::{
     MoeNormalization, MoeParams, MoePrefillParams, MoePrefillResolution, MoeQ8RouterPolicy,
-    MoeRecipe, MoeResolution, MoeRouteCapability,
+    MoeRecipe, MoeResolution, MoeRouteCapability, NARROW_VERIFY_MAX_ROWS,
 };
 use crate::pipeline::sealed_moe::{MoeProtocol, MoeRouterInput, SealedMoeCall};
 use crate::types::DispatchError;
@@ -1991,10 +1991,12 @@ pub(super) fn select_prefill(
         0
     };
     let force_mq4_grouped_fp16 = resolution.force_mq4_grouped_fp16 || params.force_mq4_grouped_fp16;
+    // Lower bound of 2 is load-bearing: a 1-row window is decode, not a verify
+    // window, so it must not take the coalesced/Path-2 re-admit.
     let coalesced_verify = ctx.arch.is_gfx1201()
         && ctx.workload == crate::context::DispatchWorkload::SpeculativeVerify
-        && (2..=4).contains(&ctx.batch_size)
-        && (2..=4).contains(&params.batch_size)
+        && (2..=NARROW_VERIFY_MAX_ROWS).contains(&ctx.batch_size)
+        && (2..=NARROW_VERIFY_MAX_ROWS).contains(&params.batch_size)
         && route.is_none()
         && resolution.use_path2;
     let compact_ep = matches!(
