@@ -1329,8 +1329,18 @@ fn run_cpu_ref_worker(out_dir: PathBuf) {
         ));
     }
 
+    // GEMV-step coverage for this worker's narrow (≤4-row) forwards: every window
+    // splices, so no host-mapped GEMV step may stay on the GPU. This counter sees
+    // only the step seam — no MoE grouped GPU read occurs here because narrow
+    // windows splice; narrow-window MoE coverage itself comes from the per-shape
+    // splice trace.
     let final_counters = cpu_exec_counters();
-    assert_eq!(final_counters.1, 0, "{} host-mapped steps leaked to the GPU", final_counters.1);
+    assert_eq!(
+        final_counters.1,
+        0,
+        "{} host-mapped GEMV steps stayed on the GPU",
+        final_counters.1
+    );
     lines.push(format!(
         "COUNTERS role=ref on_cpu={} leak={} per_forward={m} prefill_steps={prefill_steps} \
 graph_captures={} graph_replays={} graph_mode={}",

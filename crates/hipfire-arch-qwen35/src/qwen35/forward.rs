@@ -6303,6 +6303,21 @@ fn op_code(op: &OpBinding) -> u32 {
     op.weights.first().map(|w| w.0).unwrap_or(u32::MAX)
 }
 
+/// Whether one MoE layer's FFN reads a host-mapped weight: the router, the
+/// shared expert, or either routed projection (owner-backed, so packed layers
+/// report honestly — per-expert views are borrowed slices).
+fn moe_ffn_host_mapped(gpu: &Gpu, ffn: &MoeFfnWeights) -> bool {
+    use hipfire_dispatch::families::moe::RoutedExpertWeights;
+    let (gate_up_host, down_host) = ffn.host_mapped_projections();
+    gate_up_host
+        || down_host
+        || gpu.host_located(&ffn.router.buf)
+        || gpu.host_located(&ffn.shared_expert_gate.buf)
+        || gpu.host_located(&ffn.shared_expert.gate.buf)
+        || gpu.host_located(&ffn.shared_expert.up.buf)
+        || gpu.host_located(&ffn.shared_expert.down.buf)
+}
+
 impl<'a> ForwardBindings for Qwen35Bindings<'a> {
     fn run_proj(
         &mut self,
@@ -7191,6 +7206,68 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
         Err(DispatchError::Hip(format!(
             "qwen35 has no Escape super-op ({kind:?})"
         )))
+    }
+
+    fn op_reads_host_mapped_weight(&self, gpu: &Gpu, op: &SuperOp) -> bool {
+        // Decode lowered ops read GEMV/GEMM weights only; norm/state/KV/conv reads
+        // stay on the GPU by design and must not trip the offload refusal. `Moe`
+        // covers the router, the shared expert, and the routed projections so a
+        // spilled expert tier fails closed rather than reading over PCIe. `Norm`,
+        // `Recurrent`, `Conv`, and `Escape` carry no weight reads.
+        match op.kind {
+            SuperOpKind::Proj => match (self.layer, op_code(&op.binding)) {
+                (LayerWeights::FullAttn(l), q35_op::PROJ_QKV) => {
+                    gpu.host_located(&l.wq.buf)
+                        || gpu.host_located(&l.wk.buf)
+                        || gpu.host_located(&l.wv.buf)
+                }
+                (LayerWeights::FullAttnMoe(l), q35_op::PROJ_QKV) => {
+                    gpu.host_located(&l.wq.buf)
+                        || gpu.host_located(&l.wk.buf)
+                        || gpu.host_located(&l.wv.buf)
+                }
+                (LayerWeights::DeltaNet(l), q35_op::PROJ_QKVZA) => {
+                    gpu.host_located(&l.wqkv.buf)
+                        || gpu.host_located(&l.wz.buf)
+                        || gpu.host_located(&l.w_beta.buf)
+                        || gpu.host_located(&l.w_alpha.buf)
+                }
+                (LayerWeights::DeltaNetMoe(l), q35_op::PROJ_QKVZA) => {
+                    gpu.host_located(&l.wqkv.buf)
+                        || gpu.host_located(&l.wz.buf)
+                        || gpu.host_located(&l.w_beta.buf)
+                        || gpu.host_located(&l.w_alpha.buf)
+                }
+                (LayerWeights::DeltaNet(l), q35_op::PROJ_GATE_UP) => {
+                    gpu.host_located(&l.w_gate.buf) || gpu.host_located(&l.w_up.buf)
+                }
+                (LayerWeights::FullAttn(l), q35_op::PROJ_GATE_UP) => {
+                    gpu.host_located(&l.w_gate.buf) || gpu.host_located(&l.w_up.buf)
+                }
+                _ => false,
+            },
+            SuperOpKind::ResidualGemv => match (self.layer, op_code(&op.binding)) {
+                (LayerWeights::FullAttn(l), q35_op::RESID_WO) => gpu.host_located(&l.wo.buf),
+                (LayerWeights::FullAttnMoe(l), q35_op::RESID_WO) => gpu.host_located(&l.wo.buf),
+                (LayerWeights::DeltaNet(l), q35_op::RESID_WO) => gpu.host_located(&l.wo.buf),
+                (LayerWeights::DeltaNetMoe(l), q35_op::RESID_WO) => gpu.host_located(&l.wo.buf),
+                (LayerWeights::DeltaNet(l), q35_op::RESID_DOWN_SWIGLU) => {
+                    gpu.host_located(&l.w_down.buf)
+                }
+                (LayerWeights::FullAttn(l), q35_op::RESID_DOWN_SWIGLU) => {
+                    gpu.host_located(&l.w_down.buf)
+                }
+                _ => false,
+            },
+            SuperOpKind::Attend => false,
+            SuperOpKind::Moe => match self.layer {
+                LayerWeights::DeltaNetMoe(l) => moe_ffn_host_mapped(gpu, &l.ffn),
+                LayerWeights::FullAttnMoe(l) => moe_ffn_host_mapped(gpu, &l.ffn),
+                _ => false,
+            },
+            SuperOpKind::Norm | SuperOpKind::Recurrent | SuperOpKind::Conv => false,
+            SuperOpKind::Escape(_) => false,
+        }
     }
 }
 

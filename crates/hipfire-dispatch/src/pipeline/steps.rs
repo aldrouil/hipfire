@@ -998,10 +998,13 @@ pub fn execute_validated_steps_with_moe_hooks<'a>(
             i += 1;
         } else {
             if cpu_exec::cpu_exec_enabled() && cpu_exec::reads_host_mapped_weight(gpu, &steps[i]) {
-                // Host-mapped weight that the CPU could not take: an unsupported
-                // quant format, or a step shape that never reached the seam. Counted
-                // so the failure is visible instead of silent (see the coverage
-                // line at load and `cpu_exec_counters`).
+                // Host-mapped GEMV weight that the CPU could not take: an
+                // unsupported quant format, or a step shape that never reached the
+                // seam. Counted so the failure is visible instead of silent (see
+                // the coverage line at load and `cpu_exec_counters`). This counter
+                // covers GEMV/GEMV-residual steps in the step seam only; the MoE
+                // tier's coverage is reported by the load-time coverage line, which
+                // remains the authority there.
                 cpu_exec::count_host_mapped_gpu_step();
             }
             if let (Step::HyperWrite(write), Some(Step::HyperRead(read))) =

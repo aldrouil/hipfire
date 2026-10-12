@@ -93,13 +93,18 @@ pub fn moe_cpu_experts_enabled() -> bool {
 pub fn moe_trace_enabled() -> bool {
     hipfire_config::developer_var("HIPFIRE_CPU_EXEC_TRACE").is_ok()
 }
-/// (steps executed on the CPU, host-mapped steps that stayed on the GPU).
+/// (steps executed on the CPU, host-mapped GEMV steps that stayed on the GPU).
 ///
-/// The second number is the honest coverage failure signal: it counts steps whose
-/// weight tensor *was* host-mapped while CPU execution was enabled but whose
-/// shape never reached the CPU — either an unsupported quant format or a fused
-/// launch the seam did not split. Zero means every host-mapped step this process
-/// executed went to the CPU.
+/// The second number is the honest coverage-failure signal for the step seam
+/// only: it counts `Step::Gemv` / `Step::GemvResidual` steps whose weight tensor
+/// *was* host-mapped while CPU execution was enabled but whose shape never
+/// reached the CPU — either an unsupported quant format or a fused launch the
+/// seam did not split. The MoE tier is structurally invisible to it: the grouped
+/// host read a wide prefill deliberately keeps on the GPU is never counted, nor
+/// is the `llama.rs` fused split. The MoE tier's coverage is reported by the
+/// load-time coverage line (`cpu exec: N/N spilled layers fully covered by the
+/// CPU seam … uncovered quants: …`), which remains the authority there. Zero
+/// means every host-mapped GEMV step this process executed went to the CPU.
 static CPU_STEPS: AtomicUsize = AtomicUsize::new(0);
 static HOST_MAPPED_GPU_STEPS: AtomicUsize = AtomicUsize::new(0);
 
@@ -1443,7 +1448,10 @@ pub(crate) fn plan_step<'a>(gpu: &Gpu, step: &'a Step<'a>) -> Option<CpuStep<'a>
 }
 
 /// Whether `step` reads a host-mapped weight, regardless of whether the CPU can
-/// decode it — the coverage counter's question.
+/// decode it — the coverage counter's question. Matches `Step::Gemv` /
+/// `Step::GemvResidual` in the step seam only: the MoE tier's grouped host read
+/// (which wide prefill deliberately keeps on the GPU) and the `llama.rs` fused
+/// split are structurally invisible to it — see the counter docs above.
 pub(crate) fn reads_host_mapped_weight(gpu: &Gpu, step: &Step) -> bool {
     match step {
         Step::Gemv { w, .. } | Step::GemvResidual { w, .. } => gpu.host_located(w.buf),

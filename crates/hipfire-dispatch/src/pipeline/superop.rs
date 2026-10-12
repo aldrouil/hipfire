@@ -34,7 +34,9 @@
 //! NOTE: nothing here is on a live path yet. The live forward remains
 //! `execute_steps`; this substrate is wired behind `HIPFIRE_FORWARD_LOWERED`
 //! (default off) in later steps, validated byte-identical via the
-//! `HIPFIRE_FORWARD_ORACLE` dual-run.
+//! `HIPFIRE_FORWARD_ORACLE` dual-run. `run_layer_program` additionally refuses
+//! the `HIPFIRE_FORWARD_LOWERED` + `memory.offload_exec=cpu` combination when a
+//! program op reads a host-mapped weight (see the executor docs).
 
 use super::steps::{match_fused_prefix, step_op_kind, Step};
 use crate::context::DispatchCtx;
@@ -392,6 +394,23 @@ pub trait ForwardBindings {
         kind: EscapeKind,
     ) -> Result<(), DispatchError>;
 
+    /// Whether this op reads a host-mapped weight buffer.
+    ///
+    /// The lowered program carries indices only ([`WeightSlot`]), so the executor
+    /// cannot test residency itself: the arch answers from its live weight tables
+    /// via `gpu.host_located(&weight.buf)` — the same test
+    /// `crate::cpu_exec::reads_host_mapped_weight` applies to a `Step`'s weight.
+    /// Only GEMV/GEMM weights count (projections, the fused down-projection, the
+    /// MoE router/shared/routed weights): norm, state, KV, and conv reads stay on
+    /// the GPU by design (see the `cpu_exec` scope docs) and must not trip this.
+    /// `run_layer_program` refuses the `HIPFIRE_FORWARD_LOWERED` +
+    /// `memory.offload_exec=cpu` combination when any op answers true. Defaults
+    /// to `false`, so resident-only archs (no spill support) — and any lowered
+    /// program with no host-mapped weight — run exactly as before.
+    fn op_reads_host_mapped_weight(&self, _gpu: &Gpu, _op: &SuperOp) -> bool {
+        false
+    }
+
     // ── Expert-parallel (Ship 6 substrate-EP) hooks ─────────────────────────
     // Default to unsupported; only EP-target MoE arches (qwen3.6-A3B, MiniMax,
     // DeepSeek-V4) override these. Non-MoE arches and the single-GPU path never
@@ -715,12 +734,36 @@ pub fn dispatch_super_op<B: ForwardBindings>(
 /// arch's forward (qwen35 first) builds a `LoweredForward` at load and calls this
 /// behind `HIPFIRE_FORWARD_LOWERED` (default off), oracle-validated byte-identical
 /// vs the hand `execute_steps` path before the default is flipped per arch.
+///
+/// Fail closed on `HIPFIRE_FORWARD_LOWERED` + `memory.offload_exec=cpu`: when CPU
+/// execution is enabled and any op in `program` reads a host-mapped weight (via
+/// [`ForwardBindings::op_reads_host_mapped_weight`] — the same
+/// `gpu.host_located(&weight.buf)` test `crate::cpu_exec::reads_host_mapped_weight`
+/// applies to a `Step`'s weight), this returns a `DispatchError` instead of
+/// launching. The lowered path bypasses the step seam that routes host-mapped
+/// weights to the CPU, so it would read them on the GPU over PCIe and skip both
+/// the CPU splice and the splice coverage. A lowered program with no
+/// host-mapped weight runs exactly as before.
 pub fn run_layer_program<B: ForwardBindings>(
     gpu: &mut Gpu,
     ctx: &DispatchCtx,
     program: &LayerProgram,
     bindings: &mut B,
 ) -> Result<(), DispatchError> {
+    if crate::cpu_exec::cpu_exec_enabled()
+        && program
+            .iter()
+            .any(|op| bindings.op_reads_host_mapped_weight(gpu, op))
+    {
+        return Err(DispatchError::Hip(
+            "HIPFIRE_FORWARD_LOWERED with memory.offload_exec=cpu refuses a lowered program \
+             reading a host-mapped weight: the lowered path bypasses the step seam that routes \
+             host-mapped weights to the CPU, so it would read them on the GPU over PCIe and skip \
+             the CPU splice and the splice coverage. Set memory.offload_exec=pcie \
+             (HIPFIRE_OFFLOAD_EXEC=pcie) or HIPFIRE_FORWARD_LOWERED=0"
+                .into(),
+        ));
+    }
     for op in program {
         dispatch_super_op(gpu, ctx, op, bindings)?;
     }
