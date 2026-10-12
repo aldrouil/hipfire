@@ -12,6 +12,7 @@
 
 use super::steps::Step;
 use crate::context::DispatchCtx;
+use crate::cpu_exec;
 use crate::families::moe::{
     MoeNormalization, MoeParams, MoePrefillParams, MoePrefillResolution, MoeQ8RouterPolicy,
     MoeRecipe, MoeResolution, MoeRouteCapability,
@@ -49,6 +50,7 @@ pub enum MoeStage {
     RowGather,
     Combine,
     HostExperts,
+    CpuSplice,
 }
 
 fn router_shared_fuse_allowed(
@@ -414,6 +416,7 @@ impl<'a> SealedMoeOp<'a> {
             MoeStage::RowGather => self.row_gather(gpu),
             MoeStage::Combine => self.combine(gpu),
             MoeStage::HostExperts => self.host_experts(gpu),
+            MoeStage::CpuSplice => self.cpu_splice(gpu),
         }
     }
 
@@ -1100,6 +1103,71 @@ impl<'a> SealedMoeOp<'a> {
         )
     }
 
+    /// The CPU routed-expert splice, executed at the point the routed GPU tail
+    /// would have run. The arch declares it (`cpu_deferred_experts`) and supplies
+    /// the expert payload through `RoutedExpertWeights::cpu_splice_expert`; the
+    /// seam owns the invocation order, the capture/replay refusal inside the
+    /// executor and the coverage counters.
+    pub(super) fn cpu_splice(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
+        match self.state.call.protocol() {
+            MoeProtocol::IndexedDecode => {
+                let (params, _) = self.state.decode_parts()?;
+                let gpu_ref: &Gpu = &*gpu;
+                cpu_exec::moe_cpu_experts(
+                    gpu_ref,
+                    params.hidden,
+                    params.mi,
+                    params.batch_size,
+                    params.k,
+                    params.x_rot_local,
+                    params.topk_indices,
+                    params.topk_weights,
+                    params.x_residual,
+                    params.expert_down_awq_ptrs.is_some(),
+                    |id| {
+                        params.routed_experts.cpu_splice_expert(gpu_ref, id).ok_or_else(|| {
+                            DispatchError::Hip(format!(
+                                "moe cpu expert splice: expert {id} has no CPU payload"
+                            ))
+                        })
+                    },
+                )
+            }
+            MoeProtocol::GroupedPrefill => {
+                let (params, _) = self.state.prefill_parts()?;
+                let gpu_ref: &Gpu = &*gpu;
+                // `dim` is the model hidden size, which is exactly the routed down
+                // projection's row count: `MoePrefillParams` has no `hidden` field
+                // and `down_m` is built as `experts[0].down.m` (its `down_k` is
+                // `mi`), matching `moe_cpu_experts`' `(dim, mi)` pair. Do not
+                // "correct" this to a hidden field that does not exist.
+                // The residual destination is the arch's unconditional
+                // `&pbs.x_batch`: a CPU-deferred window never carries `routed_out`
+                // (the sealed program refuses that combination), so the
+                // `unwrap_or` below is defensive only.
+                cpu_exec::moe_cpu_experts(
+                    gpu_ref,
+                    params.down_m,
+                    params.mi,
+                    params.batch_size,
+                    params.k_top,
+                    params.x_rot_batch,
+                    params.topk_indices,
+                    params.topk_weights,
+                    params.routed_out.unwrap_or(params.x_batch),
+                    params.expert_down_awq_ptrs.is_some(),
+                    |id| {
+                        params.routed_experts.cpu_splice_expert(gpu_ref, id).ok_or_else(|| {
+                            DispatchError::Hip(format!(
+                                "moe cpu expert splice: expert {id} has no CPU payload"
+                            ))
+                        })
+                    },
+                )
+            }
+        }
+    }
+
     pub(super) fn mutation_fence(&self, _gpu: &mut Gpu) -> Result<(), DispatchError> {
         match self.state.call.protocol() {
             MoeProtocol::IndexedDecode => super::decode_mutation_fence_stage(),
@@ -1293,6 +1361,13 @@ fn lower_decode<'a>(
         }
         if params.recipe.shared_after_combine() && !params.skip_shared {
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::SharedDown))?;
+        }
+        if selection.cpu_deferred_experts {
+            // Last, exactly where the arch ran its splice: after every sealed
+            // stage of this program. The splice and `SharedDown` both accumulate
+            // into the same residual buffer, so this ordering keeps the fp
+            // accumulation sequence identical to the pre-stage arrangement.
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::CpuSplice))?;
         }
     } else {
         if params.ep_row_gather.is_some() {

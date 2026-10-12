@@ -522,6 +522,35 @@ impl hipfire_dispatch::families::moe::RoutedExpertWeights for MoeFfnWeights {
             .then_some((gate_up, down))
         })
     }
+
+    /// CPU-splice payload for one routed expert, resolved from the packed bucket
+    /// owners: a per-expert view is `Borrowed` and invisible to `Gpu::host_bytes`,
+    /// so the owning bucket has to be found by hand (same walk as
+    /// `packed_expert_host_bytes`' own pinning test). `None` means the layer has
+    /// no packed owners, the id is out of range, or the dtype has no CPU decoder —
+    /// the caller reports that as "no CPU payload" and the load-time coverage
+    /// report names uncovered formats.
+    fn cpu_splice_expert(
+        &self,
+        gpu: &Gpu,
+        expert_idx: usize,
+    ) -> Option<hipfire_dispatch::cpu_exec::CpuMoeExpert<'_>> {
+        let owners = self.packed_expert_owners.as_ref()?;
+        let expert = self.experts.get(expert_idx)?;
+        let gate_up =
+            packed_expert_host_bytes(gpu, &owners.gate_up, &expert.gate_up.buf, "gate_up").ok()?;
+        let down =
+            packed_expert_host_bytes(gpu, &owners.down, &expert.down.buf, "down").ok()?;
+        let gate_up_quant =
+            hipfire_dispatch::cpu_exec::cpu_quant_for(expert.gate_up.gpu_dtype)?;
+        let down_quant = hipfire_dispatch::cpu_exec::cpu_quant_for(expert.down.gpu_dtype)?;
+        Some(hipfire_dispatch::cpu_exec::CpuMoeExpert {
+            gate_up_quant,
+            gate_up,
+            down_quant,
+            down,
+        })
+    }
 }
 
 /// Build the complete typed Qwen softmax/shared decode recipe from the
@@ -849,14 +878,6 @@ fn moe_ffn_decode_impl<'a>(
     }
     let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
     let bound = ffn.bound_experts()?;
-    // The CPU expert splice needs the residual and the gate_up activation after
-    // `seal_decode` moves `moe_params`; capture the references first (shared
-    // borrows, no copy). The sealed call omits the routed GPU stages exactly
-    // when it carries the CPU-deferred selection, so the splice tracks that and
-    // not merely the loader's arming (an EP partial or a deferred combine keeps
-    // the GPU routed stages).
-    let splice_residual = moe_params.x_residual;
-    let splice_x_rot = moe_params.x_rot_local;
     let deferred_routed_experts = moe_params.cpu_deferred_experts;
     // Only when explicitly asked: the oracle downloads the activation and the
     // route for every MoE layer, which is a host sync point on the decode path.
@@ -910,28 +931,15 @@ fn moe_ffn_decode_impl<'a>(
     }
 
     let sealed_ns = t_sealed.elapsed().as_nanos() as u64;
-    let t_splice = std::time::Instant::now();
-    // CPU expert splice: the sealed step above omitted the routed GPU stages for
-    // this call, so the whole routed FFN is owed here. Recompute it on the CPU
-    // from the intact host blobs (per-expert dtype/stride, graded included) and
-    // accumulate into the residual. Wide batched forwards bind the real tables,
-    // run the GPU routed stages, and never reach this.
+    // The sealed program above runs the CPU expert splice in place of the routed
+    // GPU stages for this call, so the splice's cost is inside `sealed_ns` and
+    // cannot be separated on this side; `cpu_splice_ns` therefore reports 0 and
+    // the stage-side trace is the authority for the splice's own timing.
     if deferred_routed_experts {
-        run_cpu_moe_experts(
-            gpu,
-            ffn,
-            config,
-            splice_x_rot,
-            s.topk_indices,
-            s.topk_weights,
-            splice_residual,
-            1,
-        )?;
         // CPU deferral omits the GPU tail that used to change the activation
         // staging cache key; reused scratch must be refreshed by the next layer.
         gpu.invalidate_fp16_cache();
     }
-    let splice_ns = t_splice.elapsed().as_nanos() as u64;
     let total_ns = t_window.elapsed().as_nanos() as u64;
     if hipfire_dispatch::cpu_exec::moe_trace_enabled() {
         hipfire_dispatch::cpu_exec::moe_window_trace(
@@ -939,12 +947,10 @@ fn moe_ffn_decode_impl<'a>(
             hipfire_dispatch::cpu_exec::MoeWindowTiming {
                 total_ns,
                 gpu_sealed_ns: sealed_ns,
-                cpu_splice_ns: if deferred_routed_experts { splice_ns } else { 0 },
-                other_ns: total_ns.saturating_sub(sealed_ns).saturating_sub(if deferred_routed_experts {
-                    splice_ns
-                } else {
-                    0
-                }),
+                // The splice now runs inside the sealed program (stage-side), so
+                // its cost is part of `gpu_sealed_ns`; see the comment above.
+                cpu_splice_ns: 0,
+                other_ns: total_ns.saturating_sub(sealed_ns),
                 rows: 1,
                 top_k: k,
             },

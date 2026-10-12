@@ -723,6 +723,21 @@ pub trait RoutedExpertWeights {
         })
     }
 
+    /// CPU-splice payload for one selected expert: the packed byte spans plus
+    /// their canonical CPU decoder. `None` (the default) means this adapter
+    /// cannot resolve one, and the caller must supply its own resolver — the
+    /// historical contract. Host-placed packed adapters override this using
+    /// their allocation owners, exactly as they do for
+    /// [`Self::host_mapped_projections`]: a borrowed per-expert view is not
+    /// enough to find the owning bucket.
+    fn cpu_splice_expert(
+        &self,
+        _gpu: &Gpu,
+        _expert_idx: usize,
+    ) -> Option<crate::cpu_exec::CpuMoeExpert<'_>> {
+        None
+    }
+
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
