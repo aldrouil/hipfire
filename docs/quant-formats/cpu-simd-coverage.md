@@ -84,6 +84,7 @@ grouped quant (plain tensor, 256-element "group").
 | 20 | MQ3G256Lloyd | 112 | 8-entry `fp16` codebook | 3-bit indices | yes | `mq3g256lloyd_row_dot` | AVX2 + FMA + F16C |
 | 30 | MQ4G256Lloyd | 160 | 16-entry `fp16` codebook | nibble indices | yes | `mq4g256lloyd_row_dot` | AVX2 + FMA + F16C |
 | 31 | MQ5G256 | 168 | f32 `scale`+`zero` | 5-bit packs | yes | `mq5g256_row_dot` | AVX2 + FMA |
+| 34 | MFP4G32E8 | 152 | 16 B row header (`fp16` row scale) + eight 17 B blocks/256 (1 B E8 scale + 16 B nibbles) | 4-bit lattice codes | yes | `mfp4g32_e8_row_dot` | AVX2 + FMA + F16C |
 | 40 | TQ2G128 | 34/128 | `fp16` `d` | 2-bit codes, `(code-1)·d` | no | `tq2g128_row_dot` | AVX2 + FMA + F16C |
 | 41 | BQ1G128 | 18/128 | `fp16` `d` | sign bits, `±d` | no | `bq1g128_row_dot` | AVX2 + FMA + F16C |
 | 44 | MQ4G256V2 | 136 | per-128 `fp16` `[s z]×2` | nibbles | yes | `mq4g256v2_row_dot` | AVX2 + FMA + F16C |
@@ -115,8 +116,9 @@ any runner.
   the crate has no decode for them at all (so a step over one stays on the GPU
   over PCIe): qt 0/4 (`Q4F16G64`/`Q4K`, GGUF-side), qt 5 (`Q8HFQ`, padded rows the
   group model cannot express), qt 14 (`MQ8G256`, `RotationPlan::Mq8Internal` —
-  an int8-quantized activation, not a plain FWHT of f32), qt 21/24/32-37
-  (HFP4/MFP4 family: per-row 16 B header + per-32 block scales), qt 28/29
+  an int8-quantized activation, not a plain FWHT of f32), qt 21/24/32/33/35/36/37
+  (HFP4/MFP4 family: per-row 16 B header + per-32 block scales — qt 34 `MFP4G32E8`
+  is covered above), qt 28/29
   (PARO4G128(-T), a Givens rotation on the *activation*), qt 38/39
   (`MQ{2,3}G256GL`, MoE-indexed only). See `quant.rs`'s test module for the
   itemised reasoning.

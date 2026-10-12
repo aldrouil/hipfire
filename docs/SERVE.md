@@ -99,7 +99,16 @@ Config and env owners for bind, idle, queue, and body limits:
    `dflash_mode=on` with no DFlash draft and no MTP head — is not transient:
    every later request reloads and is refused the same way, while `/health`
    still answers `ok`. Fix the config (or pass `developer.dflash_draft`)
-   rather than retrying.
+   rather than retrying. The same holds for the partial-offload refusals, each
+   of which names its knob on screen: a pinned `memory.gpu_layer_budget` /
+   `memory.moe_expert_budget` placement that does not fit device weights, a
+   spill that exceeds pinned host RAM (+ 4 GiB headroom) or the GTT
+   `pages_limit`, an unpackable host-placed expert layer (neither the uniform
+   nor the graded packer applies), host-placed packed AWQ experts under
+   `memory.offload_exec=cpu`, a configured spill on a non-spillable load
+   (`tp > 1`, `pp > 1`, EP, VL tower, paged experts, REAP keep-map, or a
+   non-Qwen3.5 arch), and `memory.offload_exec=cpu` together with a
+   retained-replay (Redline) backend.
    Multi-slot serve (`serve.multi_slot = true`) fails closed instead: the slot
    engine is its only backend, so a failed pre-warm (for example, slot-engine
    allocations that do not fit beside another process on the card) logs the

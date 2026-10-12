@@ -126,9 +126,8 @@ done
 ```
 
 `auto` is never silent: its load line states what it chose
-(`partial offload: auto — {free} MiB free, needs {over} MiB more than capacity ->
-{n} layers fully offloaded, {m} layers experts-only offloaded`, or
-`auto: model fits — every layer resident`). **Capture that line** — it is the
+(`partial offload: {host} of {n} layers host-placed, routed experts host on {k} layers, device weights {X} MiB of {Y} MiB available`, or
+`partial offload: model fits - every layer resident`). **Capture that line** — it is the
 placement being scored. Also run `moe_expert_budget=auto` with
 `gpu_layer_budget` still `Full`, to check the case where the expert tier alone
 cannot free enough (it must then refuse naming `memory.gpu_layer_budget`).
