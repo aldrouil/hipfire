@@ -50,7 +50,7 @@ pub struct Qwen35Bundle {
     /// lease without a release acknowledgement.
     pub weight_lease: Option<SharedWeightLease>,
 }
-/// Device bytes a draft file will take, estimated the way the loader's own
+/// Device bytes one draft file will take, estimated the way the loader's own
 /// admission estimates a weight file: file bytes + 1/8 for the expanded/AWQ
 /// tensors + 512 MiB of scratch. An over-estimate for a head that loads only its
 /// own layers, which is the safe direction — it can only make the trunk spill
@@ -59,50 +59,102 @@ pub(crate) fn draft_file_reserve_bytes(path: &std::path::Path) -> u64 {
     let Ok(meta) = std::fs::metadata(path) else {
         return 0;
     };
-    let file = meta.len();
-    file + file / 8 + (512 << 20)
+    reserve_for_bytes(meta.len())
 }
 
-/// Device bytes a draft will take when it loads beside a spilled trunk.
+/// The `draft_file_reserve_bytes` formula for a known byte count: file bytes +
+/// 1/8 for the expanded/AWQ tensors + 512 MiB of scratch. Split out so the
+/// bundled-trailer arm (which knows its section size without a file of its
+/// own) charges the same estimate as a sidecar file of the same size.
+fn reserve_for_bytes(file_bytes: u64) -> u64 {
+    file_bytes + file_bytes / 8 + (512 << 20)
+}
+
+/// Where the MTP head that will load beside a trunk lives.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum MtpHeadLocation {
+    /// A standalone `.mtp` sidecar file.
+    Sidecar(std::path::PathBuf),
+    /// A head bundled inside the trunk file itself: only the appended MTP
+    /// section counts — the trunk's own bytes are already in the arch census
+    /// (`qwen35_layer_bytes`), so charging the whole file would count them
+    /// twice and force a maximal spill.
+    Bundled { section_bytes: u64 },
+}
+
+/// Device bytes the drafts take when they load beside a spilled trunk.
 ///
 /// Drafts stay on the GPU — they are not part of the trunk spill — so their
-/// bytes come out of the capacity the placement may spend. Estimated the way the
-/// loader's own admission estimates a weight file (file bytes + 1/8 for the
-/// expanded/AWQ tensors + 512 MiB of scratch), which is an over-estimate for a
-/// head that loads only its own layers. 0 when no draft is in play.
-fn draft_device_reserve_bytes(hfq: &HfqFile, ctx: &LoadCtx) -> u64 {
+/// bytes come out of the capacity the placement may spend. Pure (paths and a
+/// byte count in, bytes out; the only filesystem reads are the files' own
+/// lengths), so unit tests pin the arithmetic without a GPU. 0 when no draft
+/// is in play.
+///
+/// `mtp_head` is the exact head that will load (`None` = none), and
+/// `dflash_draft` the DFlash draft file that will load on the slots route.
+/// The single caller that both resolvers share — this is what fixes the
+/// slots under-reserve, where the old inline probe charged only the MTP
+/// sidecar and silently dropped a DFlash draft.
+pub(crate) fn draft_device_reserve_bytes(
+    mtp_head: Option<&MtpHeadLocation>,
+    dflash_draft: Option<&std::path::Path>,
+) -> u64 {
     let mut bytes = 0u64;
-    let mut add = |path: Option<&std::path::Path>| {
-        if let Some(path) = path {
+    match mtp_head {
+        Some(MtpHeadLocation::Sidecar(path)) => {
             bytes = bytes.saturating_add(draft_file_reserve_bytes(path));
         }
-    };
-    // The MTP head, unless speculation was explicitly turned off.
-    if ctx.spec.mtp != Some(false) {
-        match ctx.mtp_path.clone() {
-            Some(path) => add(Some(&path)),
-            None => {
-                let sidecar = trunk_mtp_sidecar(hfq);
-                add(sidecar.as_deref());
+        Some(MtpHeadLocation::Bundled { section_bytes }) => {
+            if *section_bytes > 0 {
+                bytes = bytes.saturating_add(reserve_for_bytes(*section_bytes));
             }
         }
+        None => {}
     }
-    // DFlash draft. (DSpark is a DeepSeek4 module and never attaches here.)
-    if let Some(draft) = ctx.draft_path {
-        add(Some(std::path::Path::new(draft)));
+    if let Some(path) = dflash_draft {
+        bytes = bytes.saturating_add(draft_file_reserve_bytes(path));
     }
     bytes
 }
 
-/// The default MTP sidecar the loader resolves when the CLI named none: the
-/// first existing `sidecar_candidates(trunk, "mtp")` spelling (last-extension
-/// replacement, then the stem spelling `model.mtp`). A single
-/// `path + ".mtp"` concatenation misses the stem spelling and charges 0 for a
-/// head that then loads, under-reserving the placement.
-fn trunk_mtp_sidecar(hfq: &HfqFile) -> Option<std::path::PathBuf> {
-    crate::mtp_head::mtp_sidecar_candidates(hfq.path())
+/// The MTP head that will load beside this trunk: the bundled trailer first,
+/// then the first existing `sidecar_candidates(trunk, "mtp")` spelling
+/// (last-extension replacement, then the stem spelling `model.mtp`). Both
+/// loaders probe in this order (bundled, then sidecar), so the reserve always
+/// covers what actually loads. A single `path + ".mtp"` concatenation misses
+/// the stem spelling and charges 0 for a head that then loads,
+/// under-reserving the placement.
+///
+/// A bundled trailer (the MTP head rides inside the trunk file itself, found
+/// by `detect_bundled_mtp_offset`) reserves only the appended MTP section
+/// (`file_len − offset − trailer`). The section is a second HFQM container
+/// after the trunk's tensors: `HfqFile::open` parses exactly the `n_tensors`
+/// index entries of the header at offset 0 (`open_at_offset`), and the census
+/// (`qwen35_layer_bytes`) walks only that `tensor_infos()` — no MTP tensor
+/// is ever counted there, while the head loader opens the same file
+/// separately at the trailer offset (`load_mtp_head_at_offset`). The two
+/// containers are disjoint, so the section size is the head's footprint with
+/// no double count; the file+1/8+512MiB formula on top is the same
+/// over-estimate the sidecar arm already uses for a head that loads only its
+/// own layers (safe direction: it can only spill slightly more, never less).
+pub(crate) fn resolve_mtp_head_file(trunk: &std::path::Path) -> Option<MtpHeadLocation> {
+    if let Some(offset) = crate::mtp_head::detect_bundled_mtp_offset(trunk)
+        .ok()
+        .flatten()
+    {
+        let section_bytes = std::fs::metadata(trunk)
+            .map(|meta| {
+                meta.len()
+                    .saturating_sub(offset)
+                    .saturating_sub(crate::mtp_head::BUNDLE_TRAILER_LEN)
+            })
+            .unwrap_or(0);
+        return Some(MtpHeadLocation::Bundled { section_bytes });
+    }
+    crate::mtp_head::mtp_sidecar_candidates(trunk)
         .into_iter()
         .find(|p| p.is_file())
+        .map(MtpHeadLocation::Sidecar)
 }
 
 /// Resolve partial GPU offload before the first allocation.
@@ -170,49 +222,47 @@ fn resolve_partial_offload(
     let pbs_reservation =
         crate::qwen35::prefill::minimum_prefill_reservation_bytes(config, &ctx.gpu.arch);
     let pbs = pbs_reservation.unwrap_or(0) as u64;
-    let slack = 128u64 << 20;
-    // A draft stays on the GPU: MTP (bundled trailer or `.mtp` sidecar), the
-    // DFlash draft and the DSpark module are all device-resident and are *not*
-    // part of the trunk spill, so they must be reserved out of the capacity the
-    // placement spends — otherwise `auto` would over-place the trunk and the
-    // head's own load would OOM after the weights landed.
-    let draft_reservation = draft_device_reserve_bytes(hfq, ctx);
-    let capacity = offload::weight_capacity(free_vram, kv.bytes, pbs, draft_reservation, slack);
-
+    // A draft stays on the GPU: MTP (bundled trailer or `.mtp` sidecar) and
+    // the DFlash draft are both device-resident and are *not* part of the
+    // trunk spill, so they must be reserved out of the capacity the placement
+    // spends — otherwise `auto` would over-place the trunk and the head's own
+    // load would OOM after the weights landed.
+    let mtp_head: Option<MtpHeadLocation>;
+    let dflash_draft: Option<&std::path::Path> = ctx.draft_path.map(std::path::Path::new);
+    if ctx.spec.mtp != Some(false) {
+        mtp_head = match ctx.mtp_path.clone() {
+            // An explicit CLI path is always a standalone sidecar file.
+            Some(path) => Some(MtpHeadLocation::Sidecar(path)),
+            None => resolve_mtp_head_file(hfq.path()),
+        };
+    } else {
+        // Speculation explicitly off: the MTP head will not load. A DFlash
+        // draft is still charged when named — the slots route runs its
+        // DFlash2 chain independently of the MTP kill switch.
+        mtp_head = None;
+    }
+    // (DSpark is a DeepSeek4 module and never attaches here.)
+    let draft_reservation = draft_device_reserve_bytes(mtp_head.as_ref(), dflash_draft);
     let layer_bytes = crate::qwen35::load::qwen35_layer_bytes(hfq, config);
-    let (placement, line) = offload::plan(
-        &layer_bytes,
-        budgets,
-        &capacity,
-        offload::Orientation::SuffixResident,
-    )?;
-    eprintln!("  {line}");
+    let inputs = offload::CapacityInputs {
+        free_vram,
+        kv_bytes: kv.bytes,
+        kv_rows: kv.rows,
+        kv_stride: stride as u64,
+        prefill_floor: pbs,
+        prefill_floor_absent: pbs_reservation.is_none(),
+        draft_bytes: draft_reservation,
+        slack: 128u64 << 20,
+    };
     // Every pinned host byte, not just the routed experts: a whole-layer spill
     // hosts each layer's own weights too, and those are the largest host consumer
-    // a dense model has. `host_expert_bytes` remains the per-layer expert figure
-    // in the report line.
-    let host_bytes = layer_bytes.host_bytes(&placement);
-    eprintln!(
-        "  kv reserved: {} tokens x {stride} B = {} MiB; pbs floor {}; draft {} MiB; slack {} MiB; \
-         weight budget {} MiB of {} MiB free",
-        kv.rows,
-        kv.bytes / (1 << 20),
-        match pbs_reservation {
-            Some(bytes) => format!("{} MiB", bytes / (1 << 20)),
-            None => "0 MiB (no MoE prefill sizing)".to_string(),
-        },
-        draft_reservation / (1 << 20),
-        slack / (1 << 20),
-        capacity.weight_bytes / (1 << 20),
-        free_vram / (1 << 20),
-    );
-    if !placement.is_fully_resident() {
-        eprintln!(
-            "  {}",
-            offload::report(&placement, &layer_bytes, host_bytes)
-        );
-    }
-    offload::admit_host_placement(host_bytes)?;
+    // a dense model has.
+    let placement = offload::resolve_placement(
+        &layer_bytes,
+        &inputs,
+        budgets,
+        offload::Orientation::SuffixResident,
+    )?;
     Ok(Some(placement))
 }
 
@@ -1346,5 +1396,75 @@ mod tests {
         use hipfire_runtime::kv_mode::{KvMode, KvPair};
 
         validate_cask_static_layout(false, KvPair::Split(KvMode::Fwht3, VMode::Lloyd3)).unwrap();
+    }
+
+    /// The draft-reserve arithmetic, pinned without a GPU: one file reserves
+    /// file + file/8 + 512 MiB, and MTP + DFlash charge independently and add.
+    #[test]
+    fn draft_reserve_charges_mtp_and_dflash() {
+        let dir = std::env::temp_dir().join(format!("hipfire-draft-reserve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let write_sized = |name: &str, len: u64| {
+            let path = dir.join(name);
+            std::fs::write(&path, vec![0u8; len as usize]).expect("temp file");
+            path
+        };
+        let file_len = 8 << 20;
+        let mtp = write_sized("model.mtp", file_len);
+        let dflash = write_sized("draft.hfq", file_len);
+        let expect = file_len + file_len / 8 + (512 << 20);
+        assert_eq!(draft_file_reserve_bytes(&mtp), expect);
+        assert_eq!(draft_file_reserve_bytes(&dflash), expect);
+        assert_eq!(draft_file_reserve_bytes(&dir.join("missing.mtp")), 0);
+        // Each side alone, then both together: the single helper both
+        // resolvers call, so a slots load with a DFlash sidecar charges it.
+        let mtp_sidecar = MtpHeadLocation::Sidecar(mtp);
+        assert_eq!(draft_device_reserve_bytes(Some(&mtp_sidecar), None), expect);
+        assert_eq!(draft_device_reserve_bytes(None, Some(&dflash)), expect);
+        assert_eq!(
+            draft_device_reserve_bytes(Some(&mtp_sidecar), Some(&dflash)),
+            expect.saturating_mul(2)
+        );
+        // A bundled head charges only its appended section, never the trunk.
+        let bundled = MtpHeadLocation::Bundled { section_bytes: file_len };
+        assert_eq!(draft_device_reserve_bytes(Some(&bundled), None), expect);
+        assert_eq!(
+            draft_device_reserve_bytes(Some(&bundled), Some(&dflash)),
+            expect.saturating_mul(2)
+        );
+        assert_eq!(draft_device_reserve_bytes(None, None), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The MTP head probe both resolvers share: the stem sidecar spelling
+    /// resolves, the last-extension spelling shadows it, and a bundled
+    /// trailer resolves to the appended section size (its MTP container is
+    /// disjoint from the trunk index the census walks — see
+    /// `resolve_mtp_head_file`).
+    #[test]
+    fn mtp_head_probe_prefers_sidecar_spelling_then_bundle() {
+        let dir = std::env::temp_dir().join(format!("hipfire-mtp-head-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let trunk = dir.join("model.mq4v2.hfq");
+        std::fs::write(&trunk, [0u8; 64]).expect("temp file");
+        // No sidecar, no trailer: no head.
+        assert!(resolve_mtp_head_file(&trunk).is_none());
+        // Stem spelling (`model.mtp`) resolves.
+        let stem = dir.join("model.mtp");
+        std::fs::write(&stem, [0u8; 64]).expect("temp file");
+        assert!(matches!(
+            resolve_mtp_head_file(&trunk),
+            Some(MtpHeadLocation::Sidecar(p)) if p == stem
+        ));
+        // The last-extension spelling shadows the stem when both exist.
+        let specific = dir.join("model.mq4v2.mtp");
+        std::fs::write(&specific, [0u8; 64]).expect("temp file");
+        assert!(matches!(
+            resolve_mtp_head_file(&trunk),
+            Some(MtpHeadLocation::Sidecar(p)) if p == specific
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

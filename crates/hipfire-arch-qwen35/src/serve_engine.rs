@@ -623,7 +623,7 @@ impl Rig {
         cfg: &EngineConfig,
         gpu: &Gpu,
         free_vram: u64,
-        kv_bytes: u64,
+        kv: hipfire_runtime::offload::KvReserve,
     ) -> Result<hipfire_runtime::offload::Placement, String> {
         use hipfire_config::memory::{effective_offload_budgets, OffloadBudget};
         use hipfire_runtime::offload;
@@ -646,55 +646,47 @@ impl Rig {
         if budgets == (OffloadBudget::Full, OffloadBudget::Full) {
             return Ok(offload::Placement::all_device(config.n_layers));
         }
-        let pbs = crate::qwen35::prefill::minimum_prefill_reservation_bytes(config, &gpu.arch)
-            .unwrap_or(0) as u64;
+        let pbs_reservation =
+            crate::qwen35::prefill::minimum_prefill_reservation_bytes(config, &gpu.arch);
+        let pbs = pbs_reservation.unwrap_or(0) as u64;
         // The slots MTP loader probes the bundled trailer first, then every
         // `sidecar_candidates(trunk, "mtp")` spelling (stem-based
-        // `ornith-1.5-35b-a3b.mtp` included). The reserve must probe the same
-        // list — string-appending `.mtp` to the full filename misses the stem
-        // spelling, charges 0 for a head that then loads, and under-reserves
-        // the placement. A bundled trailer needs no reserve (already charged
-        // as part of the trunk file).
-        let draft = if cfg.mtp_k > 0 {
-            let bundled = crate::mtp_head::detect_bundled_mtp_offset(&cfg.model_path)
-                .ok()
-                .flatten()
-                .is_some();
-            if bundled {
-                0
-            } else {
-                crate::mtp_head::mtp_sidecar_candidates(&cfg.model_path)
-                    .into_iter()
-                    .find(|p| p.is_file())
-                    .map(|p| crate::carrier::draft_file_reserve_bytes(&p))
-                    .unwrap_or(0)
-            }
+        // `ornith-1.5-35b-a3b.mtp` included) — the same list the sequential
+        // carrier reserves through `carrier::resolve_mtp_head_file`, so the
+        // two routes charge the same head. Unlike the old inline probe here,
+        // a configured DFlash draft is charged too: it loads on this route
+        // (`dflash_draft` arms the slot DFlash2 chain) and silently dropping
+        // it under-reserved the placement and over-placed the trunk.
+        let mtp_head: Option<crate::carrier::MtpHeadLocation> = if cfg.mtp_k > 0 {
+            crate::carrier::resolve_mtp_head_file(&cfg.model_path)
         } else {
-            0
+            // MTP off: no head will load, but a configured DFlash draft still
+            // runs its own chain and stays on the device.
+            None
         };
-        let capacity = offload::weight_capacity(free_vram, kv_bytes, pbs, draft, 128 << 20);
-        let (placement, line) = offload::plan(
-            layer_bytes,
-            budgets,
-            &capacity,
-            offload::Orientation::SuffixResident,
-        )?;
-        eprintln!("  {line}");
-        eprintln!(
-            "  kv reserved: {} MiB; pbs floor {} MiB; draft {} MiB; slack 128 MiB; weight budget \
-             {} MiB of {} MiB free",
-            kv_bytes / (1 << 20),
-            pbs / (1 << 20),
-            draft / (1 << 20),
-            capacity.weight_bytes / (1 << 20),
-            free_vram / (1 << 20),
+        let draft = crate::carrier::draft_device_reserve_bytes(
+            mtp_head.as_ref(),
+            cfg.dflash_draft.as_deref(),
         );
-        let host_bytes = layer_bytes.host_bytes(&placement);
-        if !placement.is_fully_resident() {
-            eprintln!("  {}", offload::report(&placement, layer_bytes, host_bytes));
-        }
-        offload::admit_host_placement(host_bytes)?;
-        Ok(placement)
+        // The slots KV footprint is an arena product, but the caller factored
+        // it through `offload::kv_reserve`, so the shared line names its real
+        // rows × stride shape.
+        let inputs = offload::CapacityInputs {
+            free_vram,
+            kv_bytes: kv.bytes,
+            kv_rows: kv.rows,
+            kv_stride: kv.stride_bytes,
+            prefill_floor: pbs,
+            prefill_floor_absent: pbs_reservation.is_none(),
+            draft_bytes: draft,
+            slack: 128 << 20,
+        };
+        offload::resolve_placement(
+            layer_bytes,
+            &inputs,
+            budgets,
+            offload::Orientation::SuffixResident,
+        )
     }
 
     /// Build the GPU rig.
@@ -900,10 +892,13 @@ impl Rig {
 
         let cap_rounded = cfg.cap_tokens.div_ceil(128) * 128;
         let kv_pages = paged_pages.unwrap_or(cfg.n_slots * cap_rounded / 128);
-        let kv_bytes = (n_fa_layers as u64)
-            * (kv_pages as u64)
-            * (PAGE_TOKENS as u64)
-            * (per_pos_bytes as u64 + per_pos_v_bytes as u64);
+        let kv_rows = n_fa_layers
+            .saturating_mul(kv_pages)
+            .saturating_mul(PAGE_TOKENS);
+        let kv_stride = per_pos_bytes.saturating_add(per_pos_v_bytes) as u64;
+        let kv = hipfire_runtime::offload::kv_reserve(kv_stride, kv_rows)
+            .ok_or("slots KV reservation overflow")?;
+        let kv_bytes = kv.bytes;
 
         // Partial GPU offload is resolved here, once, before the preflight — the
         // same call the sequential carrier makes, so both routes place
@@ -917,7 +912,7 @@ impl Rig {
             cfg,
             &gpu,
             vram_free as u64,
-            kv_bytes,
+            kv,
         )?;
 
         // Charge only what actually lands on the device. With partial offload the

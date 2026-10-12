@@ -553,6 +553,95 @@ pub fn report(placement: &Placement, layers: &LayerBytes, host_bytes: u64) -> St
     )
 }
 
+/// Every measured claim on device memory a placement search must respect,
+/// gathered by the arch loader before the first allocation.
+///
+/// One struct so the sequential carrier and the slots engine cannot drift:
+/// both fill the same fields from their own loaders and hand them to
+/// [`resolve_placement`]. `kv_rows`/`kv_stride` and `prefill_floor_absent`
+/// are display-only — they let the single operator line below name the KV
+/// shape and the prefill-floor reason without re-deriving them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CapacityInputs {
+    /// Measured free VRAM, in bytes.
+    pub free_vram: u64,
+    /// KV footprint that must stay resident, in bytes.
+    pub kv_bytes: u64,
+    /// Display-only KV shape: `kv reserved: {kv_rows} tokens x {kv_stride} B`.
+    pub kv_rows: usize,
+    /// Display-only KV stride, in bytes per token.
+    pub kv_stride: u64,
+    /// Prefill-scratch floor, in bytes (0 when the arch has no sizing model).
+    pub prefill_floor: u64,
+    /// True when `prefill_floor` is 0 for lack of a sizing model (MoE), not
+    /// because the floor measured zero — the operator line says so.
+    pub prefill_floor_absent: bool,
+    /// Device-resident draft bytes (MTP head, DFlash draft) that ride beside
+    /// the trunk and are not part of its spill.
+    pub draft_bytes: u64,
+    /// Fixed slack for the allocations nobody sized.
+    pub slack: u64,
+}
+
+/// The whole placement assembly in one place: capacity, search, operator
+/// lines, host admission.
+///
+/// Computes the [`Capacity`] via [`weight_capacity`], runs [`plan`], prints
+/// the plan line plus the single operator capacity line ([`capacity_line`])
+/// and — only for a spilling placement — the residency [`report`], then
+/// admits the pinned host bytes via [`admit_host_placement`]. The tier order
+/// in `plan` and the `orientation` parameter are untouched; this owns only
+/// the order the steps run in, so the two loaders cannot drift apart again.
+pub fn resolve_placement(
+    layer_bytes: &LayerBytes,
+    inputs: &CapacityInputs,
+    budgets: (OffloadBudget, OffloadBudget),
+    orientation: Orientation,
+) -> Result<Placement, String> {
+    let capacity = weight_capacity(
+        inputs.free_vram,
+        inputs.kv_bytes,
+        inputs.prefill_floor,
+        inputs.draft_bytes,
+        inputs.slack,
+    );
+    let (placement, line) = plan(layer_bytes, budgets, &capacity, orientation)?;
+    eprintln!("  {line}");
+    eprintln!("  {}", capacity_line(inputs, &capacity));
+    let host_bytes = layer_bytes.host_bytes(&placement);
+    if !placement.is_fully_resident() {
+        eprintln!("  {}", report(&placement, layer_bytes, host_bytes));
+    }
+    admit_host_placement(host_bytes)?;
+    Ok(placement)
+}
+
+/// The single operator capacity line both loaders print.
+///
+/// The sequential form (the richer one): KV as rows × stride, the prefill
+/// floor with its reason when the arch has no sizing model for it, then the
+/// draft reserve, the slack, and the resulting weight budget against free
+/// VRAM. No caller formats its own copy.
+pub fn capacity_line(inputs: &CapacityInputs, capacity: &Capacity) -> String {
+    let pbs = if inputs.prefill_floor_absent {
+        "0 MiB (no MoE prefill sizing)".to_string()
+    } else {
+        format!("{} MiB", inputs.prefill_floor / MIB)
+    };
+    format!(
+        "kv reserved: {} tokens x {} B = {} MiB; pbs floor {}; draft {} MiB; slack {} MiB; \
+         weight budget {} MiB of {} MiB free",
+        inputs.kv_rows,
+        inputs.kv_stride,
+        inputs.kv_bytes / MIB,
+        pbs,
+        inputs.draft_bytes / MIB,
+        inputs.slack / MIB,
+        capacity.weight_bytes / MIB,
+        inputs.free_vram / MIB,
+    )
+}
+
 /// Largest contiguous resident tail fitting `effective_capacity_bytes`, kept here
 /// (moved out of `hipfire_config`) because it is placement arithmetic, not config
 /// vocabulary. `Layers`-pinned placements use [`plan`]; this is the scan `auto`
@@ -1138,6 +1227,117 @@ mod tests {
         let line = report(&placement, &layers, 800 << 20);
         assert!(line.contains("routed experts per layer"), "{line}");
         assert!(line.contains("pinned host 800 MiB"), "{line}");
+    }
+
+    #[test]
+    fn resolve_placement_runs_the_assembly_unchanged() {
+        let layers = bytes(&[100, 100, 100], &[400, 400, 400], 50);
+        let inputs = CapacityInputs {
+            free_vram: 4096,
+            kv_bytes: 200,
+            kv_rows: 4,
+            kv_stride: 50,
+            prefill_floor: 0,
+            prefill_floor_absent: true,
+            draft_bytes: 0,
+            slack: 128,
+        };
+        let budgets = (OffloadBudget::Auto, OffloadBudget::Auto);
+        let expected_capacity = weight_capacity(
+            inputs.free_vram,
+            inputs.kv_bytes,
+            inputs.prefill_floor,
+            inputs.draft_bytes,
+            inputs.slack,
+        );
+        let (expected_placement, _) =
+            plan(&layers, budgets, &expected_capacity, Orientation::SuffixResident).unwrap();
+        let expected_host = layers.host_bytes(&expected_placement);
+        let placement =
+            resolve_placement(&layers, &inputs, budgets, Orientation::SuffixResident).unwrap();
+        assert_eq!(placement, expected_placement);
+        assert_eq!(
+            layers.device_bytes(&placement),
+            layers.device_bytes(&expected_placement)
+        );
+        assert_eq!(layers.host_bytes(&placement), expected_host);
+        // The shared capacity line names every claim (KV shape, prefill
+        // reason, draft, slack, budget) in the one adopted format.
+        let line = capacity_line(&inputs, &expected_capacity);
+        assert!(line.contains("kv reserved: 4 tokens x 50 B"), "{line}");
+        assert!(
+            line.contains("pbs floor 0 MiB (no MoE prefill sizing)"),
+            "{line}"
+        );
+        assert!(line.contains("weight budget"), "{line}");
+        // A measured prefill floor prints its value, not the MoE reason.
+        let sized = CapacityInputs {
+            prefill_floor: 1 << 20,
+            prefill_floor_absent: false,
+            ..inputs
+        };
+        let sized_line = capacity_line(
+            &sized,
+            &weight_capacity(
+                sized.free_vram,
+                sized.kv_bytes,
+                sized.prefill_floor,
+                sized.draft_bytes,
+                sized.slack,
+            ),
+        );
+        assert!(sized_line.contains("pbs floor 1 MiB"), "{sized_line}");
+        assert!(!sized_line.contains("no MoE prefill sizing"), "{sized_line}");
+    }
+
+    #[test]
+    fn spilling_inputs_resolve_identically_whichever_loader_built_them() {
+        // Same census + same charged totals + same budgets ⇒ identical
+        // Capacity/Placement no matter which loader built the inputs: this is
+        // the invariant that keeps the sequential and slots routes from
+        // drifting apart again.
+        let layers = bytes(&[100, 100, 100], &[400, 400, 400], 50);
+        let budgets = (OffloadBudget::Auto, OffloadBudget::Auto);
+        let kv = kv_reserve(10, 10).unwrap();
+        let sequential = CapacityInputs {
+            free_vram: 1500,
+            kv_bytes: kv.bytes,
+            kv_rows: kv.rows,
+            kv_stride: kv.stride_bytes,
+            prefill_floor: 0,
+            prefill_floor_absent: true,
+            draft_bytes: 250,
+            slack: 0,
+        };
+        // The slots route factors the same arena product through kv_reserve;
+        // only the (rows, stride) factorisation differs, never the total.
+        let through_slots = kv_reserve(kv.bytes, 1).unwrap();
+        assert_eq!(through_slots.bytes, kv.bytes);
+        let slots = CapacityInputs {
+            kv_rows: through_slots.rows,
+            kv_stride: through_slots.stride_bytes,
+            ..sequential
+        };
+        let cap_seq = weight_capacity(
+            sequential.free_vram,
+            sequential.kv_bytes,
+            sequential.prefill_floor,
+            sequential.draft_bytes,
+            sequential.slack,
+        );
+        let cap_slots = weight_capacity(
+            slots.free_vram,
+            slots.kv_bytes,
+            slots.prefill_floor,
+            slots.draft_bytes,
+            slots.slack,
+        );
+        assert_eq!(cap_seq, cap_slots);
+        let (p_seq, _) = plan(&layers, budgets, &cap_seq, Orientation::SuffixResident).unwrap();
+        let (p_slots, _) =
+            plan(&layers, budgets, &cap_slots, Orientation::SuffixResident).unwrap();
+        assert_eq!(p_seq, p_slots);
+        assert!(!p_seq.is_fully_resident());
     }
 
     #[test]
