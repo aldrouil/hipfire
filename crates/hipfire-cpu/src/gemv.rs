@@ -92,7 +92,30 @@ pub fn gemv_with_simd(
     // re-detecting the CPU feature per row (`m` is thousands on every real
     // shape).
     let use_simd = simd::row_dot_enabled(q, requested);
-    y[..m].par_iter_mut().enumerate().for_each(|(row, out)| {
+    #[cfg(target_arch = "x86_64")]
+    if use_simd && m > 1 {
+        if let Some(kind) = simd::activation_sum_kind(q) {
+            ACTIVATION_SUMS.with(|cell| {
+                let mut cache = cell.borrow_mut();
+                let sums = &mut cache.sums;
+                sums.resize(k / 256, 0.0);
+                // Recompute even at an unchanged address: the caller may reuse
+                // its activation buffer for the next token or projection.
+                simd::prepare_activation_sums(kind, x, sums);
+                y[..m].par_iter_mut().with_min_len(64).enumerate().for_each(|(row, out)| {
+                    *out = simd::row_dot_with_activation_sums(
+                        q,
+                        &packed[row * rb..],
+                        k,
+                        x,
+                        sums,
+                    );
+                });
+            });
+            return;
+        }
+    }
+    y[..m].par_iter_mut().with_min_len(64).enumerate().for_each(|(row, out)| {
         *out = dot_row_simd(q, &packed[row * rb..], k, x, use_simd);
     });
 }
@@ -419,9 +442,9 @@ fn gemv_shared_sourced_split<S: SharedJobSource + Sync>(
     }
 }
 
-/// Thread-local, capacity-reusing scratch for the batched GEMV's prepared
-/// activation sums (x86_64 only — the vector row kernels are the only
-/// consumer).
+/// Thread-local, capacity-reusing scratch for prepared activation sums. Ordinary
+/// GEMV uses only `sums`; batched GEMV also deduplicates activation rows.
+/// The x86_64 vector row kernels are the only consumers.
 #[cfg(target_arch = "x86_64")]
 #[derive(Default)]
 struct ActivationSumCache {

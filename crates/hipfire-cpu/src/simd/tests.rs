@@ -346,31 +346,91 @@ fn forced_scalar_path_is_the_s1_arithmetic() {
 /// Prepared sums must preserve each affine format's arithmetic. Awkward
 /// metadata and activations expose rounding differences hidden by the
 /// power-of-two shared-job fixtures.
+///
+/// This covers the actual dense path — [`gemv_with_simd`] with runtime
+/// detection, which serves rows from the TLS activation-sum scratch — against
+/// independent uncached SIMD arithmetic, bit for bit. The activation buffer is
+/// allocated once and mutated in place across tokens and shapes so its address
+/// repeats: a consumer that skipped the re-prepare on a cache hit (same
+/// address, same `k`) would serve the previous token's sums here. The `k`
+/// sequence grows and shrinks for the same reason: a scratch buffer that is
+/// only extended, never recomputed or truncated, serves stale sums after a
+/// shrink/grow pair. Output/input tails carry sentinels to pin overwrites.
 #[test]
 #[cfg(target_arch = "x86_64")]
 fn cached_and_uncached_agree_on_awkward_inputs() {
+    const M: usize = 7;
+    const MAX_K: usize = 12288;
+    const X_TAIL: usize = 16;
+    const Y_TAIL: usize = 4;
+    const X_SENTINEL: f32 = 12345.678;
+    const Y_SENTINEL: f32 = -9876.543;
+    const SUM_SENTINEL: f32 = 555.25;
+    // Grow then shrink: stale scratch survives exactly this shape pair.
+    const KS: [usize; 5] = [256, 2048, 512, 12288, 256];
     for q in [CpuQuant::Mq4G256, CpuQuant::Mq6G256] {
         if !row_dot_enabled(q, None) {
             continue;
         }
-        for k in [256, 512, 2048, 12288] {
-            let m = 7;
-            let mut packed = testfix::weight_bytes(q, m, k);
-            awkward_headers(q, &mut packed, m, k);
+        let kind = activation_sum_kind(q).unwrap();
+        // One buffer for the whole format: same address every token and shape.
+        let mut x = vec![X_SENTINEL; MAX_K + X_TAIL];
+        let mut y = vec![Y_SENTINEL; M + Y_TAIL];
+        let mut sums = vec![SUM_SENTINEL; MAX_K / 256];
+        let x_addr = x.as_ptr();
+        for &k in &KS {
+            let mut packed = testfix::weight_bytes(q, M, k);
+            awkward_headers(q, &mut packed, M, k);
+            let rb = row_bytes(q, k);
             for token in 0..4 {
-                let x: Vec<f32> = (0..k)
-                    .map(|i| (((i + token * 71) as u64 * 2654435761) % 4096) as f32 * 0.001 - 2.0)
-                    .collect();
-                let mut sums = vec![0.0; k / 256];
-                prepare_activation_sums(activation_sum_kind(q).unwrap(), &x, &mut sums);
-                for row in 0..m {
-                    let weights = &packed[row * row_bytes(q, k)..];
-                    let uncached = row_dot_avx2(q, weights, k, &x);
-                    let cached = row_dot_with_activation_sums(q, weights, k, &x, &sums);
+                // Mutate in place: no allocation, address must not change.
+                assert_eq!(x.as_ptr(), x_addr);
+                for (i, v) in x.iter_mut().enumerate().take(k) {
+                    *v = (((i + token * 71 + k) as u64 * 2654435761) % 4096) as f32 * 0.001 - 2.0;
+                }
+                // Poison the current tail so a read past `k` (or a stale long
+                // scratch) cannot hide behind zeros.
+                for v in x.iter_mut().skip(k).take(X_TAIL) {
+                    *v = X_SENTINEL;
+                }
+                y.fill(Y_SENTINEL);
+                for v in sums.iter_mut().take(k / 256) {
+                    *v = SUM_SENTINEL;
+                }
+                // The real dense path: prepares TLS scratch internally.
+                gemv_with_simd(q, &packed, M, k, &x, &mut y, None);
+                // Independent uncached arithmetic plus the direct prepared
+                // kernel over an explicitly re-prepared caller buffer.
+                prepare_activation_sums(kind, &x[..k], &mut sums[..k / 256]);
+                for row in 0..M {
+                    let weights = &packed[row * rb..];
+                    let uncached = row_dot_avx2(q, weights, k, &x[..k]);
+                    let cached =
+                        row_dot_with_activation_sums(q, weights, k, &x[..k], &sums[..k / 256]);
                     assert_eq!(
                         cached.to_bits(),
                         uncached.to_bits(),
                         "{q:?} k={k} token={token} row={row}"
+                    );
+                    assert_eq!(
+                        y[row].to_bits(),
+                        uncached.to_bits(),
+                        "{q:?} k={k} token={token} row={row} (gemv_with_simd)"
+                    );
+                }
+                // Tails must be untouched: nothing reads/writes past the shape.
+                for (i, v) in x.iter().enumerate().skip(k).take(X_TAIL) {
+                    assert_eq!(
+                        v.to_bits(),
+                        X_SENTINEL.to_bits(),
+                        "{q:?} k={k} token={token} x tail[{i}]"
+                    );
+                }
+                for (i, v) in y.iter().enumerate().skip(M) {
+                    assert_eq!(
+                        v.to_bits(),
+                        Y_SENTINEL.to_bits(),
+                        "{q:?} k={k} token={token} y tail[{i}]"
                     );
                 }
             }
