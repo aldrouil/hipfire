@@ -2,6 +2,7 @@
 
 ## Unreleased (0.4.2)
 
+- **MoE offload recording inventory synchronized (CI/tooling only).** Updates the Qwen35 placement-loader and shared MTP capture site names, inventories narrow MTP verify eligibility, the serve loader, and CPU expert/transfer capture guards, and classifies CPU-offload load refusals under `eager-only-refusals`. Restores the `railgun-cert` source-inventory gate without changing runtime behavior or weakening its checks.
 - **Flash-Next (Qwen4) native MTP under expert parallelism.** `--spec mtp` / `speculation.mtp = on` now admits native MTP on an EP mesh (EP2, EP4); every rank holds its own drafter replica and speculative advances fan out across the mesh. `speculation.mtp = auto` under EP stays AR, so EP default and flag-off bytes are unchanged. Lanes and naive sampled mode (`HIPFIRE_MTP_SAMPLED_MODE=naive`) stay refused under EP.
   - Exactness on gfx1201 (R9700), pinned Flash-Next XTS (sha256 `8b15b6fe…`): the `fn_ep_oracle --spec mtp` state oracle passes single vs beta (17/17 compared), EP2 vs single (34/34) and EP4 vs single (52/52): greedy tokens, per-window results and trunk, head and drafter state at window boundaries on every rank. The EP4 serve battery with thinking passes.
   - Measured (3 fresh processes per arm, R9700s, greedy, route `mtp+ngram`, committed prompts): code (`humaneval_0`, 134 tokens) 44.4 tok/s on one card, 81.7 on EP2, 121.6 on EP4; prose (`fiction_lighthouse`, 44 tokens) 34.5 / 63.4 / 87.1 tok/s. Short outputs; decode tok/s, not end-to-end.
