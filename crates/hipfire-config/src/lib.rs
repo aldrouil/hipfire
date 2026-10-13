@@ -344,6 +344,14 @@ pub enum ValueRule {
         min: i64,
         max: i64,
     },
+    /// Like [`ValueRule::NullableInteger`], but also accepts the literal
+    /// `auto` (case-insensitive) — the spelling the TUI rows and the help text
+    /// use for these budget keys, and the one an operator is likely to type.
+    /// `-1` remains the wire spelling that `auto` is equivalent to.
+    NullableIntegerOrAuto {
+        min: i64,
+        max: i64,
+    },
     NullableFloat {
         min: f64,
         max: f64,
@@ -419,6 +427,11 @@ impl ConfigField {
                 matches!(value, ConfigValue::Null)
                     || matches!(value, ConfigValue::Integer(v) if *v >= min && *v <= max)
             }
+            ValueRule::NullableIntegerOrAuto { min, max } => {
+                matches!(value, ConfigValue::Null)
+                    || matches!(value, ConfigValue::Integer(v) if *v >= min && *v <= max)
+                    || matches!(value, ConfigValue::String(v) if v.trim().eq_ignore_ascii_case("auto"))
+            }
             ValueRule::NullableFloat { min, max } => {
                 matches!(value, ConfigValue::Null)
                     || value.as_f64().is_some_and(|v| v >= min && v <= max)
@@ -472,6 +485,15 @@ impl ConfigField {
                 Some(ConfigValue::Null)
             }
             ValueRule::NullableInteger { .. } => raw.parse::<i64>().ok().map(ConfigValue::Integer),
+            ValueRule::NullableIntegerOrAuto { .. } if raw.eq_ignore_ascii_case("null") => {
+                Some(ConfigValue::Null)
+            }
+            ValueRule::NullableIntegerOrAuto { .. } if raw.trim().eq_ignore_ascii_case("auto") => {
+                Some(ConfigValue::String(raw.to_owned()))
+            }
+            ValueRule::NullableIntegerOrAuto { .. } => {
+                raw.parse::<i64>().ok().map(ConfigValue::Integer)
+            }
             ValueRule::NullableFloat { .. } if raw.eq_ignore_ascii_case("null") => {
                 Some(ConfigValue::Null)
             }
@@ -729,11 +751,23 @@ pub static FIELDS: &[ConfigField] = &[
         Memory,
         ModelLoad,
         DefaultValue::Null,
-        ValueRule::NullableInteger { min: -1, max: 65536 },
+        ValueRule::NullableIntegerOrAuto { min: -1, max: 65536 },
         true,
         false,
         Some("HIPFIRE_GPU_LAYER_BUDGET"),
-        "Resident-layer budget for partial GPU offload: N keeps the last N layers on the GPU and spills the rest to system RAM; unset keeps every layer on the GPU. The number counts layers ON the GPU, not layers offloaded — 3 on a 64-layer model spills 61. 'auto' (-1) defers placement to the engine, which currently keeps every layer on the GPU."
+        "Resident-layer budget for partial GPU offload: N keeps the last N layers on the GPU and spills the rest to system RAM; unset keeps every layer on the GPU for a dense model (a Qwen MoE defaults to auto-fit when both budget keys are unset). The number counts layers ON the GPU, not layers offloaded — 3 on a 64-layer model spills 61. 'auto' (-1) places by fit: the smallest spill that loads, routed experts first, and a model that already fits is left fully resident."
+    ),
+    field!(
+        "memory.moe_expert_budget",
+        "moe_expert_budget",
+        Memory,
+        ModelLoad,
+        DefaultValue::Null,
+        ValueRule::NullableIntegerOrAuto { min: -1, max: 65536 },
+        true,
+        false,
+        Some("HIPFIRE_MOE_EXPERT_BUDGET"),
+        "Resident routed-expert budget for a Mixture-of-Experts model whose experts exceed VRAM: N keeps the last N layers' routed experts on the GPU and spills the rest to system RAM; unset resolves to auto-fit on a Qwen MoE (an over-fit MoE spills instead of OOMing mid-load) and keeps every routed expert on the GPU for a dense model. The number counts layers whose expert weights stay ON the GPU — llama.cpp's `--n-cpu-moe K` is this value written as `n_layers - K`. Only routed experts move: attention, router, shared expert and KV stay on the card. 'auto' (-1) places by fit, spilling routed experts before whole layers. No effect on a dense model, and none on an architecture that cannot spill experts (a configured spill fails that arch's load rather than being ignored)."
     ),
     field!(
         "memory.offload_exec",
@@ -4212,6 +4246,115 @@ pub fn parse_tri_state(mode: &str) -> Option<bool> {
         _ => None,
     }
 }
+/// The `on`/`off`/`auto` MTP selector the CLI lowers into `params.mtp_mode`.
+/// `Off` keeps AR, `On` arms the head wherever one exists, `Auto` arms it
+/// except over a host-mapped expert spill (the shared [`mtp_host_spill_policy`]
+/// decline). `Default = Off`: the slots `mtp_mode` param defaults to `"off"`
+/// unless the operator opted in, and the daemon parse keeps that default
+/// verbatim — only the `auto`-vs-`on` distinction now survives beside `mtp_k`.
+/// Exact, lower-case; anything unrecognized (including `auto` and the empty
+/// string, which the slots `mtp_k` rule already treats as off) resolves as
+/// documented on [`MtpMode::parse`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MtpMode {
+    /// Never arm the head (today's behaviour, unchanged).
+    #[default]
+    Off,
+    /// Arm unless the host-spill policy declines (today's `auto`).
+    Auto,
+    /// Arm even over a host-mapped expert spill (explicit opt-in).
+    On,
+}
+
+impl MtpMode {
+    /// Parse a `params.mtp_mode` value. Absent normalizes to `"off"` at the
+    /// call site (so the default stays `Off`); an explicit empty string maps
+    /// to `Off` too, matching the slots `mtp_k` rule that already treats an
+    /// empty name as off. Any other unrecognized spelling defers to `Auto`,
+    /// matching the schema default the CLI sends.
+    pub fn parse(raw: &str) -> Self {
+        match raw {
+            "off" | "" => Self::Off,
+            "on" => Self::On,
+            _ => Self::Auto,
+        }
+    }
+}
+
+/// One MTP-over-host-spill verdict, shared by the qwen35 and qwen4 arming
+/// sites. `attach` decides whether the head loads; `reason` is the shared
+/// static sentence both arches print inside their one decline line (the
+/// per-arch line adds its own counts via [`mtp_host_spill_decline_line`]).
+pub struct MtpHostSpillPolicy {
+    pub attach: bool,
+    pub reason: &'static str,
+}
+
+/// Whether an MTP head stays attached once `host_mapped_expert_blobs` routed
+/// experts sit in host RAM. The arch's admitted list is data: an arch that
+/// keeps `auto` armed on a measured GPU names it (qwen4's `&["gfx1201"]`),
+/// one with no such measurement passes none (qwen35's `&[]`). `On` always
+/// attaches (explicit opt-in); `Off` never does; a fully resident placement
+/// (`blobs == 0`) always attaches.
+///
+/// Folds in the qwen4 spelling it replaces
+/// (`host == 0 || mtp == Some(true) || arch == "gfx1201"`): same table, with
+/// the `gfx1201` clause as the admitted list instead of a second function.
+/// Worst-case pre-placement use passes the largest count the placement can
+/// still produce (never the literal `1` the old pre-copy pinned).
+pub fn mtp_host_spill_policy(
+    mode: MtpMode,
+    host_mapped_expert_blobs: usize,
+    arch: &str,
+    admitted_arm_arches: &[&str],
+) -> MtpHostSpillPolicy {
+    if host_mapped_expert_blobs == 0 {
+        return MtpHostSpillPolicy {
+            attach: !matches!(mode, MtpMode::Off),
+            reason: "",
+        };
+    }
+    if matches!(mode, MtpMode::Off) {
+        return MtpHostSpillPolicy {
+            attach: false,
+            reason: "",
+        };
+    }
+    if matches!(mode, MtpMode::On) || admitted_arm_arches.contains(&arch) {
+        return MtpHostSpillPolicy {
+            attach: true,
+            reason: "",
+        };
+    }
+    MtpHostSpillPolicy {
+        attach: false,
+        reason: "MTP: off by default with host-mapped experts; opt in with --spec mtp",
+    }
+}
+
+/// The one shared MTP-over-spill decline line, worded once here so the
+/// sequential and slots routes report the same decline. `model` is the arch
+/// label (`"qwen35"`, `"qwen4 native"`); `detail` is the placement fact that
+/// disambiguates the spill (`"offload_exec=cpu"` / `"offload_exec=pcie"` on
+/// qwen35, `"on <arch>"` on qwen4, which names the admitted-arch clause).
+pub fn mtp_host_spill_decline_line(
+    model: &str,
+    host_mapped_expert_blobs: usize,
+    host_mapped_expert_bytes: u64,
+    detail: &str,
+) -> String {
+    format!(
+        "  {model} {} ({host_mapped_expert_blobs} expert blobs, {:.2} GiB, {detail})",
+        mtp_host_spill_reason(),
+        host_mapped_expert_bytes as f64 / (1u64 << 30) as f64,
+    )
+}
+
+/// The shared static decline sentence inside [`mtp_host_spill_decline_line`]
+/// (and [`MtpHostSpillPolicy::reason`]).
+pub fn mtp_host_spill_reason() -> &'static str {
+    "MTP: off by default with host-mapped experts; opt in with --spec mtp"
+}
 /// MTP divergent-render checkpoint + strict-prefix terminal-repair policy.
 ///
 /// Resolved once at drafter construction from the documented process-snapshot
@@ -5668,6 +5811,53 @@ mod tests {
             assert_eq!(parse_tri_state(deferred), None, "{deferred:?}");
         }
     }
+    #[test]
+    fn mtp_mode_parse_preserves_tri_state() {
+        // The daemon's slots parse must keep auto distinct from on: absent
+        // normalizes to "off" at the call site (default Off), while an
+        // explicit empty string matches the mtp_k rule (off, not auto).
+        assert_eq!(MtpMode::parse("off"), MtpMode::Off);
+        assert_eq!(MtpMode::parse(""), MtpMode::Off);
+        assert_eq!(MtpMode::parse("auto"), MtpMode::Auto);
+        assert_eq!(MtpMode::parse("on"), MtpMode::On);
+        assert_eq!(MtpMode::parse("anything-else"), MtpMode::Auto);
+        assert_eq!(MtpMode::default(), MtpMode::Off);
+    }
+
+    #[test]
+    fn mtp_host_spill_policy_truth_table() {
+        // (mode, blobs, arch, admitted) -> attach. qwen35 passes &[] (never
+        // attaches on a spill under auto); qwen4 passes &["gfx1201"].
+        let qwen35: &[&str] = &[];
+        let qwen4: &[&str] = &["gfx1201"];
+        // Fully resident: attaches unless explicitly off.
+        assert!(mtp_host_spill_policy(MtpMode::Auto, 0, "gfx1100", qwen35).attach);
+        assert!(mtp_host_spill_policy(MtpMode::On, 0, "gfx1100", qwen35).attach);
+        assert!(!mtp_host_spill_policy(MtpMode::Off, 0, "gfx1100", qwen35).attach);
+        // Off never attaches, even on a spill.
+        assert!(!mtp_host_spill_policy(MtpMode::Off, 21, "gfx1201", qwen4).attach);
+        assert!(!mtp_host_spill_policy(MtpMode::Off, 21, "gfx1100", qwen35).attach);
+        // On always attaches, even on a spill on an unmeasured arch.
+        assert!(mtp_host_spill_policy(MtpMode::On, 21, "gfx1100", qwen35).attach);
+        assert!(mtp_host_spill_policy(MtpMode::On, 21, "gfx1030", qwen4).attach);
+        // qwen35 under auto: never attaches on a spill, on any arch.
+        for arch in ["gfx1100", "gfx1151", "gfx1201", "gfx1030"] {
+            let policy = mtp_host_spill_policy(MtpMode::Auto, 21, arch, qwen35);
+            assert!(!policy.attach, "qwen35 auto on {arch}");
+            assert_eq!(policy.reason, mtp_host_spill_reason());
+        }
+        // qwen4 under auto: attaches only on the admitted arch.
+        assert!(mtp_host_spill_policy(MtpMode::Auto, 21, "gfx1201", qwen4).attach);
+        assert!(!mtp_host_spill_policy(MtpMode::Auto, 21, "gfx1100", qwen4).attach);
+        assert!(!mtp_host_spill_policy(MtpMode::Auto, 21, "gfx1151", qwen4).attach);
+        // Attached verdicts carry no reason; the decline line words it once.
+        assert_eq!(mtp_host_spill_policy(MtpMode::On, 21, "gfx1100", qwen35).reason, "");
+        assert_eq!(mtp_host_spill_policy(MtpMode::Auto, 0, "gfx1100", qwen35).reason, "");
+        let line = mtp_host_spill_decline_line("qwen35", 21, 3 << 30, "offload_exec=pcie");
+        assert!(line.contains(mtp_host_spill_reason()), "{line}");
+        assert!(line.contains("21 expert blobs"), "{line}");
+        assert!(line.contains("offload_exec=pcie"), "{line}");
+    }
 
     #[test]
     fn developer_bool_defaults_when_unset() {
@@ -6921,9 +7111,10 @@ pub mod topology {
 /// Placement policy for partial GPU offload — decides which layers stay in
 /// device VRAM versus spill to host RAM, resolved once at load so placement is
 /// fixed for the model's lifetime and never thrashes per request. This module is
-/// intentionally pure and GPU-independent: it owns the configuration vocabulary
-/// ([`GpuLayerBudget`]) and the admission arithmetic ([`largest_fitting_tail`]);
-/// the qwen35 load path consumes them to pick `i_gpu_start`.
+/// intentionally pure and GPU-independent: it owns only the configuration
+/// vocabulary ([`OffloadBudget`]); the placement arithmetic and admission live in
+/// `hipfire_runtime::offload`, which has the device measurements config cannot
+/// take.
 pub mod memory {
     use super::{developer_var, process_value};
     use std::path::{Path, PathBuf};
@@ -6931,34 +7122,34 @@ pub mod memory {
     /// Resident-layer budget for partial GPU offload (`memory.gpu_layer_budget`,
     /// compat env `HIPFIRE_GPU_LAYER_BUDGET`). Resolved once at load.
     ///
-    /// * [`GpuLayerBudget::Full`] is the unset default: keep every layer
+    /// * [`OffloadBudget::Full`] is the unset default: keep every layer
     ///   resident, never offload — byte-identical to a pure-VRAM run and the
     ///   regression guard for the whole feature.
-    /// * [`GpuLayerBudget::Auto`] (`-1`) defers placement to the engine, as `auto`
-    ///   does for every other key. The engine currently keeps every layer on the
-    ///   GPU, because a real placement needs a measured device and per-layer
-    ///   weight bytes (see [`largest_fitting_tail`]) and this is resolved where
-    ///   neither exists. `auto` will mean the same thing once that measurement is
-    ///   in hand — it will just decide a split instead of nothing.
-    /// * [`GpuLayerBudget::Layers`] pins exactly this many resident layers; the
+    /// * [`OffloadBudget::Auto`] (`-1`) defers placement to the engine, as `auto`
+    ///   does for every other key: the loader measures free VRAM, the per-layer
+    ///   weight bytes and the KV reservation, then places by fit — routed experts
+    ///   first, whole layers only when the expert tier cannot free enough. A model
+    ///   that already fits is left fully resident.
+    /// * [`OffloadBudget::Layers`] pins exactly this many resident layers; the
     ///   layers before them spill to host RAM.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum GpuLayerBudget {
-        /// Fully resident — never offload (the zero-diff default).
+    pub enum OffloadBudget {
+        /// Fully resident — never offload (the zero-diff default for dense).
         Full,
-        /// Defers placement to the engine, as `auto` does everywhere else in the
-        /// config. The engine currently keeps every layer on the GPU.
+        /// Places by fit: the minimum spill that loads, routed experts first,
+        /// whole layers only when the expert tier cannot free enough. A model
+        /// that already fits stays fully resident.
         Auto,
         /// Pin exactly this many resident layers; spill everything before them.
         Layers(usize),
     }
 
-    impl std::fmt::Display for GpuLayerBudget {
+    impl std::fmt::Display for OffloadBudget {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             match self {
-                GpuLayerBudget::Full => write!(f, "full"),
-                GpuLayerBudget::Auto => write!(f, "auto"),
-                GpuLayerBudget::Layers(n) => write!(f, "{n}"),
+                OffloadBudget::Full => write!(f, "full"),
+                OffloadBudget::Auto => write!(f, "auto"),
+                OffloadBudget::Layers(n) => write!(f, "{n}"),
             }
         }
     }
@@ -6969,23 +7160,25 @@ pub mod memory {
     /// or absent setting never forces offload); `"auto"`/`"-1"` selects auto; any
     /// other non-negative integer pins that many resident layers. A negative value
     /// other than `-1` is treated as unset rather than an error.
-    pub fn parse_gpu_layer_budget(raw: Option<&str>) -> GpuLayerBudget {
+    pub fn parse_gpu_layer_budget(raw: Option<&str>) -> OffloadBudget {
         match raw.map(|v| v.trim().to_ascii_lowercase()) {
-            None => GpuLayerBudget::Full,
-            Some(v) if v.is_empty() => GpuLayerBudget::Full,
-            Some(v) if v == "auto" || v == "-1" => GpuLayerBudget::Auto,
+            None => OffloadBudget::Full,
+            Some(v) if v.is_empty() => OffloadBudget::Full,
+            Some(v) if v == "auto" || v == "-1" => OffloadBudget::Auto,
             Some(v) => match v.parse::<i64>() {
-                Ok(n) if n >= 0 => GpuLayerBudget::Layers(n as usize),
-                _ => GpuLayerBudget::Full,
+                Ok(n) if n >= 0 => OffloadBudget::Layers(n as usize),
+                _ => OffloadBudget::Full,
             },
         }
     }
 
-    /// The configured [`GpuLayerBudget`] from the process snapshot. Reads exactly
-    /// one resolved value: unset or `"auto"`/`"-1"` selects auto-fit; a non-negative
-    /// integer pins that many resident layers; anything else fails closed to full
-    /// residency (the zero-diff baseline).
-    pub fn gpu_layer_budget() -> GpuLayerBudget {
+    /// The configured [`OffloadBudget`] from the process snapshot. Reads exactly
+    /// one resolved value: `"auto"`/`"-1"` selects auto-fit; a non-negative integer
+    /// pins that many resident layers; unset/empty/unparseable fails closed to full
+    /// residency (the zero-diff baseline). For placement, use
+    /// [`effective_offload_budgets`] — a Qwen MoE defaults to auto-fit when both
+    /// keys are unset.
+    pub fn gpu_layer_budget() -> OffloadBudget {
         parse_gpu_layer_budget(process_value("HIPFIRE_GPU_LAYER_BUDGET").as_deref())
     }
 
@@ -7159,6 +7352,20 @@ pub mod memory {
         PathBuf::from(path)
     }
 
+    /// Suffix of a Flash-Next trunk overlay sidecar: pre-encoded QT44 trunk
+    /// tensors (an HFQM container bound to its base by size and index
+    /// sha256) that the Qwen4 loader substitutes for the base's tensors.
+    pub const TRUNK_OVERLAY_SIDECAR_SUFFIX: &str = ".trunk-overlay";
+
+    /// Path of the trunk overlay sidecar of `model`: `<model file
+    /// name>.trunk-overlay`, appended to the full file name (extension
+    /// included), the same placement as [`ple_sidecar_path`].
+    pub fn trunk_overlay_sidecar_path(model: &Path) -> PathBuf {
+        let mut path = model.as_os_str().to_owned();
+        path.push(TRUNK_OVERLAY_SIDECAR_SUFFIX);
+        PathBuf::from(path)
+    }
+
     /// Optional override of the PLE hot-rank sidecar path
     /// (`HIPFIRE_PLE_HOT_RANK_FILE`); empty or unset means `<model>.plehot`.
     pub fn ple_hot_rank_file() -> Option<String> {
@@ -7180,6 +7387,146 @@ pub mod memory {
     /// (`HIPFIRE_PLE_HOT_DEBUG=1`, developer variable).
     pub fn ple_hot_debug() -> bool {
         developer_var("HIPFIRE_PLE_HOT_DEBUG").is_ok_and(|v| v == "1")
+    }
+
+    /// The configured routed-expert [`OffloadBudget`] from the process snapshot
+    /// (`memory.moe_expert_budget`). Same parser and spelling as
+    /// [`gpu_layer_budget`]: unset/empty/unparseable is [`OffloadBudget::Full`]
+    /// (never spill an expert), `"auto"`/`"-1"` is [`OffloadBudget::Auto`], and a
+    /// non-negative integer pins that many layers whose routed experts stay on
+    /// the device. This is the raw key; [`effective_offload_budgets`] resolves a
+    /// Qwen MoE to auto-fit when both keys are unset.
+    pub fn moe_expert_budget() -> OffloadBudget {
+        parse_gpu_layer_budget(process_value("HIPFIRE_MOE_EXPERT_BUDGET").as_deref())
+    }
+
+    /// The budgets a placement search actually runs with, given whether the
+    /// model is a Mixture-of-Experts.
+    ///
+    /// MoE is the one case where auto-fit is the default rather than opt-in. A
+    /// Qwen3.5/3.6 MoE has a third placement axis (the routed-expert tier) and
+    /// routinely does not fit VRAM; leaving it fully resident is an
+    /// `hipMalloc: out of memory` mid-load, not a refusal. So unset (the `Full`
+    /// sentinel) means `Auto` on both tiers for a MoE — a model that already
+    /// fits still resolves to all-resident and stays byte-identical. Dense keeps
+    /// the opt-in contract: unset is `Full` and never spills. An explicit
+    /// `Layers(n)` or `auto` on either key still overrides the default.
+    pub fn effective_offload_budgets(is_moe: bool) -> (OffloadBudget, OffloadBudget) {
+        resolve_effective_budgets(is_moe, gpu_layer_budget(), moe_expert_budget())
+    }
+
+    /// Pure form of [`effective_offload_budgets`], testable without the
+    /// process-global snapshot.
+    pub(crate) fn resolve_effective_budgets(
+        is_moe: bool,
+        layer: OffloadBudget,
+        expert: OffloadBudget,
+    ) -> (OffloadBudget, OffloadBudget) {
+        if is_moe && layer == OffloadBudget::Full && expert == OffloadBudget::Full {
+            (OffloadBudget::Auto, OffloadBudget::Auto)
+        } else {
+            (layer, expert)
+        }
+    }
+
+    /// Whether an explicit spill was configured on either tier: at least one of
+    /// `memory.gpu_layer_budget` / `memory.moe_expert_budget` resolved off
+    /// [`OffloadBudget::Full`]. The trigger behind the loader's
+    /// `partial_offload_refusal` gate. Reads the process
+    /// snapshot (not pure); the pure eligibility table is [`spill_support`].
+    pub fn spill_requested() -> bool {
+        gpu_layer_budget() != OffloadBudget::Full || moe_expert_budget() != OffloadBudget::Full
+    }
+
+    /// Whether a spill may be requested on this path, and whether this path
+    /// can honour it: the single policy behind the loader's
+    /// `partial_offload_refusal` gate and both Qwen3.5 placement resolvers
+    /// (sequential carrier, slots engine). Pure over caller-supplied facts —
+    /// GPU-free and dependency-free — so every spelling agrees by
+    /// construction. Each refusal has a stable name; callers own the wording.
+    ///
+    /// Priority matches the loader gate it replaces (arch, tp, pp, EP, VL,
+    /// paged, REAP): the first failing dimension wins, so a tp>1 MoE reports
+    /// the topology, never the expert pinning behind it.
+    /// [`effective_offload_budgets`] decides *what* the budgets resolve to;
+    /// this decides whether a resolved spill may *run* here.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum SpillSupport {
+        /// The path honours a spill; resolve budgets (and auto-fit) normally.
+        Supported,
+        /// The path cannot honour a spill; the payload names the dimension.
+        Refused(SpillRefusal),
+    }
+
+    impl SpillSupport {
+        /// True for [`SpillSupport::Supported`].
+        pub fn is_supported(&self) -> bool {
+            matches!(self, SpillSupport::Supported)
+        }
+    }
+
+    /// Why a path cannot honour a spill. Stable names for the refusal
+    /// dimension — callers map these to their own messages (the loader gate
+    /// keeps its existing sentences verbatim; the arch resolvers name the
+    /// same reason in their fail-closed refusal).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum SpillRefusal {
+        /// Neither Qwen3.5 dense (5) nor MoE (6); carries the arch id.
+        Arch(u32),
+        /// Tensor-parallel ranks each load every layer; carries tp.
+        Tp(usize),
+        /// Pipeline bands own per-device layouts; carries pp.
+        Pp(usize),
+        /// An expert is pinned to one rank; carries the expert count.
+        ExpertParallel(usize),
+        /// The Qwen3.5-VL vision tower loads through its own lowered loader.
+        VisionTower,
+        /// The weight pager owns the expert buffers.
+        PagedExperts,
+        /// The pruned (REAP keep-map) expert load has no host-placement path.
+        ReapKeepMap,
+    }
+
+    /// The spill-eligibility truth table. `ep_experts` is `Some(n)` with `n >
+    /// 0` on an expert-parallel route (`None`/zero is not expert-parallel);
+    /// `reap_keep` is whether a REAP keep-map is attached.
+    pub fn spill_support(
+        arch_id: u32,
+        tp: usize,
+        pp: usize,
+        ep_experts: Option<usize>,
+        paged_experts: bool,
+        reap_keep: bool,
+        is_vl: bool,
+    ) -> SpillSupport {
+        use SpillRefusal::*;
+        // Only the Qwen3.5 storage seam places a layer or a routed expert in
+        // host RAM. Qwen4 has its own expert-residency route and the other
+        // arches have none, so either knob is a request this loader cannot honour.
+        if !matches!(arch_id, 5 | 6) {
+            return SpillSupport::Refused(Arch(arch_id));
+        }
+        if tp > 1 {
+            return SpillSupport::Refused(Tp(tp));
+        }
+        if pp > 1 {
+            return SpillSupport::Refused(Pp(pp));
+        }
+        if let Some(experts) = ep_experts {
+            if experts > 0 {
+                return SpillSupport::Refused(ExpertParallel(experts));
+            }
+        }
+        if is_vl {
+            return SpillSupport::Refused(VisionTower);
+        }
+        if paged_experts {
+            return SpillSupport::Refused(PagedExperts);
+        }
+        if reap_keep {
+            return SpillSupport::Refused(ReapKeepMap);
+        }
+        SpillSupport::Supported
     }
 
     /// Which engine executes the ops that read a spilled layer's weights
@@ -7226,82 +7573,9 @@ pub mod memory {
         parse_offload_exec(process_value("HIPFIRE_OFFLOAD_EXEC").as_deref())
     }
 
-    /// Largest contiguous resident tail `[i_gpu_start .. n_layers)` such that the
-    /// bytes of those layers' weights plus the fully-resident KV footprint fit
-    /// within `effective_capacity_bytes` (device memory minus headroom and minus
-    /// any always-resident base overhead, already subtracted by the caller).
-    ///
-    /// Returns the *smallest* `i_gpu_start` that fits — keeping as many layers
-    /// resident as possible while still fitting — which is exactly the partial
-    /// offload objective: spill only the prefix that must. As `i_gpu_start` grows,
-    /// resident weight bytes shrink monotonically, so a linear scan from zero
-    /// finds the optimum on the first hit. Returns `None` when even offloading
-    /// every layer leaves KV over budget, in which case the load refuses cleanly
-    /// rather than OOM mid-generation.
-    pub fn largest_fitting_tail(
-        n_layers: usize,
-        per_layer_weight_bytes: &[usize],
-        kv_bytes: usize,
-        always_resident_bytes: usize,
-        effective_capacity_bytes: usize,
-    ) -> Option<usize> {
-        assert!(
-            per_layer_weight_bytes.len() == n_layers,
-            "per_layer_weight_bytes must have exactly n_layers entries"
-        );
-        // resident(i_gpu_start) = always-resident base (embed + lm_head) + the
-        // weight bytes of the resident tail [i_gpu_start..n] + fully-resident KV.
-        // Walk from the most-resident candidate (i_gpu_start=0, whose weight tail
-        // is the whole array) and shrink VRAM one layer at a time until the
-        // footprint fits within effective_capacity_bytes (= device memory minus
-        // headroom). The first fit is the largest resident tail; if even
-        // offloading every layer still overshoots, None — the load refuses rather
-        // than OOM mid-generation.
-        let mut resident: usize =
-            always_resident_bytes + per_layer_weight_bytes.iter().sum::<usize>() + kv_bytes;
-        if resident <= effective_capacity_bytes {
-            return Some(0);
-        }
-        for i_gpu_start in 1..=n_layers {
-            resident = resident.saturating_sub(per_layer_weight_bytes[i_gpu_start - 1]);
-            if resident <= effective_capacity_bytes {
-                return Some(i_gpu_start);
-            }
-        }
-        None
-    }
-
-    /// Resolve the resident-tail split point from a placement [`GpuLayerBudget`].
-    ///
-    /// Returns `i_gpu_start`: layers `[0 .. i_gpu_start)` spill to host-mapped RAM,
-    /// `[i_gpu_start .. n_layers)` stay device-resident. This is the single
-    /// policy→number call Step 3's loader uses; it never allocates or probes a
-    /// device, so it stays pure and unit-testable. Returns `None` only when the
-    /// budget is `Auto` and even offloading every layer leaves KV over capacity —
-    /// the caller refuses cleanly rather than OOM mid-generation.
-    pub fn resolve_i_gpu_start(
-        n_layers: usize,
-        per_layer_weight_bytes: &[usize],
-        kv_bytes: usize,
-        always_resident_bytes: usize,
-        effective_capacity_bytes: usize,
-        budget: GpuLayerBudget,
-    ) -> Option<usize> {
-        match budget {
-            // Fully resident — never offload (the zero-diff default).
-            GpuLayerBudget::Full => Some(0),
-            // Auto-fit: the largest resident tail that fits device memory with headroom.
-            GpuLayerBudget::Auto => largest_fitting_tail(
-                n_layers,
-                per_layer_weight_bytes,
-                kv_bytes,
-                always_resident_bytes,
-                effective_capacity_bytes,
-            ),
-            // Pin exactly this many resident layers; spill everything before them.
-            GpuLayerBudget::Layers(resident) => Some(n_layers - resident.min(n_layers)),
-        }
-    }
+    // Placement arithmetic (`largest_fitting_tail`, the policy→split call) lives
+    // in `hipfire_runtime::offload`: it is placement, not configuration
+    // vocabulary, and it needs a device measurement this crate cannot take.
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -7328,23 +7602,23 @@ pub mod memory {
         #[test]
         fn gpu_layer_budget_roundtrip() {
             // Unset resolves to full residency — the zero-diff baseline.
-            assert_eq!(parse_gpu_layer_budget(None), GpuLayerBudget::Full);
+            assert_eq!(parse_gpu_layer_budget(None), OffloadBudget::Full);
             // Empty string is unset, not auto.
-            assert_eq!(parse_gpu_layer_budget(Some("")), GpuLayerBudget::Full);
+            assert_eq!(parse_gpu_layer_budget(Some("")), OffloadBudget::Full);
             // "auto" and "-1" both select auto-fit (case-insensitive).
-            assert_eq!(parse_gpu_layer_budget(Some("auto")), GpuLayerBudget::Auto);
-            assert_eq!(parse_gpu_layer_budget(Some("-1")), GpuLayerBudget::Auto);
-            assert_eq!(parse_gpu_layer_budget(Some("AUTO")), GpuLayerBudget::Auto);
+            assert_eq!(parse_gpu_layer_budget(Some("auto")), OffloadBudget::Auto);
+            assert_eq!(parse_gpu_layer_budget(Some("-1")), OffloadBudget::Auto);
+            assert_eq!(parse_gpu_layer_budget(Some("AUTO")), OffloadBudget::Auto);
             // A non-negative integer pins that many resident layers (trimmed).
-            assert_eq!(parse_gpu_layer_budget(Some("3")), GpuLayerBudget::Layers(3));
+            assert_eq!(parse_gpu_layer_budget(Some("3")), OffloadBudget::Layers(3));
             assert_eq!(
                 parse_gpu_layer_budget(Some(" 12 ")),
-                GpuLayerBudget::Layers(12)
+                OffloadBudget::Layers(12)
             );
             // Garbage, negatives other than -1, and anything unparseable fail
             // closed to full residency rather than forcing an offload.
-            assert_eq!(parse_gpu_layer_budget(Some("banana")), GpuLayerBudget::Full);
-            assert_eq!(parse_gpu_layer_budget(Some("-2")), GpuLayerBudget::Full);
+            assert_eq!(parse_gpu_layer_budget(Some("banana")), OffloadBudget::Full);
+            assert_eq!(parse_gpu_layer_budget(Some("-2")), OffloadBudget::Full);
         }
 
         #[test]
@@ -7441,6 +7715,18 @@ pub mod memory {
             assert_eq!(
                 ple_sidecar_path(Path::new("model"), PleFormat::Q4),
                 PathBuf::from("model.ple-q4")
+            );
+        }
+
+        #[test]
+        fn trunk_overlay_sidecar_path_appends_to_full_file_name() {
+            assert_eq!(
+                trunk_overlay_sidecar_path(Path::new("/m/qwen3.8-flash-next.mq4-xts")),
+                PathBuf::from("/m/qwen3.8-flash-next.mq4-xts.trunk-overlay")
+            );
+            assert_eq!(
+                trunk_overlay_sidecar_path(Path::new("model")),
+                PathBuf::from("model.trunk-overlay")
             );
         }
 
@@ -7607,122 +7893,96 @@ pub mod memory {
         }
 
         #[test]
+        fn moe_defaults_to_auto_fit_dense_stays_opted_in() {
+            use OffloadBudget::{Auto, Full, Layers};
+            // Unset MoE -> auto-fit on both tiers: an over-fit MoE spills instead
+            // of OOMing mid-load, and a fitting one still resolves all-resident.
+            assert_eq!(resolve_effective_budgets(true, Full, Full), (Auto, Auto));
+            // Unset dense -> all resident (the opt-in contract, unchanged).
+            assert_eq!(resolve_effective_budgets(false, Full, Full), (Full, Full));
+            // An explicit value on either key overrides the MoE default.
+            assert_eq!(
+                resolve_effective_budgets(true, Layers(26), Full),
+                (Layers(26), Full)
+            );
+            assert_eq!(resolve_effective_budgets(true, Full, Layers(20)), (Full, Layers(20)));
+            assert_eq!(resolve_effective_budgets(true, Full, Auto), (Full, Auto));
+            assert_eq!(resolve_effective_budgets(true, Auto, Full), (Auto, Full));
+        }
+
+        #[test]
+        fn budget_keys_accept_the_auto_spelling() {
+            // The TUI rows and the help text both use `auto`; the wire spelling
+            // `-1` is equivalent. Both must survive CLI/env validation, or the
+            // documented spelling is unusable.
+            for key in ["memory.gpu_layer_budget", "memory.moe_expert_budget"] {
+                let field = crate::field(key).expect("budget key is in the schema");
+                for spelling in ["auto", "AUTO", "-1", "26", "null"] {
+                    let parsed = field
+                        .parse_cli(spelling)
+                        .unwrap_or_else(|e| panic!("{key}={spelling}: {e}"));
+                    field.validate(&parsed).unwrap();
+                }
+                // Garbage still fails closed rather than being read as a count.
+                assert!(field.parse_cli("banana").is_err(), "{key}");
+            }
+        }
+
+        #[test]
         fn gpu_layer_budget_display() {
-            assert_eq!(GpuLayerBudget::Full.to_string(), "full");
-            assert_eq!(GpuLayerBudget::Auto.to_string(), "auto");
-            assert_eq!(GpuLayerBudget::Layers(5).to_string(), "5");
+            assert_eq!(OffloadBudget::Full.to_string(), "full");
+            assert_eq!(OffloadBudget::Auto.to_string(), "auto");
+            assert_eq!(OffloadBudget::Layers(5).to_string(), "5");
         }
 
         #[test]
-        fn largest_fitting_tail_keeps_largest_resident_tail() {
-            // Four layers of 10/20/30/40; KV footprint 20. Effective capacity 100
-            // -> weight-tail budget 80. Full resident weights=100 > 80; dropping
-            // L0 leaves 90 > 80; dropping L0,L1 leaves 70 <= 80 => i_gpu_start=2,
-            // keeping L2+L3 resident (the largest tail that fits).
-            let weights = [10usize, 20, 30, 40];
-            assert_eq!(largest_fitting_tail(4, &weights, 20, 0, 100), Some(2));
-        }
-
-        #[test]
-        fn largest_fitting_tail_full_when_everything_fits() {
-            // Weights + KV comfortably within capacity: keep all layers resident.
-            let weights = [10usize, 20, 30];
-            assert_eq!(largest_fitting_tail(3, &weights, 5, 0, 1000), Some(0));
-        }
-
-        #[test]
-        fn largest_fitting_tail_headroom_drives_offload() {
-            // Effective capacity 115: resident@0 = weights(100)+KV(20) = 120 > 115;
-            // dropping L0 leaves weights[1..]=90 + KV(20) = 110 <= 115 => i_gpu_start=1.
-            let weights = [10usize, 20, 30, 40];
-            assert_eq!(largest_fitting_tail(4, &weights, 20, 0, 115), Some(1));
-        }
-
-        #[test]
-        fn largest_fitting_tail_none_when_kv_alone_exceeds_budget() {
-            // Even offloading every layer leaves KV over capacity: refuse.
-            let weights = [10usize, 20];
-            assert_eq!(largest_fitting_tail(2, &weights, 5_000, 0, 1_000), None);
-        }
-
-        #[test]
-        fn largest_fitting_tail_all_but_last_offloaded() {
-            // Only the final layer fits after KV: i_gpu_start == n_layers-1.
-            let weights = [100usize, 100, 5];
-            let kv = 3;
-            // Effective capacity 8 -> weight-tail budget 5. sum([5])=5 <= 5 => keep
-            // only L2 resident.
-            assert_eq!(largest_fitting_tail(3, &weights, kv, 0, 8), Some(2));
-        }
-        #[test]
-        fn largest_fitting_tail_always_resident_reduces_fit() {
-            // Embed + lm_head stay resident in every mode (always_resident_bytes). With
-            // base=100, KV=10: resident@0 = 100+60+10 = 170 > 150; @1 = 160 > 150; @2 =
-            // 140 <= 150 => keep only L2 resident — the base alone leaves room for just
-            // one layer's weights.
-            let weights = [10usize, 20, 30];
-            assert_eq!(largest_fitting_tail(3, &weights, 10, 100, 150), Some(2));
-        }
-
-        #[test]
-        fn largest_fitting_tail_base_alone_exceeds_capacity() {
-            // Embed + lm_head alone overshoot capacity even with every layer offloaded:
-            // refuse rather than OOM mid-generation.
-            let weights = [10usize, 20];
-            // base=500 + KV=200 = 700 > 600 at i_gpu_start=n_layers => None.
-            assert_eq!(largest_fitting_tail(2, &weights, 200, 500, 600), None);
-        }
-
-        // resolve_i_gpu_start: policy -> split point. Full never offloads; Layers
-        // pins exactly that many resident layers; Auto delegates to
-        // largest_fitting_tail (including the None-refuse path).
-        #[test]
-        fn resolve_i_gpu_start_full_is_zero() {
-            let weights = [10usize, 20];
+        fn spill_support_truth_table() {
+            use SpillRefusal::*;
+            use SpillSupport::{Refused, Supported};
+            // Clean single-GPU non-VL non-paged non-REAP MoE: the only
+            // supported shape (dense included — the policy is MoE-blind).
+            for arch_id in [5u32, 6] {
+                assert_eq!(
+                    spill_support(arch_id, 1, 1, None, false, false, false),
+                    Supported,
+                    "arch {arch_id}"
+                );
+            }
+            // Each refusal dimension, in gate priority order.
             assert_eq!(
-                resolve_i_gpu_start(2, &weights, 10, 5, 15, GpuLayerBudget::Full),
-                Some(0)
+                spill_support(9, 1, 1, None, false, false, false),
+                Refused(Arch(9))
             );
-        }
-
-        #[test]
-        fn resolve_i_gpu_start_layers_pins_resident_count() {
-            let weights = [10usize, 20, 30];
-            // Pin exactly 2 resident of 3 -> spill the first layer.
             assert_eq!(
-                resolve_i_gpu_start(3, &weights, 10, 5, 15, GpuLayerBudget::Layers(2)),
-                Some(1)
+                spill_support(6, 2, 1, Some(4), false, false, false),
+                Refused(Tp(2)),
+                "tp wins over the EP pinning behind it"
             );
-        }
-
-        #[test]
-        fn resolve_i_gpu_start_layers_at_or_above_total_is_full() {
-            let weights = [10usize, 20];
-            // Asking for more resident layers than exist keeps everything resident.
             assert_eq!(
-                resolve_i_gpu_start(2, &weights, 10, 5, 15, GpuLayerBudget::Layers(9)),
-                Some(0)
+                spill_support(6, 1, 2, None, false, false, false),
+                Refused(Pp(2))
             );
-        }
-
-        #[test]
-        fn resolve_i_gpu_start_auto_refuses_when_nothing_fits() {
-            let weights = [10usize, 20];
-            // base + KV alone overshoot even with every layer offloaded.
             assert_eq!(
-                resolve_i_gpu_start(2, &weights, 200, 500, 600, GpuLayerBudget::Auto),
-                None
+                spill_support(6, 1, 1, Some(4), false, false, false),
+                Refused(ExpertParallel(4))
             );
-        }
-
-        #[test]
-        fn resolve_i_gpu_start_auto_matches_largest_fitting_tail() {
-            let weights = [10usize, 20, 30];
-            // base=50 + weights(60) + KV=40 = 150 > cap 90; every layer offloaded
-            // leaves 90 == cap => the whole table spills (Some(3)).
             assert_eq!(
-                resolve_i_gpu_start(3, &weights, 40, 50, 90, GpuLayerBudget::Auto),
-                Some(3)
+                spill_support(6, 1, 1, None, false, false, true),
+                Refused(VisionTower)
+            );
+            assert_eq!(
+                spill_support(6, 1, 1, None, true, false, false),
+                Refused(PagedExperts)
+            );
+            assert_eq!(
+                spill_support(6, 1, 1, None, false, true, false),
+                Refused(ReapKeepMap)
+            );
+            // `None`/zero experts is not expert-parallel — no other
+            // dimension failing means supported.
+            assert_eq!(
+                spill_support(6, 1, 1, Some(0), false, false, false),
+                Supported
             );
         }
     }

@@ -1,0 +1,1 @@
+Implement a red-black tree insertion in Java with all rotation and recoloring cases, plus a validator that checks the red-black properties. Explain each case.

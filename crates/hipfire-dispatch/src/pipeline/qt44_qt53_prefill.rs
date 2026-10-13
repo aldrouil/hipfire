@@ -154,8 +154,8 @@ pub(crate) struct ScratchDims {
     pub(crate) down_m: usize,
     /// Padded grouped rows (path 2 only; 0 on path 1).
     pub(crate) grouped_rows: usize,
-    /// The call carries a shared expert, whose F32 down may land in
-    /// `down_expanded`.
+    /// The call carries a shared expert whose F32 down may land in
+    /// `down_expanded` (no `shared_down_out`).
     pub(crate) shared_down: bool,
 }
 
@@ -257,7 +257,7 @@ pub(crate) fn scratch_requirement(
         mi: p.mi,
         down_m: p.down_m,
         grouped_rows: if use_path2 { grouped_rows } else { 0 },
-        shared_down: p.prelude.shared.is_some(),
+        shared_down: p.prelude.shared.is_some() && p.shared_down_out.is_none(),
     })
 }
 
@@ -271,20 +271,38 @@ pub(crate) fn validate_scratch(
     use_path2: bool,
     grouped_rows: usize,
 ) -> Result<(), DispatchError> {
-    scratch_requirement(gpu, p, use_path2, grouped_rows)?.require_within(&ScratchBytes::held(p))
+    scratch_requirement(gpu, p, use_path2, grouped_rows)?.require_within(&ScratchBytes::held(p))?;
+    if p.shared_down_out.is_some() && p.prelude.shared.is_some() {
+        require_shared_rows(p, shared_down_bytes(p.batch_size, p.down_m)?)?;
+    }
+    Ok(())
 }
 
-/// `down_expanded` holds at least `need` bytes (the combine-order and
-/// shared-down stages, which know their own byte count only).
-fn require_expanded(p: &MoePrefillParams<'_>, need: usize, what: &str) -> Result<(), DispatchError> {
-    let have = tensor_bytes(p.down_expanded);
+/// The tensor the unfused shared down writes (`shared_down_out`, else
+/// `down_expanded`) holds at least `need` bytes.
+fn require_shared_rows(p: &MoePrefillParams<'_>, need: usize) -> Result<(), DispatchError> {
+    let (name, tensor) = match p.shared_down_out {
+        Some(out) => ("shared_down_out", out),
+        None => ("down_expanded", p.down_expanded),
+    };
+    let have = tensor_bytes(tensor);
     if have < need {
         return Err(DispatchError::Hip(format!(
-            "qt44/qt53 grouped prefill scratch: down_expanded holds {have} bytes, \
-             {what} needs {need}; refusing before launch"
+            "qt44/qt53 grouped prefill scratch: {name} holds {have} bytes, \
+             the unfused shared down needs {need}; refusing before launch"
         )));
     }
     Ok(())
+}
+
+/// Whether the routed down of this call leaves its `rows * k_top` expanded
+/// rows in slot order in `down_expanded` for the canonical top-10 combine to
+/// read: the decode-kernel down (path 1, or path 2's few-row indexed down) with
+/// no expert-stage table. This is the layout an EP row gather fills.
+pub(crate) fn writes_slot_ordered_rows(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: bool) -> bool {
+    p.expert_stage_ptrs.is_none()
+        && !sym_iu4(gpu, p, use_path2)
+        && (!use_path2 || indexed_down(gpu, p, use_path2))
 }
 
 /// Prepare the routed expert activation basis.  The route's router/shared
@@ -648,9 +666,11 @@ pub(crate) fn shared_down(
     use_path2: bool,
 ) -> Result<(), DispatchError> {
     require_geometry(p)?;
-    // The unfused shared down writes F32 rows into `down_expanded`; the BF16
-    // epilogue below may decline at run time, so the fallback is always owed.
-    require_expanded(p, shared_down_bytes(p.batch_size, p.down_m)?, "the unfused shared down")?;
+    // The unfused shared down writes F32 rows into `shared_down_out` (an EP
+    // row gather owns `down_expanded` until its peers finish reading it), else
+    // into `down_expanded`; the BF16 epilogue below may decline at run time, so
+    // the fallback is always owed.
+    require_shared_rows(p, shared_down_bytes(p.batch_size, p.down_m)?)?;
     let shared = p
         .prelude
         .shared
@@ -668,7 +688,7 @@ pub(crate) fn shared_down(
     {
         return Ok(());
     }
-    let out = f32_view(p.down_expanded, 0, p.batch_size * p.down_m);
+    let out = f32_view(p.shared_down_out.unwrap_or(p.down_expanded), 0, p.batch_size * p.down_m);
     match down.dtype {
         DType::BF16 | DType::F32 | DType::Q8_0 | DType::MQ4G256V2 | DType::MQ4G128V2 => {
             // The shared activation is already in the basis consumed by this
@@ -1541,6 +1561,27 @@ mod scratch_tests {
             y_gate_up_grouped: (gc * 1280 * 4).max(gn * 640 * 2),
             y_down_grouped: (gc * 2560 * 4).max(gn * 2560 * 2),
         }
+    }
+
+    #[test]
+    fn a_separate_shared_down_output_leaves_down_expanded_to_the_routed_rows() {
+        // With `shared_down_out` the F32 shared-down rows are not charged to
+        // `down_expanded` (they are checked on that tensor by `validate_scratch`).
+        let rows = 8192;
+        let shared = ScratchDims { shared_down: true, ..dims(rows) };
+        let separate = ScratchDims { shared_down: false, ..dims(rows) };
+        let with = sym().requirement(&shared).unwrap();
+        let without = sym().requirement(&separate).unwrap();
+        assert_eq!(with.down_expanded, shared_down_bytes(rows, HIDDEN).unwrap());
+        assert_eq!(without.down_expanded, rows * 80);
+        // Everything else is the same.
+        assert_eq!(
+            ScratchBytes { down_expanded: 0, ..with },
+            ScratchBytes { down_expanded: 0, ..without }
+        );
+        // The few-row indexed route's routed rows are the same either way.
+        let few = ScratchDims { shared_down: false, ..dims(4) };
+        assert_eq!(indexed().requirement(&few).unwrap().down_expanded, 4 * K_TOP * HIDDEN * 4);
     }
 
     #[test]

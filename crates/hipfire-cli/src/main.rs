@@ -21,7 +21,7 @@ use hipfire_config::{
 };
 use hipfire_registry::{
     load as load_registry, LoadedRegistry, ModelEntry, RegistryPaths, RegistrySource, RegistryV1,
-    Sidecar,
+    Sidecar, TrunkOverlayPin, TRUNK_OVERLAY_PINS,
 };
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::prompt_frame::ToolCall;
@@ -1884,6 +1884,16 @@ pub(crate) fn local_model_paths(paths: &Paths, registry: &RegistryV1) -> Result<
 }
 
 pub(crate) fn pull_command(paths: &Paths, args: PullArgs) -> Result<()> {
+    pull_with_overlay_pins(paths, args, TRUNK_OVERLAY_PINS)
+}
+
+/// [`pull_command`] with an explicit trunk-overlay pin table (production passes
+/// [`TRUNK_OVERLAY_PINS`]; tests inject fixture pins).
+fn pull_with_overlay_pins(
+    paths: &Paths,
+    args: PullArgs,
+    overlay_pins: &[TrunkOverlayPin],
+) -> Result<()> {
     let loaded = load_registry(&paths.registry);
     let (tag, entry) = loaded
         .registry
@@ -1972,31 +1982,20 @@ pub(crate) fn pull_command(paths: &Paths, args: PullArgs) -> Result<()> {
         ("Qwen3", entry.qwen3.as_ref()),
         ("VAE", entry.vae.as_ref()),
     ] {
-        let Some(sidecar) = sidecar else {
-            continue;
-        };
-        let destination = paths.models.join(&sidecar.file);
-        if destination.exists() && !args.force {
-            if existing_artifact_valid(&destination, sidecar.sha256.as_deref(), sidecar.size_bytes)
-            {
-                eprintln!("  {label} sidecar already present: {}", sidecar.file);
-                continue;
-            }
-            eprintln!("  {label} sidecar stale, refreshing: {}", sidecar.file);
-        } else if destination.exists() && args.force {
-            // force always refreshes
+        if let Some(sidecar) = sidecar {
+            fetch_registry_sidecar(label, &entry.repo, sidecar, &paths.models, args.force);
         }
-        eprintln!("  Fetching {label} sidecar: {}", sidecar.file);
-        let url = artifact_url(entry, &sidecar.file);
-        if let Err(error) = download_verified(
-            &url,
-            &destination,
-            sidecar.sha256.as_deref(),
-            sidecar.size_bytes,
-            true,
-        ) {
-            eprintln!("  warning: {label} sidecar unavailable: {error:#}");
-        }
+    }
+    // The trunk overlay is not a registry field: the client carries its pin,
+    // keyed by the exact base artifact (`TRUNK_OVERLAY_PINS`).
+    if let Some(overlay) = hipfire_registry::trunk_overlay_in(entry, overlay_pins) {
+        fetch_registry_sidecar(
+            "Trunk overlay",
+            overlay.repo,
+            &overlay.sidecar,
+            &paths.models,
+            args.force,
+        );
     }
     for (name, sidecar) in &entry.heads {
         let destination = paths.models.join(&sidecar.file);
@@ -2021,16 +2020,39 @@ pub(crate) fn pull_command(paths: &Paths, args: PullArgs) -> Result<()> {
     Ok(())
 }
 
+/// Fetch one optional registry sidecar into `models`: an existing valid file is
+/// kept, a stale one (or any under `force`) is refreshed through
+/// [`download_verified`]. A failed download only warns; the base stays usable.
+fn fetch_registry_sidecar(label: &str, repo: &str, sidecar: &Sidecar, models: &Path, force: bool) {
+    let destination = models.join(&sidecar.file);
+    if destination.exists() && !force {
+        if existing_artifact_valid(&destination, sidecar.sha256.as_deref(), sidecar.size_bytes) {
+            eprintln!("  {label} sidecar already present: {}", sidecar.file);
+            return;
+        }
+        eprintln!("  {label} sidecar stale, refreshing: {}", sidecar.file);
+    }
+    eprintln!("  Fetching {label} sidecar: {}", sidecar.file);
+    if let Err(error) = download_verified(
+        &artifact_url_in(repo, &sidecar.file),
+        &destination,
+        sidecar.sha256.as_deref(),
+        sidecar.size_bytes,
+        true,
+    ) {
+        eprintln!("  warning: {label} sidecar unavailable: {error:#}");
+    }
+}
+
 pub(crate) fn artifact_url(entry: &ModelEntry, file: &str) -> String {
+    artifact_url_in(&entry.repo, file)
+}
+
+fn artifact_url_in(repo: &str, file: &str) -> String {
     let base = env::var("HIPFIRE_HF_BASE")
         .or_else(|_| env::var("HF_ENDPOINT"))
         .unwrap_or_else(|_| "https://huggingface.co".into());
-    format!(
-        "{}/{}/resolve/main/{}",
-        base.trim_end_matches('/'),
-        entry.repo,
-        file
-    )
+    format!("{}/{}/resolve/main/{}", base.trim_end_matches('/'), repo, file)
 }
 
 #[cfg(test)]
@@ -2191,6 +2213,17 @@ fn rm_command(paths: &Paths, args: RmArgs) -> Result<()> {
 /// the same shared-keeper rule (every `qwen3.8:27b*` tier declares the one
 /// `qwen3.8-27b-vision.hfq`).
 fn rm_with_registry(paths: &Paths, registry: &RegistryV1, args: RmArgs) -> Result<()> {
+    rm_with_overlay_pins(paths, registry, TRUNK_OVERLAY_PINS, args)
+}
+
+/// [`rm_with_registry`] with an explicit trunk-overlay pin table (production
+/// passes [`TRUNK_OVERLAY_PINS`]; tests inject fixture pins).
+fn rm_with_overlay_pins(
+    paths: &Paths,
+    registry: &RegistryV1,
+    overlay_pins: &[TrunkOverlayPin],
+    args: RmArgs,
+) -> Result<()> {
     let resolved = registry_entry_for_path(paths, registry, &args.model);
     let path = find_model_path(paths, registry, &args.model)
         .unwrap_or_else(|| paths.models.join(&args.model));
@@ -2231,6 +2264,12 @@ fn rm_with_registry(paths: &Paths, registry: &RegistryV1, args: RmArgs) -> Resul
             .map(|sidecar| paths.models.join(&sidecar.file))
             .filter(|path| path.is_file()),
         );
+        if let Some(overlay) = hipfire_registry::trunk_overlay_in(entry, overlay_pins) {
+            let overlay_path = paths.models.join(&overlay.sidecar.file);
+            if overlay_path.is_file() {
+                targets.insert(overlay_path);
+            }
+        }
         if let Some(sidecar) = entry.dflash.as_ref() {
             let sidecar_path = paths.models.join(&sidecar.file);
             if sidecar_path.is_file() {
@@ -2373,6 +2412,12 @@ fn rm_with_registry(paths: &Paths, registry: &RegistryV1, args: RmArgs) -> Resul
             .into_iter()
             .filter(|sidecar| sidecar.is_file()),
     );
+    // A trunk overlay rides with its base: the pinned overlay file (also
+    // reached through a legacy-named link) and `<resolved file>.trunk-overlay`.
+    let overlay = hipfire_config::memory::trunk_overlay_sidecar_path(&path);
+    if overlay.is_file() {
+        targets.insert(overlay);
+    }
     if let Some((file, _)) = kept_mtp.as_ref() {
         // The stem sweep matched the shared head beside the trunk; keep it.
         let kept = paths.models.join(file);
@@ -3958,6 +4003,15 @@ pub(crate) fn load_params(
 /// really lives, not the models directory the draft was pulled into — then
 /// next to the target. An explicit draft always wins; a final `off` never
 /// carries a draft (`project_dflash_draft` strips it) and returns early.
+///
+/// `dflash_mode` is the spec-decode knob, so `on` is resolved against every
+/// drafter the model can actually run, not DFlash alone: with no declared
+/// DFlash draft, an MTP head the loader would find ([`mtp_head_available`])
+/// serves the request instead of failing a load closed on a draft this model
+/// never declared (`qwen3.6:35b-a3b-mq4p` and every other MTP-only MoE tier).
+/// `on` still fails closed when nothing can spec — a declared DFlash draft
+/// that is not pulled, or no drafter at all — and when the operator turned
+/// the only available mechanism off (`speculation.mtp=off`).
 pub(crate) fn resolve_dflash_sidecar(
     params: &mut serde_json::Value,
     entry: Option<&ModelEntry>,
@@ -3965,7 +4019,8 @@ pub(crate) fn resolve_dflash_sidecar(
     model_path: &Path,
     tag: Option<&str>,
 ) -> Result<()> {
-    if !matches!(params["dflash_mode"].as_str(), Some("auto" | "on")) {
+    let mode = params["dflash_mode"].as_str().unwrap_or("off");
+    if !matches!(mode, "auto" | "on") {
         return Ok(());
     }
     if params
@@ -3975,14 +4030,43 @@ pub(crate) fn resolve_dflash_sidecar(
     {
         return Ok(());
     }
+    // `HIPFIRE_DFLASH_DRAFT` needs no branch: `load_env_layer` folds it into
+    // `developer.dflash_draft`, which `project_dflash_draft` already projected.
     let Some(sidecar) = entry.and_then(|entry| entry.dflash.as_ref()) else {
-        if params["dflash_mode"].as_str() == Some("on") && model_path.is_file() {
+        if mode != "on" || !model_path.is_file() {
+            return Ok(());
+        }
+        if mtp_head_available(entry, models_dir, model_path) {
+            if params["mtp_mode"].as_str() == Some("off") {
+                bail!(
+                    "dflash_mode=on: {} has no DFlash draft and MTP is off; \
+                     set speculation.mtp=auto/on, set speculation.dflash=off, or pass developer.dflash_draft",
+                    tag.unwrap_or("<model>")
+                );
+            }
+            // Arm it explicitly rather than leaning on the `auto` default: the
+            // loader degrades native qwen35 MTP to AR under `auto` as soon as
+            // any routed expert is host-mapped (`mtp_spill_degrade`), which is
+            // the normal state of an offloaded MoE (measured 10.7 vs AR 44.6
+            // tok/s). The knob is `on`, so this load must spec or refuse — not
+            // silently run AR.
+            params["mtp_mode"] = serde_json::json!("on");
+            eprintln!(
+                "[hipfire] dflash_mode=on: {} declares no DFlash draft; spec decode resolves to the MTP head",
+                tag.unwrap_or("<model>")
+            );
+            return Ok(());
+        }
+        if entry.is_some() {
             bail!(
-                "DFlash needs a draft model: {} is not a registry-managed artifact; add --model-draft <draft.hfq>, or run the model by its registry tag (which pairs its draft)",
-                model_path.display()
+                "DFlash draft required (dflash_mode=on) but registry entry {} declares no DFlash draft and no MTP head is present; set speculation.dflash=off/auto or pass developer.dflash_draft",
+                tag.unwrap_or("<model>")
             );
         }
-        return Ok(());
+        bail!(
+            "DFlash draft required (dflash_mode=on) but {} is not a registry-managed artifact; pass developer.dflash_draft or use the registry tag",
+            model_path.display()
+        );
     };
     let beside_target = model_path.parent().unwrap_or_else(|| Path::new("."));
     let candidate = [models_dir, beside_target]
@@ -4005,6 +4089,26 @@ pub(crate) fn resolve_dflash_sidecar(
         sidecar.file
     );
     Ok(())
+}
+
+/// Whether this load has an MTP head [`resolve_mtp_sidecar`] will wire.
+///
+/// Mirrors that resolver's candidate ladder minus its `requested`-as-typed
+/// slot (`load_params` sees only the canonical `model_path`): the registry
+/// `mtp` sidecar in `models_dir`, `<entry file>.mtp` in `models_dir`, then
+/// `<trunk>.mtp` beside the target. `find_model_path` canonicalizes, so a
+/// symlinked trunk's `.mtp` is a models-dir candidate either way. A head that
+/// only the loader's own `<trunk>.mtp` / bundled-trailer probe finds counts
+/// too — the daemon reaches the same bytes with `params["mtp"]` unset.
+fn mtp_head_available(entry: Option<&ModelEntry>, models_dir: &Path, model_path: &Path) -> bool {
+    let mut candidates = vec![model_path.with_extension("mtp")];
+    if let Some(entry) = entry {
+        candidates.push(models_dir.join(Path::new(&entry.file).with_extension("mtp")));
+        if let Some(sidecar) = entry.mtp.as_ref() {
+            candidates.push(models_dir.join(&sidecar.file));
+        }
+    }
+    candidates.into_iter().any(|candidate| candidate.is_file())
 }
 
 /// Resolve the Qwen MTP head sidecar into `params["mtp"]`.
@@ -8474,7 +8578,7 @@ fn is_model_file(name: &str) -> bool {
 /// `"tokenizer": "{}"`, so loading it as a trunk fails with
 /// `tokenizer metadata field missing or wrong type: model`.
 fn registry_sidecar_files(registry: &RegistryV1) -> BTreeSet<&str> {
-    registry
+    let mut files: BTreeSet<&str> = registry
         .models
         .values()
         .flat_map(|entry| {
@@ -8496,7 +8600,10 @@ fn registry_sidecar_files(registry: &RegistryV1) -> BTreeSet<&str> {
             .map(|sidecar: &Sidecar| sidecar.file.as_str())
             .chain(entry.heads.values().map(|sidecar| sidecar.file.as_str()))
         })
-        .collect()
+        .collect();
+    // The trunk overlays are compiled-in pins, not registry fields.
+    files.extend(TRUNK_OVERLAY_PINS.iter().map(|pin| pin.file));
+    files
 }
 
 /// True when `name` is a model file worth showing in a local listing.
@@ -8507,7 +8614,16 @@ fn registry_sidecar_files(registry: &RegistryV1) -> BTreeSet<&str> {
 /// suffix-only test hides exactly those models.
 pub(crate) fn is_listable_model_file(name: &str, registry: &RegistryV1) -> bool {
     !ple::is_ple_sidecar_name(name)
+        && !is_trunk_overlay_name(name)
         && (is_model_file(name) || registry.models.values().any(|entry| entry.file == name))
+}
+
+/// True for a Flash-Next trunk overlay sidecar (`<base>.trunk-overlay`): an
+/// HFQM container of pre-encoded QT44 tensors that belongs to its base and is
+/// never a model on its own.
+fn is_trunk_overlay_name(name: &str) -> bool {
+    name.to_ascii_lowercase()
+        .ends_with(hipfire_config::memory::TRUNK_OVERLAY_SIDECAR_SUFFIX)
 }
 
 /// True when `name` can actually serve a completion, as opposed to merely
@@ -8643,6 +8759,13 @@ fn config_rule_json(rule: ValueRule) -> serde_json::Value {
             "minimum": min,
             "maximum": max,
         }),
+        ValueRule::NullableIntegerOrAuto { min, max } => serde_json::json!({
+            "type": ["integer", "string", "null"],
+            "minimum": min,
+            "maximum": max,
+            "enum": ["auto"],
+            "nullable": true,
+        }),
         ValueRule::NullableFloat { min, max } => serde_json::json!({
             "type": ["number", "null"],
             "minimum": min,
@@ -8675,6 +8798,7 @@ fn config_rule_label(rule: ValueRule) -> &'static str {
         ValueRule::NullableString => "string|null",
         ValueRule::NullableEnum(_) => "enum|null",
         ValueRule::NullableInteger { .. } => "integer|null",
+        ValueRule::NullableIntegerOrAuto { .. } => "integer|auto|null",
         ValueRule::NullableFloat { .. } => "number|null",
         ValueRule::KvAdaptive => "kv-adaptive",
         ValueRule::Deepseek4Placement => "deepseek4-placement",
@@ -10261,6 +10385,19 @@ mod tests {
         .unwrap()
     }
 
+    fn resolved_with_dflash_mtp(dflash: &str, mtp: &str) -> hipfire_config::ResolvedConfig {
+        let mut explicit = ConfigLayer::default();
+        explicit.set_cli("speculation.dflash", dflash).unwrap();
+        explicit.set_cli("speculation.mtp", mtp).unwrap();
+        resolve([NamedLayer {
+            source: ConfigSource::OneShot {
+                argument: format!("speculation.dflash={dflash}"),
+            },
+            layer: explicit,
+        }])
+        .unwrap()
+    }
+
     fn resolved_with_vision_mode(mode: &str) -> hipfire_config::ResolvedConfig {
         let mut explicit = ConfigLayer::default();
         explicit.set_cli("vision.mode", mode).unwrap();
@@ -11801,7 +11938,11 @@ mod tests {
             message.contains("not a registry-managed artifact"),
             "{message}"
         );
-        assert!(message.contains("--model-draft"), "{message}");
+        // The override this message names is `developer.dflash_draft` (the
+        // branch reworded the copy away from the CLI flag alone): assert the
+        // message still points at the override it names, not just at the
+        // precondition asserted above.
+        assert!(message.contains("developer.dflash_draft"), "{message}");
         let resolved = resolved_with_dflash_mode("auto", None);
         let params = load_params(
             &resolved,
@@ -11820,6 +11961,154 @@ mod tests {
         assert!(
             params.get("draft").is_none(),
             "auto on a bare artifact runs AR"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn dflash_on_engages_the_mtp_head_when_no_dflash_draft_is_declared() {
+        // `dflash_mode` is the spec-decode knob: on an MTP-only tier
+        // (`qwen3.6:35b-a3b-mq4p` declares a registry `mtp` slot and no
+        // `dflash`) `on` used to fail the load closed on a draft the model
+        // never declared, so serve pre-warm errored and every request failed
+        // the same way. It now resolves to the head the loader would wire.
+        let paths = test_paths("dflash-on-mtp-tie-in");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.6-35b-a3b.mq4p");
+        fs::write(&model_path, b"trunk").unwrap();
+        let head = paths.models.join("qwen3.6-35b-a3b.mtp");
+        fs::write(&head, b"head").unwrap();
+        let entry = ModelEntry {
+            repo: "hipfire-models/qwen3.6-35b-a3b".into(),
+            file: "qwen3.6-35b-a3b.mq4p".into(),
+            size_gb: 19.8,
+            min_vram_gb: 20.0,
+            desc: "mq4p MoE + mtp".into(),
+            mtp: Some(hipfire_registry::Sidecar {
+                file: "qwen3.6-35b-a3b.mtp".into(),
+                sha256: None,
+                size_bytes: None,
+            }),
+            ..Default::default()
+        };
+        let resolved = resolved_with_dflash_mode("on", None);
+        let tag = "qwen3.6:35b-a3b-mq4p";
+        let mut params = load_params(
+            &resolved,
+            Some(&entry),
+            &paths.models,
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some(tag),
+            false,
+            None,
+        )
+        .expect("on must resolve to the MTP head, not fail closed");
+        assert!(
+            params.get("draft").is_none(),
+            "an MTP-only model wires no DFlash draft"
+        );
+        assert_eq!(
+            params["mtp_mode"], "on",
+            "the knob is `on`, so MTP must be armed explicitly: `auto` degrades \
+             to AR as soon as a routed expert is host-mapped"
+        );
+        // The pairing is completed by the caller (serve/run), which wires the
+        // head after load_params returns.
+        resolve_mtp_sidecar(
+            &mut params,
+            Some(&entry),
+            &paths.models,
+            &model_path,
+            tag,
+            Some(tag),
+        );
+        assert_eq!(params["mtp"], head.display().to_string());
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn dflash_on_refuses_when_the_only_mechanism_is_turned_off() {
+        // Tie-in must not silently override `speculation.mtp=off`: nothing can
+        // serve the request, so `on` still fails the load closed.
+        let paths = test_paths("dflash-on-mtp-off");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.6-35b-a3b.mq4p");
+        fs::write(&model_path, b"trunk").unwrap();
+        fs::write(paths.models.join("qwen3.6-35b-a3b.mtp"), b"head").unwrap();
+        let entry = ModelEntry {
+            repo: "hipfire-models/qwen3.6-35b-a3b".into(),
+            file: "qwen3.6-35b-a3b.mq4p".into(),
+            size_gb: 19.8,
+            min_vram_gb: 20.0,
+            desc: "mq4p MoE + mtp".into(),
+            mtp: Some(hipfire_registry::Sidecar {
+                file: "qwen3.6-35b-a3b.mtp".into(),
+                sha256: None,
+                size_bytes: None,
+            }),
+            ..Default::default()
+        };
+        let resolved = resolved_with_dflash_mtp("on", "off");
+        let error = load_params(
+            &resolved,
+            Some(&entry),
+            &paths.models,
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.6:35b-a3b-mq4p"),
+            false,
+            None,
+        )
+        .expect_err("on with the MTP head disabled must refuse");
+        let message = format!("{error:#}");
+        assert!(message.contains("MTP is off"), "{message}");
+        assert!(message.contains("speculation.mtp"), "{message}");
+        assert!(message.contains("speculation.dflash"), "{message}");
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn dflash_on_names_the_registry_entry_when_it_declares_no_drafter() {
+        // The old message claimed the model "is not a registry-managed
+        // artifact" even when the operator used the registry tag; the entry
+        // simply declared no DFlash draft.
+        let paths = test_paths("dflash-on-no-drafter");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.5-4b.mq4");
+        fs::write(&model_path, b"trunk").unwrap();
+        let entry = ModelEntry {
+            repo: "hipfire-models/qwen3.5-4b".into(),
+            file: "qwen3.5-4b.mq4".into(),
+            size_gb: 2.6,
+            min_vram_gb: 3.4,
+            desc: "no drafter".into(),
+            ..Default::default()
+        };
+        let resolved = resolved_with_dflash_mode("on", None);
+        let error = load_params(
+            &resolved,
+            Some(&entry),
+            &paths.models,
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.5:4b"),
+            false,
+            None,
+        )
+        .expect_err("on with no drafter at all must fail closed");
+        let message = format!("{error:#}");
+        assert!(message.contains("registry entry qwen3.5:4b"), "{message}");
+        assert!(message.contains("declares no DFlash draft"), "{message}");
+        assert!(
+            !message.contains("not a registry-managed artifact"),
+            "a resolved entry is registry-managed: {message}"
         );
         fs::remove_dir_all(&paths.root).unwrap();
     }
@@ -17216,6 +17505,202 @@ mod tests {
         assert_eq!(listed, ["split-model-base.mq4", "split-model.mq4"]);
         assert!(registry_sidecar_files(&registry).contains("split-model-base.mq4.ple-q8"));
         assert!(registry_sidecar_files(&registry).contains("split-model-base.mq4.ple-q4"));
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    // ---- Flash-Next trunk overlay sidecar: pull, rm, listings -----------------
+
+    const OVERLAY_BASE: &[u8] = b"overlay-base-bytes";
+    const OVERLAY_BYTES: &[u8] = b"pre-encoded-qt44-overlay-bytes";
+
+    /// The registry entry carries no overlay field: the overlay comes only from
+    /// the injected pin table, keyed by the base's sha256/size.
+    fn overlay_registry_raw() -> String {
+        format!(
+            r#"{{
+            "schema_version":1,
+            "generated_at":"2099-01-01T00:00:00Z",
+            "models":{{
+                "overlay-model":{{
+                    "repo":"test/repo","file":"overlay-model.mq4","size_gb":0.001,
+                    "min_vram_gb":1,"desc":"x","sha256":"{}","size_bytes":{}
+                }}
+            }},
+            "aliases":{{}}
+        }}"#,
+            ple_sha(OVERLAY_BASE),
+            OVERLAY_BASE.len(),
+        )
+    }
+
+    fn overlay_pins() -> Vec<TrunkOverlayPin> {
+        vec![TrunkOverlayPin {
+            base_sha256: ple_sha(OVERLAY_BASE).leak(),
+            base_size: OVERLAY_BASE.len() as u64,
+            repo: "test/repo",
+            file: "overlay-model.mq4.trunk-overlay",
+            sha256: ple_sha(OVERLAY_BYTES).leak(),
+            size_bytes: OVERLAY_BYTES.len() as u64,
+        }]
+    }
+
+    fn pull_overlay_model(paths: &Paths, force: bool) {
+        pull_with_overlay_pins(
+            paths,
+            PullArgs {
+                model: "overlay-model".into(),
+                force,
+                ple: ple::PleSelection::Auto,
+            },
+            &overlay_pins(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn pull_downloads_and_verifies_the_trunk_overlay_once() {
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _reg = EnvGuard::set("HIPFIRE_REGISTRY_URL", "https://example.com/test.json");
+        let paths = test_paths("overlay-pull");
+        write_test_registry_cache(&paths, &overlay_registry_raw());
+        let overlay = paths.models.join("overlay-model.mq4.trunk-overlay");
+
+        let mut files = std::collections::HashMap::new();
+        files.insert("overlay-model.mq4".to_owned(), OVERLAY_BASE.to_vec());
+        files.insert(
+            "overlay-model.mq4.trunk-overlay".to_owned(),
+            OVERLAY_BYTES.to_vec(),
+        );
+        let (base, handle) = exact_http_server(files);
+        let _hf = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+        DOWNLOAD_INVOCATIONS.with(|count| count.set(0));
+        pull_overlay_model(&paths, false);
+        handle.join().unwrap();
+        assert_eq!(
+            fs::read(paths.models.join("overlay-model.mq4")).unwrap(),
+            OVERLAY_BASE
+        );
+        assert_eq!(fs::read(&overlay).unwrap(), OVERLAY_BYTES);
+        DOWNLOAD_INVOCATIONS.with(|count| assert_eq!(count.get(), 2));
+
+        // A valid file on disk is not downloaded again (an empty server would
+        // refuse any request; the invocation counter proves none was made).
+        let (base, handle) = exact_http_server(std::collections::HashMap::new());
+        let _hf2 = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+        pull_overlay_model(&paths, false);
+        handle.join().unwrap();
+        DOWNLOAD_INVOCATIONS.with(|count| assert_eq!(count.get(), 2));
+        assert_eq!(fs::read(&overlay).unwrap(), OVERLAY_BYTES);
+
+        // A stale overlay is refreshed and re-verified.
+        fs::write(&overlay, b"stale").unwrap();
+        let mut files = std::collections::HashMap::new();
+        files.insert(
+            "overlay-model.mq4.trunk-overlay".to_owned(),
+            OVERLAY_BYTES.to_vec(),
+        );
+        let (base, handle) = exact_http_server(files);
+        let _hf3 = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+        pull_overlay_model(&paths, false);
+        handle.join().unwrap();
+        DOWNLOAD_INVOCATIONS.with(|count| assert_eq!(count.get(), 3));
+        assert_eq!(fs::read(&overlay).unwrap(), OVERLAY_BYTES);
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn pull_never_installs_a_trunk_overlay_that_fails_verification() {
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _reg = EnvGuard::set("HIPFIRE_REGISTRY_URL", "https://example.com/test.json");
+        let paths = test_paths("overlay-pull-corrupt");
+        write_test_registry_cache(&paths, &overlay_registry_raw());
+        let mut files = std::collections::HashMap::new();
+        files.insert("overlay-model.mq4".to_owned(), OVERLAY_BASE.to_vec());
+        // Same length as the pinned payload, different bytes: the digest rejects it.
+        files.insert(
+            "overlay-model.mq4.trunk-overlay".to_owned(),
+            vec![b'x'; OVERLAY_BYTES.len()],
+        );
+        let (base, handle) = exact_http_server(files);
+        let _hf = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+        pull_overlay_model(&paths, false);
+        handle.join().unwrap();
+        assert!(paths.models.join("overlay-model.mq4").is_file());
+        assert!(
+            !paths.models.join("overlay-model.mq4.trunk-overlay").exists(),
+            "a failed verification must not leave the overlay installed"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn rm_removes_the_trunk_overlay_with_its_base() {
+        let paths = test_paths("overlay-rm");
+        let registry = RegistryV1::parse(&overlay_registry_raw(), "overlay rm").unwrap();
+        fs::create_dir_all(&paths.models).unwrap();
+        for file in ["overlay-model.mq4", "overlay-model.mq4.trunk-overlay", "untouched.mq4"] {
+            fs::write(paths.models.join(file), b"x").unwrap();
+        }
+        rm_with_overlay_pins(
+            &paths,
+            &registry,
+            &overlay_pins(),
+            RmArgs {
+                model: "overlay-model".into(),
+                yes: true,
+            },
+        )
+        .unwrap();
+        assert!(!paths.models.join("overlay-model.mq4").exists());
+        assert!(!paths.models.join("overlay-model.mq4.trunk-overlay").exists());
+        assert!(paths.models.join("untouched.mq4").exists());
+
+        // An unregistered base takes its `<file>.trunk-overlay` with it too.
+        for file in ["local.mq4", "local.mq4.trunk-overlay"] {
+            fs::write(paths.models.join(file), b"x").unwrap();
+        }
+        rm_with_overlay_pins(
+            &paths,
+            &registry,
+            &overlay_pins(),
+            RmArgs {
+                model: "local.mq4".into(),
+                yes: true,
+            },
+        )
+        .unwrap();
+        assert!(!paths.models.join("local.mq4").exists());
+        assert!(!paths.models.join("local.mq4.trunk-overlay").exists());
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn trunk_overlays_are_never_listed_or_served_as_models() {
+        let paths = test_paths("overlay-listing");
+        fs::create_dir_all(&paths.models).unwrap();
+        let registry = RegistryV1::parse(&overlay_registry_raw(), "overlay listing").unwrap();
+        let overlays = [
+            "overlay-model.mq4.trunk-overlay",
+            "qwen3.8-flash-next.mq4-xts.trunk-overlay",
+            "unregistered.mq4.trunk-overlay",
+        ];
+        for name in overlays {
+            assert!(!is_listable_model_file(name, &registry), "{name}");
+            assert!(
+                !is_standalone_model(&paths.models.join(name), name, &registry),
+                "{name}"
+            );
+        }
+        assert!(registry_sidecar_files(&registry).contains(TRUNK_OVERLAY_PINS[0].file));
+        for name in overlays.iter().chain(&["overlay-model.mq4"]) {
+            fs::write(paths.models.join(name), b"x").unwrap();
+        }
+        let listed: Vec<String> = local_model_paths(&paths, &registry)
+            .unwrap()
+            .iter()
+            .filter_map(|path| path.file_name()?.to_str().map(str::to_owned))
+            .collect();
+        assert_eq!(listed, ["overlay-model.mq4"]);
         fs::remove_dir_all(&paths.root).unwrap();
     }
 }

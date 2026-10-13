@@ -921,6 +921,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         kernel,
         "gemm_mixed_moe_grouped_wmma_k2"
             | "gemm_mixed_moe_grouped_wmma_gfx12"
+            | "gemm_mixed_moe_grouped_wmma_coalesced_gfx1201"
             | "gemm_mixed_moe_grouped_wmma_4w_k2"
     ) {
         // expert_weight_ptrs, dtype_tags, tile_ids, sorted_slot_index, X_src (read); Y_grouped (write)
@@ -1631,6 +1632,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
             | "gemv_mixed_moe_down_k8_indexed_batched_expanded"
             | "gemm_mixed_moe_grouped_wmma_k2"
             | "gemm_mixed_moe_grouped_wmma_gfx12"
+            | "gemm_mixed_moe_grouped_wmma_coalesced_gfx1201"
             | "gemm_mixed_moe_grouped_wmma_4w_k2"
     ) {
         return Some(64);
@@ -5088,6 +5090,10 @@ pub struct ReplayController {
     prepared_pm4: Option<PreparedPm4Replay>,
     auto_lifecycle: bool,
     forward_eligible: bool,
+    /// The model owns host-mapped weights the CPU multiplies; a CPU step is a host
+    /// sync point, so a retained tape can neither record nor replay it. Set by the
+    /// loader from the resolved placement; cleared on unload.
+    host_cpu_weights: bool,
     replay_observation: ReplayObservation,
     radiowave_effect_launches: usize,
     fallback_effect_launches: usize,
@@ -5204,6 +5210,7 @@ impl ReplayController {
             prepared_pm4: None,
             auto_lifecycle: false,
             forward_eligible: true,
+            host_cpu_weights: false,
             replay_observation: ReplayObservation::default(),
             unknown_effect_launches: 0,
             radiowave_effect_launches: 0,
@@ -6946,10 +6953,19 @@ impl ReplayController {
         Ok(())
     }
 
+    /// Record whether the loaded model owns CPU-executed (host) weights. Set once
+    /// per load from the resolved placement; cleared on unload.
+    pub fn set_host_cpu_weights(&mut self, on: bool) {
+        self.host_cpu_weights = on;
+    }
+
     /// Start one explicitly delimited prefill or decode capture. This clears
     /// only the prior launch sequence; validation observations and the backend
     /// request remain intact.
     pub fn begin_capture(&mut self) -> Result<(), &'static str> {
+        if self.host_cpu_weights {
+            return Err("the model owns CPU-executed (host) weights");
+        }
         match self.state {
             ReplayState::Hip => return Err("replay backend is disabled"),
             ReplayState::Fallback => return Err("replay controller is in sticky fallback"),
@@ -9490,6 +9506,7 @@ mod tests {
         for symbol in [
             "gemm_mixed_moe_grouped_wmma_k2",
             "gemm_mixed_moe_grouped_wmma_gfx12",
+            "gemm_mixed_moe_grouped_wmma_coalesced_gfx1201",
             "gemm_mixed_moe_grouped_wmma_4w_k2",
         ] {
             let mut blob = hip_bridge::KernargBlob::new();

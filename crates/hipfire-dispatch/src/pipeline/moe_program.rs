@@ -12,9 +12,10 @@
 
 use super::steps::Step;
 use crate::context::DispatchCtx;
+use crate::cpu_exec;
 use crate::families::moe::{
     MoeNormalization, MoeParams, MoePrefillParams, MoePrefillResolution, MoeQ8RouterPolicy,
-    MoeRecipe, MoeResolution, MoeRouteCapability,
+    MoeRecipe, MoeResolution, MoeRouteCapability, NARROW_VERIFY_MAX_ROWS,
 };
 use crate::pipeline::sealed_moe::{MoeProtocol, MoeRouterInput, SealedMoeCall};
 use crate::types::DispatchError;
@@ -49,6 +50,7 @@ pub enum MoeStage {
     RowGather,
     Combine,
     HostExperts,
+    CpuSplice,
 }
 
 fn router_shared_fuse_allowed(
@@ -89,6 +91,10 @@ pub(super) struct MoeDecodeSelection {
     pub(super) ninepath_mq3l: bool,
     pub(super) ninepath_mq4v2: bool,
     pub(super) ninepath_mq6v2: bool,
+    /// The routed expert FFN runs in the arch's CPU splice after this program:
+    /// no routed GPU stage may be lowered (see
+    /// [`MoeParams::cpu_deferred_experts`](crate::families::moe::MoeParams::cpu_deferred_experts)).
+    pub(super) cpu_deferred_experts: bool,
 }
 
 /// Static grouped-prefill choices resolved while sealing. It deliberately
@@ -97,8 +103,13 @@ pub(super) struct MoePrefillSelection {
     pub(super) resolution: MoePrefillResolution,
     pub(super) path2_m_total: usize,
     pub(super) force_mq4_grouped_fp16: bool,
+    pub(super) coalesced_verify: bool,
     /// Exact architecture-selected route, or the generic grouped path.
     pub(super) route: Option<crate::families::moe::MoeRouteCapability>,
+    /// The routed expert FFN runs in the arch's CPU splice after this program:
+    /// no routed GPU stage may be lowered (see
+    /// [`MoePrefillParams::cpu_deferred_experts`](crate::families::moe::MoePrefillParams::cpu_deferred_experts)).
+    pub(super) cpu_deferred_experts: bool,
 }
 
 /// The call's static kernel selection. Neither variant stores a step list or
@@ -260,6 +271,9 @@ impl<'a> MoeStepState<'a> {
         };
         let target = params.routed_out.unwrap_or(params.x_batch);
         selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped)
+            // A CPU-deferred call omits the combine that would consume the
+            // absorbed fill, so it must never absorb one.
+            && !selection.cpu_deferred_experts
             && matches!(params.prelude.normalization, MoeNormalization::Provided)
             && super::qt44_qt53_prefill::combine_initial_zero_applies(
                 gpu,
@@ -402,6 +416,7 @@ impl<'a> SealedMoeOp<'a> {
             MoeStage::RowGather => self.row_gather(gpu),
             MoeStage::Combine => self.combine(gpu),
             MoeStage::HostExperts => self.host_experts(gpu),
+            MoeStage::CpuSplice => self.cpu_splice(gpu),
         }
     }
 
@@ -885,6 +900,7 @@ impl<'a> SealedMoeOp<'a> {
             &selection.resolution,
             selection.path2_m_total,
             selection.force_mq4_grouped_fp16,
+            selection.coalesced_verify,
         )
     }
 
@@ -1010,6 +1026,7 @@ impl<'a> SealedMoeOp<'a> {
             selection.path2_m_total,
             total_slots,
             selection.force_mq4_grouped_fp16,
+            selection.coalesced_verify,
         )?;
         let compact_ep = matches!(
             &params.prelude.route,
@@ -1086,6 +1103,71 @@ impl<'a> SealedMoeOp<'a> {
         )
     }
 
+    /// The CPU routed-expert splice, executed at the point the routed GPU tail
+    /// would have run. The arch declares it (`cpu_deferred_experts`) and supplies
+    /// the expert payload through `RoutedExpertWeights::cpu_splice_expert`; the
+    /// seam owns the invocation order, the capture/replay refusal inside the
+    /// executor and the coverage counters.
+    pub(super) fn cpu_splice(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
+        match self.state.call.protocol() {
+            MoeProtocol::IndexedDecode => {
+                let (params, _) = self.state.decode_parts()?;
+                let gpu_ref: &Gpu = &*gpu;
+                cpu_exec::moe_cpu_experts(
+                    gpu_ref,
+                    params.hidden,
+                    params.mi,
+                    params.batch_size,
+                    params.k,
+                    params.x_rot_local,
+                    params.topk_indices,
+                    params.topk_weights,
+                    params.x_residual,
+                    params.expert_down_awq_ptrs.is_some(),
+                    |id| {
+                        params.routed_experts.cpu_splice_expert(gpu_ref, id).ok_or_else(|| {
+                            DispatchError::Hip(format!(
+                                "moe cpu expert splice: expert {id} has no CPU payload"
+                            ))
+                        })
+                    },
+                )
+            }
+            MoeProtocol::GroupedPrefill => {
+                let (params, _) = self.state.prefill_parts()?;
+                let gpu_ref: &Gpu = &*gpu;
+                // `dim` is the model hidden size, which is exactly the routed down
+                // projection's row count: `MoePrefillParams` has no `hidden` field
+                // and `down_m` is built as `experts[0].down.m` (its `down_k` is
+                // `mi`), matching `moe_cpu_experts`' `(dim, mi)` pair. Do not
+                // "correct" this to a hidden field that does not exist.
+                // The residual destination is the arch's unconditional
+                // `&pbs.x_batch`: a CPU-deferred window never carries `routed_out`
+                // (the sealed program refuses that combination), so the
+                // `unwrap_or` below is defensive only.
+                cpu_exec::moe_cpu_experts(
+                    gpu_ref,
+                    params.down_m,
+                    params.mi,
+                    params.batch_size,
+                    params.k_top,
+                    params.x_rot_batch,
+                    params.topk_indices,
+                    params.topk_weights,
+                    params.routed_out.unwrap_or(params.x_batch),
+                    params.expert_down_awq_ptrs.is_some(),
+                    |id| {
+                        params.routed_experts.cpu_splice_expert(gpu_ref, id).ok_or_else(|| {
+                            DispatchError::Hip(format!(
+                                "moe cpu expert splice: expert {id} has no CPU payload"
+                            ))
+                        })
+                    },
+                )
+            }
+        }
+    }
+
     pub(super) fn mutation_fence(&self, _gpu: &mut Gpu) -> Result<(), DispatchError> {
         match self.state.call.protocol() {
             MoeProtocol::IndexedDecode => super::decode_mutation_fence_stage(),
@@ -1094,12 +1176,68 @@ impl<'a> SealedMoeOp<'a> {
     }
 
     pub(super) fn row_gather(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
-        let (params, _) = self.state.decode_parts()?;
-        let gather = params.ep_row_gather.ok_or_else(|| {
-            DispatchError::Hip("sealed moe: row gather lowered without a gather".into())
-        })?;
+        let missing =
+            || DispatchError::Hip("sealed moe: row gather lowered without a gather".into());
+        let overflow =
+            || DispatchError::Hip("sealed moe: row gather extent overflows".into());
+        // The gather, the layer, the slot count and the producer's buffers, per
+        // protocol: one decode row's `k` slots, or a few-row prefill's
+        // `batch_size * k_top` slots in slot order.
+        let (gather, layer_idx, slots, width, down_expanded, topk_indices) =
+            match self.state.call.protocol() {
+                MoeProtocol::IndexedDecode => {
+                    let (params, _) = self.state.decode_parts()?;
+                    let gather = params.ep_row_gather.ok_or_else(missing)?;
+                    (
+                        gather,
+                        params.layer_idx,
+                        params.k,
+                        params.hidden,
+                        params.down_expanded,
+                        params.topk_indices,
+                    )
+                }
+                MoeProtocol::GroupedPrefill => {
+                    let (params, selection) = self.state.prefill_parts()?;
+                    let gather = params.ep_row_gather.ok_or_else(missing)?;
+                    if !selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped)
+                        || !super::qt44_qt53_prefill::writes_slot_ordered_rows(
+                            gpu,
+                            params,
+                            selection.resolution.use_path2,
+                        )
+                    {
+                        return Err(DispatchError::Hip(
+                            "sealed moe: an EP row gather needs the grouped QT44/QT53 down to have written slot-ordered expanded rows".into(),
+                        ));
+                    }
+                    // The unfused shared down runs after the combine and would
+                    // overwrite rows a peer may still be reading.
+                    let shared_out = params.shared_down_out.ok_or_else(|| {
+                        DispatchError::Hip(
+                            "sealed moe: a prefill EP row gather requires a separate shared-down output".into(),
+                        )
+                    })?;
+                    if shared_out.buf.as_ptr() == params.down_expanded.buf.as_ptr() {
+                        return Err(DispatchError::Hip(
+                            "sealed moe: the shared-down output aliases the gathered expanded rows".into(),
+                        ));
+                    }
+                    (
+                        gather,
+                        params.ep_layer_idx,
+                        params
+                            .batch_size
+                            .checked_mul(params.k_top)
+                            .ok_or_else(overflow)?,
+                        params.down_m,
+                        params.down_expanded,
+                        params.topk_indices,
+                    )
+                }
+            };
         // The exchange waits on peer devices and a host barrier; neither can
-        // be recorded into a graph or retained body. EP decode is eager-only.
+        // be recorded into a graph or retained body. EP is eager-only.
         if gpu.graphs.capture_mode
             || gpu.graphs.verify.capturing.is_some()
             || gpu.graphs.replay.capturing.is_some()
@@ -1109,13 +1247,10 @@ impl<'a> SealedMoeOp<'a> {
                 "sealed moe: expert-parallel row gather refused while a graph capture or replay record is armed".into(),
             ));
         }
-        let rows = params
-            .k
-            .checked_mul(params.hidden)
-            .ok_or_else(|| DispatchError::Hip("sealed moe: row gather extent overflows".into()))?;
-        let down_expanded = super::slice_moe_f32_view(params.down_expanded, 0, rows);
+        let rows = slots.checked_mul(width).ok_or_else(overflow)?;
+        let down_expanded = super::slice_moe_f32_view(down_expanded, 0, rows);
         gather
-            .gather_rows(gpu, params.layer_idx, &down_expanded, params.topk_indices)
+            .gather_rows(gpu, layer_idx, slots, &down_expanded, topk_indices)
             .map_err(|error| DispatchError::Hip(format!("sealed moe: EP row gather: {error}")))
     }
 }
@@ -1177,9 +1312,17 @@ fn lower_decode<'a>(
         }
     }
     if selection.resolution.use_gpu_topk {
-        append_step(&mut steps, Step::MoeStage(op(state), MoeStage::GateUp))?;
-        append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Activation))?;
-        append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Down))?;
+        // A CPU-deferred call keeps the GPU router/rotation/shared stages, but
+        // must not lower any routed GPU stage: the arch's CPU splice supplies
+        // the routed contribution into the residual after this program, and the
+        // expanded routed scratch is not refreshed here, so combining it would
+        // fold stale rows. The mutation fence still marks the routed-stage
+        // boundary the splice completes.
+        if !selection.cpu_deferred_experts {
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::GateUp))?;
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Activation))?;
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Down))?;
+        }
         append_step(
             &mut steps,
             Step::MoeStage(op(state), MoeStage::MutationFence),
@@ -1189,8 +1332,8 @@ fn lower_decode<'a>(
                 params.dtypes.routed_down,
                 params.expert_dtype_tags.is_some(),
             );
-        let combine_after_down = params.ep_mode
-            != crate::families::moe::MoeEpMode::RootRoutedPartial
+        let combine_after_down = !selection.cpu_deferred_experts
+            && params.ep_mode != crate::families::moe::MoeEpMode::RootRoutedPartial
             && !selection.ninepath_d4
             && (selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped)
                 || !down_self_combines)
@@ -1219,6 +1362,13 @@ fn lower_decode<'a>(
         if params.recipe.shared_after_combine() && !params.skip_shared {
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::SharedDown))?;
         }
+        if selection.cpu_deferred_experts {
+            // Last, exactly where the arch ran its splice: after every sealed
+            // stage of this program. The splice and `SharedDown` both accumulate
+            // into the same residual buffer, so this ordering keeps the fp
+            // accumulation sequence identical to the pre-stage arrangement.
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::CpuSplice))?;
+        }
     } else {
         if params.ep_row_gather.is_some() {
             return Err(DispatchError::Hip(
@@ -1240,6 +1390,17 @@ fn lower_prefill<'a>(
     let mut steps = SmallVec::new();
     let op = |state: &'a MoeStepState<'a>| SealedMoeOp::new(state);
     append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Normalize))?;
+    if params.ep_row_gather.is_some()
+        && (!selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped)
+            || params.routed_out.is_some())
+    {
+        // The gather fills the expanded rows the grouped QT44/QT53 down wrote,
+        // for the canonical combine into the residual; every other prefill
+        // lowering has a different row layout or EP contract.
+        return Err(DispatchError::Hip(
+            "sealed moe: a prefill EP row gather requires the grouped QT44/QT53 route combining into the residual".into(),
+        ));
+    }
     if selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
         append_step(&mut steps, Step::MoeStage(op(state), MoeStage::InputBasis))?;
         append_step(
@@ -1258,6 +1419,25 @@ fn lower_prefill<'a>(
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::SharedDown))?;
         }
         append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Route))?;
+        if selection.cpu_deferred_experts {
+            // The arch's CPU splice owns the routed FFN for this narrow window;
+            // lowering the grouped routed tail would read/write scratch the
+            // splice does not consume and fold stale expanded rows. The fence
+            // still marks the routed-stage boundary the splice completes.
+            append_step(
+                &mut steps,
+                Step::MoeStage(op(state), MoeStage::MutationFence),
+            )?;
+            if params.recipe.shared_after_combine() {
+                append_step(&mut steps, Step::MoeStage(op(state), MoeStage::SharedDown))?;
+            }
+            // Last, exactly where the arch ran its splice: after every sealed
+            // stage of this program. The splice and `SharedDown` both accumulate
+            // into the same residual buffer, so this ordering keeps the fp
+            // accumulation sequence identical to the pre-stage arrangement.
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::CpuSplice))?;
+            return Ok(steps);
+        }
         if selection.resolution.use_path2 {
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Scatter))?;
         }
@@ -1271,6 +1451,9 @@ fn lower_prefill<'a>(
             &mut steps,
             Step::MoeStage(op(state), MoeStage::MutationFence),
         )?;
+        if params.ep_row_gather.is_some() {
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::RowGather))?;
+        }
         append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Combine))?;
         if params.recipe.shared_after_combine() {
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::SharedDown))?;
@@ -1314,15 +1497,17 @@ fn lower_prefill<'a>(
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::InputBasis))?;
         }
     }
-    if selection.resolution.use_path2 {
-        append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Scatter))?;
+    if !selection.cpu_deferred_experts {
+        if selection.resolution.use_path2 {
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Scatter))?;
+        }
+        append_step(&mut steps, Step::MoeStage(op(state), MoeStage::GateUp))?;
+        if selection.resolution.use_path2 {
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Unscatter))?;
+        }
+        append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Activation))?;
+        append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Down))?;
     }
-    append_step(&mut steps, Step::MoeStage(op(state), MoeStage::GateUp))?;
-    if selection.resolution.use_path2 {
-        append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Unscatter))?;
-    }
-    append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Activation))?;
-    append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Down))?;
     append_step(
         &mut steps,
         Step::MoeStage(op(state), MoeStage::MutationFence),
@@ -1332,11 +1517,24 @@ fn lower_prefill<'a>(
         super::sealed_moe::PrefillRouteMode::ProduceRoot { .. }
             | super::sealed_moe::PrefillRouteMode::AdoptRoot { .. }
     );
-    if !compact_ep && (selection.resolution.use_path2 || !selection.resolution.down_path0) {
+    // A CPU-deferred window must not combine: the expanded routed scratch was
+    // not refreshed by this program, so folding it would publish stale rows.
+    // The arch's CPU splice accumulates the routed contribution into `x_batch`.
+    if !selection.cpu_deferred_experts
+        && !compact_ep
+        && (selection.resolution.use_path2 || !selection.resolution.down_path0)
+    {
         append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Combine))?;
     }
     if params.recipe.shared_after_combine() {
         append_step(&mut steps, Step::MoeStage(op(state), MoeStage::SharedDown))?;
+    }
+    if selection.cpu_deferred_experts {
+        // Last, exactly where the arch ran its splice: after every sealed
+        // stage of this program. The splice and `SharedDown` both accumulate
+        // into the same residual buffer, so this ordering keeps the fp
+        // accumulation sequence identical to the pre-stage arrangement.
+        append_step(&mut steps, Step::MoeStage(op(state), MoeStage::CpuSplice))?;
     }
     Ok(steps)
 }
@@ -1351,6 +1549,23 @@ pub(super) fn execute(gpu: &mut Gpu, call: &SealedMoeCall<'_>) -> Result<(), Dis
         MoeProtocol::GroupedPrefill => lower_prefill(&state)?,
     };
     super::steps::execute_validated_steps(gpu, call.dispatch_ctx(), &steps)
+}
+
+/// The MoE stages a call lowers to, in order (test probe: nothing launches).
+#[cfg(test)]
+pub(super) fn lowered_stages(call: &SealedMoeCall<'_>) -> Result<Vec<MoeStage>, DispatchError> {
+    let state = MoeStepState::new(call);
+    let steps = match call.protocol() {
+        MoeProtocol::IndexedDecode => lower_decode(&state)?,
+        MoeProtocol::GroupedPrefill => lower_prefill(&state)?,
+    };
+    Ok(steps
+        .iter()
+        .filter_map(|step| match step {
+            Step::MoeStage(_, stage) => Some(*stage),
+            _ => None,
+        })
+        .collect())
 }
 
 /// [`execute`] for a call preceded by `Step::Clear(clear)` and, optionally,
@@ -1526,6 +1741,33 @@ pub(super) fn select_decode(
         params.n_exp,
         !params.routed_experts.is_empty(),
     )?;
+    if params.cpu_deferred_experts {
+        // The arch's CPU splice consumes the GPU-produced route and the rotated
+        // input, then accumulates the routed FFN into `x_residual` after this
+        // program. It therefore needs the GPU top-K path (never the per-expert
+        // host GEMV fallback), a rotated activation, a single-device non-EP
+        // call, and a recipe whose routed combine owes no bf16 round trip.
+        if !resolution.use_gpu_topk || !resolution.needs_x_rot_local {
+            return Err(DispatchError::Hip(
+                "CPU-deferred routed experts require the GPU top-K path with a rotated local activation"
+                    .into(),
+            ));
+        }
+        if params.ep_mode != crate::families::moe::MoeEpMode::None
+            || params.routed_out.is_some()
+            || params.defer_routed_combine
+        {
+            return Err(DispatchError::Hip(
+                "CPU-deferred routed experts require a single-device call with no EP partial and no deferred routed combine"
+                    .into(),
+            ));
+        }
+        if params.recipe.bf16_round_trip() {
+            return Err(DispatchError::Hip(
+                "CPU-deferred routed experts cannot omit a recipe's bf16 round trip".into(),
+            ));
+        }
+    }
     if params.ep_mode == crate::families::moe::MoeEpMode::RootRoutedPartial {
         if !resolution.use_gpu_topk {
             return Err(DispatchError::Hip(
@@ -1677,10 +1919,18 @@ pub(super) fn select_decode(
         ninepath_mq3l,
         ninepath_mq4v2,
         ninepath_mq6v2,
+        cpu_deferred_experts: params.cpu_deferred_experts,
     })
 }
 
 /// Resolve all grouped-prefill choices without a GPU or an instruction list.
+///
+/// The prefill [`MoePrefillResolution`] reads owner-derived residency via
+/// `routed_experts.host_mapped_projections()`: on narrow gfx1201 MTP verify
+/// with a host-mapped uniform MQ4 gate_up+down, Path 2 (grouped-WMMA) is
+/// re-admitted. Residency comes from the packed weight owners — never inferred
+/// from borrowed tensor kinds — so resident-only weights or any other
+/// format/arch keep the indexed Path 1 policy unchanged.
 pub(super) fn select_prefill(
     ctx: &DispatchCtx,
     params: &MoePrefillParams<'_>,
@@ -1729,7 +1979,8 @@ pub(super) fn select_prefill(
     if route.is_none() {
         super::reject_mq4g128v2_moe(&params.dtypes)?;
     }
-    let resolution = MoePrefillResolution::resolve(&params.dtypes, &ctx.arch, &ctx.flags);
+    let (host_gate_up, host_down) = params.routed_experts.host_mapped_projections();
+    let resolution = MoePrefillResolution::resolve_with_batch_ctx(&params.dtypes, &ctx.arch, &ctx.flags, ctx.batch_size, ctx.workload == crate::context::DispatchWorkload::SpeculativeVerify, host_gate_up || host_down);
     let _total_slots = params
         .batch_size
         .checked_mul(params.k_top)
@@ -1740,6 +1991,14 @@ pub(super) fn select_prefill(
         0
     };
     let force_mq4_grouped_fp16 = resolution.force_mq4_grouped_fp16 || params.force_mq4_grouped_fp16;
+    // Lower bound of 2 is load-bearing: a 1-row window is decode, not a verify
+    // window, so it must not take the coalesced/Path-2 re-admit.
+    let coalesced_verify = ctx.arch.is_gfx1201()
+        && ctx.workload == crate::context::DispatchWorkload::SpeculativeVerify
+        && (2..=NARROW_VERIFY_MAX_ROWS).contains(&ctx.batch_size)
+        && (2..=NARROW_VERIFY_MAX_ROWS).contains(&params.batch_size)
+        && route.is_none()
+        && resolution.use_path2;
     let compact_ep = matches!(
         params.prelude.route,
         super::sealed_moe::PrefillRouteMode::ProduceRoot { .. }
@@ -1750,11 +2009,29 @@ pub(super) fn select_prefill(
             "root-routed EP prefill requires an expanded-output down projection".into(),
         ));
     }
+    if params.cpu_deferred_experts {
+        // A CPU-deferred narrow window keeps the GPU router/shared stages and
+        // the arch's CPU splice; it must not be an EP partial (the routed
+        // contribution would be folded twice) and must not rely on the grouped
+        // routed tail it is about to omit.
+        if compact_ep || params.routed_out.is_some() {
+            return Err(DispatchError::Hip(
+                "CPU-deferred routed experts require a replicated (non-EP) prefill".into(),
+            ));
+        }
+        if params.recipe.bf16_round_trip() {
+            return Err(DispatchError::Hip(
+                "CPU-deferred routed experts cannot omit a recipe's bf16 round trip".into(),
+            ));
+        }
+    }
     Ok(MoePrefillSelection {
         resolution,
         path2_m_total,
         force_mq4_grouped_fp16,
+        coalesced_verify,
         route,
+        cpu_deferred_experts: params.cpu_deferred_experts,
     })
 }
 

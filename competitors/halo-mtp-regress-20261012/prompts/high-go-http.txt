@@ -1,0 +1,1 @@
+Write a Go HTTP server with handlers for creating, listing and deleting todo items stored in memory behind a mutex, plus tests using httptest. Explain the concurrency model.

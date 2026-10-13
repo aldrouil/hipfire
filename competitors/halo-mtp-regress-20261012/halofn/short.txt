@@ -1,0 +1,1 @@
+Write a detailed, multi-paragraph explanation of how a CPU cache hierarchy works, covering L1, L2 and L3 caches, cache lines, associativity, write-back policies and coherence protocols.

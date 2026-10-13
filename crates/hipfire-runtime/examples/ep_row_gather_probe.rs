@@ -400,7 +400,7 @@ fn run_case(
                             for round in 0..rounds {
                                 let parity = round % k;
                                 ctx(gpu.copy_f32_buffer(&bufs[parity], &d.staging[round], words), "producer")?;
-                                ctx(transport.exchange(gpu, rank, parity, &d.ids), "exchange")?;
+                                ctx(transport.exchange(gpu, rank, parity, &d.ids, SLOTS), "exchange")?;
                                 ctx(gpu.copy_f32_buffer(&d.snaps[round], &bufs[parity], words), "snapshot")?;
                             }
                             Ok(())
@@ -446,7 +446,7 @@ fn run_case(
                     if fault == (Fault::SkipGather { rank: r }) {
                         continue;
                     }
-                    ctx(transport.gather(&mut rig.gpus[r], r, parity, &data[r].ids), "gather")?;
+                    ctx(transport.gather(&mut rig.gpus[r], r, parity, &data[r].ids, SLOTS), "gather")?;
                 }
                 for r in 0..n {
                     ctx(
@@ -648,7 +648,7 @@ fn timing_mode(cfg: &TimingCfg) -> R<()> {
             ctx(transport.publish(&mut rig.gpus[r], r, parity), "publish")?;
         }
         for r in 0..n {
-            ctx(transport.gather(&mut rig.gpus[r], r, parity, &ids[r]), "gather")?;
+            ctx(transport.gather(&mut rig.gpus[r], r, parity, &ids[r], SLOTS), "gather")?;
         }
         rig.sync_all()?;
         let dt = t.elapsed().as_secs_f64() * 1e6;

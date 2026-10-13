@@ -19,6 +19,7 @@
 use crate::bundle::{BundleError, Qwen4Bundle};
 use crate::gpu_forward::{
     qwen4_ep_buffer_index, Qwen4PeerExpertSource, QWEN4_EP_GATHER_BUFFERS,
+    QWEN4_EP_GATHER_MAX_ROWS,
 };
 use crate::weights::Qwen4EpPlacement;
 use hipfire_dispatch::families::moe::MoeRowGather;
@@ -33,6 +34,7 @@ use hipfire_runtime::session_cache::{SessionCache, SessionRoute};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::any::Any;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::JoinHandle;
@@ -553,9 +555,23 @@ pub struct PeerMirrors {
     entries: Vec<(MirrorRole, TensorSpec, GpuTensor)>,
     last_logits: Option<usize>,
     last_top1: Option<usize>,
+    /// This peer's replica of rank 0's native MTP drafter, built on the first
+    /// drafter fan-out ([`Qwen4Bundle::ep_drafter_fanout`]) and freed with the
+    /// mirrors.
+    drafter: Option<crate::mtp_spec::Qwen4MtpDrafter>,
 }
 
 impl PeerMirrors {
+    /// This peer's drafter replica, built from `params` (rank 0's construction
+    /// parameters) on first use.
+    pub(crate) fn drafter(
+        &mut self,
+        params: crate::mtp_spec::ReplicaParams,
+    ) -> &mut crate::mtp_spec::Qwen4MtpDrafter {
+        self.drafter
+            .get_or_insert_with(|| crate::mtp_spec::Qwen4MtpDrafter::new_replica(params))
+    }
+
     fn ensure(
         &mut self,
         gpu: &mut Gpu,
@@ -608,6 +624,12 @@ impl PeerMirrors {
     }
 
     fn free(self, gpu: &mut Gpu) -> Result<(), String> {
+        if let Some(drafter) = self.drafter {
+            <crate::mtp_spec::Qwen4MtpDrafter as hipfire_runtime::spec::MtpDrafter>::mtp_free(
+                Box::new(drafter),
+                gpu,
+            );
+        }
         let mut first = None;
         for (_, _, tensor) in self.entries {
             if let Err(error) = gpu.free_tensor(tensor) {
@@ -669,6 +691,9 @@ fn sync_device(gpu: &mut Gpu) -> Result<(), String> {
         .map_err(|error| format!("device synchronize: {error}"))
 }
 
+/// `last_buffer` before any invocation.
+const NO_BUFFER: usize = usize::MAX;
+
 /// The row-gather hook one rank installs into its forward
 /// (`Qwen4GpuForward::attach_ep`).
 pub(crate) struct Qwen4EpRowGatherHook {
@@ -678,6 +703,20 @@ pub(crate) struct Qwen4EpRowGatherHook {
     /// Device addresses of this rank's gather buffers, to check the expanded
     /// rows the stage hands over are the buffer it exchanges.
     buffer_ptrs: [usize; QWEN4_EP_GATHER_BUFFERS],
+    /// Buffer index of this rank's previous invocation. The transport's hazard
+    /// rule forbids the same buffer on two consecutive invocations.
+    last_buffer: AtomicUsize,
+}
+
+/// Record `buffer` as the rank's current invocation in `last`; `Err` when the
+/// previous invocation used the same one.
+fn note_gather_buffer(last: &AtomicUsize, rank: usize, buffer: usize) -> Result<(), String> {
+    if last.swap(buffer, Ordering::Relaxed) == buffer {
+        return Err(format!(
+            "qwen4 EP row gather: gather buffer {buffer} of rank {rank} used by two consecutive invocations"
+        ));
+    }
+    Ok(())
 }
 
 impl MoeRowGather for Qwen4EpRowGatherHook {
@@ -685,6 +724,7 @@ impl MoeRowGather for Qwen4EpRowGatherHook {
         &self,
         gpu: &mut Gpu,
         layer_idx: u16,
+        slots: usize,
         down_expanded: &GpuTensor,
         topk_indices: &GpuTensor,
     ) -> Result<(), String> {
@@ -696,9 +736,29 @@ impl MoeRowGather for Qwen4EpRowGatherHook {
                 self.rank
             ));
         }
+        note_gather_buffer(&self.last_buffer, self.rank, buffer)?;
         self.gather
-            .exchange(gpu, self.rank, buffer, topk_indices)
+            .exchange(gpu, self.rank, buffer, topk_indices, slots)
             .map_err(|error| format!("qwen4 EP row gather layer {layer_idx} rank {}: {error}", self.rank))
+    }
+}
+
+#[cfg(test)]
+mod gather_hook_tests {
+    use super::*;
+
+    #[test]
+    fn consecutive_gathers_never_reuse_a_buffer() {
+        let last = AtomicUsize::new(NO_BUFFER);
+        // Trunk parity, then the head's two buffers interleaved with the trunk.
+        for buffer in [0, 1, 0, 1, 2, 0, 3, 1, 2, 3, 0] {
+            note_gather_buffer(&last, 1, buffer).unwrap();
+        }
+        let error = note_gather_buffer(&last, 1, 0).unwrap_err();
+        assert!(error.contains("buffer 0") && error.contains("rank 1"), "{error}");
+        // The same buffer twice in a row is refused wherever it occurs.
+        assert!(note_gather_buffer(&last, 1, 2).is_ok());
+        assert!(note_gather_buffer(&last, 1, 2).is_err());
     }
 }
 
@@ -881,7 +941,7 @@ impl Qwen4Bundle {
         let trunk_layers = self.config.num_hidden_layers;
         let spec = EpRowGatherSpec {
             ranks,
-            slots: self.config.num_experts_per_tok,
+            slots: QWEN4_EP_GATHER_MAX_ROWS * self.config.num_experts_per_tok,
             row_bytes: self.config.hidden_size * std::mem::size_of::<f32>(),
         };
         let fingerprint = self.ep_replication_fingerprint();
@@ -1018,6 +1078,7 @@ impl Qwen4Bundle {
                 trunk_layers,
                 gather: gather.clone(),
                 buffer_ptrs: buffers.map(|buffer| buffer.buf.as_ptr() as usize),
+                last_buffer: AtomicUsize::new(NO_BUFFER),
             });
             let mut forward = bundle
                 .execution
@@ -1087,6 +1148,56 @@ impl Qwen4Bundle {
         result
             .and_then(|values| agree(what, values))
             .map_err(BundleError::Forward)
+    }
+
+    /// Fan a native-MTP drafter call out to every rank. `lead` runs rank 0's
+    /// `leader` drafter with this bundle (mesh detached, so nested calls run
+    /// locally) on the caller's thread and `gpu`; `follow` runs on every peer
+    /// with that peer's drafter replica (created from rank 0's construction
+    /// parameters on the first call) and its own bundle. Before `follow`, the
+    /// replica replays the target-less calls rank 0 ran since the last fan-out
+    /// (`configure_request`, `mtp_reset`, in order) and mirrors rank 0's n-gram
+    /// arming. The host results must agree on every rank; rank 0's is returned.
+    /// Without a mesh this is exactly `lead`. Neither closure may poll an
+    /// abort: no rank may stop alone.
+    pub(crate) fn ep_drafter_fanout<R: Send + PartialEq + std::fmt::Debug>(
+        &mut self,
+        what: &str,
+        gpu: &mut Gpu,
+        leader: &mut crate::mtp_spec::Qwen4MtpDrafter,
+        lead: impl FnOnce(
+            &mut crate::mtp_spec::Qwen4MtpDrafter,
+            &mut Qwen4Bundle,
+            &mut Gpu,
+        ) -> Result<R, String>,
+        follow: &(dyn Fn(
+            &mut crate::mtp_spec::Qwen4MtpDrafter,
+            &mut Qwen4Bundle,
+            &mut Gpu,
+        ) -> Result<R, String>
+              + Sync),
+    ) -> Result<R, String> {
+        let Some(mesh) = self.ep.take() else {
+            return lead(leader, self, gpu);
+        };
+        let params = leader.replica_params();
+        let ngram_active = leader.ngram_active();
+        let owed = leader.pending_replay().to_vec();
+        let result = mesh.run(
+            || lead(&mut *leader, &mut *self, &mut *gpu),
+            &|bundle, peer_gpu, mirrors| {
+                let replica = mirrors.drafter(params);
+                replica.replay(peer_gpu, &owed)?;
+                replica.mirror_ngram_active(ngram_active);
+                follow(replica, bundle, peer_gpu)
+            },
+        );
+        self.ep = Some(mesh);
+        let agreed = result.and_then(|values| agree(what, values));
+        if agreed.is_ok() {
+            leader.clear_replay();
+        }
+        agreed
     }
 
     /// Refuse an entry point that has no EP replication (lanes, MTP/spec, state

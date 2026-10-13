@@ -270,6 +270,9 @@ pub struct Qwen4Bundle {
     /// daemon-facing call is replicated on the peer ranks. `None` = single
     /// device (the default; no behaviour change).
     pub(crate) ep: Option<Box<Qwen4EpMesh>>,
+    /// Accepted trunk overlay sidecar (`attach_trunk_overlay`), consumed by
+    /// `attach_forward`; `None` = none pending.
+    pub(crate) trunk_overlay: Option<crate::trunk_overlay::Qwen4TrunkOverlay>,
 }
 
 /// `HIPFIRE_QWEN4_PENALTY_PREPASS=0` keeps a penalized request's repeat /
@@ -651,6 +654,7 @@ impl Qwen4Bundle {
             state_format,
             lanes: None,
             ep: None,
+            trunk_overlay: None,
         })
     }
 
@@ -729,6 +733,65 @@ impl Qwen4Bundle {
         self.weight_store.external_rows_len()
     }
 
+    /// Hand the bundle an accepted trunk overlay
+    /// ([`crate::trunk_overlay::resolve_trunk_overlay`]).  [`Self::attach_forward`]
+    /// applies it before `HIPFIRE_QWEN4_REQUANT`: a payload that fails its
+    /// sha256 or the weights' pre-check logs `REFUSED` and the base weights
+    /// run.  One overlay, before the forward attaches.
+    pub fn attach_trunk_overlay(
+        &mut self,
+        overlay: crate::trunk_overlay::Qwen4TrunkOverlay,
+    ) -> Result<(), BundleError> {
+        if self.execution.is_some() {
+            return Err(BundleError::Forward(
+                "Qwen4 trunk overlay must attach before the forward resources".to_string(),
+            ));
+        }
+        if self.trunk_overlay.is_some() {
+            return Err(BundleError::Forward(
+                "Qwen4 trunk overlay is already attached".to_string(),
+            ));
+        }
+        self.trunk_overlay = Some(overlay);
+        Ok(())
+    }
+
+    /// Apply the pending trunk overlay, if any.  A refusal (payload digest,
+    /// weight pre-check) is logged and leaves the base weights; a failure
+    /// after replacement started is an error.
+    fn apply_pending_trunk_overlay(&mut self, gpu: &mut Gpu) -> Result<(), BundleError> {
+        let Some(overlay) = self.trunk_overlay.take() else {
+            return Ok(());
+        };
+        let payloads = match overlay.bound.read_verified() {
+            Ok(payloads) => payloads,
+            Err(reason) => {
+                eprintln!(
+                    "{}",
+                    crate::trunk_overlay::overlay_refusal_line(overlay.path(), &reason)
+                );
+                return Ok(());
+            }
+        };
+        match self
+            .weights
+            .apply_trunk_overlay(gpu, &payloads)
+            .map_err(BundleError::Forward)?
+        {
+            crate::weights::TrunkOverlayOutcome::Refused(reason) => {
+                eprintln!(
+                    "{}",
+                    crate::trunk_overlay::overlay_refusal_line(overlay.path(), &reason)
+                );
+            }
+            crate::weights::TrunkOverlayOutcome::Applied(applied) => {
+                self.config.trunk_iu4_default = Some(overlay.default);
+                eprintln!("{}", crate::trunk_overlay::applied_line(&overlay, &applied));
+            }
+        }
+        Ok(())
+    }
+
     /// Attach reusable ordinary-HIP execution resources after the manifest
     /// transaction and model state have assembled successfully.
     ///
@@ -803,6 +866,7 @@ impl Qwen4Bundle {
                 );
             }
         }
+        self.apply_pending_trunk_overlay(gpu)?;
         self.weights
             .requant_from_env(gpu)
             .map_err(BundleError::Forward)?;
@@ -870,6 +934,9 @@ impl Qwen4Bundle {
             &self.config,
             max_seq,
             self.state.qsa_backend(),
+            // The forward is attached before the head: its EP binding (placement
+            // and the rank's dummy expert) builds the head's EP decode table.
+            self.execution.as_ref().and_then(Qwen4GpuForward::ep_binding),
         )
         .map_err(|error| BundleError::Forward(error.to_string()))?;
         self.mtp = Some(mtp);
@@ -1492,6 +1559,7 @@ impl Qwen4Bundle {
             position,
             fresh_qsa_selection,
             MtpStep::Predict,
+            self.execution.as_ref().and_then(Qwen4GpuForward::mtp_ep_gather),
         )
         .map_err(|error| BundleError::Forward(error.to_string()))?
         .ok_or_else(|| {
@@ -1521,6 +1589,7 @@ impl Qwen4Bundle {
                 position,
                 fresh_qsa_selection,
                 top1_out,
+                self.execution.as_ref().and_then(Qwen4GpuForward::mtp_ep_gather),
             )
             .map_err(|error| BundleError::Forward(error.to_string()))
     }
@@ -1784,6 +1853,7 @@ impl Qwen4Bundle {
                 position,
                 fresh_qsa_selection,
                 MtpStep::Advance,
+                self.execution.as_ref().and_then(Qwen4GpuForward::mtp_ep_gather),
             )
             .map(|_| ())
             .map_err(|error| BundleError::Forward(error.to_string()))
@@ -1809,6 +1879,7 @@ impl Qwen4Bundle {
                 position,
                 true,
                 MtpStep::Append,
+                self.execution.as_ref().and_then(Qwen4GpuForward::mtp_ep_gather),
             )
             .map(|_| ())
             .map_err(|error| BundleError::Forward(error.to_string()))
@@ -1846,7 +1917,7 @@ impl Qwen4Bundle {
     /// that is `None` too.
     ///
     /// `context` names the caller and is passed through unchanged: only
-    /// [`MtpFillContext::PromptFill`] can take the opt-in DET projections.
+    /// [`MtpFillContext::PromptFill`] can take the DET projections.
     pub(crate) fn mtp_append_rows(
         &mut self,
         gpu: &mut Gpu,
@@ -1932,6 +2003,7 @@ impl Qwen4Bundle {
             position,
             fresh_qsa_selection,
             logits,
+            self.execution.as_ref().and_then(Qwen4GpuForward::mtp_ep_gather),
         )
         .map_err(|error| BundleError::Forward(error.to_string()))
     }

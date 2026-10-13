@@ -48,9 +48,11 @@ hipfire-arch-dots-ocr = { path = "../hipfire-arch-dots-ocr" }
 hipfire-arch-diffusion = { path = "../hipfire-arch-diffusion" }
 serde_json.workspace = true
 
-# fn_ep_oracle (lab example) only: the MoE dump context hook and SHA-256.
+# fn_ep_oracle (lab example) only: the MoE dump context hook, SHA-256 and the
+# Qwen4 lab head-state digest (`lab_resident_head_items`).
 [dev-dependencies]
 hipfire-dispatch = { path = "../hipfire-dispatch" }
+hipfire-arch-qwen4 = { path = "../hipfire-arch-qwen4", features = ["lab"] }
 sha2.workspace = true
 
 # ---------------------------------------------------------------------------

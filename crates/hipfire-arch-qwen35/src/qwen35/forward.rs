@@ -472,6 +472,19 @@ impl hipfire_dispatch::families::moe::RoutedExpertWeights for MoeFfnWeights {
         }
     }
 
+    fn host_mapped_projections(&self) -> (bool, bool) {
+        if let Some(owners) = &self.packed_expert_owners {
+            owners.host_mapped_projections()
+        } else {
+            self.get(0).map_or((false, false), |(gate_up, down)| {
+                (
+                    gate_up.buf.buf.is_host_mapped(),
+                    down.buf.buf.is_host_mapped(),
+                )
+            })
+        }
+    }
+
     fn get(
         &self,
         expert_idx: usize,
@@ -507,6 +520,35 @@ impl hipfire_dispatch::families::moe::RoutedExpertWeights for MoeFfnWeights {
                 metadata, &gate_up, &down, expert_idx,
             )
             .then_some((gate_up, down))
+        })
+    }
+
+    /// CPU-splice payload for one routed expert, resolved from the packed bucket
+    /// owners: a per-expert view is `Borrowed` and invisible to `Gpu::host_bytes`,
+    /// so the owning bucket has to be found by hand (same walk as
+    /// `packed_expert_host_bytes`' own pinning test). `None` means the layer has
+    /// no packed owners, the id is out of range, or the dtype has no CPU decoder —
+    /// the caller reports that as "no CPU payload" and the load-time coverage
+    /// report names uncovered formats.
+    fn cpu_splice_expert(
+        &self,
+        gpu: &Gpu,
+        expert_idx: usize,
+    ) -> Option<hipfire_dispatch::cpu_exec::CpuMoeExpert<'_>> {
+        let owners = self.packed_expert_owners.as_ref()?;
+        let expert = self.experts.get(expert_idx)?;
+        let gate_up =
+            packed_expert_host_bytes(gpu, &owners.gate_up, &expert.gate_up.buf, "gate_up").ok()?;
+        let down =
+            packed_expert_host_bytes(gpu, &owners.down, &expert.down.buf, "down").ok()?;
+        let gate_up_quant =
+            hipfire_dispatch::cpu_exec::cpu_quant_for(expert.gate_up.gpu_dtype)?;
+        let down_quant = hipfire_dispatch::cpu_exec::cpu_quant_for(expert.down.gpu_dtype)?;
+        Some(hipfire_dispatch::cpu_exec::CpuMoeExpert {
+            gate_up_quant,
+            gate_up,
+            down_quant,
+            down,
         })
     }
 }
@@ -572,6 +614,17 @@ fn moe_params_for_decode<'a>(
         per_expert_gate_up,
         per_expert_down,
     };
+    crate::qwen35::weights::trace_moe_arm(
+        "decode",
+        moe_dtypes.routed_gate_up,
+        moe_dtypes.routed_down,
+        moe_dtypes.experts_all_gate_up_mq4,
+        ffn.packed_expert_owners.as_ref().is_some_and(|owners| {
+            owners.gate_up.iter().all(|b| b.buf.is_host_mapped())
+                && owners.down.iter().all(|b| b.buf.is_host_mapped())
+        }),
+        per_expert_gate_up.is_some() || per_expert_down.is_some(),
+    );
     let shared = Some(hipfire_dispatch::families::moe::MoeSharedDecode {
         weights: hipfire_dispatch::families::moe::MoeSharedWeights {
             selector: ffn.shared_expert_gate.dispatch_ref(),
@@ -600,6 +653,9 @@ fn moe_params_for_decode<'a>(
         norm_topk_prob: config.norm_topk_prob,
         x_rot_prerotated,
         defer_routed_combine,
+        cpu_deferred_experts: ffn.cpu_deferred_experts
+            && ep_mode == MoeEpMode::None
+            && !defer_routed_combine,
         ep_mode,
         layer_idx: ffn.layer_idx,
         x_norm,
@@ -654,6 +710,51 @@ fn moe_params_for_decode<'a>(
     }
 }
 
+/// Resolve one routed expert's host-mapped bytes from the packed owner buckets.
+///
+/// Per-expert views are non-owning `sub_offset` slices, so `Gpu::host_bytes`
+/// (which reads the allocation registry by exact pointer) returns `None` for
+/// them. Locate the bucket owner whose device range contains the view pointer,
+/// then return `offset..offset+view_len` from that owner's host bytes — the
+/// same bytes the GPU indexed kernel would read, at the expert's own dtype.
+/// Uniform layers have a single bucket per projection and graded layers one per
+/// `(gate_up, down)` tier, so this works for both without knowing which.
+fn packed_expert_host_bytes<'a>(
+    gpu: &Gpu,
+    buckets: &'a [GpuTensor],
+    view: &GpuTensor,
+    what: &str,
+) -> Result<&'a [u8], DispatchError> {
+    let base = view.buf.as_ptr() as usize;
+    let len = view.buf.size();
+    for owner in buckets {
+        let start = owner.buf.as_ptr() as usize;
+        let end = start + owner.buf.size();
+        if base >= start && base < end {
+            let offset = base - start;
+            let bytes = gpu.host_bytes(owner).ok_or_else(|| {
+                DispatchError::Hip(format!(
+                    "moe cpu expert splice: {what} bucket owner has no host bytes"
+                ))
+            })?;
+            let view_end = offset.checked_add(len).ok_or_else(|| {
+                DispatchError::Hip(format!(
+                    "moe cpu expert splice: {what} expert extent overflows"
+                ))
+            })?;
+            if view_end > bytes.len() {
+                return Err(DispatchError::Hip(format!(
+                    "moe cpu expert splice: {what} expert view exceeds bucket owner bytes"
+                )));
+            }
+            return Ok(&bytes[offset..view_end]);
+        }
+    }
+    Err(DispatchError::Hip(format!(
+        "moe cpu expert splice: {what} expert view is not inside any packed bucket owner"
+    )))
+}
+
 /// Execute an already-built decode recipe and retain the existing observation
 /// and expert-statistics hooks around the shared sealed Step executor.
 fn moe_ffn_decode_impl<'a>(
@@ -682,6 +783,32 @@ fn moe_ffn_decode_impl<'a>(
     }
     let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
     let bound = ffn.bound_experts()?;
+    let deferred_routed_experts = moe_params.cpu_deferred_experts;
+    // Only when explicitly asked: the oracle downloads the activation and the
+    // route for every MoE layer, which is a host sync point on the decode path.
+    let oracle_input = hipfire_config::developer_var("HIPFIRE_MOE_CPU_ORACLE")
+        .is_ok()
+        .then_some((moe_params.x_norm, moe_params.dtypes.routed_gate_up));
+    // Resolve the expert-statistics toggle exactly once: the same answer gates
+    // the CPU-deferred refusal below and the end-of-step capture, and the
+    // `developer_var` lookup must not be repeated on the decode hot path.
+    let stats_enabled = expert_stats_enabled();
+    // When the sealed step below carries the CPU-deferred selection it omits
+    // the entire routed GPU FFN, so `s.down_expanded` is never written. Both
+    // diagnostics depend on that buffer: `moe_cpu_oracle_report` compares the
+    // GPU routed result against the CPU splice, and `capture_expert_stats`
+    // measures the routed output norm. A silent skip or a stale-buffer read
+    // would misreport, so fail closed and point at the supported loads. This
+    // refuses only the CPU-deferred route; EP / PCIe / resident are untouched.
+    if deferred_routed_experts && (oracle_input.is_some() || stats_enabled) {
+        return Err(HipError::new(
+            1,
+            "explicit GPU routed expert oracle/statistics unavailable with \
+             CPU-deferred experts; use PCIe/resident",
+        ));
+    }
+    let t_window = std::time::Instant::now();
+    let t_sealed = std::time::Instant::now();
     let sealed = hipfire_dispatch::pipeline::sealed_moe::seal_decode(bound, &ctx, moe_params)
         .map_err(HipError::from)?;
     hipfire_dispatch::pipeline::execute_steps(
@@ -707,6 +834,61 @@ fn moe_ffn_decode_impl<'a>(
         };
         dumped.map_err(HipError::from)?;
     }
+
+    let sealed_ns = t_sealed.elapsed().as_nanos() as u64;
+    // The sealed program above runs the CPU expert splice in place of the routed
+    // GPU stages for this call, so the splice's cost is inside `sealed_ns` and
+    // cannot be separated on this side; `cpu_splice_ns` therefore reports 0 and
+    // the stage-side trace is the authority for the splice's own timing.
+    if deferred_routed_experts {
+        // CPU deferral omits the GPU tail that used to change the activation
+        // staging cache key; reused scratch must be refreshed by the next layer.
+        gpu.invalidate_fp16_cache();
+    }
+    let total_ns = t_window.elapsed().as_nanos() as u64;
+    if hipfire_dispatch::cpu_exec::moe_trace_enabled() {
+        hipfire_dispatch::cpu_exec::moe_window_trace(
+            ffn.layer_idx as usize,
+            hipfire_dispatch::cpu_exec::MoeWindowTiming {
+                total_ns,
+                gpu_sealed_ns: sealed_ns,
+                // The splice now runs inside the sealed program (stage-side), so
+                // its cost is part of `gpu_sealed_ns`; see the comment above.
+                cpu_splice_ns: 0,
+                other_ns: total_ns.saturating_sub(sealed_ns),
+                rows: 1,
+                top_k: k,
+            },
+        );
+    }
+    if let Some((x_norm, routed_gate_up)) = oracle_input {
+        if let (Some(q), Some(owners)) = (
+            hipfire_dispatch::cpu_exec::cpu_quant_for(routed_gate_up),
+            ffn.packed_expert_owners.as_ref(),
+        ) {
+            // Uniform-only diagnostic: skip graded layers rather than report
+            // one tier's bytes as the whole layer.
+            if owners.gate_up.len() == 1 && owners.down.len() == 1 {
+                if let (Some(gu), Some(dn)) = (owners.gate_up.first(), owners.down.first()) {
+                    hipfire_dispatch::cpu_exec::moe_cpu_oracle_report(
+                        gpu,
+                        q,
+                        config.dim,
+                        config.moe_intermediate_size,
+                        config.num_experts_per_tok,
+                        gu,
+                        dn,
+                        x_norm,
+                        s.topk_indices,
+                        s.topk_weights,
+                        s.down_expanded,
+                        ffn.layer_idx,
+                        ffn.expert_down_awq_ptrs.is_some(),
+                    );
+                }
+            }
+        }
+    }
     #[cfg(feature = "moe-oracle")]
     {
         let oracle_pos =
@@ -727,7 +909,7 @@ fn moe_ffn_decode_impl<'a>(
         )
         .map_err(|e| HipError::new(0, &e))?;
     }
-    if expert_stats_enabled() {
+    if stats_enabled {
         capture_expert_stats(
             gpu,
             ffn.layer_idx,
@@ -1670,7 +1852,7 @@ pub fn forward_scratch(
     // host sync point — a D2H and an H2D around the multiplication — so it can
     // neither be recorded into a hipGraph nor replayed out of one. Take the
     // non-captured path for the model's whole lifetime instead.
-    let cpu_blocks_capture = hipfire_dispatch::cpu_offload_active(config.i_gpu_start);
+    let cpu_blocks_capture = gpu.owns_host_cpu_weights();
     if graph_would_be_used && cpu_blocks_capture {
         hipfire_dispatch::log_capture_disabled_once();
     }
@@ -2146,10 +2328,10 @@ fn forward_scratch_layers(
     hidden_rb: Option<&mut HiddenStateRingBuffer>,
     mrope: Option<&MropeCtx>,
 ) -> HipResult<()> {
-    // #397 Ship 6 — forward-as-pipeline. When HIPFIRE_FORWARD_LOWERED=1, route
-    // single-GPU decode through the lowered super-op executor. Skipped when a
-    // hidden-state ring buffer is active (spec-decode capture engages only the
-    // hand path for now). Default off → the hand arms below run unchanged.
+    // #397 Ship 6 — forward-as-pipeline. When the lowered toggle is on (default
+    // on; `HIPFIRE_FORWARD_LOWERED=0` opts out), route single-GPU decode through
+    // the lowered super-op executor. Skipped when a hidden-state ring buffer is
+    // active (spec-decode capture engages only the hand path for now).
     //
     // Also skipped when a 3D mrope context is present: the lowered executor's
     // ATTEND_FULL binding (`Qwen35Bindings::run_attend`) still issues the 1D
@@ -2157,7 +2339,18 @@ fn forward_scratch_layers(
     // channel for the (t,h,w) buffer, so routing a VL request through it would
     // silently reinstate sequential positions. VL therefore always takes the
     // hand arms below, which DO branch on `mrope`.
-    if forward_lowered_enabled() && hidden_rb.is_none() && mrope.is_none() {
+    //
+    // Also skipped when the model owns host CPU weights
+    // (`memory.offload_exec=cpu` over a spilled prefix): the lowered executor
+    // bypasses the `execute_steps` seam that routes host-mapped weights to the
+    // CPU splice and refuses them instead, while the hand arms below keep the
+    // splice. Device-resident and PCIe-spilled models report false here, so
+    // their lowered routing is unchanged.
+    if forward_lowered_enabled()
+        && hidden_rb.is_none()
+        && mrope.is_none()
+        && !gpu.owns_host_cpu_weights()
+    {
         return forward_scratch_layers_lowered(gpu, weights, config, pos, kv_cache, dn_state, s);
     }
 
@@ -5937,14 +6130,14 @@ pub fn forward_prefill_dense_tp_with_hidden(
 }
 // #397 Ship 6 — forward-as-pipeline: qwen35 DECODE lowered path (ADDITIVE).
 //
-// `HIPFIRE_FORWARD_LOWERED=1` routes the single-GPU decode layer loop through
-// the dispatch substrate's `run_layer_program` executor (one pre-resolved
-// `LayerProgram` of coarse super-ops per layer) instead of the hand-written
-// arms in `forward_scratch_layers`. The hand arms are left UNTOUCHED, so the
-// default (flag off) is byte-identical to master by construction; the lowered
-// path is validated byte-identical via the external committed-token md5 gate
-// (`FORWARD_LOWERED=0` vs `=1`, same prompt) on the fleet before the default is
-// flipped per arch. See [[project_ship6_forward_pipeline_design_2026_06_07]].
+// `HIPFIRE_FORWARD_LOWERED=0` opts back out to the hand-written arms in
+// `forward_scratch_layers`. The hand arms are left UNTOUCHED, so the opt-out
+// is byte-identical to master by construction; the lowered path is validated
+// byte-identical via the external committed-token md5 gate (`FORWARD_LOWERED=0`
+// vs default, same prompt) on the fleet before the default is flipped per arch.
+// `forward_scratch_layers` additionally keeps CPU-spilled models
+// (`memory.offload_exec=cpu` over host-mapped weights) on the hand arms, whose
+// `execute_steps` seam routes to the CPU splice the lowered executor bypasses.
 //
 // The super-op handlers call the SAME helper fns the hand path uses
 // (`qkv/qkvza/gate_up_via_execute_steps`, `kv_cache_attention_dispatch`,
@@ -6119,6 +6312,21 @@ pub(crate) struct Qwen35Bindings<'a> {
 
 fn op_code(op: &OpBinding) -> u32 {
     op.weights.first().map(|w| w.0).unwrap_or(u32::MAX)
+}
+
+/// Whether one MoE layer's FFN reads a host-mapped weight: the router, the
+/// shared expert, or either routed projection (owner-backed, so packed layers
+/// report honestly — per-expert views are borrowed slices).
+fn moe_ffn_host_mapped(gpu: &Gpu, ffn: &MoeFfnWeights) -> bool {
+    use hipfire_dispatch::families::moe::RoutedExpertWeights;
+    let (gate_up_host, down_host) = ffn.host_mapped_projections();
+    gate_up_host
+        || down_host
+        || gpu.host_located(&ffn.router.buf)
+        || gpu.host_located(&ffn.shared_expert_gate.buf)
+        || gpu.host_located(&ffn.shared_expert.gate.buf)
+        || gpu.host_located(&ffn.shared_expert.up.buf)
+        || gpu.host_located(&ffn.shared_expert.down.buf)
 }
 
 impl<'a> ForwardBindings for Qwen35Bindings<'a> {
@@ -7010,6 +7218,68 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
             "qwen35 has no Escape super-op ({kind:?})"
         )))
     }
+
+    fn op_reads_host_mapped_weight(&self, gpu: &Gpu, op: &SuperOp) -> bool {
+        // Decode lowered ops read GEMV/GEMM weights only; norm/state/KV/conv reads
+        // stay on the GPU by design and must not trip the offload refusal. `Moe`
+        // covers the router, the shared expert, and the routed projections so a
+        // spilled expert tier fails closed rather than reading over PCIe. `Norm`,
+        // `Recurrent`, `Conv`, and `Escape` carry no weight reads.
+        match op.kind {
+            SuperOpKind::Proj => match (self.layer, op_code(&op.binding)) {
+                (LayerWeights::FullAttn(l), q35_op::PROJ_QKV) => {
+                    gpu.host_located(&l.wq.buf)
+                        || gpu.host_located(&l.wk.buf)
+                        || gpu.host_located(&l.wv.buf)
+                }
+                (LayerWeights::FullAttnMoe(l), q35_op::PROJ_QKV) => {
+                    gpu.host_located(&l.wq.buf)
+                        || gpu.host_located(&l.wk.buf)
+                        || gpu.host_located(&l.wv.buf)
+                }
+                (LayerWeights::DeltaNet(l), q35_op::PROJ_QKVZA) => {
+                    gpu.host_located(&l.wqkv.buf)
+                        || gpu.host_located(&l.wz.buf)
+                        || gpu.host_located(&l.w_beta.buf)
+                        || gpu.host_located(&l.w_alpha.buf)
+                }
+                (LayerWeights::DeltaNetMoe(l), q35_op::PROJ_QKVZA) => {
+                    gpu.host_located(&l.wqkv.buf)
+                        || gpu.host_located(&l.wz.buf)
+                        || gpu.host_located(&l.w_beta.buf)
+                        || gpu.host_located(&l.w_alpha.buf)
+                }
+                (LayerWeights::DeltaNet(l), q35_op::PROJ_GATE_UP) => {
+                    gpu.host_located(&l.w_gate.buf) || gpu.host_located(&l.w_up.buf)
+                }
+                (LayerWeights::FullAttn(l), q35_op::PROJ_GATE_UP) => {
+                    gpu.host_located(&l.w_gate.buf) || gpu.host_located(&l.w_up.buf)
+                }
+                _ => false,
+            },
+            SuperOpKind::ResidualGemv => match (self.layer, op_code(&op.binding)) {
+                (LayerWeights::FullAttn(l), q35_op::RESID_WO) => gpu.host_located(&l.wo.buf),
+                (LayerWeights::FullAttnMoe(l), q35_op::RESID_WO) => gpu.host_located(&l.wo.buf),
+                (LayerWeights::DeltaNet(l), q35_op::RESID_WO) => gpu.host_located(&l.wo.buf),
+                (LayerWeights::DeltaNetMoe(l), q35_op::RESID_WO) => gpu.host_located(&l.wo.buf),
+                (LayerWeights::DeltaNet(l), q35_op::RESID_DOWN_SWIGLU) => {
+                    gpu.host_located(&l.w_down.buf)
+                }
+                (LayerWeights::FullAttn(l), q35_op::RESID_DOWN_SWIGLU) => {
+                    gpu.host_located(&l.w_down.buf)
+                }
+                _ => false,
+            },
+            SuperOpKind::Attend => false,
+            SuperOpKind::Moe => match self.layer {
+                LayerWeights::DeltaNetMoe(l) => moe_ffn_host_mapped(gpu, &l.ffn),
+                LayerWeights::FullAttnMoe(l) => moe_ffn_host_mapped(gpu, &l.ffn),
+                _ => false,
+            },
+            SuperOpKind::Norm | SuperOpKind::Recurrent | SuperOpKind::Conv => false,
+            SuperOpKind::Escape(_) => false,
+        }
+    }
 }
 
 /// Cached `HIPFIRE_FORWARD_LOWERED` toggle. #397 Ship 6: the qwen35 single-GPU
@@ -7529,7 +7799,8 @@ mod tests {
     #[test]
     fn flash_partials_split_sizing_is_exact_gfx1100_only() {
         // Legacy: batch rows at min(q8 tile, 128, batched tile).
-        let legacy = |heads: usize, kv: usize, tile: usize| 16 * heads * kv.div_ceil(tile) * 258 * 4;
+        let legacy =
+            |heads: usize, kv: usize, tile: usize| 16 * heads * kv.div_ceil(tile) * 258 * 4;
 
         // gfx1100 Qwen3.8-27B at 8K (Q8 decode tile32, batched tile128): 32
         // batched rows at tile128 dominate one tile32 decode row, half the
@@ -7544,15 +7815,33 @@ mod tests {
         assert_eq!(len("gfx1100", 24, 8_192, 32, 128, Some(1)), 6_340_608);
         assert_eq!(len("gfx1100", 24, 8_192, 32, 128, Some(64)), 101_449_728);
         // Past 8K gfx1100 decodes at tile128 too: legacy sizing.
-        assert_eq!(len("gfx1100", 24, 65_536, 128, 128, None), legacy(24, 65_536, 128));
+        assert_eq!(
+            len("gfx1100", 24, 65_536, 128, 128, None),
+            legacy(24, 65_536, 128)
+        );
 
         // Every other arch keeps the legacy buffer, including the shapes whose
         // decode tile is finer than the batched tile.
-        assert_eq!(len("gfx1201", 24, 8_192, 128, 128, None), legacy(24, 8_192, 128));
-        assert_eq!(len("gfx1151", 24, 8_192, 128, 128, None), legacy(24, 8_192, 128));
-        assert_eq!(len("gfx1201", 8, 8_192, 16, 128, None), legacy(8, 8_192, 16));
-        assert_eq!(len("gfx1151", 16, 2_048, 32, 128, None), legacy(16, 2_048, 32));
-        assert_eq!(len("gfx1101", 24, 8_192, 32, 128, None), legacy(24, 8_192, 32));
+        assert_eq!(
+            len("gfx1201", 24, 8_192, 128, 128, None),
+            legacy(24, 8_192, 128)
+        );
+        assert_eq!(
+            len("gfx1151", 24, 8_192, 128, 128, None),
+            legacy(24, 8_192, 128)
+        );
+        assert_eq!(
+            len("gfx1201", 8, 8_192, 16, 128, None),
+            legacy(8, 8_192, 16)
+        );
+        assert_eq!(
+            len("gfx1151", 16, 2_048, 32, 128, None),
+            legacy(16, 2_048, 32)
+        );
+        assert_eq!(
+            len("gfx1101", 24, 8_192, 32, 128, None),
+            legacy(24, 8_192, 32)
+        );
     }
     #[test]
     fn gfx1201_fa_epilogue_admits_q8_and_fp8_tile() {
@@ -7738,5 +8027,46 @@ mod tests {
         // Mirror dense_tp_allreduce_batched's overflow guard.
         let res: Result<usize, &str> = n.checked_mul(dim).ok_or("overflow");
         assert!(res.is_err());
+    }
+
+    /// The `CpuSplice` stage resolves a selected expert's host bytes from the
+    /// packed bucket owners because per-expert views are `Borrowed` and invisible
+    /// to `Gpu::host_bytes`. Pin that ownership walk: two graded buckets of
+    /// different stride, each holding real byte patterns, and the exact
+    /// `sub_offset(pos*stride, stride)` views the graded packer builds.
+    #[test]
+    fn packed_expert_view_bytes_finds_owning_bucket() {
+        let Some(mut gpu) = Gpu::init().ok() else {
+            return; // no GPU: metadata-only environment
+        };
+        let a0: Vec<u8> = (0u8..16).collect();
+        let a1: Vec<u8> = (100u8..116).collect();
+        let b0: Vec<u8> = (200u8..212).collect();
+        let bucket_a = gpu
+            .upload_raw_host_mapped(&[a0.clone(), a1.clone()].concat(), &[2, 16])
+            .expect("host bucket A");
+        let bucket_b = gpu
+            .upload_raw_host_mapped(&b0.clone(), &[1, 12])
+            .expect("host bucket B");
+        let buckets = vec![bucket_a, bucket_b];
+        let view_a0 = buckets[0].sub_offset(0, 16);
+        let view_a1 = buckets[0].sub_offset(16, 16);
+        let view_b0 = buckets[1].sub_offset(0, 12);
+        assert_eq!(
+            packed_expert_host_bytes(&gpu, &buckets, &view_a0, "gate_up").unwrap(),
+            a0.as_slice()
+        );
+        assert_eq!(
+            packed_expert_host_bytes(&gpu, &buckets, &view_a1, "gate_up").unwrap(),
+            a1.as_slice()
+        );
+        assert_eq!(
+            packed_expert_host_bytes(&gpu, &buckets, &view_b0, "down").unwrap(),
+            b0.as_slice()
+        );
+        // A view outside every owner fails closed rather than resolving to some
+        // other expert's bytes.
+        let stray = GpuTensor::null_for_test();
+        assert!(packed_expert_host_bytes(&gpu, &buckets, &stray, "gate_up").is_err());
     }
 }

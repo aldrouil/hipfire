@@ -75,6 +75,12 @@ const REAL: &[(&str, u8, DType, CpuQuant)] = &[
     ("qwen3.5-2b.hf6", 8, DType::HFQ6G256, CpuQuant::Hfq6G256),
     // Same format, larger model: the 9B's 4096-wide rows exercise 16 groups.
     ("qwen3.5-9b.mq4", 13, DType::MQ4G256, CpuQuant::Mq4G256),
+    (
+        "qwen3.6-35b-a3b.mfp4",
+        34,
+        DType::MFP4G32E8,
+        CpuQuant::Mfp4G32E8,
+    ),
 ];
 
 /// Formats with no fixture on disk: (quant_type, DType, CpuQuant).
@@ -114,6 +120,7 @@ const SYNTH: &[(u8, DType, CpuQuant)] = &[
 const EXTRA: &[(u8, DType, CpuQuant)] = &[
     (49, DType::MQ3G256V2, CpuQuant::Mq3G256V2),
     (45, DType::MQ4CG256, CpuQuant::Mq4CG256),
+    (34, DType::MFP4G32E8, CpuQuant::Mfp4G32E8),
 ];
 
 fn models_dir() -> PathBuf {
@@ -195,6 +202,10 @@ fn synth_weights(q: CpuQuant, m: usize, k: usize) -> Vec<u8> {
                     0xb400, 0xb000, 0x3000, 0x3400, 0x3800, 0x3c00,
                 ])),
                 CpuQuant::Q8F16 => bytes[..2].copy_from_slice(&0x3800u16.to_le_bytes()),
+                // qt 34 is covered by the REAL row (real quantizer bytes) and
+                // the packed-host multirow oracle — never by this synthetic
+                // path, so this arm is unreachable by construction.
+                CpuQuant::Mfp4G32E8 => {}
                 // The element formats are covered bit-exactly by the fixture
                 // tables in `hipfire-cpu` and by the cross-check over real norms.
                 CpuQuant::F16 | CpuQuant::F32 | CpuQuant::Bf16 => unreachable!("not in SYNTH"),
@@ -637,12 +648,117 @@ fn gpu_cpu_gemv_parity_per_format() {
     }
     // A format with no canonical decoder has no other oracle: state which ones
     // were only checked synthetically, so the record is not read as if every row
-    // came from a real tensor.
+    // came from a real tensor. qt 34 (MFP4G32-E8) keeps its canonical-group
+    // decode inside `hipfire-cpu` (`decode_group_codes` + the row-header arm),
+    // covered there by the literal oracle and `row_bytes` stride test; it has
+    // no `dequantize_to_f32` row-tensor arm, so its tensor-level oracle here is
+    // the production launcher vs the transcription over the REAL row (plus the
+    // packed-host multirow oracle) — never a synthetic buffer.
     eprintln!(
         "\nnote: qt 45/47/48/49/50/9/10/31 have no canonical `dequantize_to_f32` arm; \
          their rows are the production launcher vs the transcription (synthetic buffers, \
          or a real tensor via HIPFIRE_PARITY_EXTRA_MODEL)."
     );
+}
+
+/// Exercise the actual CPU/GPU seam, not only the CPU GEMV transcription.
+/// Consecutive CPU returns share storage without an intervening host read,
+/// while GPU consumers and the next CPU download must see every update.
+#[test]
+#[ignore = "requires HIP GPU and HIPFIRE_OFFLOAD_EXEC=cpu"]
+fn cpu_offload_return_stream_and_reuse_parity() -> Result<(), Box<dyn std::error::Error>> {
+    assert!(hipfire_dispatch::cpu_exec_enabled(), "run with HIPFIRE_OFFLOAD_EXEC=cpu");
+    let mut gpu = Gpu::init()?;
+    for stream_case in 0..3 {
+        if stream_case != 0 {
+            gpu.active_stream = Some(gpu.hip.stream_create_non_blocking()?);
+        }
+        for (dtype, q) in [
+            (DType::MQ4G256, CpuQuant::Mq4G256),
+            (DType::HFQ6G256, CpuQuant::Hfq6G256),
+            (DType::Q8_0, CpuQuant::Q8F16),
+        ] {
+            // Growth, then a smaller logical extent in the same allocation.
+            for (case, k) in [256usize, 1024, 256].into_iter().enumerate() {
+                let m = k;
+                let bytes = synth_weights(q, m, k);
+                let w = gpu.upload_raw_host_mapped(&bytes, &[bytes.len()])?;
+                let scales: Vec<f32> = (0..k).map(|i| 0.75 + (i % 7) as f32 * 0.125).collect();
+                let scale = gpu.upload_f32(&scales, &[k])?;
+                let mut x_host = activation(k, case + stream_case * 3);
+                let prerotated = q.is_fwht_g256() && case == 1;
+                if prerotated {
+                    divide_by_awq_scale(&mut x_host, &scales);
+                    rotate_x(&mut x_host);
+                }
+                let x = gpu.upload_f32(&x_host, &[k])?;
+                let out = gpu.zeros(&[m], DType::F32)?;
+                let seed = activation(m, case + 17);
+                let acc = gpu.upload_f32(&seed, &[m])?;
+                let delta = gpu.upload_f32(&vec![0.125; m], &[m])?;
+                let wr = WeightRef {
+                    buf: &w,
+                    dtype,
+                    m,
+                    k,
+                    row_stride: 0,
+                    rotation: None,
+                    awq_scale: Some(&scale),
+                    lloyd_lut_e4m3: None,
+                    lloyd_lut_f16: None,
+                    lloyd_lut_c16: None,
+                };
+                let rotate = q.is_fwht_g256() && !prerotated;
+                let mut prepared = x_host;
+                if rotate {
+                    divide_by_awq_scale(&mut prepared, &scales);
+                    rotate_x(&mut prepared);
+                }
+                let mut want_out = vec![0.0; m];
+                cpu_gemv(q, &bytes, m, k, &prepared, &mut want_out);
+                for value in &mut want_out {
+                    *value += 0.125;
+                }
+                let mut residual_input = want_out.clone();
+                if q.is_fwht_g256() {
+                    divide_by_awq_scale(&mut residual_input, &scales);
+                    rotate_x(&mut residual_input);
+                }
+                let mut increment = vec![0.0; m];
+                cpu_gemv(q, &bytes, m, k, &residual_input, &mut increment);
+                let mut want_acc = seed;
+                for _ in 0..4 {
+                    hipfire_dispatch::run_host_mapped_gemv(&gpu, &wr, &x, rotate, &out)?;
+                    gpu.add_inplace_f32(&out, &delta)?;
+                    hipfire_dispatch::run_host_mapped_gemv_residual(&gpu, &wr, &out, &acc)?;
+                    gpu.add_inplace_f32(&acc, &delta)?;
+                    hipfire_cpu::epilogue::residual_add(&mut want_acc, &increment);
+                    for value in &mut want_acc {
+                        *value += 0.125;
+                    }
+                }
+                match gpu.active_stream.as_ref() {
+                    Some(stream) => gpu.hip.stream_synchronize(stream)?,
+                    None => gpu.hip.stream_synchronize_default()?,
+                }
+                assert_eq!(gpu.download_f32(&out)?, want_out,
+                    "{q:?} stream {stream_case} k={k}: GPU consumer saw a stale CPU output");
+                assert_eq!(gpu.download_f32(&acc)?, want_acc,
+                    "{q:?} stream {stream_case} k={k}: residual return/storage reuse changed arithmetic");
+                gpu.free_tensor(w)?;
+                gpu.free_tensor(scale)?;
+                gpu.free_tensor(x)?;
+                gpu.free_tensor(out)?;
+                gpu.free_tensor(acc)?;
+                gpu.free_tensor(delta)?;
+            }
+        }
+        if let Some(stream) = gpu.active_stream.take() {
+            gpu.hip.stream_destroy(stream)?;
+        }
+    }
+    eprintln!("CPU_OFFLOAD_RETURN_STREAM_REUSE_PARITY PASS");
+    Ok(())
 }
 
 fn q_format_name(q: CpuQuant) -> &'static str {
@@ -675,5 +791,6 @@ fn q_format_name(q: CpuQuant) -> &'static str {
         CpuQuant::F32 => "F32",
         CpuQuant::Bf16 => "Bf16",
         CpuQuant::Q8F16 => "Q8F16",
+        CpuQuant::Mfp4G32E8 => "Mfp4G32E8",
     }
 }

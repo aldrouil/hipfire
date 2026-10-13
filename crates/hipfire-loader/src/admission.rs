@@ -159,8 +159,10 @@ pub fn qwen4_kv_adaptive_requested(value: Option<&str>) -> bool {
 /// and `Some(false)` keeps AR. The retained Redline default (a `.mq4r` name)
 /// owns the load instead: its tape is the single-row AR forward, which no MTP
 /// window runs, so `auto` stays AR there and an explicit `Some(true)` refuses.
-/// Under expert parallelism (`ep` > 1) the head is never attached: `auto`
-/// stays AR and an explicit `Some(true)` refuses naming EP.
+/// Under expert parallelism (`ep` > 1) the head is attached only on an explicit
+/// request: `Some(true)` admits it (the drafter is replicated on every rank),
+/// while `auto` (`None`) and `Some(false)` stay AR, so the EP default and
+/// flag-off bytes are unchanged.
 pub(crate) fn qwen4_native_mtp(
     spec: SpecLoadCfg,
     gpu_arch: &str,
@@ -170,13 +172,7 @@ pub(crate) fn qwen4_native_mtp(
     ep: usize,
 ) -> Result<bool, String> {
     if ep > 1 {
-        return match spec.mtp {
-            Some(true) => Err(format!(
-                "qwen4: native MTP is not supported with expert parallelism (topology.ep = {ep}); \
-                 unset speculation.mtp or set topology.ep = 1 (HIPFIRE_QWEN4_EP=0)"
-            )),
-            _ => Ok(false),
-        };
+        return Ok(spec.mtp == Some(true));
     }
     let retained = hipfire_runtime::config::retained_redline_default(
         gpu_arch, "qwen4", path, pp, tp, ep, true,
@@ -256,12 +252,117 @@ pub(crate) fn qwen4_developer_ple_policy(
 /// `auto` keeps AR there and only an explicit `speculation.mtp = "on"`
 /// (`--spec mtp`) attaches the head. `speculation.mtp = "off"` always keeps
 /// AR (the admitted head is never attached then).
+///
+/// Thin twin over the shared [`hipfire_config::mtp_host_spill_policy`]: the
+/// qwen4 admitted list is `&["gfx1201"]` (the arch clause is data, not a
+/// second function). Kept so the two policy call sites in `carriers.rs` keep
+/// their typed-`SpecLoadCfg` spelling.
 pub(crate) fn qwen4_mtp_with_host_mapped_experts(
     spec: SpecLoadCfg,
     gpu_arch: &str,
     host_mapped_experts: usize,
 ) -> bool {
-    host_mapped_experts == 0 || spec.mtp == Some(true) || gpu_arch == "gfx1201"
+    let mode = match spec.mtp {
+        Some(true) => hipfire_config::MtpMode::On,
+        Some(false) => hipfire_config::MtpMode::Off,
+        None => hipfire_config::MtpMode::Auto,
+    };
+    hipfire_config::mtp_host_spill_policy(mode, host_mapped_experts, gpu_arch, &["gfx1201"]).attach
+}
+
+/// Fail-closed list for partial GPU offload, raised where the arch is dispatched.
+///
+/// An arch that never reaches the placement resolver must still be refused rather
+/// than handed a resident load: "arch crates are typed declarations and the loader
+/// owns placement" is only enforceable if an arch that cannot honour a placement
+/// never quietly receives one. Returns `Err` naming the offending key and the
+/// reason; `Ok(())` when no spill was requested or the source can honour it.
+///
+/// The trigger stays here — an *explicitly configured* spill (either budget key
+/// off `Full`) is refused on an unsupported path (`spill_requested`, so the
+/// MoE auto-fit default never trips this gate) — but every refusal dimension
+/// is `hipfire_config::memory::spill_support`'s, mapped below to the existing
+/// sentences. Wording is verbatim; only the derivation is shared.
+pub(crate) fn partial_offload_refusal(
+    arch_id: u32,
+    source: &ModelSource,
+    tp: usize,
+    pp: usize,
+    ep_experts: Option<usize>,
+) -> Result<(), String> {
+    use hipfire_config::memory::{spill_requested, spill_support, SpillSupport};
+    if !spill_requested() {
+        return Ok(());
+    }
+    let keys = "memory.gpu_layer_budget / memory.moe_expert_budget";
+    // Facts the predicate owns: the loader's topology counts, the EP expert
+    // count, and the model flags from the source — the tower tensor probe and
+    // the parsed Qwen3.5 config (paged/REAP). Tower *tensor* presence decides
+    // text-vs-VL, never config metadata (`config.is_vl_text` is the
+    // nested-name text wrapper, which a plain text checkpoint carries too), so
+    // ask the same probe the admission record uses.
+    let ModelSource::Hfq(hfq) = source else {
+        return match spill_support(arch_id, tp, pp, ep_experts, false, false, false) {
+            SpillSupport::Supported => Ok(()),
+            SpillSupport::Refused(refusal) => Err(spill_refusal_message(refusal, keys)),
+        };
+    };
+    let is_vl = probe_vision(source, arch_id)?;
+    let (paged_experts, reap_keep) = if matches!(arch_id, 5 | 6) {
+        let config = hipfire_arch_qwen35::qwen35::config_from_hfq(hfq)
+            .map_err(|e| format!("qwen35 config: {e}"))?;
+        (config.paged_experts, config.reap_keep.is_some())
+    } else {
+        (false, false)
+    };
+    match spill_support(arch_id, tp, pp, ep_experts, paged_experts, reap_keep, is_vl) {
+        SpillSupport::Supported => Ok(()),
+        SpillSupport::Refused(refusal) => Err(spill_refusal_message(refusal, keys)),
+    }
+}
+
+/// The loader gate's sentences for each `SpillRefusal` dimension — verbatim
+/// from the hand-written checks this replaced (`{keys}` is the two budget
+/// keys; non-arch arms interpolate their own count).
+fn spill_refusal_message(refusal: hipfire_config::memory::SpillRefusal, keys: &str) -> String {
+    use hipfire_config::memory::SpillRefusal::*;
+    match refusal {
+        // Only the Qwen3.5 storage seam places a layer or a routed expert in host
+        // RAM. Qwen4 has its own expert-residency route and the other arches have
+        // none, so either knob is a request this loader cannot honour.
+        Arch(arch_id) => format!(
+            "load refused: partial GPU offload ({keys}) is implemented for Qwen3.5 dense and MoE \
+             only; this source is arch id {arch_id}. Unset both keys for this model"
+        ),
+        Tp(tp) => format!(
+            "load refused: partial GPU offload ({keys}) supports the single-GPU topology only; \
+             tp={tp} loads every layer on every rank and never places one in host RAM. Unset both \
+             keys for this model"
+        ),
+        Pp(pp) => format!(
+            "load refused: partial GPU offload ({keys}) supports the single-GPU topology only; \
+             pp={pp} would place the first pipeline band's spilled weights in host RAM mapped by \
+             device 0, which has never been run. Unset both keys for this model"
+        ),
+        ExpertParallel(_) => format!(
+            "load refused: partial GPU offload ({keys}) cannot be combined with expert parallelism \
+             — an expert is pinned to one rank and its weights stay on that rank's device. Unset \
+             both keys for this model"
+        ),
+        VisionTower => format!(
+            "load refused: partial GPU offload ({keys}) cannot place the Qwen3.5-VL vision tower, \
+             which loads through its own lowered loader. Unset both keys for this model"
+        ),
+        PagedExperts => format!(
+            "load refused: partial GPU offload ({keys}) cannot be combined with paged experts — \
+             the weight pager owns those buffers and would move them behind the placement's back. \
+             Unset both keys for this model"
+        ),
+        ReapKeepMap => format!(
+            "load refused: partial GPU offload ({keys}) cannot be combined with a REAP keep-map — \
+             the pruned expert load has no host-placement path. Unset both keys for this model"
+        ),
+    }
 }
 
 /// The source-only portion of Qwen4 admission. The validated config and
@@ -299,12 +400,6 @@ pub fn qwen4_request_admission(
         return Err(format!(
             "qwen4: only pp=1, tp=1 with expert-parallel ep in {{1, 2, 4}} is admitted (pp={}, tp={}, ep={})",
             effective_mesh.pp, effective_mesh.tp, effective_mesh.ep
-        ));
-    }
-    if effective_mesh.ep > 1 && native_mtp {
-        return Err(format!(
-            "qwen4: native MTP is not supported with expert parallelism (topology.ep = {})",
-            effective_mesh.ep
         ));
     }
     Ok(())
@@ -1443,23 +1538,10 @@ pub fn admit_source_with_options(
         };
         (topology, Some(carrier))
     };
-    // Partial GPU offload (#793): only the single-GPU dense Qwen3.5 loader
-    // places layers in host RAM. Refuse a budget that would spill under tp>1,
-    // pp>1 or on a MoE model before any teardown. Unset budget: no parse.
-    if matches!(arch_id, 5 | 6)
-        && hipfire_config::memory::gpu_layer_budget()
-            != hipfire_config::memory::GpuLayerBudget::Full
-    {
-        if let ModelSource::Hfq(hfq) = &source {
-            let config = hipfire_arch_qwen35::qwen35::config_from_hfq(hfq)
-                .map_err(|e| format!("qwen35 config: {e}"))?;
-            if let Some(refusal) =
-                hipfire_arch_qwen35::qwen35::offload_topology_refusal(&config, tp, pp)
-            {
-                return Err(refusal);
-            }
-        }
-    }
+    // Partial GPU offload: fail closed where the arch is dispatched, before any
+    // teardown, so a source that cannot honour a configured spill never receives
+    // a resident load.
+    partial_offload_refusal(arch_id, &source, tp, pp, qwen35_ep_experts)?;
     let heterogeneous_reason = hints.deepseek4_heterogeneous && arch_id == 9;
     // Qwen4 owns its own VMM QSA layout and certification (gfx1151/gfx1201), so
     // its capability replaces the Qwen/KvCache predicates below; its
@@ -1769,6 +1851,7 @@ pub fn admit_source_with_options(
 #[cfg(test)]
 mod tests {
     use super::*;
+
     fn admit_source(
         path: &str,
         tp: usize,
@@ -1862,16 +1945,18 @@ mod tests {
             qwen4_native_mtp(with(None), "gfx1030", mq4r, 1, 1, 1),
             Ok(true)
         );
-        // Expert parallelism never attaches the head: `auto`/off stay AR, an
-        // explicit `on` refuses and names EP.
+        // Expert parallelism attaches the head only on an explicit `on`:
+        // `auto`/off stay AR.
         for ep in [2, 4] {
             assert_eq!(qwen4_native_mtp(with(None), "gfx1201", hfq, 1, 1, ep), Ok(false));
             assert_eq!(
                 qwen4_native_mtp(with(Some(false)), "gfx1201", hfq, 1, 1, ep),
                 Ok(false)
             );
-            let error = qwen4_native_mtp(with(Some(true)), "gfx1201", hfq, 1, 1, ep).unwrap_err();
-            assert!(error.contains("expert parallelism"), "{error}");
+            assert_eq!(
+                qwen4_native_mtp(with(Some(true)), "gfx1201", hfq, 1, 1, ep),
+                Ok(true)
+            );
         }
     }
 
@@ -1892,8 +1977,7 @@ mod tests {
             assert!(admit(pp, tp, ep, false).is_err(), "pp {pp} tp {tp} ep {ep}");
         }
         for ep in [2, 4] {
-            let error = admit(1, 1, ep, true).unwrap_err();
-            assert!(error.contains("expert parallelism") && error.contains("MTP"), "{error}");
+            assert_eq!(admit(1, 1, ep, true), Ok(()), "ep {ep}");
         }
     }
 
@@ -2650,6 +2734,104 @@ mod tests {
             assert_eq!(explicit.max_seq, 50000);
             assert!(explicit.sequence_reason.is_none());
             cleanup(&path);
+        }
+    }
+    /// The loader gate and the arch resolvers reach the same verdict for the
+    /// same facts: the gate's refusal (when a spill was requested) is exactly
+    /// the predicate's `Refused` arm, and silence is exactly `Supported`. The
+    /// arch side is asserted in the arch crate (`spill_resolver_agrees_with_*`
+    /// there calls the same predicate through its own facts — this pins the
+    /// gate half of the agreement here, where the snapshot trigger lives).
+    mod spill_agreement {
+        use super::*;
+        use hipfire_config::memory::{spill_support, SpillRefusal, SpillSupport};
+
+        /// The arch resolver's verdict for these facts: one call, not a
+        /// condition list — the shape both twins must copy.
+        fn arch_verdict(
+            arch_id: u32,
+            tp: usize,
+            pp: usize,
+            ep_experts: Option<usize>,
+            paged_experts: bool,
+            reap_keep: bool,
+            is_vl: bool,
+        ) -> SpillSupport {
+            spill_support(arch_id, tp, pp, ep_experts, paged_experts, reap_keep, is_vl)
+        }
+
+        fn verdicts_agree(
+            arch_id: u32,
+            tp: usize,
+            pp: usize,
+            ep_experts: Option<usize>,
+            paged_experts: bool,
+            reap_keep: bool,
+            is_vl: bool,
+        ) {
+            let gate = spill_support(arch_id, tp, pp, ep_experts, paged_experts, reap_keep, is_vl);
+            assert_eq!(
+                arch_verdict(arch_id, tp, pp, ep_experts, paged_experts, reap_keep, is_vl),
+                gate,
+                "loader gate and arch resolver disagree"
+            );
+        }
+
+        #[test]
+        fn loader_gate_and_arch_resolver_agree_on_every_dimension() {
+            // Supported shape (dense included): both stay silent.
+            for arch_id in [5u32, 6] {
+                verdicts_agree(arch_id, 1, 1, None, false, false, false);
+            }
+            // Every refusal dimension: both refuse, same arm.
+            verdicts_agree(9, 1, 1, None, false, false, false);
+            verdicts_agree(6, 2, 1, None, false, false, false);
+            verdicts_agree(6, 1, 2, None, false, false, false);
+            verdicts_agree(6, 1, 1, Some(4), false, false, false);
+            verdicts_agree(6, 1, 1, None, false, false, true);
+            verdicts_agree(6, 1, 1, None, true, false, false);
+            verdicts_agree(6, 1, 1, None, false, true, false);
+        }
+
+        #[test]
+        fn refusal_messages_name_the_key_and_the_reason() {
+            // Spot-check the arm the auto-fit unification added: the VL
+            // message is verbatim (tower, lowered loader, unset-both-keys).
+            let msg = spill_refusal_message(SpillRefusal::VisionTower, "the-keys");
+            assert!(msg.contains("the-keys"), "names the key: {msg}");
+            assert!(msg.contains("vision tower"), "names the reason: {msg}");
+            assert!(msg.contains("Unset both keys"), "names the remedy: {msg}");
+            // Every other arm renders non-empty too (verbatim sentences above).
+            for refusal in [
+                SpillRefusal::Arch(9),
+                SpillRefusal::Tp(2),
+                SpillRefusal::Pp(2),
+                SpillRefusal::ExpertParallel(4),
+                SpillRefusal::PagedExperts,
+                SpillRefusal::ReapKeepMap,
+            ] {
+                assert!(
+                    !spill_refusal_message(refusal, "the-keys").is_empty(),
+                    "{refusal:?} must render"
+                );
+            }
+        }
+
+        #[test]
+        fn dense_unset_model_stays_resident_and_silent() {
+            // The zero-diff default: a dense model with both keys unset is
+            // compatible (`Supported`), and `Full`/`Full` budgets resolve to
+            // the all-device placement with no capacity check — the refusal
+            // below can never fire on this path.
+            use hipfire_config::memory::{effective_offload_budgets, OffloadBudget};
+            assert_eq!(
+                spill_support(5, 1, 1, None, false, false, false),
+                SpillSupport::Supported
+            );
+            assert_eq!(
+                effective_offload_budgets(false),
+                (OffloadBudget::Full, OffloadBudget::Full)
+            );
         }
     }
     mod head_overlay {

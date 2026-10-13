@@ -37,13 +37,14 @@ pub fn mq4r_redline_default(gpu_arch: &str, model_path: &str, pp: usize, tp: usi
 /// AR graph. Qwen4 (Flash-Next) on exact gfx1201 is admitted the same way:
 /// single GPU, no drafter (a native MTP head is a drafter, so only an
 /// MTP-off load replays), byte-identical greedy text to the HIP graph.
-/// `replay.backend = "hip"` opts out. A Qwen3.5 process configured
+/// `replay.backend = "hip"` opts out. A Qwen3.5-family process configured
 /// for CPU-executed partial offload (`memory.offload_exec = "cpu"` with a
-/// `memory.gpu_layer_budget` layer count) gets no retained default: its spilled
-/// layers' GEMVs run on the host between GPU launches, which a retained tape
-/// does not record. Expert parallelism (`ep` > 1, Flash-Next EP) runs one
-/// program per rank with a cross-device row gather between kernels, which a
-/// single-device retained tape cannot record, so it is never admitted.
+/// spill on either tier — an explicit layer or routed-expert count, or
+/// `auto`/unset on a MoE, which auto-fits) gets no retained default: its
+/// spilled layers' GEMVs run on the host between GPU launches, which a
+/// retained tape does not record. Expert parallelism (`ep` > 1, Flash-Next EP)
+/// runs one program per rank with a cross-device row gather between kernels,
+/// which a single-device retained tape cannot record, so it is never admitted.
 pub fn retained_redline_default(
     gpu_arch: &str,
     model_arch: &str,
@@ -53,13 +54,45 @@ pub fn retained_redline_default(
     ep: usize,
     has_drafter: bool,
 ) -> bool {
+    retained_redline_default_for_moe(
+        gpu_arch,
+        model_arch,
+        model_path,
+        pp,
+        tp,
+        ep,
+        has_drafter,
+        is_qwen35_moe_arch(model_arch),
+    )
+}
+
+/// The MoE-fact form of [`retained_redline_default`]: `is_moe` is whether the
+/// model is a Qwen3.5 MoE (parsed once by the caller from the arch id or the
+/// config — never re-derived from a string here). Split out so the MoE-ness
+/// fact is threaded, not guessed: the old string test
+/// (`model_arch == "qwen3_5_moe"`) could not see a MoE served under another
+/// label, while this takes the fact as an argument.
+///
+/// `ep` is carried through from the caller: expert parallelism runs one program
+/// per rank with a cross-device row gather between kernels, which a
+/// single-device retained tape cannot record, so an EP load is never admitted.
+pub fn retained_redline_default_for_moe(
+    gpu_arch: &str,
+    model_arch: &str,
+    model_path: &str,
+    pp: usize,
+    tp: usize,
+    ep: usize,
+    has_drafter: bool,
+    is_moe: bool,
+) -> bool {
     if ep != 1 {
         return false;
     }
     if model_arch.eq_ignore_ascii_case("muse_glimmer") {
         return false;
     }
-    if model_arch.eq_ignore_ascii_case("qwen3_5") && cpu_offload_configured() {
+    if is_qwen35_family(model_arch) && cpu_offload_configured(is_moe) {
         return false;
     }
     if mq4r_redline_default(gpu_arch, model_path, pp, tp) {
@@ -85,9 +118,39 @@ pub fn retained_redline_default(
             .is_some_and(|extension| extension.eq_ignore_ascii_case("mq2r"))
 }
 
-fn cpu_offload_configured() -> bool {
-    use hipfire_config::memory::{gpu_layer_budget, offload_exec, GpuLayerBudget, OffloadExec};
-    offload_exec() == OffloadExec::Cpu && matches!(gpu_layer_budget(), GpuLayerBudget::Layers(_))
+fn is_qwen35_family(model_arch: &str) -> bool {
+    model_arch.eq_ignore_ascii_case("qwen3_5") || model_arch.eq_ignore_ascii_case("qwen3_5_moe")
+}
+
+/// Whether the model is a Qwen3.5 MoE, from the caller's parsed arch label.
+/// Kept beside `is_qwen35_family` so the label table lives in one place; the
+/// daemon passes the stronger fact (arch id / parsed config) where it has it.
+fn is_qwen35_moe_arch(model_arch: &str) -> bool {
+    model_arch.eq_ignore_ascii_case("qwen3_5_moe")
+}
+
+fn cpu_offload_configured(is_moe: bool) -> bool {
+    // Match the placement the loader resolves: a MoE auto-fits when both keys
+    // are unset, and `auto` is an explicit search on either tier. Asking only
+    // for `Layers(n)` on the layer tier missed both the expert tier and the
+    // `auto` spelling this branch added.
+    let (layer, expert) = hipfire_config::memory::effective_offload_budgets(is_moe);
+    cpu_offload_configured_from(hipfire_config::memory::offload_exec(), layer, expert)
+}
+
+/// Pure form of [`cpu_offload_configured`] over already-resolved inputs, so the
+/// composition is testable without the process snapshot (which `process_value`
+/// caches once per process and a unit test therefore cannot control).
+fn cpu_offload_configured_from(
+    exec: hipfire_config::memory::OffloadExec,
+    layer: hipfire_config::memory::OffloadBudget,
+    expert: hipfire_config::memory::OffloadBudget,
+) -> bool {
+    use hipfire_config::memory::{OffloadBudget, OffloadExec};
+    if exec != OffloadExec::Cpu {
+        return false;
+    }
+    !matches!((layer, expert), (OffloadBudget::Full, OffloadBudget::Full))
 }
 
 #[derive(Debug, Clone)]
@@ -567,5 +630,49 @@ mod tests {
         for gpu_arch in ["gfx1100", "gfx1151", "gfx1200"] {
             assert!(!retained_redline_default(gpu_arch, "qwen4", fn_xts, 1, 1, false));
         }
+    }
+
+    #[test]
+    fn cpu_offload_takes_the_threaded_moe_fact_not_a_label() {
+        // Two things are pinned here. (1) The label table maps each accepted
+        // spelling of the MoE arch label exactly once — that is this module's
+        // own subject, and the daemon passes the stronger parsed fact where it
+        // has one. (2) The decision's *composition* is a pure function of the
+        // exec mode and the resolved budget pair; the live value is deliberately
+        // not asserted, because both of its inputs come from the process
+        // snapshot, which `process_value` caches once per process — on a machine
+        // that sets `memory.offload_exec=cpu` the function is true by design.
+        use super::{cpu_offload_configured_from, is_qwen35_moe_arch};
+        use hipfire_config::memory::{OffloadBudget, OffloadExec};
+
+        // Not cpu: never a cpu-offload model, whatever the budgets say.
+        for budget in [
+            OffloadBudget::Full,
+            OffloadBudget::Auto,
+            OffloadBudget::Layers(4),
+        ] {
+            assert!(!cpu_offload_configured_from(OffloadExec::Pcie, budget, budget));
+        }
+        // cpu with both tiers unset is still not configured (dense default).
+        assert!(!cpu_offload_configured_from(
+            OffloadExec::Cpu,
+            OffloadBudget::Full,
+            OffloadBudget::Full
+        ));
+        // cpu with either tier placed at all is configured — the expert tier and
+        // the `auto` spelling included, which the older layer-tier-only check
+        // missed.
+        for (layer, expert) in [
+            (OffloadBudget::Layers(4), OffloadBudget::Full),
+            (OffloadBudget::Full, OffloadBudget::Layers(4)),
+            (OffloadBudget::Auto, OffloadBudget::Auto),
+        ] {
+            assert!(cpu_offload_configured_from(OffloadExec::Cpu, layer, expert));
+        }
+
+        assert!(is_qwen35_moe_arch("qwen3_5_moe"));
+        assert!(is_qwen35_moe_arch("QWEN3_5_MOE"));
+        assert!(!is_qwen35_moe_arch("qwen3_5"));
+        assert!(!is_qwen35_moe_arch("qwen4"));
     }
 }

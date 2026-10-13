@@ -158,6 +158,10 @@ MTP-head **loading** is registry-driven too. Every Qwen3.8-27B trunk tier above 
 - On gfx1201 with H2 (`qwen3.8:27b-mq4-xts`), MTP decode against AR measured 1.09–1.65× on six of eight task genres, 0.96× on a tool answer and 0.95× on code editing. Greedy MTP output matches its own verifier's argmax, but it can differ from greedy AR output.
 - `hipfire rm` keeps the shared head while another installed tier still declares it ([`CLI.md`](CLI.md)).
 
+Flash-Next trunk-overlay **loading** is pinned in the client, not declared in the registry. The four stock Flash-Next MQ4 XTS tags (`qwen3.8:flash-next`, `-mq4`, `-gptq3`, `-mq4-xts`) resolve to one base artifact (sha256 `8b15b6fe…`, 125288544792 B), and the client carries a compiled-in pin for it naming `qwen3.8-flash-next.mq4-xts.trunk-overlay` (305543168 B, sha256 `df49bc0a…`, always the canonical base file name plus `.trunk-overlay`, whichever legacy spelling the wire entry uses) in `hipfire-models/qwen3.8-flash-next`. `hipfire pull <tag>` fetches it next to the base. There is no registry schema change: older clients keep parsing the published `registry/v1.json`. It is the zab tier as an overlay: an HFQM container with the 108 GDN `in_proj_{z,a,b}` projections encoded as symmetric QT44, bound to the base by file size and index SHA-256, that the Qwen4 loader substitutes for the base's MQ6 tensors and then arms the `gfx1151-zab-v1` A4 trunk route. The bytes are the ones the developer map `HIPFIRE_QWEN4_REQUANT="...=qt44:<dir>"` applies.
+- `HIPFIRE_QWEN4_TRUNK_OVERLAY` unset or `auto` applies the overlay only on gfx1151 (the exact architecture of the `gfx1151-zab-v1` trunk default); `0` never applies it (kill switch, the stock base weights load); `1` applies it on any architecture (the A4 route itself still arms by default only on gfx1151; elsewhere `HIPFIRE_QWEN4_TRUNK_IU4` must select it); any other value is a load error.
+- `hipfire rm` removes the overlay with its base; the local-only `qwen3.8:flash-next-mq4-xts-zab` tier is the same bytes baked into one file and declares no overlay.
+
 ### Qwen3 (non-3.5) dense HF4
 
 | Tag | File | Size GB | Min VRAM | Notes |

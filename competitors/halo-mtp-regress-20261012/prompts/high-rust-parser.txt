@@ -1,0 +1,1 @@
+Write a Rust program that reads lines from stdin, parses each as an arithmetic expression with +, -, *, / and parentheses using a recursive descent parser, and prints results. Include tests.

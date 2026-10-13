@@ -10,8 +10,9 @@ Bare interactive `hipfire` launches the terminal UI when `hipfire-tui` is instal
 
 | Command | Purpose |
 |---|---|
-| `hipfire pull <tag>` | Download a registry model into `~/.hipfire/models/`. When the entry declares a DFlash draft (`dflash.file`), the pull also fetches that sidecar. Pull alone does **not** enable speculation: the schema `dflash_mode` default is **`off`**, and only the Qwen3.8-27B tiers that declare a draft (`qwen3.8:27b`, `-mq3*`, `-mq4*`) carry a registry-layer `auto` that uses the pulled draft ([CONFIG.md](CONFIG.md#qwen38-27b-paired-dflash-default)); if that file is absent the load keeps MTP `auto`. With `auto`, the loader uses the sidecar when present (otherwise the MTP head when one is declared, else AR); with `on`, load fails closed if the sidecar is missing; an explicit `dflash_mode=off` (canonical `speculation.dflash=off`) is the kill switch and beats the registry layer. Override the path with `developer.dflash_draft` / `HIPFIRE_DFLASH_DRAFT` (or `run --model-draft`). When the entry declares a vision tower (`vision.file`, e.g. every `qwen3.8:27b*` tier → `qwen3.8-27b-vision.hfq`), the pull also fetches that sidecar; override with `run --vision` / `serve --vision` / `HIPFIRE_VISION_SIDECAR`. When the entry declares an MTP head (`mtp.file`, e.g. every Qwen3.8-27B trunk tier → `qwen3.8-27b.mtp`), the pull fetches it too, and because `mtp_mode` defaults to `auto`, the next load speculates with it ([MODELS.md](MODELS.md#dflash-draft-artifacts-registry)). |
+| `hipfire pull <tag>` | Download a registry model into `~/.hipfire/models/`. When the entry declares a DFlash draft (`dflash.file`), the pull also fetches that sidecar. Pull alone does **not** enable speculation: the schema `dflash_mode` default is **`off`**, and only the Qwen3.8-27B tiers that declare a draft (`qwen3.8:27b`, `-mq3*`, `-mq4*`) carry a registry-layer `auto` that uses the pulled draft ([CONFIG.md](CONFIG.md#qwen38-27b-paired-dflash-default)); if that file is absent the load keeps MTP `auto`. With `auto`, the loader uses the sidecar when present (otherwise the MTP head when one is declared, else AR); with `on`, load fails closed if the sidecar is missing. `dflash_mode` is the spec-decode knob, so `on` resolves to whichever drafter the model attaches: with no declared DFlash draft, an MTP head (registry `mtp` slot or the `<trunk>.mtp` sibling) serves the request — `qwen3.6:35b-a3b-mq4p` and every other MTP-only tier — and `on` arms that head explicitly (`mtp_mode=on`), since `auto` alone declines native qwen35 MTP on any host-mapped expert spill (either `offload_exec` seam). `on` still refuses when no drafter is present at all, or when `speculation.mtp=off` disables the only mechanism. An explicit `dflash_mode=off` (canonical `speculation.dflash=off`) is the kill switch and beats the registry layer. Override the path with `developer.dflash_draft` / `HIPFIRE_DFLASH_DRAFT` (or `run --model-draft`). When the entry declares a vision tower (`vision.file`, e.g. every `qwen3.8:27b*` tier → `qwen3.8-27b-vision.hfq`), the pull also fetches that sidecar; override with `run --vision` / `serve --vision` / `HIPFIRE_VISION_SIDECAR`. When the entry declares an MTP head (`mtp.file`, e.g. every Qwen3.8-27B trunk tier → `qwen3.8-27b.mtp`), the pull fetches it too, and because `mtp_mode` defaults to `auto`, the next load speculates with it ([MODELS.md](MODELS.md#dflash-draft-artifacts-registry)). |
 | `hipfire pull <tag> --ple auto\|q4\|q8\|all\|none` | For a split Flash-Next entry, choose which PLE row sidecar is downloaded next to the base (default `auto`: `memory.ple_format`, else q4 on gfx1151 / q8 elsewhere). See [Flash-Next split PLE layout](#flash-next-split-ple-layout). |
+| `hipfire pull <flash-next tag>` (trunk overlay) | The four stock Flash-Next MQ4 XTS tags also fetch the `qwen3.8-flash-next.mq4-xts.trunk-overlay` sidecar (~305.5 MB) next to the base, from a pin compiled into the client. See [Flash-Next trunk overlay](#flash-next-trunk-overlay). |
 | `hipfire ple derive [--format q4] [--rank PATH] <model>` / `hipfire ple split [--out PATH] [--keep-original] <model>` | Derive `<model>.ple-q4` from the Q8 rows, or split a monolithic model into a PLE-less base + `<base>.ple-q8`. `<model>` is a path or registry tag. |
 | `hipfire ple rebind --old-base PATH --new-base PATH --source PATH` | Copy an existing q4 PLE sidecar to `<new-base>.ple-q4` with a new base binding, only after proving both monolithic bases have identical embedded PLE descriptors and Q8 bytes. The source sidecar is never modified. |
 | `hipfire list [-r\|--remote] [-j\|--json]` | Local models; `-r` also lists pullable registry tags; user aliases from `quantize --register` appear separately. |
@@ -80,6 +81,30 @@ decode to the q4 the loader derives locally from the q8 rows).
   their `.plehotrows` packs and `<model>.plehot`. `*.ple-q4`, `*.ple-q8`,
   `*.plehot` and `*.plehotrows` files are sidecars: never listed or served as
   models.
+
+### Flash-Next trunk overlay
+
+The four stock Flash-Next MQ4 XTS tags (`qwen3.8:flash-next`, `-mq4`, `-gptq3`,
+`-mq4-xts`) share one base artifact (sha256 `8b15b6fe…`, 125288544792 B). The
+client carries a compiled-in pin for that base, naming the trunk overlay
+`qwen3.8-flash-next.mq4-xts.trunk-overlay` (the canonical base file name plus
+`.trunk-overlay`; 305543168 B, sha256 `df49bc0a…`) in the
+`hipfire-models/qwen3.8-flash-next` repo. There is no registry schema change, so
+older clients keep parsing the published registry. The overlay holds the 108 GDN
+`in_proj_{z,a,b}` projections as pre-encoded symmetric QT44, bound to the base by
+size and index SHA-256. The Qwen4 loader substitutes them for the base's MQ6
+tensors on gfx1151 by default; `HIPFIRE_QWEN4_TRUNK_OVERLAY=0` restores the base
+weights and `=1` applies the overlay on any architecture.
+
+- **Pull.** `hipfire pull <tag>` downloads and SHA-256 verifies the pinned
+  overlay with the other sidecars; a valid file already on disk is not
+  downloaded again, a stale one is refreshed. As for other sidecars, a failed
+  overlay download prints a warning and the pull still succeeds (the base loads
+  unchanged). Any other registry entry (e.g. the RTN-asym file or the local-only
+  zab tier) has no overlay.
+- **`rm` and listings.** `rm <tag>` removes the overlay with the base
+  (`<file>.trunk-overlay`). `*.trunk-overlay` files are sidecars: never listed
+  or served as models.
 
 ## Inference
 

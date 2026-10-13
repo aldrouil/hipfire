@@ -66,8 +66,18 @@ pub const KNOBS: &[KnobInfo] = &[
         summary: "How many of the model's layers stay on the GPU. The rest spill to system RAM.",
         effect: "Frees VRAM for a longer context, but decode slows sharply: a spilled layer's weights are read over PCIe every step instead of from VRAM. Load also takes much longer.",
         default: "",
-        when: "Leave it unset for normal use — every layer then stays on the GPU. Set a count when the model or context will not otherwise fit.",
-        note: Some("The number counts layers ON THE GPU, not layers offloaded: 3 on a 64-layer model keeps 3 on the GPU and spills the other 61. 'auto' (-1) lets the engine choose, and it currently keeps every layer on the GPU."),
+        when: "Leave it unset for normal use — a MoE then auto-fits (spills only what must), dense stays fully on the GPU. Set a count when the model or context will not otherwise fit.",
+        note: Some("The number counts layers ON THE GPU, not layers offloaded: 3 on a 64-layer model keeps 3 on the GPU and spills the other 61. 'auto' (-1) places by fit: the smallest spill that loads, routed experts first, and a model that already fits is left fully resident. On VL / paged-expert / REAP / pp>1 paths the auto-fit default does not run and unset stays resident."),
+        options: &[],
+    },
+    KnobInfo {
+        key: "moe_expert_budget",
+        title: "Expert layers kept on the GPU",
+        summary: "For a Mixture-of-Experts model: how many layers keep their routed experts on the GPU. The rest spill to system RAM.",
+        effect: "Frees the VRAM a MoE model's experts dominate. A spilled expert is read over PCIe only when the router selects it, so a decode step pays for its few routed experts rather than the whole layer.",
+        default: "",
+        when: "Leave it unset for normal use — a MoE then auto-fits (spills only what must), dense ignores it. Set it (or 'auto') when a MoE model's experts do not fit, or when the row above still leaves too little VRAM.",
+        note: Some("Counts layers whose routed experts stay ON the GPU; llama.cpp's --n-cpu-moe K is this value written as n_layers - K. Only routed experts move — attention, router, shared expert and KV stay on the card. Needs the packed-expert layout (uniform, packable MQ4 experts). No effect on a dense model, and none on an architecture that cannot spill experts: a configured spill fails that model's load rather than being ignored. On VL / paged-expert / REAP paths the auto-fit default does not run and unset stays resident."),
         options: &[],
     },
     KnobInfo {
@@ -129,11 +139,11 @@ pub const KNOBS: &[KnobInfo] = &[
     KnobInfo {
         key: "dflash_mode",
         title: "Spec decode (DFlash)",
-        summary: "Speculative decoding: a small drafter proposes tokens the target verifies in batches.",
+        summary: "Speculative decoding: a drafter the target verifies in batches — the model's DFlash draft when one is declared, else its MTP head.",
         effect: "Big decode speedup on predictable output (code, tool-calls, structured: ~4-5x). On free-form prose the acceptance rate is ~1, so it is a slight loss. Correctness is unchanged (the target verifies every token).",
         default: "off",
-        when: "Turn on for code/agentic workloads with a drafter attached; leave off for open-ended chat.",
-        note: Some("A thinking BUDGET routes DFlash to plain decode: the dispatch gate bails when max_think_tokens > 0 and the think block isn't closed (the default thinking-on path sets a budget). Turn thinking off — or set its budget to 0 — and use greedy to actually get spec-decode."),
+        when: "Turn on for code/agentic workloads with a drafter attached (a DFlash draft or the model's MTP head); a declared draft that is not pulled still refuses the load. `on` arms the head explicitly, which also overrides `auto`'s host-spill decline. Leave off for open-ended chat.",
+        note: Some("A thinking BUDGET routes a DFlash draft to plain decode: the dispatch gate bails when max_think_tokens > 0 and the think block isn't closed (the default thinking-on path sets a budget). Turn thinking off — or set its budget to 0 — and use greedy to actually get spec-decode."),
         options: &[
             ("off", "No speculative decoding (plain autoregressive)."),
             ("on", "Use the drafter whenever one is attached + the gate allows."),
@@ -229,14 +239,14 @@ pub const KNOBS: &[KnobInfo] = &[
         key: "mtp_mode",
         title: "Multi-token prediction (MTP)",
         summary: "Uses a model's MTP head to predict several tokens per step where supported.",
-        effect: "Can raise decode throughput on MTP-capable models with no correctness cost; a no-op on models without an MTP head.",
+        effect: "Raises decode throughput on MTP-capable models when the head is usable at the loaded placement; a no-op on models without an MTP head.",
         default: "auto",
-        when: "Leave on auto; force on/off only when A/B-testing throughput.",
-        note: None,
+        when: "Leave on auto; force on/off only when A/B-testing throughput. A host-mapped routed-expert spill needs `on` to override `auto`'s decline.",
+        note: Some("`auto` declines a host-mapped routed-expert spill (memory.moe_expert_budget, either offload_exec seam): the verify re-reads or recomputes the experts, and a head that is unverified there has produced garbled windows (`qwen3.6-35b-a3b.mq6` — mtp windows at tau 0.04-0.13 while its single-row AR decodes coherently). The load prints one line and decodes AR; set on (or --spec mtp) to opt back in."),
         options: &[
             ("off", "No multi-token prediction."),
             ("on", "Force the MTP head where the model has one."),
-            ("auto", "Use MTP when supported, else single-token."),
+            ("auto", "Use MTP when supported and not host-spilled; else single-token."),
         ],
     },
     KnobInfo {
@@ -395,6 +405,21 @@ mod tests {
         let dflash = knob_info("dflash_mode").expect("dflash entry");
         assert_eq!(dflash.title, "Spec decode (DFlash)");
         assert!(knob_info("does_not_exist").is_none());
+    }
+
+    #[test]
+    fn dflash_explainer_claims_the_mtp_head_as_a_drafter() {
+        // The row resolves `on` against the model's attached drafter, so the
+        // copy must not promise DFlash alone: an MTP-only tier
+        // (`qwen3.6:35b-a3b-mq4p`) spec-decodes through its head.
+        let dflash = knob_info("dflash_mode").expect("dflash entry");
+        for field in [dflash.summary, dflash.when] {
+            assert!(field.contains("MTP"), "{field}");
+        }
+        assert!(
+            dflash.when.contains("not pulled"),
+            "the declared-draft fail-closed case must stay in the copy"
+        );
     }
 
     #[test]

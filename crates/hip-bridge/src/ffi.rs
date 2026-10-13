@@ -11,6 +11,7 @@ use libloading::{Library, Symbol};
 use std::ffi::{c_char, c_int, c_uint, c_void, CString, OsStr, OsString};
 use std::ptr;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 /// Per-thread accumulators for time spent inside HIP FFI calls. Used by
 /// Phase 3a host-vs-GPU diagnostics to attribute the forward pass wall
@@ -446,7 +447,7 @@ impl HipMemAccessDesc {
 
 /// Loaded HIP runtime — holds the dlopen'd library and resolved function pointers.
 pub struct HipRuntime {
-    _lib: Library,
+    _lib: Arc<Library>,
 
     // Init
     fn_init: unsafe extern "C" fn(c_uint) -> u32,
@@ -807,11 +808,87 @@ fn host_maps_qwen4_experts() -> bool {
     }
 }
 
+
+/// clr's hardware-queue cap. RDNA4 (gfx1200/gfx1201) can randomly lose inference
+/// throughput with multiple hardware queues when MTP and PCIe offload are used.
+/// One hardware queue avoids that regression. Set the cap before the runtime
+/// loads, without changing older GPUs' defaults.
+const GPU_MAX_HW_QUEUES: &str = "GPU_MAX_HW_QUEUES";
+
+/// Physical KFD topology arches that are RDNA4. `HSA_OVERRIDE_GFX_VERSION` is
+/// deliberately ignored: the queue cap is about the physical card, and the
+/// override is a compatibility lie HIP reports, not a different device.
+fn is_rdna4(arch: &str) -> bool {
+    matches!(arch, "gfx1200" | "gfx1201")
+}
+
+/// Whether the ROCr-exposed cards left by a raw HIP filter include RDNA4.
+/// HIP ordinals follow ROCr agent order, not the BDF-sorted enumeration.
+/// Resolve the whole filter before arming: an unknown entry leaves it unset.
+fn visible_has_rdna4(
+    devices: &mut [hipfire_config::devices::GpuDevice],
+    hip_filter: Option<&str>,
+) -> bool {
+    let Some(filter) = hip_filter else {
+        return devices.iter().any(|device| is_rdna4(&device.arch));
+    };
+    devices.sort_unstable_by_key(|device| device.rocr_index);
+    let mut has_rdna4 = false;
+    for token in filter.split(',').map(str::trim) {
+        let device = match token.parse::<usize>() {
+            Ok(ordinal) => devices.get(ordinal),
+            Err(_) => {
+                let uuid = token
+                    .get(..4)
+                    .filter(|prefix| prefix.eq_ignore_ascii_case("GPU-"))
+                    .and_then(|_| u128::from_str_radix(&token[4..], 16).ok());
+                devices.iter().find(|device| uuid.is_some() && device.unique_id == uuid)
+            }
+        };
+        let Some(device) = device else {
+            return false;
+        };
+        has_rdna4 |= is_rdna4(&device.arch);
+    }
+    has_rdna4
+}
+
+/// Cap hardware queues to one when a visible physical card is RDNA4, unless the
+/// operator set [`GPU_MAX_HW_QUEUES`] (any value, including empty). Identity
+/// comes from the KFD topology, never a HIP probe, so an unreadable topology or
+/// a filter naming no card leaves the variable untouched.
+fn arm_single_hw_queue_on_rdna4() {
+    if std::env::var_os(GPU_MAX_HW_QUEUES).is_some() {
+        return;
+    }
+    if matches!(
+        std::env::var(hipfire_config::devices::ROCR_VISIBLE_DEVICES),
+        Err(std::env::VarError::NotUnicode(_))
+    ) {
+        return;
+    }
+    let Some(mut devices) = hipfire_config::devices::startup_devices() else {
+        return;
+    };
+    let filter = match std::env::var(hipfire_config::devices::HIP_VISIBLE_DEVICES) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        // A filter we cannot read is a filter we cannot resolve.
+        Err(std::env::VarError::NotUnicode(_)) => return,
+    };
+    if !visible_has_rdna4(&mut devices, filter.as_deref()) {
+        return;
+    }
+    std::env::set_var(GPU_MAX_HW_QUEUES, "1");
+    eprintln!("[hip-bridge] {GPU_MAX_HW_QUEUES}=1 (physical RDNA4 visible)");
+}
 impl HipRuntime {
     /// Load the HIP runtime via dlopen.
     /// Uses the shared ROCm resolver so runtime, headers, and hipcc stay within
     /// one selected installation.
     pub fn load() -> HipResult<Self> {
+        // Physical-identity knobs must be set before the runtime dlopens.
+        arm_single_hw_queue_on_rdna4();
         keep_pageable_copies_out_of_reclaim();
         if host_maps_qwen4_experts() {
             keep_host_memory_out_of_reclaim(&format!("{QWEN4_EXPERT_VRAM_LAYERS_ENV} set"));
@@ -1332,7 +1409,7 @@ impl HipRuntime {
                     "hipMemGetInfo",
                     unsafe extern "C" fn(*mut usize, *mut usize) -> u32
                 ) },
-                _lib: lib,
+                _lib: Arc::new(lib),
                 launch_grid_yz_limit: AtomicU32::new(u32::MAX),
         };
 
@@ -1665,6 +1742,41 @@ impl HipRuntime {
         // # Safety or documented preconditions; out-params are stack locals.
         let code = unsafe { func(host) };
         self.check(code, "hipHostFree")
+    }
+
+    /// Own reusable pinned host storage, portable across devices. The library
+    /// stays loaded until the allocation is freed, even if the runtime drops.
+    pub fn host_buffer(&self, size: usize) -> HipResult<PinnedHostBuffer> {
+        if size == 0 {
+            return Err(HipError::new(0, "host_buffer requires non-zero size"));
+        }
+        let free = self.missing_vmm_symbol("hipHostFree", self.fn_host_free)?;
+        // hipHostMallocPortable: this thread-local stage may outlive a Gpu or
+        // be reused with another device after a model swap.
+        let ptr = self.host_malloc(size, 1)?;
+        // SAFETY: hipHostMalloc succeeded with a non-zero extent. Initialize
+        // once so as_bytes_mut can expose ordinary initialized Rust bytes.
+        unsafe { std::ptr::write_bytes(ptr.cast::<u8>(), 0, size) };
+        Ok(PinnedHostBuffer {
+            ptr,
+            size,
+            free,
+            _lib: Arc::clone(&self._lib),
+        })
+    }
+
+    /// Reusable pinned CPU/GPU transfer storage. Same-stream downloads may be
+    /// queued after an outstanding upload without exposing host references.
+    pub fn transfer_buffer(&self, size: usize) -> HipResult<PinnedTransferBuffer> {
+        Ok(PinnedTransferBuffer {
+            storage: Some(self.host_buffer(size)?),
+            device: self.current_device()?,
+            stream: ptr::null_mut(),
+            pending: false,
+            get_device: self.fn_get_device,
+            set_device: self.fn_set_device,
+            synchronize: self.fn_device_synchronize,
+        })
     }
 
     pub fn mem_get_allocation_granularity(
@@ -2667,7 +2779,7 @@ impl HipRuntime {
         &self,
         dst: &mut [u8],
         src: &DeviceBuffer,
-        stream: &Stream,
+        stream: Option<&Stream>,
     ) -> HipResult<()> {
         assert!(dst.len() <= src.size);
         // SAFETY: pointers are live HIP allocations or host slices; sizes were
@@ -2679,7 +2791,7 @@ impl HipRuntime {
                 src.ptr as *const c_void,
                 dst.len(),
                 MemcpyKind::DeviceToHost as c_uint,
-                stream.0,
+                stream.map_or(ptr::null_mut(), |s| s.0),
             )
         };
         memory_effects::dtoh();
@@ -3030,6 +3142,197 @@ impl HipRuntime {
 
 // ── Handle wrappers ─────────────────────────────────────────────
 
+/// Owned, initialized `hipHostMallocPortable` storage. Async users must finish
+/// all copies before accessing or dropping it. On an unrecoverable drain error,
+/// retain/leak the owner rather than freeing memory still used by the device.
+pub struct PinnedHostBuffer {
+    ptr: *mut c_void,
+    size: usize,
+    free: unsafe extern "C" fn(*mut c_void) -> u32,
+    _lib: Arc<Library>,
+}
+
+impl PinnedHostBuffer {
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: this owner holds size initialized bytes until Drop. The
+        // mutable borrow excludes other host access; GPU quiescence is the
+        // caller's async-copy contract.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.cast(), self.size) }
+    }
+}
+
+impl Drop for PinnedHostBuffer {
+    fn drop(&mut self) {
+        // SAFETY: unique hipHostMalloc owner; its library is still live. The
+        // caller must have drained async copies before dropping the owner.
+        let _ = unsafe { (self.free)(self.ptr) };
+    }
+}
+
+/// Pinned transfer storage whose outstanding GPU accesses survive a CPU call.
+///
+/// Host access is available only after `complete` drains the queued downloads.
+/// Uploads and following downloads on the same stream reuse the allocation
+/// without an intervening host wait. Stream changes and teardown must retire
+/// the old accesses first; a failed teardown retains the allocation.
+pub struct PinnedTransferBuffer {
+    storage: Option<PinnedHostBuffer>,
+    device: i32,
+    stream: HipStream,
+    pending: bool,
+    get_device: unsafe extern "C" fn(*mut c_int) -> u32,
+    set_device: unsafe extern "C" fn(c_int) -> u32,
+    synchronize: unsafe extern "C" fn() -> u32,
+}
+
+impl PinnedTransferBuffer {
+    pub fn size(&self) -> usize {
+        self.storage.as_ref().expect("live transfer storage").size()
+    }
+
+    pub fn device(&self) -> i32 {
+        self.device
+    }
+
+    /// The runtime must be bound to this buffer's device, and the stream and
+    /// device allocation must remain live until their queued work completes.
+    pub fn download_async(
+        &mut self,
+        hip: &HipRuntime,
+        src: &DeviceBuffer,
+        offset: usize,
+        size: usize,
+        stream: Option<&Stream>,
+    ) -> HipResult<()> {
+        self.check_span(offset, size)?;
+        if size > src.size() {
+            return Err(HipError::new(0, "pinned download exceeds device buffer"));
+        }
+        self.begin(hip, stream)?;
+        let storage = self.storage.as_ref().expect("live transfer storage");
+        // SAFETY: checked allocation extent; no host reference exists while
+        // pending. Same-stream copies order prior upload reads before these
+        // writes, and the owner drains before host reuse/free.
+        let code = unsafe {
+            (hip.fn_memcpy_async)(
+                storage.ptr.cast::<u8>().add(offset).cast(),
+                src.ptr,
+                size,
+                MemcpyKind::DeviceToHost as c_uint,
+                self.stream,
+            )
+        };
+        memory_effects::dtoh();
+        hip.check(code, "hipMemcpyAsync pinned D2H")
+    }
+
+    /// Enqueue a return from owned storage, not a caller's temporary slice.
+    /// The runtime, stream and destination obey `download_async`'s contract.
+    pub fn upload_async(
+        &mut self,
+        hip: &HipRuntime,
+        dst: &DeviceBuffer,
+        offset: usize,
+        size: usize,
+        stream: Option<&Stream>,
+    ) -> HipResult<()> {
+        self.check_span(offset, size)?;
+        if size > dst.size() {
+            return Err(HipError::new(0, "pinned upload exceeds device buffer"));
+        }
+        if hip_fault_consume(0, "upload") {
+            return Err(hip_fault_err("upload"));
+        }
+        self.begin(hip, stream)?;
+        let storage = self.storage.as_ref().expect("live transfer storage");
+        // SAFETY: checked source extent, and no host access is allowed until
+        // complete drains the stream. The pinned owner survives this enqueue.
+        let code = unsafe {
+            (hip.fn_memcpy_async)(
+                dst.ptr,
+                storage.ptr.cast::<u8>().add(offset).cast(),
+                size,
+                MemcpyKind::HostToDevice as c_uint,
+                self.stream,
+            )
+        };
+        memory_effects::htod();
+        hip.check(code, "hipMemcpyAsync pinned H2D")
+    }
+
+    /// Complete the caller's existing D2H readiness boundary.
+    pub fn complete(&mut self, hip: &HipRuntime) -> HipResult<()> {
+        if self.pending {
+            if self.stream.is_null() {
+                hip.stream_synchronize_default()?;
+            } else {
+                hip.stream_synchronize(&Stream(self.stream))?;
+            }
+            self.pending = false;
+        }
+        Ok(())
+    }
+
+    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+        assert!(!self.pending, "host access before pinned transfer completion");
+        self.storage.as_mut().expect("live transfer storage").as_bytes_mut()
+    }
+
+    fn check_span(&self, offset: usize, size: usize) -> HipResult<()> {
+        if offset.checked_add(size).is_none_or(|end| end > self.size()) {
+            return Err(HipError::new(0, "pinned transfer extent exceeds storage"));
+        }
+        Ok(())
+    }
+
+    fn begin(&mut self, hip: &HipRuntime, stream: Option<&Stream>) -> HipResult<()> {
+        let raw = stream.map_or(ptr::null_mut(), |s| s.0);
+        if self.pending && self.stream != raw {
+            // The old stream may have been destroyed already. Drain the owning
+            // device, not a potentially stale handle, on this rare transition.
+            hip.device_synchronize()?;
+            self.pending = false;
+        }
+        self.stream = raw;
+        // Mark before submission: even a failed API call must not release or
+        // expose storage while an earlier copy might still be using it.
+        self.pending = true;
+        Ok(())
+    }
+}
+
+impl Drop for PinnedTransferBuffer {
+    fn drop(&mut self) {
+        if !self.pending {
+            return;
+        }
+        let mut previous = 0;
+        // SAFETY: the pinned owner keeps the function-pointer library live.
+        // Bind its device before draining; restore the caller's device so
+        // cached thread binding remains valid outside this destructor.
+        let drained = unsafe {
+            if (self.get_device)(&mut previous) != HIP_SUCCESS {
+                false
+            } else if (self.set_device)(self.device) != HIP_SUCCESS {
+                false
+            } else {
+                let code = (self.synchronize)();
+                let restored = (self.set_device)(previous);
+                code == HIP_SUCCESS && restored == HIP_SUCCESS
+            }
+        };
+        if !drained {
+            // Retain both allocation and library rather than freeing memory
+            // that the device may still access after a failed drain.
+            std::mem::forget(self.storage.take());
+        }
+    }
+}
+
 /// GPU stream handle.
 pub struct Stream(HipStream);
 impl Stream {
@@ -3115,5 +3418,121 @@ mod pageable_copy_staging_tests {
             assert_eq!(decide(Some("0"), Some(preset)), PageableCopyStaging::Preset, "preset {preset:?} with opt-out");
             assert_eq!(decide(Some("1"), Some(preset)), PageableCopyStaging::Preset, "preset {preset:?} with =1");
         }
+    }
+}
+
+mod rdna4_hw_queue_tests {
+    use super::*;
+    use hipfire_config::devices::{GpuDevice, PciBdf};
+
+    fn card(index: usize, arch: &str, unique_id: Option<u128>) -> GpuDevice {
+        GpuDevice {
+            index,
+            rocr_index: index,
+            node: index as u32,
+            arch: arch.into(),
+            unique_id,
+            bdf: PciBdf {
+                domain: 0,
+                bus: index as u8,
+                device: 0,
+                function: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn only_exact_rdna4_arches_match() {
+        assert!(is_rdna4("gfx1200"));
+        assert!(is_rdna4("gfx1201"));
+        assert!(!is_rdna4("gfx1202"));
+        assert!(!is_rdna4("gfx1100"));
+        assert!(!is_rdna4("gfx1030"));
+        assert!(!is_rdna4("gfx1200 "));
+        assert!(!is_rdna4("GFX1201"));
+        assert!(!is_rdna4(""));
+    }
+
+    #[test]
+    fn older_only_selection_never_arms() {
+        let mut devices = [card(0, "gfx1100", Some(1)), card(1, "gfx1030", None)];
+        assert!(!visible_has_rdna4(&mut devices, None));
+        assert!(!visible_has_rdna4(&mut devices, Some("0")));
+        assert!(!visible_has_rdna4(&mut devices, Some("0,1")));
+    }
+
+    #[test]
+    fn mixed_selection_arms_only_when_rdna4_visible() {
+        let older = 0x43390a851e296ee5;
+        let rdna4 = 0x9eb7aeda51c88ffd;
+        let mut devices = [card(0, "gfx1100", Some(older)), card(1, "gfx1201", Some(rdna4))];
+        assert!(visible_has_rdna4(&mut devices, None));
+        assert!(!visible_has_rdna4(&mut devices, Some("0")));
+        assert!(visible_has_rdna4(&mut devices, Some("1")));
+        assert!(visible_has_rdna4(&mut devices, Some("0,1")));
+    }
+
+    #[test]
+    fn hidden_rdna4_behind_hip_uuid_filter_leaves_unset() {
+        let older = 0x43390a851e296ee5;
+        let rdna4 = 0x9eb7aeda51c88ffd;
+        let mut devices = [card(0, "gfx1100", Some(older)), card(1, "gfx1201", Some(rdna4))];
+        let older_uuid = format!("GPU-{older:016x}");
+        let rdna4_uuid = format!("GPU-{rdna4:016x}");
+        assert!(!visible_has_rdna4(&mut devices, Some(&older_uuid)));
+        assert!(visible_has_rdna4(&mut devices, Some(&rdna4_uuid)));
+        // Case-insensitive UUID match, like ROCr/HIP.
+        assert!(visible_has_rdna4(&mut devices, Some(&rdna4_uuid.to_ascii_uppercase())));
+    }
+
+    #[test]
+    fn unresolvable_filter_leaves_unset() {
+        let mut devices = [
+            card(0, "gfx1100", Some(0x43390a851e296ee5)),
+            card(1, "gfx1201", None),
+        ];
+        // Malformed / empty entries.
+        assert!(!visible_has_rdna4(&mut devices, Some("")));
+        assert!(!visible_has_rdna4(&mut devices, Some("0,")));
+        assert!(!visible_has_rdna4(&mut devices, Some(",1")));
+        assert!(!visible_has_rdna4(&mut devices, Some("garbage")));
+        assert!(!visible_has_rdna4(&mut devices, Some("1,garbage")));
+        // Ordinal outside the visible set.
+        assert!(!visible_has_rdna4(&mut devices, Some("5")));
+        // A UUID that matches no card.
+        assert!(!visible_has_rdna4(&mut devices, Some("GPU-deadbeefdeadbeef")));
+    }
+
+    #[test]
+    fn hip_ordinal_follows_rocr_not_bdf_order() {
+        // BDF-sorted enumeration is BDF 0 then BDF 1, but ROCr agent order is
+        // the reverse: HIP ordinal 0 is the older card at BDF 1, ordinal 1 is
+        // the RDNA4 at BDF 0.
+        let mut devices = [
+            GpuDevice {
+                index: 0,
+                rocr_index: 1,
+                node: 1,
+                arch: "gfx1201".into(),
+                unique_id: None,
+                bdf: PciBdf { domain: 0, bus: 0, device: 0, function: 0 },
+            },
+            GpuDevice {
+                index: 1,
+                rocr_index: 0,
+                node: 2,
+                arch: "gfx1100".into(),
+                unique_id: Some(0x43390a851e296ee5),
+                bdf: PciBdf { domain: 0, bus: 1, device: 0, function: 0 },
+            },
+        ];
+        assert!(!visible_has_rdna4(&mut devices, Some("0")));
+        assert!(visible_has_rdna4(&mut devices, Some("1")));
+    }
+
+    #[test]
+    fn unknown_arch_is_not_rdna4() {
+        let mut devices = [card(0, "gfx0000", None)];
+        assert!(!visible_has_rdna4(&mut devices, None));
     }
 }

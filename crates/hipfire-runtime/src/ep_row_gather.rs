@@ -5,10 +5,12 @@
 //! Flash-Next expert-parallel (EP) row all-gather transport.
 //!
 //! Every rank runs the unchanged single-device program. Routed experts are
-//! sharded `e -> rank e % ranks`; the down projection of one decode token
-//! writes `slots` expanded rows (rows of non-owned experts come from a zero
-//! dummy expert and are garbage-by-construction). This transport then fills
-//! every non-owned row from its owner before the unchanged canonical combine:
+//! sharded `e -> rank e % ranks`; the down projection of a decode token (or a
+//! few-row verify forward) writes `slots` expanded rows, `rows * k` in slot
+//! order (rows of non-owned experts come from a zero dummy expert and are
+//! garbage-by-construction). `slots` is passed per call (`1..=` the per-buffer
+//! capacity of [`EpRowGatherSpec::slots`]). This transport then fills every
+//! non-owned row from its owner before the unchanged canonical combine:
 //!
 //! 1. [`EpRowGather::publish`] records the rank's producer-complete event for a
 //!    buffer index on the stream the producer kernels ran on.
@@ -65,7 +67,8 @@ pub const MAX_RANKS: usize = 4;
 pub const MIN_BUFFERS: usize = 2;
 pub const MAX_BUFFERS: usize = 4;
 
-/// Shape of one gather: `ranks` participants, `slots` rows of `row_bytes` each.
+/// Shape of one gather: `ranks` participants, a per-buffer capacity of `slots`
+/// rows of `row_bytes` each (a call gathers `1..=slots` of them).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EpRowGatherSpec {
     pub ranks: usize,
@@ -117,6 +120,17 @@ impl EpRowGatherSpec {
                 self.buffer_bytes(),
                 self.slots,
                 self.row_bytes
+            )));
+        }
+        Ok(())
+    }
+
+    /// A call's slot count must be `1..=self.slots` (the per-buffer capacity).
+    fn check_call_slots(&self, slots: usize) -> HipResult<()> {
+        if slots == 0 || slots > self.slots {
+            return Err(err(format!(
+                "ep_row_gather: call slots {slots} outside 1..={} (buffer capacity)",
+                self.slots
             )));
         }
         Ok(())
@@ -450,8 +464,10 @@ impl EpRowGather {
         rank: usize,
         buffer: usize,
         slot_experts: &GpuTensor,
+        slots: usize,
     ) -> HipResult<()> {
         self.check(gpu, rank, buffer)?;
+        self.spec.check_call_slots(slots)?;
         gpu.bind_thread()?;
         if !self.ranks[rank].peers_enabled.load(Ordering::Acquire) {
             return Err(err(format!(
@@ -477,7 +493,7 @@ impl EpRowGather {
             slot_experts,
             src,
             self.ranks[rank].ptrs[buffer],
-            self.spec.slots,
+            slots,
             self.spec.ranks,
             rank,
             self.spec.row_bytes / 16,
@@ -493,13 +509,15 @@ impl EpRowGather {
         rank: usize,
         buffer: usize,
         slot_experts: &GpuTensor,
+        slots: usize,
     ) -> HipResult<()> {
+        self.spec.check_call_slots(slots)?;
         if let Err(e) = self.publish(gpu, rank, buffer) {
             self.abort();
             return Err(e);
         }
         self.barrier.wait().map_err(|m| err(m.into()))?;
-        if let Err(e) = self.gather(gpu, rank, buffer, slot_experts) {
+        if let Err(e) = self.gather(gpu, rank, buffer, slot_experts, slots) {
             self.abort();
             return Err(e);
         }
@@ -588,6 +606,16 @@ mod tests {
         assert!(s.check_buffer_len(0, 102_400).is_ok());
         assert!(s.check_buffer_len(1, 1 << 20).is_ok());
         assert!(s.check_buffer_len(0, 102_399).is_err());
+    }
+
+    #[test]
+    fn call_slots_within_capacity() {
+        let s = spec(4, 80, 10240);
+        assert!(s.check_call_slots(1).is_ok());
+        assert!(s.check_call_slots(20).is_ok());
+        assert!(s.check_call_slots(80).is_ok());
+        assert!(s.check_call_slots(0).is_err());
+        assert!(s.check_call_slots(81).is_err());
     }
 
     #[test]

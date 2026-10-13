@@ -14,6 +14,7 @@
 use crate::config::{LayerType, Qwen4Config, Qwen4FfnConfig, Qwen4PleConfig, Qwen4Profile};
 use hipfire_runtime::external_rows::RowEncoding;
 use hipfire_runtime::model_source::SourceRangeDescriptor;
+use hipfire_runtime::trunk_overlay::TrunkOverlayPayload;
 #[cfg(test)]
 use hipfire_runtime::weight_manifest::WeightResidency;
 use hipfire_runtime::tp_shard::ExpertAssign;
@@ -2146,18 +2147,14 @@ impl Qwen4Weights {
                 }
                 let bytes =
                     std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
-                if k % 256 != 0 || bytes.len() != m * (k / 256) * rdna_compute::MQ4V2_GROUP_BYTES {
+                if qt44_matrix_bytes(m, k) != Some(bytes.len()) {
                     return Err(format!(
                         "{}: {} bytes is not a {m}x{k} QT44 matrix",
                         path.display(),
                         bytes.len()
                     ));
                 }
-                let mut copy = gpu
-                    .upload_raw(&bytes, &[bytes.len()])
-                    .map_err(|error| error.to_string())?;
-                copy.dtype = DType::MQ4G256V2;
-                copy
+                upload_qt44(gpu, &bytes)?
             } else {
                 if tensor.dtype == target {
                     continue;
@@ -2169,21 +2166,135 @@ impl Qwen4Weights {
                 }
                 .map_err(|error| format!("requant {} -> {target:?}: {error}", taken.key.name))?
             };
+            let (old_bytes, new_bytes) = swap_resident(gpu, taken, copy)?;
             count += 1;
-            before += tensor.buf.size();
-            after += copy.buf.size();
-            let WeightHandle::Resident(old) =
-                std::mem::replace(&mut taken.handle, WeightHandle::Resident(copy))
-            else {
-                unreachable!()
-            };
-            gpu.free_tensor(old).map_err(|error| error.to_string())?;
+            before += old_bytes;
+            after += new_bytes;
         }
         eprintln!(
             "[qwen4] HIPFIRE_QWEN4_REQUANT {spec:?}: {count} tensors, {before} -> {after} bytes"
         );
         Ok(())
     }
+
+    /// Replace the QT44 targets of a verified trunk overlay
+    /// (`hipfire_runtime::trunk_overlay`), exactly as the `qt44:` rule of
+    /// [`Self::requant_from_env`] does (same upload, dtype and free).
+    ///
+    /// Everything is checked first: each payload must name exactly one
+    /// resident weight whose logical shape is the payload's `[m, k]` and whose
+    /// byte count is the QT44 size.  A failed check replaces nothing and is
+    /// [`TrunkOverlayOutcome::Refused`] (the base weights run).  An upload or
+    /// free error once replacement started is an `Err`.
+    pub fn apply_trunk_overlay(
+        &mut self,
+        gpu: &mut Gpu,
+        payloads: &[TrunkOverlayPayload],
+    ) -> Result<TrunkOverlayOutcome, String> {
+        let mut slots = Vec::with_capacity(payloads.len());
+        for payload in payloads {
+            let mut resident = self
+                .taken_by_name
+                .get(&payload.name)
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|&slot| matches!(self.taken[slot].handle, WeightHandle::Resident(_)));
+            let (Some(slot), None) = (resident.next(), resident.next()) else {
+                return Ok(TrunkOverlayOutcome::Refused(format!(
+                    "tensor {} does not match exactly one resident weight",
+                    payload.name
+                )));
+            };
+            let [m, k] = payload.shape;
+            let projection = &self.taken[slot].projection;
+            if projection.logical_shape != [m, k] {
+                return Ok(TrunkOverlayOutcome::Refused(format!(
+                    "tensor {}: the model's weight is {:?}, overlay is [{m}, {k}]",
+                    payload.name, projection.logical_shape
+                )));
+            }
+            if qt44_matrix_bytes(m, k) != Some(payload.bytes.len()) {
+                return Ok(TrunkOverlayOutcome::Refused(format!(
+                    "tensor {}: {} bytes is not a {m}x{k} QT44 matrix",
+                    payload.name,
+                    payload.bytes.len()
+                )));
+            }
+            if slots.contains(&slot) {
+                return Ok(TrunkOverlayOutcome::Refused(format!(
+                    "tensor {} is listed twice",
+                    payload.name
+                )));
+            }
+            slots.push(slot);
+        }
+        let (mut before, mut after) = (0usize, 0usize);
+        for (payload, &slot) in payloads.iter().zip(&slots) {
+            let copy = upload_qt44(gpu, &payload.bytes)?;
+            let (old_bytes, new_bytes) = swap_resident(gpu, &mut self.taken[slot], copy)?;
+            before += old_bytes;
+            after += new_bytes;
+        }
+        Ok(TrunkOverlayOutcome::Applied(TrunkOverlayApplied {
+            tensors: payloads.len(),
+            before_bytes: before,
+            after_bytes: after,
+        }))
+    }
+}
+
+/// What [`Qwen4Weights::apply_trunk_overlay`] did.
+#[derive(Debug)]
+pub enum TrunkOverlayOutcome {
+    Applied(TrunkOverlayApplied),
+    /// Nothing was replaced; the reason is one line.
+    Refused(String),
+}
+
+/// Tensors replaced by a trunk overlay and their device bytes before/after.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrunkOverlayApplied {
+    pub tensors: usize,
+    pub before_bytes: usize,
+    pub after_bytes: usize,
+}
+
+/// Byte size of an `m x k` QT44 matrix; `None` unless K is a multiple of 256.
+fn qt44_matrix_bytes(m: usize, k: usize) -> Option<usize> {
+    (k % 256 == 0).then(|| m * (k / 256) * rdna_compute::MQ4V2_GROUP_BYTES)
+}
+
+/// Upload pre-encoded QT44 bytes as a resident tensor (dtype `MQ4G256V2`).
+/// The one upload path of `HIPFIRE_QWEN4_REQUANT`'s `qt44:` rule and of the
+/// trunk overlay.
+fn upload_qt44(gpu: &mut Gpu, bytes: &[u8]) -> Result<GpuTensor, String> {
+    let mut copy = gpu
+        .upload_raw(bytes, &[bytes.len()])
+        .map_err(|error| error.to_string())?;
+    copy.dtype = DType::MQ4G256V2;
+    Ok(copy)
+}
+
+/// Install `copy` as `taken`'s resident tensor and free the old one; returns
+/// the old and new device bytes.
+fn swap_resident(
+    gpu: &mut Gpu,
+    taken: &mut TakenWeight,
+    copy: GpuTensor,
+) -> Result<(usize, usize), String> {
+    let WeightHandle::Resident(old) = &taken.handle else {
+        let _ = gpu.free_tensor(copy);
+        return Err(format!("{}: weight is not resident", taken.key.name));
+    };
+    let sizes = (old.buf.size(), copy.buf.size());
+    let WeightHandle::Resident(old) =
+        std::mem::replace(&mut taken.handle, WeightHandle::Resident(copy))
+    else {
+        unreachable!()
+    };
+    gpu.free_tensor(old).map_err(|error| error.to_string())?;
+    Ok(sizes)
 }
 
 fn build_root_refs(config: &Qwen4Config) -> Result<Qwen4RootWeights, WeightError> {

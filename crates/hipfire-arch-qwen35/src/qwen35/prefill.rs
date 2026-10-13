@@ -43,7 +43,7 @@ use hipfire_dispatch::families::attention::AttnParams;
 use hipfire_dispatch::families::gemv::WeightRef;
 use hipfire_dispatch::families::kv_tier::KvTierInputs;
 use hipfire_dispatch::families::kv_tier::KvTierPlan;
-use hipfire_dispatch::families::moe::codebook_batched_admit_enabled;
+use hipfire_dispatch::families::moe::{NARROW_VERIFY_MAX_ROWS, codebook_batched_admit_enabled};
 #[cfg(test)]
 use hipfire_dispatch::families::moe::{
     codebook_batched_admit_enabled_from_env, mq6_batched_admit_enabled_from_env,
@@ -333,7 +333,9 @@ fn packed_mq4_down_admitted(
     down: (DType, usize, usize),
     hidden_dim: usize,
 ) -> bool {
-    packed_admitted && separate && residual
+    packed_admitted
+        && separate
+        && residual
         && down.0 == DType::MQ4G256
         && (down.1, down.2) == (5120, 17408)
         && hidden_dim == down.2
@@ -354,18 +356,32 @@ fn try_packed_mq4_down(
         !pbs.lean && gpu.packed_mq4_admitted(down.m, down.k, n),
         h_source == FfnGateOutput::Separate,
         matches!(epilogue, BatchEpilogue::Residual),
-        (down.gpu_dtype, down.m, down.k), hidden_dim,
+        (down.gpu_dtype, down.m, down.k),
+        hidden_dim,
     ) {
         return Ok(false);
     }
     gpu.flush_residual_fold()?;
     fused_silu_mul_rotate_mq_batched_for(
-        gpu, down, &pbs.gate_ffn_batch, &pbs.up_batch,
-        &pbs.ffn_hidden_batch, hidden_dim, n,
+        gpu,
+        down,
+        &pbs.gate_ffn_batch,
+        &pbs.up_batch,
+        &pbs.ffn_hidden_batch,
+        hidden_dim,
+        n,
     )?;
-    run_residual_gemm_key(gpu, hipfire_dispatch::types::KernelKey::GemmMq4PackedResidual,
-        &down.buf, down.gpu_dtype, &pbs.ffn_hidden_batch, &pbs.x_batch,
-        down.m, down.k, n)?;
+    run_residual_gemm_key(
+        gpu,
+        hipfire_dispatch::types::KernelKey::GemmMq4PackedResidual,
+        &down.buf,
+        down.gpu_dtype,
+        &pbs.ffn_hidden_batch,
+        &pbs.x_batch,
+        down.m,
+        down.k,
+        n,
+    )?;
     Ok(true)
 }
 
@@ -409,22 +425,34 @@ fn try_packed_mq4_ffn_gate_up(
     }
     gpu.flush_residual_fold()?;
     let separate_awq_inputs = gate.awq_scale.is_some() || up.awq_scale.is_some();
-    for (index, (weight, output)) in [
-        (gate, &pbs.gate_ffn_batch),
-        (up, &pbs.up_batch),
-    ].into_iter().enumerate() {
+    for (index, (weight, output)) in [(gate, &pbs.gate_ffn_batch), (up, &pbs.up_batch)]
+        .into_iter()
+        .enumerate()
+    {
         // Sidecars are per-weight and may differ (or exist on only one side).
         // Reuse the rotated input only when neither projection carries AWQ.
         if index == 0 || separate_awq_inputs {
             fused_rmsnorm_rotate_mq_batched_for(
-                gpu, &pbs.x_batch, norm, weight, &pbs.x_rot_batch,
-                weight.k, config.norm_eps, n,
+                gpu,
+                &pbs.x_batch,
+                norm,
+                weight,
+                &pbs.x_rot_batch,
+                weight.k,
+                config.norm_eps,
+                n,
             )?;
         }
         run_plain_gemm_key(
-            gpu, hipfire_dispatch::types::KernelKey::GemmMq4Packed,
-            &weight.buf, weight.gpu_dtype, &pbs.x_rot_batch, output,
-            weight.m, weight.k, n,
+            gpu,
+            hipfire_dispatch::types::KernelKey::GemmMq4Packed,
+            &weight.buf,
+            weight.gpu_dtype,
+            &pbs.x_rot_batch,
+            output,
+            weight.m,
+            weight.k,
+            n,
         )?;
     }
     Ok(true)
@@ -1629,6 +1657,17 @@ pub const PREFILL_MAX_BATCH: usize = 256;
 /// Minimum number of rows for the batched prefill kernels.
 const MIN_BATCH: usize = 2;
 
+/// Widest batched forward whose routed experts run on the CPU when the loader
+/// armed the expert splice (`memory.offload_exec=cpu`). Matches the MTP verify
+/// window (drafts + 1, capped at 4): the narrow speculative verify and the
+/// accepted-prefix rollback replay both fit, so they share the single-token
+/// decode's CPU target arithmetic. The gate is width-only — every armed-sink
+/// forward at `n <= 4` splices on the CPU irrespective of dispatch workload, so
+/// a `Standard` tape-disabled rollback replay and an ordinary very short prompt
+/// prefill take it too. Wider prompt prefill and wide verify keep the GPU
+/// grouped PCIe read, which beats the CPU expert FFN by >10x at chunk sizes.
+/// Single source is [`hipfire_dispatch::families::moe::NARROW_VERIFY_MAX_ROWS`].
+
 /// gfx1100-measured default prefill chunk size (Qwen3.8 / MQ4V2 gate-up BT path).
 /// Exact `gfx1100` only — not gfx1101/1102/1151 or other gfx11 variants.
 const PREFILL_DEFAULT_BATCH_GFX1100: usize = 512;
@@ -1750,7 +1789,9 @@ fn dense_layers_have_projection_dtype(weights: &Qwen35Weights, dtype: DType) -> 
 
 fn native_mq4_widened_requested() -> bool {
     hipfire_config::developer_var("HIPFIRE_GFX1100_MQ4_WIDE_PREFILL")
-        .ok().as_deref() == Some("1")
+        .ok()
+        .as_deref()
+        == Some("1")
 }
 
 /// Separately admitted native MQ4 route: no V2 producer or lean PBS contract.
@@ -1763,7 +1804,9 @@ fn native_mq4_widened_route(gpu: &Gpu, weights: &Qwen35Weights) -> bool {
 }
 
 fn native_mq4_widened_flags_admitted(
-    arch: &str, flags: &rdna_compute::FeatureFlags, screen: bool,
+    arch: &str,
+    flags: &rdna_compute::FeatureFlags,
+    screen: bool,
 ) -> bool {
     arch == "gfx1100"
         && !flags.fp16_disabled
@@ -2031,15 +2074,36 @@ fn lean_dense_prefill_allocation_bytes(config: &Qwen35Config, rows: usize) -> Op
 /// Steady-state bytes of one dense tape-free [`PrefillBatchScratch`] at
 /// `rows` rows: every unconditional allocation including positions, rope,
 /// tokens, the four F16 sidecars and the 256-byte prologue control plane.
-/// `None` for MoE configs (out of scope) or on arithmetic overflow.
+/// `None` on arithmetic overflow.
 ///
-/// Term-by-term mirror of `PrefillBatchScratch::new_opt(..., false)` for
-/// dense configs: F32 `3D + 4K + 8V + 2H + 3I + 6Q + 2W + 3` elems/row, F16
+/// Only the *dense* arms are enumerated here (this enumerator predates the MoE
+/// route). A MoE config is charged through
+/// [`PrefillBatchScratch::projected_allocation_bytes`], the checked mirror of the
+/// same constructor that already models its shared-expert, expanded-expert and
+/// grouped-GEMM scratch term-for-term. Returning `None` for MoE (the previous
+/// behaviour) left the reservation at zero, and the placement search then
+/// under-spilled by exactly that scratch — the difference between a load and an
+/// `hipMalloc: out of memory`.
+///
+/// Term-by-term mirror of `PrefillBatchScratch::new_opt(..., false)` for dense
+/// configs: F32 `3D + 4K + 8V + 2H + 3I + 6Q + 2W + 3` elems/row, F16
 /// `D + V + I + Q` elems/row, plus 256 fixed bytes.
 fn dense_prefill_allocation_bytes(config: &Qwen35Config, rows: usize) -> Option<usize> {
     if config.num_experts != 0 {
-        return None;
+        // `cap_gdn_tape = true` is the conservative arm: the tape is an
+        // `alloc_opt!` in the constructor, so charging it can only make the
+        // placement spill slightly more, never less.
+        return crate::qwen35::batch::PrefillBatchScratch::projected_allocation_bytes(
+            config, rows, true,
+        )
+        .ok()
+        .and_then(|bytes| usize::try_from(bytes).ok());
     }
+    dense_layer_prefill_allocation_bytes(config, rows)
+}
+
+/// The arch-independent terms of [`dense_prefill_allocation_bytes`].
+fn dense_layer_prefill_allocation_bytes(config: &Qwen35Config, rows: usize) -> Option<usize> {
     let d = config.dim;
     let i = config.hidden_dim;
     let k = config
@@ -2132,9 +2196,17 @@ pub fn minimum_prefill_reservation_bytes(config: &Qwen35Config, arch: &str) -> O
     // explicit experimental MQ4 opt-ins, conservatively reserve their prelude
     // too; the default V2/other-format reservation remains unchanged.
     let packed = hipfire_config::developer_var("HIPFIRE_GFX1100_PACKED_MQ4_PREFILL")
-        .ok().as_deref() == Some("1");
+        .ok()
+        .as_deref()
+        == Some("1");
     if arch == "gfx1100" && (native_mq4_widened_requested() || packed) {
-        base.checked_add(native_mq4_projection_deficit(config, WIDENED_COMMIT_ROWS, 0, 0, 0)?)
+        base.checked_add(native_mq4_projection_deficit(
+            config,
+            WIDENED_COMMIT_ROWS,
+            0,
+            0,
+            0,
+        )?)
     } else {
         Some(base)
     }
@@ -2150,11 +2222,18 @@ fn native_mq4_projection_deficit(
     live_f16: usize,
     live_partials: usize,
 ) -> Option<usize> {
-    let mmq = config.hidden_dim.checked_add(127)?.checked_div(128)?
-        .checked_mul(144)?.checked_mul(rows)?;
+    let mmq = config
+        .hidden_dim
+        .checked_add(127)?
+        .checked_div(128)?
+        .checked_mul(144)?
+        .checked_mul(rows)?;
     let tail = rows.min(127);
     let f16 = tail.checked_mul(config.hidden_dim)?.checked_mul(2)?;
-    let partials = tail.checked_mul(config.dim)?.checked_mul(4)?.checked_mul(4)?;
+    let partials = tail
+        .checked_mul(config.dim)?
+        .checked_mul(4)?
+        .checked_mul(4)?;
     mmq.saturating_sub(live_mmq)
         .checked_add(f16.saturating_sub(live_f16))?
         .checked_add(partials.saturating_sub(live_partials))
@@ -2322,11 +2401,13 @@ fn memory_admitted_rung(
         .unwrap_or(usize::MAX);
         let projection_deficit = if native_mq4 {
             native_mq4_projection_deficit(
-                config, rung,
+                config,
+                rung,
                 gpu.scratch.q8_1_mmq_x_scratch_bytes,
                 gpu.scratch.fp16_x_scratch_bytes,
                 gpu.scratch.ksplit_det_partials_bytes,
-            ).unwrap_or(usize::MAX)
+            )
+            .unwrap_or(usize::MAX)
         } else if fp8_projection {
             let x_need = rung.checked_mul(config.hidden_dim).unwrap_or(usize::MAX);
             let sums_need = rung
@@ -4879,6 +4960,7 @@ fn build_moe_prefill_params<'a>(
     model_has_mq6_moe: bool,
     routed_out: Option<&'a GpuTensor>,
     route: PrefillRouteMode<'a>,
+    cpu_deferred_experts: bool,
 ) -> HipResult<(
     hipfire_dispatch::pipeline::sealed_moe::BoundMoeExperts<'a>,
     hipfire_dispatch::families::moe::MoePrefillParams<'a>,
@@ -4939,6 +5021,17 @@ fn build_moe_prefill_params<'a>(
         per_expert_gate_up,
         per_expert_down,
     };
+    crate::qwen35::weights::trace_moe_arm(
+        "prefill",
+        moe_dtypes.routed_gate_up,
+        moe_dtypes.routed_down,
+        moe_dtypes.experts_all_gate_up_mq4,
+        ffn.packed_expert_owners.as_ref().is_some_and(|owners| {
+            owners.gate_up.iter().all(|b| b.buf.is_host_mapped())
+                && owners.down.iter().all(|b| b.buf.is_host_mapped())
+        }),
+        per_expert_gate_up.is_some() || per_expert_down.is_some(),
+    );
 
     let paro_gate_up =
         ffn.paro_shared
@@ -5005,6 +5098,7 @@ fn build_moe_prefill_params<'a>(
         force_mq4_grouped_fp16: model_has_mq6_moe
             && gpu.arch_caps.is_gfx1151()
             && gpu.flags.moe_grouped_i8.is_none(),
+        cpu_deferred_experts,
         topk_indices,
         topk_weights,
         x_batch: &pbs.x_batch,
@@ -5031,6 +5125,9 @@ fn build_moe_prefill_params<'a>(
         paro_down,
         down_awq_scale: None,
         routed_out,
+        ep_row_gather: None,
+        shared_down_out: None,
+        ep_layer_idx: 0,
     };
     Ok((bound, moe_prefill_params))
 }
@@ -5063,6 +5160,7 @@ pub(crate) fn preflight_moe_ffn_batched_ep(
         model_has_mq6_moe,
         Some(routed_out),
         route,
+        false,
     )?;
     hipfire_dispatch::pipeline::sealed_moe::seal_prefill_ep(bound, ctx, params)
         .map(|_| ())
@@ -5093,6 +5191,7 @@ pub(crate) fn moe_ffn_batched_ep_slot_geometry(
         model_has_mq6_moe,
         Some(routed_out),
         PrefillRouteMode::ProduceRoot { slot: &proof_slot },
+        false,
     )?;
     let resolution = hipfire_dispatch::families::moe::MoePrefillResolution::resolve(
         &params.dtypes,
@@ -5139,6 +5238,7 @@ pub(crate) fn finish_moe_ffn_batched_ep_slot_order(
         model_has_mq6_moe,
         Some(routed_out),
         PrefillRouteMode::ProduceRoot { slot: &proof_slot },
+        false,
     )?;
     let sealed = hipfire_dispatch::pipeline::sealed_moe::seal_prefill_ep(bound, ctx, params)
         .map_err(HipError::from)?;
@@ -5158,6 +5258,45 @@ pub(crate) fn prefill_moe_ffn_body_batched_with_route<'a>(
     routed_out: Option<&'a GpuTensor>,
     route: PrefillRouteMode<'a>,
 ) -> HipResult<()> {
+    prefill_moe_ffn_body_batched_with_route_layered(
+        gpu, ffn, ffn_norm, config, pbs, n, ctx, model_has_mq6_moe, routed_out, route,
+        ffn.layer_idx as usize,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prefill_moe_ffn_body_batched_with_route_layered<'a>(
+    gpu: &mut Gpu,
+    ffn: &'a MoeFfnWeights,
+    ffn_norm: &'a GpuTensor,
+    config: &Qwen35Config,
+    pbs: &'a PrefillBatchScratch,
+    n: usize,
+    ctx: &'a DispatchCtx,
+    model_has_mq6_moe: bool,
+    routed_out: Option<&'a GpuTensor>,
+    route: PrefillRouteMode<'a>,
+    layer_idx: usize,
+) -> HipResult<()> {
+    // Narrow CPU-arithmetic forwards (the `<=4`-row speculative verify and the
+    // accepted-prefix rollback replay) must recompute the routed experts on the
+    // CPU, matching single-token decode; the GPU grouped PCIe read would
+    // otherwise diverge from the CPU target arithmetic these rows are validated
+    // against. The splice is width-only: any splice-armed layer at `n <= 4`
+    // takes it regardless of dispatch workload, so the tape-disabled
+    // accepted-prefix rollback (a `Standard` `forward_prefill_batch` call) and
+    // an ordinary very short `<=4` prompt prefill both land on the CPU. Wider
+    // prompt prefill and wide verify keep the real expert tables and the GPU
+    // grouped read, where the CPU expert FFN loses by >10x. Expert-parallel
+    // prefill never defers: its routed partial is gathered and all-reduced, and
+    // the CPU splice would fold the routed FFN into `x_batch` twice.
+    let cpu_deferred_experts = ffn.cpu_deferred_experts
+        && n <= NARROW_VERIFY_MAX_ROWS
+        && routed_out.is_none()
+        && !matches!(
+            route,
+            PrefillRouteMode::ProduceRoot { .. } | PrefillRouteMode::AdoptRoot { .. }
+        );
     let (bound, params) = build_moe_prefill_params(
         gpu,
         ffn,
@@ -5168,11 +5307,14 @@ pub(crate) fn prefill_moe_ffn_body_batched_with_route<'a>(
         model_has_mq6_moe,
         routed_out,
         route,
+        cpu_deferred_experts,
     )?;
     let compact_ep = matches!(
         &params.prelude.route,
         PrefillRouteMode::ProduceRoot { .. } | PrefillRouteMode::AdoptRoot { .. }
     ) && bound.rank_count() > 1;
+    // The CPU splice below adds into `pbs.x_batch` directly, so it is correct
+    // on every down path: the deferred program omitted the routed stages.
     let sealed = if compact_ep {
         hipfire_dispatch::pipeline::sealed_moe::seal_prefill_ep(bound, ctx, params)
     } else {
@@ -5192,8 +5334,48 @@ pub(crate) fn prefill_moe_ffn_body_batched_with_route<'a>(
         )
         .map_err(|e| hip_bridge::HipError::new(0, &e))?;
 
+        // Window span (opt-in `HIPFIRE_CPU_EXEC_TRACE` only): sealed GPU program
+        // vs CPU splice vs caller-side gap. Host wall around calls this body
+        // already makes; no new sync, no order change.
+        let t_window = std::time::Instant::now();
+        let t_sealed = std::time::Instant::now();
         execute_steps(gpu, ctx, &[Step::Moe(sealed)])
             .map_err(|e| HipError::new(0, &e.to_string()))?;
+        let sealed_ns = t_sealed.elapsed().as_nanos() as u64;
+        // The sealed program above runs the CPU expert splice in place of the
+        // routed GPU stages for this call, so the splice's cost is inside
+        // `sealed_ns` and cannot be separated on this side; `cpu_splice_ns`
+        // therefore reports 0 and the stage-side trace is the authority for
+        // the splice's own timing.
+        if cpu_deferred_experts {
+            // The omitted GPU routed tail no longer changes the FP16 staging
+            // cache key. The next layer reuses x_rot_batch with new contents.
+            gpu.invalidate_fp16_cache();
+        } else {
+            // `memory.offload_exec=cpu` deliberately does **not** splice the
+            // routed experts for ordinary wide prefill: the batched prefill
+            // params bind the real expert tables, so the sealed step above
+            // already produced the routed contribution with the GPU's grouped
+            // read over the host-mapped blobs (one weight pass per unique expert
+            // per chunk). The CPU expert FFN is compute-bound and loses to that
+            // by >10x at chunk sizes (measured 15x on ornith/gfx1201).
+        }
+        let total_ns = t_window.elapsed().as_nanos() as u64;
+        if hipfire_dispatch::cpu_exec::moe_trace_enabled() {
+            hipfire_dispatch::cpu_exec::moe_window_trace(
+                layer_idx,
+                hipfire_dispatch::cpu_exec::MoeWindowTiming {
+                    total_ns,
+                    gpu_sealed_ns: sealed_ns,
+                    // The splice now runs inside the sealed program (stage-side), so
+                    // its cost is part of `gpu_sealed_ns`; see the comment above.
+                    cpu_splice_ns: 0,
+                    other_ns: total_ns.saturating_sub(sealed_ns),
+                    rows: n,
+                    top_k: config.num_experts_per_tok,
+                },
+            );
+        }
 
         #[cfg(feature = "moe-oracle")]
         {
@@ -7739,7 +7921,13 @@ fn batch_chunk_delta_net_ffn_gate_up(
         return Ok(FfnGateOutput::Separate);
     }
     if try_packed_mq4_ffn_gate_up(
-        gpu, &layer.w_gate, &layer.w_up, &layer.ffn_norm, config, pbs, n,
+        gpu,
+        &layer.w_gate,
+        &layer.w_up,
+        &layer.ffn_norm,
+        config,
+        pbs,
+        n,
     )? {
         return Ok(FfnGateOutput::Separate);
     }
@@ -10406,7 +10594,13 @@ fn batch_chunk_full_attn_ffn_gate_up(
         return Ok(FfnGateOutput::Separate);
     }
     if try_packed_mq4_ffn_gate_up(
-        gpu, &layer.w_gate, &layer.w_up, &layer.ffn_norm, config, pbs, n,
+        gpu,
+        &layer.w_gate,
+        &layer.w_up,
+        &layer.ffn_norm,
+        config,
+        pbs,
+        n,
     )? {
         return Ok(FfnGateOutput::Separate);
     }
@@ -11217,6 +11411,10 @@ fn batch_chunk_delta_net_moe(
     routed_out: Option<&GpuTensor>,
     route: PrefillRouteMode<'_>,
 ) -> HipResult<()> {
+    // Layer span (opt-in trace only): attention half vs MoE FFN body. Host
+    // wall around work this chunk already runs; no new sync, no order change.
+    let t_layer = std::time::Instant::now();
+    let t_attn = std::time::Instant::now();
     // Batched MoE LA layer. LA body is the same as DeltaNet
     // (rmsnorm + qkvza + sigmoid_alpha + conv1d + L2norm +
     // repeat_interleave + GDN + gated_norm + wo+residual);
@@ -12014,7 +12212,10 @@ fn batch_chunk_delta_net_moe(
     // silu_mul + w_down) block. Takes pbs.x_batch as input AND
     // accumulates the FFN output residual back into it via the
     // batched indexed down kernel's atomicAdd path.
-    prefill_moe_ffn_body_batched_with_route(
+    // Attn half ends here; MoE FFN body (with its own window span) below.
+    let attn_ns = t_attn.elapsed().as_nanos() as u64;
+    let t_moe = std::time::Instant::now();
+    prefill_moe_ffn_body_batched_with_route_layered(
         gpu,
         &layer.ffn,
         &layer.ffn_norm,
@@ -12025,7 +12226,22 @@ fn batch_chunk_delta_net_moe(
         weights.moe_has_mq6,
         routed_out,
         route,
+        layer_idx,
     )?;
+    let moe_ns = t_moe.elapsed().as_nanos() as u64;
+    let total_ns = t_layer.elapsed().as_nanos() as u64;
+    if hipfire_dispatch::moe_trace_enabled() {
+        hipfire_dispatch::moe_layer_trace(
+            layer_idx,
+            false,
+            hipfire_dispatch::MoeLayerTiming {
+                total_ns,
+                attn_ns,
+                moe_ns,
+                rows: n,
+            },
+        );
+    }
 
     Ok(())
 }
@@ -12054,6 +12270,13 @@ fn batch_chunk_full_attn_moe(
     weights: &Qwen35Weights,
     route: PrefillRouteMode<'_>,
 ) -> HipResult<()> {
+    // Layer span (opt-in trace only): attention half vs MoE FFN body. Host
+    // wall around work this chunk already runs; no new sync, no order change.
+    // `t_attn` starts here so it covers the prep half (QKV projection +
+    // norms + RoPE, the largest GPU piece) plus the finish's attend tail;
+    // `attn_ns` closes just before the finish's MoE FFN body.
+    let t_layer = std::time::Instant::now();
+    let t_attn = std::time::Instant::now();
     // F2 split: QKV projection + norms + RoPE (everything above the old
     // attend call) live in `batch_chunk_full_attn_moe_prep`; called here
     // for the single-chunk path in the original position.
@@ -12068,6 +12291,7 @@ fn batch_chunk_full_attn_moe(
         tree_verify,
         layer_idx,
     )?;
+    let attn_head_ns = t_attn.elapsed().as_nanos() as u64;
     // F2 split: KV-write + flash attention, sigmoid/wo and the MoE FFN now
     // live in `batch_chunk_full_attn_moe_finish` so a chunk pair can share
     // one merged attend step; called here for the single-chunk path in the
@@ -12092,6 +12316,24 @@ fn batch_chunk_full_attn_moe(
         routed_out,
         route,
     )?;
+    // Single-chunk path only: the merged-pair path calls prep/finish directly
+    // and stays untimed. `attn` = prep head (QKV/norms/RoPE); the finish's
+    // attend-tail + MoE body are inside `finish` and not separately timed
+    // here, so `moe` = total − head (reconciles standalone; precise per-layer
+    // MoE comes from the `moe window` lines).
+    let total_ns = t_layer.elapsed().as_nanos() as u64;
+    if hipfire_dispatch::moe_trace_enabled() {
+        hipfire_dispatch::moe_layer_trace(
+            layer_idx,
+            true,
+            hipfire_dispatch::MoeLayerTiming {
+                total_ns,
+                attn_ns: attn_head_ns,
+                moe_ns: total_ns.saturating_sub(attn_head_ns),
+                rows: n,
+            },
+        );
+    }
     Ok(())
 }
 
@@ -12481,6 +12723,8 @@ fn batch_chunk_full_attn_moe_finish(
     routed_out: Option<&GpuTensor>,
     route: PrefillRouteMode<'_>,
 ) -> HipResult<()> {
+    // (Layer timers live in the parent `batch_chunk_full_attn_moe`: `t_attn`
+    // covers the prep half plus this attend tail; `attn_ns` closes below.)
     // Batched KV write + flash attention (via dispatch).
     batch_chunk_fa_attend(
         gpu,
@@ -12639,8 +12883,9 @@ fn batch_chunk_full_attn_moe_finish(
         )?;
     }
 
-    // Batched MoE FFN.
-    prefill_moe_ffn_body_batched_with_route(
+    // Batched MoE FFN (parent `batch_chunk_full_attn_moe` owns the layer
+    // span on the single-chunk path; the pair path calls this untimed).
+    prefill_moe_ffn_body_batched_with_route_layered(
         gpu,
         &layer.ffn,
         &layer.ffn_norm,
@@ -12651,6 +12896,7 @@ fn batch_chunk_full_attn_moe_finish(
         weights.moe_has_mq6,
         routed_out,
         route,
+        layer_idx,
     )?;
     Ok(())
 }
@@ -13884,8 +14130,7 @@ pub(crate) fn forward_batch_chunk_impl(
     let n_v_heads = config.linear_num_value_heads;
     let hd = config.linear_key_head_dim;
     let dim_row_bytes = dim * 4;
-    let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu)
-        .with_verify_tile_attend(fusion == DflashFusionCtx::ChainVerify);
+
 
     let do_embed = band.map(|b| b.is_first_band).unwrap_or(true);
     let layer_start = band.map(|b| b.layer_start).unwrap_or(0);
@@ -14058,7 +14303,8 @@ pub(crate) fn forward_batch_chunk_impl(
                 && (n % 512 == 0 || (64..512).contains(&(n % 512)))));
     let ctx = DispatchCtx::new(gpu)
         .with_workload(dispatch_workload)
-        .with_verify_tile_attend(fusion == DflashFusionCtx::ChainVerify);
+        .with_verify_tile_attend(fusion == DflashFusionCtx::ChainVerify)
+        .with_batch_size(n);
 
     for layer_idx in layer_start..layer_end {
         match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
@@ -14992,13 +15238,21 @@ mod tests {
         ] {
             assert!(!packed_mq4_ffn_gate_up_admitted(true, rejected, shape, 256));
             assert!(!packed_mq4_ffn_gate_up_admitted(true, shape, rejected, 256));
-            assert!(!packed_mq4_ffn_gate_up_admitted(true, rejected, rejected, 256));
+            assert!(!packed_mq4_ffn_gate_up_admitted(
+                true, rejected, rejected, 256
+            ));
         }
     }
 
     #[test]
     fn packed_mq4_down_refuses_prepared_partial_and_nonuniform_inputs() {
-        assert!(!packed_mq4_down_admitted(true, true, true, (DType::MQ4G256V2, 5120, 17408), 17408));
+        assert!(!packed_mq4_down_admitted(
+            true,
+            true,
+            true,
+            (DType::MQ4G256V2, 5120, 17408),
+            17408
+        ));
         for dtype in [DType::MQ4G256] {
             let shape = (dtype, 5120, 17408);
             assert!(packed_mq4_down_admitted(true, true, true, shape, 17408));
@@ -15006,10 +15260,27 @@ mod tests {
             assert!(!packed_mq4_down_admitted(true, false, true, shape, 17408));
             assert!(!packed_mq4_down_admitted(true, true, false, shape, 17408));
             assert!(!packed_mq4_down_admitted(true, true, true, shape, 8704));
-            assert!(!packed_mq4_down_admitted(true, true, true, (dtype, 2560, 17408), 17408));
+            assert!(!packed_mq4_down_admitted(
+                true,
+                true,
+                true,
+                (dtype, 2560, 17408),
+                17408
+            ));
         }
-        for dtype in [DType::MQ4G256V2Lloyd, DType::MQ4G256Lloyd, DType::HFQ4G256, DType::Q8_0] {
-            assert!(!packed_mq4_down_admitted(true, true, true, (dtype, 5120, 17408), 17408));
+        for dtype in [
+            DType::MQ4G256V2Lloyd,
+            DType::MQ4G256Lloyd,
+            DType::HFQ4G256,
+            DType::Q8_0,
+        ] {
+            assert!(!packed_mq4_down_admitted(
+                true,
+                true,
+                true,
+                (dtype, 5120, 17408),
+                17408
+            ));
         }
     }
 
@@ -15169,10 +15440,28 @@ mod tests {
     fn q8_multirow_attn_rejects_replay_recording_on_supported_arches() {
         for arch in ["gfx1100", "gfx1151", "gfx1201"] {
             assert!(q8_multirow_attn_admitted(
-                arch, true, 256, 8, 8192, Some(4096), false, false, false, false,
+                arch,
+                true,
+                256,
+                8,
+                8192,
+                Some(4096),
+                false,
+                false,
+                false,
+                false,
             ));
             assert!(!q8_multirow_attn_admitted(
-                arch, true, 256, 8, 8192, Some(4096), false, false, false, true,
+                arch,
+                true,
+                256,
+                8,
+                8192,
+                Some(4096),
+                false,
+                false,
+                false,
+                true,
             ));
         }
     }
@@ -16697,7 +16986,6 @@ mod tests {
         Qwen35Config {
             dim: 5120,
             n_layers: 64,
-            i_gpu_start: 0,
             vocab_size: 152064,
             norm_eps: 1e-6,
             eos_token: 2,
@@ -16753,7 +17041,11 @@ mod tests {
     fn native_mq4_wide_rejects_unaudited_dispatch_overrides() {
         let make = || rdna_compute::FeatureFlags::for_test("gfx1100");
         assert!(native_mq4_widened_flags_admitted("gfx1100", &make(), false));
-        assert!(!native_mq4_widened_flags_admitted("gfx1201", &make(), false));
+        assert!(!native_mq4_widened_flags_admitted(
+            "gfx1201",
+            &make(),
+            false
+        ));
         assert!(!native_mq4_widened_flags_admitted("gfx1100", &make(), true));
         let mut variants = Vec::new();
         let mut f = make(); f.fp16_disabled = true; variants.push(f);
@@ -16768,7 +17060,9 @@ mod tests {
         packed.packed_mq4_prefill = true;
         assert!(native_mq4_widened_flags_admitted("gfx1100", &packed, false));
         packed.mmq_override = Some(false);
-        assert!(!native_mq4_widened_flags_admitted("gfx1100", &packed, false));
+        assert!(!native_mq4_widened_flags_admitted(
+            "gfx1100", &packed, false
+        ));
         for f in variants {
             assert!(!native_mq4_widened_flags_admitted("gfx1100", &f, false));
         }
@@ -16781,14 +17075,27 @@ mod tests {
         let f16 = 127 * 17408 * 2;
         let partials = 127 * 5120 * 4 * 4;
         assert_eq!(mmq, 153 * 1024 * 1024);
-        assert_eq!(native_mq4_projection_deficit(&config, 8192, 0, 0, 0),
-                   Some(mmq + f16 + partials));
-        assert_eq!(native_mq4_projection_deficit(&config, 8192, mmq, f16, partials), Some(0));
-        assert_eq!(native_mq4_projection_deficit(&config, 8192, mmq + 1, 0, partials), Some(f16));
-        assert_eq!(native_mq4_projection_deficit(&config, usize::MAX, 0, 0, 0), None);
+        assert_eq!(
+            native_mq4_projection_deficit(&config, 8192, 0, 0, 0),
+            Some(mmq + f16 + partials)
+        );
+        assert_eq!(
+            native_mq4_projection_deficit(&config, 8192, mmq, f16, partials),
+            Some(0)
+        );
+        assert_eq!(
+            native_mq4_projection_deficit(&config, 8192, mmq + 1, 0, partials),
+            Some(f16)
+        );
+        assert_eq!(
+            native_mq4_projection_deficit(&config, usize::MAX, 0, 0, 0),
+            None
+        );
         for rows in [512, 1024, 2048, 4096, 8192] {
-            assert_eq!(native_mq4_projection_deficit(&config, rows, 0, 0, 0),
-                       Some(rows * 19584 + f16 + partials));
+            assert_eq!(
+                native_mq4_projection_deficit(&config, rows, 0, 0, 0),
+                Some(rows * 19584 + f16 + partials)
+            );
         }
     }
 
@@ -16831,10 +17138,31 @@ mod tests {
         let fp8_delta = (4096 - 512) * fp8_row_bytes_wide(&config).unwrap();
         assert_eq!(fp8_delta, 64_354_304);
         assert_eq!(dense_delta + fp8_delta, 2_664_144_896);
-        // MoE configs are out of scope for the byte ledger.
+        // MoE configs charge the same dense terms plus the Path-2 grouped-GEMM
+        // scratch `PrefillBatchScratch::new_opt` allocates for them, through the
+        // checked mirror of that constructor. This used to be `None` (out of
+        // scope), which left `minimum_prefill_reservation_bytes` undefined for
+        // every MoE model and made the partial-offload placement under-spill by
+        // exactly that scratch.
         let mut moe = widened_test_config();
         moe.num_experts = 256;
-        assert_eq!(dense_prefill_allocation_bytes(&moe, 512), None);
+        moe.num_experts_per_tok = 8;
+        moe.moe_intermediate_size = 512;
+        moe.shared_expert_intermediate_size = 512;
+        let moe_bytes =
+            dense_prefill_allocation_bytes(&moe, 512).expect("a MoE config is chargeable");
+        let dense_only = dense_layer_prefill_allocation_bytes(&moe, 512).unwrap();
+        assert!(
+            moe_bytes > dense_only,
+            "the MoE charge must include the grouped scratch it allocates: {moe_bytes} vs {dense_only}"
+        );
+        let mirror =
+            crate::qwen35::batch::PrefillBatchScratch::projected_allocation_bytes(&moe, 512, true)
+                .unwrap();
+        assert_eq!(
+            moe_bytes as u64, mirror,
+            "must be exactly the constructor mirror"
+        );
         // Wrong hidden_dim breaks the allocation envelope.
         let mut narrow = widened_test_config();
         narrow.hidden_dim = 3584;

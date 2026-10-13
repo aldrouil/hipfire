@@ -40,8 +40,21 @@
 //! `--perturb-*` (negative control): after step S is recorded, one mantissa bit
 //! of the first nonzero word of rank R's GDN layer-0 recurrent state is flipped
 //! (every following token reads it), so that rank must diverge from step S+1.
+//!
+//! `--spec mtp` (S5): the model loads with native MTP and each prompt runs
+//! through the load's MTP speculator exactly as the daemon drives it
+//! (`configure_request` with `--temp/--top-p/--top-k/--seed/--ngram`,
+//! `prefill`, `step` windows) until `--tokens` tokens are emitted. Then
+//! `logits.jsonl` holds one `window` record per window (emitted tokens,
+//! proposed/accepted, positions) and a final `tokens` record per prompt, and
+//! `state.jsonl` holds per-rank digests (trunk `debug_digest` + every MTP head
+//! byte family as `mtp.<name>`) whose `step` is the window index, after the
+//! prefill (window 0), every `--state-every` windows (default 8) and after the
+//! last window. Window-boundary state comparisons across arms need the same
+//! window routes on every arm (`HIPFIRE_MTP_AR_FLOOR=0`; the floor is timed).
 
 use hipfire_arch_qwen4::bundle::Qwen4Bundle;
+use hipfire_runtime::spec::{PrefillOutcome, SpecRequestConfig, Speculator};
 use hipfire_dispatch::pipeline::moe_dump;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use serde_json::{json, Value};
@@ -150,6 +163,21 @@ struct Args {
     state_quant: Option<String>,
     skip_model_hash: bool,
     truncate_prompt_tokens: Option<usize>,
+    /// `--spec mtp`: drive the load's native MTP speculator instead of AR.
+    mtp: Option<MtpArgs>,
+}
+
+/// The `--spec mtp` request: sampling (`--temp 0` = greedy), seed, the
+/// n-gram modifier (`auto` = the daemon's arch default) and how often the
+/// per-rank state digest is taken (every `state_every` windows, plus the
+/// window after prefill and the last one).
+struct MtpArgs {
+    temp: f32,
+    top_p: f32,
+    top_k: Option<u32>,
+    seed: u64,
+    ngram: Option<bool>,
+    state_every: usize,
 }
 
 fn usize_list(value: &str) -> R<BTreeSet<usize>> {
@@ -176,6 +204,13 @@ fn parse_args() -> R<Args> {
     let mut state_quant = None;
     let mut skip_model_hash = false;
     let mut truncate_prompt_tokens = None;
+    let mut spec_mtp = false;
+    let mut temp = 0.0f32;
+    let mut top_p = 1.0f32;
+    let mut top_k = None;
+    let mut seed = 0x1357_9BDFu64;
+    let mut ngram = None;
+    let mut state_every = 8usize;
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
         let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
@@ -197,6 +232,24 @@ fn parse_args() -> R<Args> {
             "--truncate-prompt-tokens" => {
                 truncate_prompt_tokens = Some(value("--truncate-prompt-tokens")?.parse::<usize>().map_err(e)?)
             }
+            "--spec" => match value("--spec")?.as_str() {
+                "mtp" => spec_mtp = true,
+                "off" => spec_mtp = false,
+                other => return Err(format!("--spec takes mtp or off, got {other:?}")),
+            },
+            "--temp" => temp = value("--temp")?.parse::<f32>().map_err(e)?,
+            "--top-p" => top_p = value("--top-p")?.parse::<f32>().map_err(e)?,
+            "--top-k" => top_k = Some(value("--top-k")?.parse::<u32>().map_err(e)?),
+            "--seed" => seed = value("--seed")?.parse::<u64>().map_err(e)?,
+            "--ngram" => {
+                ngram = match value("--ngram")?.as_str() {
+                    "on" => Some(true),
+                    "off" => Some(false),
+                    "auto" => None,
+                    other => return Err(format!("--ngram takes on, off or auto, got {other:?}")),
+                }
+            }
+            "--state-every" => state_every = value("--state-every")?.parse::<usize>().map_err(e)?.max(1),
             other => return Err(format!("unknown argument {other}")),
         }
     }
@@ -207,6 +260,9 @@ fn parse_args() -> R<Args> {
     };
     if prompt_files.is_empty() {
         return Err("at least one --prompt-file is required".into());
+    }
+    if spec_mtp && (perturb.is_some() || !moe_dump_positions.is_empty()) {
+        return Err("--perturb-* and --moe-dump-positions are AR-mode options".into());
     }
     Ok(Args {
         model: model.ok_or("--model is required")?,
@@ -223,6 +279,14 @@ fn parse_args() -> R<Args> {
         state_quant,
         skip_model_hash,
         truncate_prompt_tokens,
+        mtp: spec_mtp.then_some(MtpArgs {
+            temp,
+            top_p,
+            top_k,
+            seed,
+            ngram,
+            state_every,
+        }),
     })
 }
 
@@ -343,6 +407,153 @@ fn emit(file: &mut std::fs::File, record: &Value) -> R<()> {
     file.flush().map_err(e)
 }
 
+/// One `--spec mtp` prompt.
+struct MtpRun<'a> {
+    prompt_index: usize,
+    prompt: &'a Prompt,
+    tokens: usize,
+    state_every: usize,
+    ranks: usize,
+}
+
+/// Rank `rank`'s state digest rows: `Qwen4State::debug_digest` (trunk) then
+/// the SHA-256 of every resident MTP head byte family (`mtp.<name>`).
+fn mtp_state_rows(bundle: &mut Qwen4Bundle, gpu: &mut Gpu, rank: usize) -> R<Vec<Value>> {
+    let rows = |bundle: &mut Qwen4Bundle, gpu: &mut Gpu| -> R<Vec<Value>> {
+        let mut rows: Vec<Value> = bundle
+            .state
+            .debug_digest(gpu)
+            .map_err(e)?
+            .into_iter()
+            .map(|(name, value)| json!([name, value]))
+            .collect();
+        for (name, bytes) in bundle.lab_resident_head_items(gpu)? {
+            rows.push(json!([format!("mtp.{name}"), sha256_hex(&bytes)]));
+        }
+        Ok(rows)
+    };
+    if rank == 0 {
+        rows(bundle, gpu)
+    } else {
+        bundle.with_rank_mut(gpu, rank, |peer, peer_gpu, _| rows(peer, peer_gpu))
+    }
+}
+
+/// Prefill and decode one prompt through the native MTP speculator the way
+/// the daemon drives it (`configure_request`, `prefill`, then `step` windows
+/// with `position += emit.len()`, `seed = next_seed`) until `tokens` tokens
+/// (the prefill seed included) are emitted. Writes one `window` record per
+/// window to the logits sink, the per-rank state digest (as `state` records
+/// whose `step` is the window index) after the prefill, every `state_every`
+/// windows and after the last window, and a final `tokens` record. Returns
+/// the emitted token count.
+fn mtp_prompt(
+    gpu: &mut Gpu,
+    bundle: &mut Qwen4Bundle,
+    speculator: &mut dyn Speculator,
+    request: SpecRequestConfig,
+    run: &MtpRun<'_>,
+    sinks: &mut Sinks,
+) -> R<usize> {
+    let ids = &run.prompt.ids;
+    bundle.reset(gpu).map_err(e)?;
+    speculator.reset(gpu)?;
+    speculator.configure_request(request);
+    let first = match speculator.prefill(gpu, bundle, ids, ids, 0, false, None, &|| false)? {
+        PrefillOutcome::Ready { first_token } => first_token,
+        PrefillOutcome::Aborted => return Err("MTP prefill aborted".into()),
+    };
+    let mut position = ids.len();
+    let mut seed = first;
+    let mut emitted = vec![first];
+    let digest = |bundle: &mut Qwen4Bundle, gpu: &mut Gpu, window: usize, sinks: &mut Sinks| -> R<()> {
+        for rank in 0..run.ranks {
+            let rows = mtp_state_rows(bundle, gpu, rank)?;
+            emit(
+                &mut sinks.state,
+                &json!({
+                    "kind": "state",
+                    "prompt": run.prompt_index,
+                    "step": window,
+                    "rank": rank,
+                    "digest": rows,
+                }),
+            )?;
+        }
+        Ok(())
+    };
+    emit(
+        &mut sinks.logits,
+        &json!({
+            "kind": "window",
+            "prompt": run.prompt_index,
+            "window": 0,
+            "position": position,
+            "target_position": bundle.state.position,
+            "emit": [first],
+        }),
+    )?;
+    digest(bundle, gpu, 0, sinks)?;
+    let mut window = 0usize;
+    let mut digested = 0usize;
+    while emitted.len() < run.tokens {
+        window += 1;
+        let step = speculator.step(
+            gpu,
+            bundle,
+            position,
+            seed,
+            &emitted,
+            None,
+            request.temp,
+            run.tokens - emitted.len(),
+        )?;
+        position += step.emit.len();
+        emitted.extend(step.emit.iter().copied());
+        seed = step.next_seed;
+        emit(
+            &mut sinks.logits,
+            &json!({
+                "kind": "window",
+                "prompt": run.prompt_index,
+                "window": window,
+                "position": position,
+                "target_position": bundle.state.position,
+                "emit": step.emit.to_vec(),
+                "proposed": step.proposed,
+                "accepted": step.accepted,
+            }),
+        )?;
+        if window % run.state_every == 0 {
+            digest(bundle, gpu, window, sinks)?;
+            digested = window;
+        }
+        if window % 32 == 0 {
+            eprintln!(
+                "[fn_ep_oracle] prompt {}: window {window}, {}/{} tokens",
+                run.prompt_index,
+                emitted.len(),
+                run.tokens
+            );
+        }
+    }
+    if digested != window {
+        digest(bundle, gpu, window, sinks)?;
+    }
+    emit(
+        &mut sinks.logits,
+        &json!({
+            "kind": "tokens",
+            "prompt": run.prompt_index,
+            "windows": window,
+            "count": emitted.len(),
+            "ids_md5": ids_md5(&emitted),
+            "ids": emitted,
+        }),
+    )?;
+    Ok(emitted.len())
+}
+
 fn run() -> R<()> {
     let args = parse_args()?;
     std::fs::create_dir_all(&args.out).map_err(|x| format!("create {}: {x}", args.out.display()))?;
@@ -359,7 +570,10 @@ fn run() -> R<()> {
     eprintln!("[fn_ep_oracle] loading {}", args.model);
     let mut gpu = Gpu::init().map_err(|x| format!("Gpu::init: {x:?}"))?;
     let cask = hipfire_runtime::loader_api::CaskConfig::default();
-    let spec_cfg = hipfire_runtime::loader_api::SpecLoadCfg::default();
+    let mut spec_cfg = hipfire_runtime::loader_api::SpecLoadCfg::default();
+    if args.mtp.is_some() {
+        spec_cfg.mtp = Some(true);
+    }
     let mut model = hipfire_loader::load_model(
         &args.model,
         args.max_seq,
@@ -395,6 +609,20 @@ fn run() -> R<()> {
         }
     }
 
+    let mut speculator = match &args.mtp {
+        Some(_) => Some(
+            model
+                .speculator
+                .take()
+                .ok_or("--spec mtp: the load attached no native MTP speculator")?,
+        ),
+        None => None,
+    };
+    let ngram = args.mtp.as_ref().map(|mtp| {
+        mtp.ngram.unwrap_or_else(|| {
+            hipfire_config::mtp_ngram_enabled_for_arch(hipfire_arch_qwen4::ARCH_ID, &gpu.arch)
+        })
+    });
     let bundle = model
         .qwen4_mut()
         .ok_or("loaded model is not a Qwen4 (Flash-Next) bundle")?;
@@ -461,6 +689,15 @@ fn run() -> R<()> {
         "perturb": args.perturb.map(|(rank, step)| json!({"rank": rank, "step": step})),
         "prompts": prompt_meta,
         "completed": false,
+        "spec": args.mtp.as_ref().map(|mtp| json!({
+            "kind": "mtp",
+            "temp": mtp.temp,
+            "top_p": mtp.top_p,
+            "top_k": mtp.top_k,
+            "seed": mtp.seed,
+            "ngram": ngram,
+            "state_every": mtp.state_every,
+        })),
     });
     let write_meta = |meta: &Value| -> R<()> {
         std::fs::write(args.out.join("meta.json"), serde_json::to_vec_pretty(meta).map_err(e)?)
@@ -482,6 +719,25 @@ fn run() -> R<()> {
             prompt.path,
             prompt.ids.len()
         );
+        if let (Some(mtp), Some(speculator)) = (&args.mtp, speculator.as_mut()) {
+            let request = SpecRequestConfig {
+                temp: mtp.temp,
+                top_p: mtp.top_p,
+                top_k: mtp.top_k,
+                rng_seed: mtp.seed,
+                allow_ngram_modifier: ngram.unwrap_or(false),
+                ..SpecRequestConfig::default()
+            };
+            let run = MtpRun {
+                prompt_index,
+                prompt,
+                tokens: args.tokens,
+                state_every: mtp.state_every,
+                ranks,
+            };
+            steps_run.push(mtp_prompt(&mut gpu, bundle, speculator.as_mut(), request, &run, &mut sinks)?);
+            continue;
+        }
         bundle.reset(&mut gpu).map_err(e)?;
         bundle
             .prefill_final(&mut gpu, &prompt.ids, 0, &logits)

@@ -1,0 +1,339 @@
+{
+ "append8k_profile": {
+  "baseline_append_ms": 189.419264,
+  "baseline_launches": 121,
+  "baseline_subchunks": "7x1024+1x1018",
+  "prompt": "ciru/ciru-8k.txt",
+  "prompt_tokens": 8186,
+  "target_ms": 25.0
+ },
+ "files": [
+  {
+   "bytes": 18336,
+   "md5": "aae48da4ae269d4a4ff4211a709bf626",
+   "path": "mixed-serve.py",
+   "purpose": "one-cell serve harness (authoritative HaloMtpRegress driver; MD5 aae48da4ae269d4a4ff4211a709bf626 pinned by MTP-APPEND-PM.md)",
+   "sha256": "6e036ed087de60c0bb3ce8c6282d0347d976b6fbbb8ba6cedd0967e0938e79ac",
+   "source": "hipx:/home/kaden/pm-wave/halo-mtp-regress/mixed-serve.py"
+  },
+  {
+   "bytes": 23857,
+   "md5": "41d061dc0a8e896fe25f17e8eda8897f",
+   "path": "driver.py",
+   "purpose": "SSE streaming + MTP phase wrapper importing mixed-serve.py from its own directory",
+   "sha256": "62f20157659d9e274a8f367272a88733dc0a6645ace374b46b943de35fc7011a",
+   "source": "hipx:/home/kaden/pm-wave/decode-sweep/driver.py"
+  },
+  {
+   "bytes": 488,
+   "md5": "eaea3ee9d84ce1c3ff1c7bc88fcc27a3",
+   "path": "mixed-manifest-r1.json",
+   "purpose": "rotated 5-prompt greedy manifest; paths are hipx pm-wave originals",
+   "sha256": "aa01b88ddb567466977d5427f8762922d6a9343710baff3197fb682961eb338d",
+   "source": "hipx:/home/kaden/pm-wave/halo-mtp-regress/mixed-manifest-r1.json"
+  },
+  {
+   "bytes": 488,
+   "md5": "338d392af56dc66e9ee665eac4131cc2",
+   "path": "mixed-manifest-r2.json",
+   "purpose": "rotated 5-prompt greedy manifest; paths are hipx pm-wave originals",
+   "sha256": "35e4dd49987b96dcb860e9e3aff05f81c953cbd31b7e1555bbce9db5b940b784",
+   "source": "hipx:/home/kaden/pm-wave/halo-mtp-regress/mixed-manifest-r2.json"
+  },
+  {
+   "bytes": 488,
+   "md5": "a7aef7d973c901dbb08680c713f1f9d4",
+   "path": "mixed-manifest-r3.json",
+   "purpose": "rotated 5-prompt greedy manifest; paths are hipx pm-wave originals",
+   "sha256": "025205f987008b693fd1c700f4d3798fba529a79c8a1f8ff4173bf2ff77053ae",
+   "source": "hipx:/home/kaden/pm-wave/halo-mtp-regress/mixed-manifest-r3.json"
+  },
+  {
+   "bytes": 283,
+   "md5": "e5b571fb625fba73ce250d5ffaf7279d",
+   "path": "manifest-example.json",
+   "purpose": "harness example",
+   "sha256": "1bfbe1d856d332af0122b8290159be0a22b0922e69faaf105f7b2de21567793e",
+   "source": "hipx:/home/kaden/pm-wave/halo-mtp-regress/manifest-example.json"
+  },
+  {
+   "bytes": 159,
+   "md5": "1d32df5f12c414d3e34c7b35b6611e6c",
+   "path": "prompts/bare_factual.txt",
+   "purpose": "HaloMtpRegress prompt",
+   "sha256": "25c0b9185242eb3aaff3e8be6b471fe4e54a06bd11e7800f5b30bcc2a0bc64ba",
+   "source": "hipx:/home/kaden/pm-wave/halo-mtp-regress/prompts/bare_factual.txt"
+  },
+  {
+   "bytes": 855,
+   "md5": "80b910784c456bbb5532eb0493a497b9",
+   "path": "prompts/code_edit_rewrite_copy.txt",
+   "purpose": "HaloMtpRegress prompt",
+   "sha256": "5f223a71ca57719c256968a15031f78483459ac22fb649690e3f9077b211e79d",
+   "source": "hipx:/home/kaden/pm-wave/halo-mtp-regress/prompts/code_edit_rewrite_copy.txt"
+  },
+  {
+   "bytes": 134,
+   "md5": "d3768bd6479ce9aae08c9e0152b39e06",
+   "path": "prompts/fiction_lighthouse.txt",
+   "purpose": "HaloMtpRegress prompt",
+   "sha256": "056c3f234b88b56ba1ad830d97718c2627cdb8df9a3729533f6ca79acd1f4413",
+   "source": "hipx:/home/kaden/pm-wave/halo-mtp-regress/prompts/fiction_lighthouse.txt"
+  },
+  {
+   "bytes": 4096,
+   "md5": "0ee8f86ada3683eda452bc294ec824a9",
+   "path": "prompts/glimmer_prefill_1024.txt",
+   "purpose": "HaloMtpRegress prompt",
+   "sha256": "8829f37e6b2543bf325a22132b252e8aa55279cb307e7b3da0a42a4e86522ac5",
+   "source": "hipx:/home/kaden/pm-wave/halo-mtp-regress/prompts/glimmer_prefill_1024.txt"
+  },
+  {
+   "bytes": 173,
+   "md5": "0d7f93bd6a082d7fec6207e97f6b6fdf",
+   "path": "prompts/high-go-http.txt",
+   "purpose": "HaloMtpRegress prompt",
+   "sha256": "7b383c4aa77cc885666823d8833307cc8f06d60f2dc85c551aa103b0fa251b3f",
+   "source": "hipx:/home/kaden/pm-wave/halo-mtp-regress/prompts/high-go-http.txt"
+  },
+  {
+   "bytes": 158,
+   "md5": "1c404752588406c11c508b4f3d1f163d",
+   "path": "prompts/high-java-redblack.txt",
+   "purpose": "HaloMtpRegress prompt",
+   "sha256": "611d44aca3121fad12e62ca3a77e30ee72aa7a52dc3f995f6f00aa0fd7ed783d",
+   "source": "hipx:/home/kaden/pm-wave/halo-mtp-regress/prompts/high-java-redblack.txt"
+  },
+  {
+   "bytes": 136,
+   "md5": "640e0fd4f55996cb175a422f0a12cef5",
+   "path": "prompts/high-reason.txt",
+   "purpose": "HaloMtpRegress prompt",
+   "sha256": "eab4b0702a0d0a230c7cb057c96a2822a435ab5dc873f8e452153be2bf766a08",
+   "source": "hipx:/home/kaden/pm-wave/halo-mtp-regress/prompts/high-reason.txt"
+  },
+  {
+   "bytes": 190,
+   "md5": "36c3049f1c47e9d2027ad8e166a676aa",
+   "path": "prompts/high-rust-parser.txt",
+   "purpose": "HaloMtpRegress prompt",
+   "sha256": "53f7c198782edb38354ab9dca1a9080a96594d3894f0b07f0623426aacac0e57",
+   "source": "hipx:/home/kaden/pm-wave/halo-mtp-regress/prompts/high-rust-parser.txt"
+  },
+  {
+   "bytes": 448,
+   "md5": "37c5aad9f9efe93b5c47f27256bdf149",
+   "path": "prompts/humaneval_3_below_zero.txt",
+   "purpose": "HaloMtpRegress prompt",
+   "sha256": "430706f794ffabb60ec5818ca7c9fdbd281b97ef9d3ac6d6ba140a7a2498f5a5",
+   "source": "hipx:/home/kaden/pm-wave/halo-mtp-regress/prompts/humaneval_3_below_zero.txt"
+  },
+  {
+   "bytes": 885,
+   "md5": "df5dedc8040ce70ba55080c4548e6024",
+   "path": "prompts/lru_cache_pep8_strict.txt",
+   "purpose": "HaloMtpRegress prompt",
+   "sha256": "186604159b61ab5ff904772c9ff6a3664110024264ae718374ece098f6f456ec",
+   "source": "hipx:/home/kaden/pm-wave/halo-mtp-regress/prompts/lru_cache_pep8_strict.txt"
+  },
+  {
+   "bytes": 140,
+   "md5": "253c7ac50857fe6d0e10fb0d2c5e35c0",
+   "path": "prompts/merge_sort_thinking_off.txt",
+   "purpose": "HaloMtpRegress prompt",
+   "sha256": "d671894964cb957643fcb961151f3d1b407cb5c206766eaed60e9c593e6ed9d0",
+   "source": "hipx:/home/kaden/pm-wave/halo-mtp-regress/prompts/merge_sort_thinking_off.txt"
+  },
+  {
+   "bytes": 175,
+   "md5": "7b0278b4cb82802847d7ce338a85dcb3",
+   "path": "prompts/mixed_code_then_prose.txt",
+   "purpose": "HaloMtpRegress prompt",
+   "sha256": "b7070ad677a4aaec683cc9f6068e701c3462485a1cc3385ebcfc776901120d5b",
+   "source": "hipx:/home/kaden/pm-wave/halo-mtp-regress/prompts/mixed_code_then_prose.txt"
+  },
+  {
+   "bytes": 260,
+   "md5": "07a7880965142971dbb3cc7493f8fb94",
+   "path": "prompts/prose_river_short.txt",
+   "purpose": "HaloMtpRegress prompt",
+   "sha256": "99e9ce75ab7825f31ad51252128f4f7edb974c7de76e7b6c20796feb15fa4b13",
+   "source": "hipx:/home/kaden/pm-wave/halo-mtp-regress/prompts/prose_river_short.txt"
+  },
+  {
+   "bytes": 206,
+   "md5": "db92b572702ab947c5fabd9c342eb616",
+   "path": "prompts/trains-meet.txt",
+   "purpose": "HaloMtpRegress prompt",
+   "sha256": "b9006dfcd0b5b4c368fd7abd56dcedd5215908e4b461b1b62271105424d4ce92",
+   "source": "hipx:/home/kaden/pm-wave/halo-mtp-regress/prompts/trains-meet.txt"
+  },
+  {
+   "bytes": 185,
+   "md5": "23cdbf64538609cd8ff476fd97a529d7",
+   "path": "halofn/short.txt",
+   "purpose": "prose prompt (halofn-short)",
+   "sha256": "83fb96f1d3d3ea5da91514089fc64b010b2840c58c6542647332f856382d8512",
+   "source": "hipx:/home/kaden/pm-wave/halofn/short.txt"
+  },
+  {
+   "bytes": 32459,
+   "md5": "c3ccdc43015ed551bcd339eebb02c893",
+   "path": "halofn/p8k.txt",
+   "purpose": "9319-token real prose (halofn-9k / 9.3K TTFT; chunk16k canonical p8k)",
+   "sha256": "4e5cd41f5ad8448c08111382f37294e788df9c85b9a7c66d8d1c5040379eb7ac",
+   "source": "hipx:/home/kaden/pm-wave/halofn/p8k.txt"
+  },
+  {
+   "bytes": 56395,
+   "md5": "68b768d0a47232a0b01a614d9681abe7",
+   "path": "halofn/p16k.txt",
+   "purpose": "16343-token real prose (16K TTFT; chunk16k p16k)",
+   "sha256": "1a56e1cce96626b25fec8f9c84a13fcd3ebf96f2a09bec9499742a1d260aa07f",
+   "source": "hipx:/home/kaden/pm-wave/halofn/p16k.txt"
+  },
+  {
+   "bytes": 39658,
+   "md5": "4203b112c9d01eea27bce2dc53d5d1b5",
+   "path": "ciru/ciru-8k.txt",
+   "purpose": "8186-token Ciru release-matrix prompt used by MTP-APPEND-PROFILE (Append8K device profile)",
+   "sha256": "b52beb72c301c9454bf92b99ba850fe27d355d13dde44bcabb445b3e0a2ff0cb",
+   "source": "hipx:/home/kaden/pm-wave/prefill-regress/rm/prompts/ciru-8k.txt"
+  },
+  {
+   "bytes": 234,
+   "md5": "ef56cb0567af21d4c4ea0ffc976d35ea",
+   "path": "ttft-p9k3.json",
+   "purpose": "streaming TTFT gate manifest (chunk16k protocol: temperature 0, thinking off, max_tokens 8, SSE, include_usage)",
+   "sha256": "b2a6a0f1362c5fe6bce447ab4cf3c8e45e983d146b114fb7e3c667d6c3501d82",
+   "source": "authored"
+  },
+  {
+   "bytes": 235,
+   "md5": "f0458908919155623e3f0a3f40d6a2a7",
+   "path": "ttft-p16k.json",
+   "purpose": "streaming TTFT gate manifest (chunk16k protocol: temperature 0, thinking off, max_tokens 8, SSE, include_usage)",
+   "sha256": "4fa67030f655f34f61e2f966d8231eb01e3c08d629e26cdeb7c28d38ace3989c",
+   "source": "authored"
+  }
+ ],
+ "fixture_set": "halo-mtp-regress-20261012",
+ "greedy_gate": {
+  "historical_default_route_receipts_MTP_FLOOR_LAND": {
+   "halofn-9k": {
+    "content_md5": [
+     "7d7f84fa1b621d2a5d9d39f5021ff24c"
+    ],
+    "tau_base": [
+     1.58
+    ],
+    "windows_base_mtp_ar_retired": [
+     [
+      98,
+      0,
+      false
+     ]
+    ]
+   },
+   "halofn-short": {
+    "content_md5": [
+     "a8129092b3d127ca7b105972255258b9"
+    ],
+    "tau_base": [
+     1.41
+    ],
+    "windows_base_mtp_ar_retired": [
+     [
+      106,
+      0,
+      false
+     ]
+    ]
+   },
+   "high-go-http": {
+    "content_md5": [
+     "a755f3a762b9430d5e234b08b1952747"
+    ],
+    "tau_base": [
+     2.59
+    ],
+    "windows_base_mtp_ar_retired": [
+     [
+      69,
+      2,
+      true
+     ]
+    ]
+   },
+   "high-java-redblack": {
+    "content_md5": [
+     "f2326123f6dedeca9ed380f95688e6c2"
+    ],
+    "tau_base": [
+     2.54
+    ],
+    "windows_base_mtp_ar_retired": [
+     [
+      72,
+      0,
+      false
+     ]
+    ]
+   },
+   "high-rust-parser": {
+    "content_md5": [
+     "c41bd4ece5466f9a0136ae6164d4bf4c"
+    ],
+    "tau_base": [
+     2.7
+    ],
+    "windows_base_mtp_ar_retired": [
+     [
+      69,
+      0,
+      false
+     ]
+    ]
+   }
+  },
+  "manifests": [
+   "mixed-manifest-r1.json",
+   "mixed-manifest-r2.json",
+   "mixed-manifest-r3.json"
+  ],
+  "max_tokens": 256,
+  "prompts": [
+   "halofn-short",
+   "high-rust-parser",
+   "high-go-http",
+   "high-java-redblack",
+   "halofn-9k"
+  ],
+  "temperature": 0,
+  "thinking_enabled": false
+ },
+ "model": {
+  "bytes": 125288544792,
+  "inode": 8292918,
+  "md5": "be007fc3219e9f6cdb1d4dfa8380625f",
+  "note": "provenance from MTP-FLOOR-LAND.md/MTP-APPEND-PROFILE.md; not rehashed inside holds",
+  "path": "/home/kaden/pm-wave/fngptq/models/qwen3.8-flash-next-gptq3.mq4",
+  "sha256_historical": "8b15b6fede7d7c5bfed0db4720a8295bedda51bc93e545fa242bd50d0f200972"
+ },
+ "recovered_utc": "2026-10-12",
+ "ttft_gate": {
+  "historical_chunk16k_unset_ttft_ms": {
+   "p16k": 9658.862,
+   "p9k3": 5947.146
+  },
+  "manifests": [
+   "ttft-p9k3.json",
+   "ttft-p16k.json"
+  ],
+  "note": "historical numbers are a different binary/session; same-binary DET0 arm is the control",
+  "prompt_tokens": {
+   "ttft-p16k": 16343,
+   "ttft-p9k3": 9319
+  }
+ }
+}

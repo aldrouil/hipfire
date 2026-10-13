@@ -295,9 +295,11 @@ fn file_identity(file: &Path, cache_dir: &Path) -> Result<Value, String> {
     Ok(json!({ "size": meta.len(), "sha256": sha }))
 }
 
-/// The model artifact and any `<model>.ple-q4` / `<model>.ple-q8` PLE-row
-/// sidecar next to it (the loader attaches one when the base is split):
-/// size and full-file SHA-256 of each, `null` for an absent sidecar.
+/// The model artifact, any `<model>.ple-q4` / `<model>.ple-q8` PLE-row
+/// sidecar next to it (the loader attaches one when the base is split) and
+/// its `<model>.trunk-overlay` (the loader applies one on its default
+/// architecture): size and full-file SHA-256 of each, `null` for an absent
+/// sidecar.
 pub fn model_identity(model: &Path, cache_dir: &Path) -> Result<Value, String> {
     let mut identity = file_identity(model, cache_dir)?;
     for suffix in ["ple-q4", "ple-q8"] {
@@ -310,6 +312,12 @@ pub fn model_identity(model: &Path, cache_dir: &Path) -> Result<Value, String> {
             Value::Null
         };
     }
+    let overlay = hipfire_config::memory::trunk_overlay_sidecar_path(model);
+    identity["trunk-overlay"] = if overlay.is_file() {
+        file_identity(&overlay, cache_dir)?
+    } else {
+        Value::Null
+    };
     Ok(identity)
 }
 

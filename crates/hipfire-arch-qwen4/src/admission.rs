@@ -400,12 +400,6 @@ pub enum AdmissionError {
     UnsupportedModality(InputModality),
     UnsupportedCapability(Qwen4Capability),
     NonSingleMesh(EffectiveMesh),
-    /// An expert-parallel mesh (`ep` > 1) was requested together with a
-    /// feature the replicated EP program does not run.
-    EpUnsupported {
-        ep: usize,
-        what: &'static str,
-    },
     UnsupportedFormat(Qwen4ArtifactFormat),
     WrongGeometry {
         component: &'static str,
@@ -437,10 +431,6 @@ impl fmt::Display for AdmissionError {
                 f,
                 "qwen4 admission: only pp=1, tp=1 with expert-parallel ep in {{1, 2, 4}} is admitted (pp={}, tp={}, ep={})",
                 mesh.pp, mesh.tp, mesh.ep
-            ),
-            Self::EpUnsupported { ep, what } => write!(
-                f,
-                "qwen4 admission: expert parallelism (ep={ep}) does not support {what}"
             ),
             Self::UnsupportedFormat(format) => {
                 write!(f, "qwen4 admission: unsupported artifact format {format:?}")
@@ -493,12 +483,6 @@ impl Qwen4Admission {
         }
         if !request.effective_mesh.is_qwen4_admitted() {
             return Err(AdmissionError::NonSingleMesh(request.effective_mesh));
-        }
-        if request.effective_mesh.ep > 1 && request.native_mtp {
-            return Err(AdmissionError::EpUnsupported {
-                ep: request.effective_mesh.ep,
-                what: "native MTP",
-            });
         }
         if !request.artifact.format.is_hfqm() {
             return Err(AdmissionError::UnsupportedFormat(
@@ -740,12 +724,13 @@ mod tests {
                 Err(AdmissionError::NonSingleMesh(_))
             ));
         }
-        // Native MTP is admitted single, refused under EP with an EP-naming error.
+        // Native MTP is admitted on every admitted mesh: under EP the drafter
+        // is replicated on every rank.
         assert!(admit(EffectiveMesh::single(), true).is_ok());
         for ep in [2, 4] {
-            let error = admit(EffectiveMesh::new(1, 1, ep), true).unwrap_err();
-            assert!(matches!(error, AdmissionError::EpUnsupported { ep: got, .. } if got == ep));
-            assert!(error.to_string().contains("expert parallelism"));
+            let admitted = admit(EffectiveMesh::new(1, 1, ep), true).expect("EP native MTP");
+            assert!(admitted.native_mtp);
+            assert_eq!(admitted.effective_mesh.ep, ep);
         }
     }
 }

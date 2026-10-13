@@ -1,0 +1,1247 @@
+Below is a mix of Rust source code and project documentation. Read it, then write a concise technical summary of what it covers.
+
+e_session_over_budget_is_rejected_not_silently_capped() {
+        // One agent asking for more than the whole card can hold.
+        let mut a = AdmissionController::new(f27b(), 32 * GIB);
+        assert!(
+            a.admit(12, 2 * 1024 * 1024).is_err(),
+            "must reject, not silently truncate"
+        );
+    }
+
+    #[test]
+    fn the_host_tier_has_its_own_budget() {
+        let mut a = AdmissionController::new(
+            ModelFootprint {
+                weights_bytes: 0,
+                kv_bytes_per_token: 0,
+            },
+            1 << 30,
+        );
+        a.set_host_budget(1000);
+        assert!(a.admit_host(600));
+        assert_eq!(a.host_used_bytes(), 600);
+        assert!(
+            !a.admit_host(600),
+            "the second must not fit; the caller spills to disk instead"
+        );
+        assert_eq!(a.host_used_bytes(), 600, "a refused admit reserves nothing");
+        a.release_host(600);
+        assert_eq!(a.host_used_bytes(), 0);
+        assert!(a.admit_host(600), "released budget must be reusable");
+    }
+
+    // ---- page_bytes helper (spec §5.1) ----
+
+    #[test]
+    fn page_bytes_computes_sum_over_layers() {
+        // 2 layers, k_stride=128, v_stride=64 → per layer: 128*(128+64) = 24576
+        // total: 2 * 24576 = 49152
+        let k = [128u64, 128];
+        let v = [64u64, 64];
+        assert_eq!(page_bytes(&k, &v), Some(49152));
+    }
+
+    #[test]
+    fn page_bytes_single_layer() {
+        // 1 layer, k=256, v=128 → 128*(256+128) = 49152
+        assert_eq!(page_bytes(&[256], &[128]), Some(49152));
+    }
+
+    #[test]
+    fn page_bytes_mismatched_strides_returns_none() {
+        assert_eq!(page_bytes(&[128, 128], &[64]), None);
+        assert_eq!(page_bytes(&[128], &[64, 64]), None);
+    }
+
+    #[test]
+    fn page_bytes_overflow_returns_none() {
+        // u64::MAX stride would overflow when multiplied by PAGE_TOKENS.
+        assert_eq!(page_bytes(&[u64::MAX], &[1]), None);
+    }
+
+    #[test]
+    fn page_bytes_empty_layers_is_zero() {
+        assert_eq!(page_bytes(&[], &[]), Some(0));
+    }
+
+}
+
+
+=== crates/hipfire-runtime/src/arch.rs ===
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+//! ## Status: intra-crate helper, NOT the architecture contract
+//!
+//! This trait once competed with `hipfire_loader::Carrier` to be "the" arch
+//! contract. It no longer does, and the distinction matters when adding a model:
+//!
+//! - **The contract** is `Carrier` (registration + load, in the loader because
+//!   `Carrier::load` returns `LoadedModel`) plus
+//!   [`crate::arch_model::ArchModel`] (the arch-agnostic view of a loaded model,
+//!   implemented in the arch crate).
+//! - **This trait** is a typed bring-up convenience — associated
+//!   `Config`/`Weights`/`State` plus `config_from_hfq` / `load_weights` /
+//!   `new_state`. It is used only *within* arch crates, by their own
+//!   `load_<arch>_bundle` functions. Measured: zero consumers in
+//!   `hipfire-loader`, `hipfire-generate` or `hipfire-daemon`.
+//!
+//! It is therefore optional. `hipfire-arch-muse-glimmer` implements it not at
+//! all and loads fine. Adopt it if the typed shape helps your crate; skip it if
+//! it does not. Its four override hooks were deleted as dead in an earlier pass.
+//!
+//! The bring-up contract for a hipfire architecture. Implement this
+//! trait in your arch crate (e.g. `hipfire-arch-qwen35`) to plug a
+//! model into the runtime. Generation, sampling, eviction, spec
+//! decode, paging, prompt framing, and EOS filtering all live in
+//! the runtime crate; the arch contributes only the model-specific
+//! pieces.
+//!
+//! Default impls cover the Qwen3.5 family conventions. Override only
+//! what diverges for your arch.
+//!
+//! # Worked examples
+//!
+//! - `crates/hipfire-arch-toy/` — minimum-viable stub, ~50 lines of
+//!   trait-impl with explanatory comments. Copy-paste this directory
+//!   as a starting point for a new arch.
+//! - `crates/amilies carry extra recurrent state (DeltaNet, LFM conv tails) alongside KV.
+
+## Dispatch and kernels
+
+### Two related dispatch surfaces
+
+1. **`rdna-compute`** — `Gpu` methods (`gemm_*`, `gemv_*`, attention, norm, MoE,
+   sampling, …) used directly by arch forwards. Arch capability predicates live
+   in `arch_caps` / feature flags; implementations pick WMMA → specialized →
+   baseline. Source modules: `dispatch.rs`, `gemm.rs`, `gemv.rs`,
+   `attention.rs`, `moe.rs`, `norm.rs`, `kernels.rs`, `compiler.rs`, `replay.rs`.
+2. **`hipfire-dispatch`** — unified family tables and pipelines so callers avoid
+   matching on `DType` by hand (`families/`, `tables/`, `pipeline/`, `ops/`).
+
+Principle (both layers): fast paths first; baseline last; drop redundant arch
+clauses when a newer predicate subsumes them.
+
+### Kernel build
+
+```text
+Rust ensure_kernel source expression (preambles, header stitching, selectors)
+        │ hipfire-kernel-registry --arch <arch>
+        ▼
+exact six-column source/flags registry
+        │ scripts/compile-kernels.sh → hipfire-kernel-pack
+        ▼
+<daemon-bin-dir>/kernels/compiled/<arch>/<module>.hsaco + .index.json + .hash
+~/.hipfire_kernels/<arch>/<module>.<hash>.hsaco  # writable JIT cache
+```
+
+The runtime verifies the installed index and object SHA-256 before loading,
+even with hipcc present. A missing or stale index falls back to JIT only when
+hipcc is available; compiler-free loads fail closed. Packaged module names
+come from the exact Rust registry, never HIP source basenames.
+
+JIT and packaged objects share one core recipe: `--genco --offload-arch=<arch>
+-O3 --no-offload-compress -fuse-cuid=none -mcode-object-version=6`, then the
+extra, per-module and per-kernel flags (`KernelCompiler::recipe_for_source`).
+`-fuse-cuid=none` drops hipcc's `__hip_cuid_*` symbol, which is named after the
+input path and argv. On one host the object bytes therefore depend only on the
+source, the recipe and the resolved toolchain and headers, not on the cache root
+or temp name. `-mcode-object-version=6` pins the AMDGPU code-object version
+instead of inheriting the compiler default, so a newer LLVM cannot change it.
+The cache ABI is part of every hot key, packaging key and index.
+It changes whenever the core recipe does, so objects from an older recipe miss
+and are recompiled instead of being mixed in.
+
+Some arch crates also ship crate-local HIP (registered through their own
+`kernels.rs`) for family-specific ops.
+
+## Serve / generate path
+
+Composition root: `crates/hipfire-daemon/src/main.rs`.
+
+After `load_model`, request handling builds sampling defaults
+(request → HFQ `generation_config` recommendations → arch ladder) and enters
+`generate`:
+
+1. **EP** (`m.ep.is_some()`) → `generate_ep` (ds4 / MiniMax ranks).
+2. **Arch short-circuits** with optional n-gram/spec when a `Speculator` is
+   loaded and temp policy allows: ids 7, 9, 11, 12, 10, 8.
+3. **Qwen3.5 / LLaMA body**: PP (`generate_multi`), DFlash/spec
+   (`generate_dflash` / `generate_spec` / MTP), VL (`generate_vl`), else dense
+   AR loops.
+
+Capability examples that are **implemented** but not automatically
+“product-certified”:
+
+- N-gram draft is model-free opt-in (`HIPFIRE_NGRAM_DRAFT`); many arches
+  implement `SpecTarget`, but acceptance and product defaults are separate.
+- DFlash draft resolution is CLI-side path/auto-match; daemon loads the path it
+  is given. Mode toggles and MoE caveats: config/env owners, not this page.
+
+Speculation inventory snapshot: [`speculation-support-inventory.md`](speculation-support-inventory.md)
+(historical — verify in source before claims).
+
+## Redline roles (capability vs certification)
+
+Three crates + one integration controller. Normative contributor procedure:
+[`REDLINE.md`](REDLINE.md) (**branch-implemented** vs `origin/beta` at the
+comparison base in [`INDEX.md`](INDEX.md)).
+
+| Piece | Owns | Does **not** own |
+|---|---|---|
+| `redline` | Experimental direct-KMD via libdrm_amdgpu (device, BO, PM4 CS, fences) | Product serve transporhipfire-arch-qwen35/src/arch.rs` — full production impl
+//!   for the Qwen3.5 hybrid DeltaNet + MoE family. Read this for the
+//!   bar: how `config_from_hfq` walks the JSON metadata, how
+//!   `load_weights` drives the weight pager, how `new_state` allocates
+//!   GPU scratch.
+//! - `crates/hipfire-arch-llama/src/arch.rs` — second impl, dense
+//!   LLaMA / Mistral / plain-Qwen3 family. Demonstrates the trait at
+//!   facade-stage (forward body still in `hipfire-runtime::llama`,
+//!   PR 14 will physically split).
+//!
+//! # Why forward isn't on the trait
+//!
+//! Forward-pass dispatch is intentionally NOT routed through this
+//! trait. Reasons:
+//!   1. Forward signatures vary heavily across arches (number of
+//!      buffers, KV layout, hybrid-vs-dense paths, vision conditioning,
+//!      MoE expert management). Forcing one trait shape would either
+//!      bloat the contract or hide essential parameters behind opaque
+//!      slots.
+//!   2. Forward dispatch is hot-path. Static dispatch via concrete-type
+//!      function calls keeps the call graph fully inlinable; dyn-trait
+//!      dispatch in the inner loop costs measurable tok/s on small
+//!      models.
+//!   3. The trait's job is BRING-UP scaffolding (load → instantiate →
+//!      generation-loop wiring), not runtime polymorphism. Once an arch
+//!      is loaded, the daemon/CLI knows the concrete type at compile
+//!      time.
+
+use crate::hfq::HfqFile;
+use crate::llama::WeightTensor;
+use rdna_compute::{DType, Gpu};
+
+/// Bring-up contract for a hipfire architecture.
+///
+/// Implementors live in their own arch crate (`hipfire-arch-<name>`)
+/// and provide the three required types (Config / Weights / State)
+/// plus five required methods. The optional override hook lets
+/// an arch deviate from Qwen3.5 family defaults without growing a
+/// per-`arch_id` `match` ladder in the daemon.
+///
+/// # Required: associated types
+///
+/// - `Config` — model-shape constants parsed from HFQ metadata.
+///   Cheap to clone, sent across threads. Example: `Qwen35Config`
+///   in `hipfire-arch-qwen35` carries dim, n_layers, head counts,
+///   MoE topology, RoPE params.
+/// - `Weights` — GPU-resident model weights. Owns `WeightTensor`
+///   handles plus any host-side metadata for the weight pager.
+/// - `State` — GPU-resident per-decode scratch (KV cache, attention
+///   workspace, recurrent state for hybrid archs).
+///
+/// # Required: methods
+///
+/// See per-method docs below.
+///
+/// # Optional: override hook
+///
+/// `eos_filter_overrides`. Default impl matches Qwen3.5 conventions.
+/// Override per-arch when the arch's end-of-turn markers diverge.
+pub trait Architecture: Send + 'static {
+    type Weights;
+    type State;
+    type Config: Clone + Send + 'static;
+
+    /// Canonical arch_id marker for this family. Existing IDs:
+    /// 0 = LLaMA / Mistral, 1 = plain Qwen3 / Qwen2,
+    /// 5 = Qwen3.5 dense, 6 = Qwen3.5/3.6 MoE.
+    ///
+    /// The actual id loaded at runtime is `HfqFile::arch_id` and may
+    /// differ from this canonical marker for families that span
+    /// multiple ids (e.g. `Llama::arch_id() == 0` but covers both 0
+    /// and 1; the dense-vs-Qwen3-norm distinction is read off the HFQ
+    /// metadata inside `config_from_hfq`).
+    fn arch_id() -> u32;
+
+    /// Human-readable arch tag for logs and CLI dispatch (e.g. `"qwen35"`,
+    /// `"llama"`).
+    fn name() -> &'static str;
+
+    /// Parse model-shape constants out of `hfq.metadata_json`.
+    ///
+    /// Returns a typed `Config` or an error string. Implementations
+    /// generally use `serde_json` to walk the metadata blob and branch
+    /// on `hfq.arch_id` for variants within the family (e.g. dense vs
+    /// MoE, with-vs-without DeltaNet).
+    ///
+    /// # Worked example: Qwen3.5
+    ///
+    /// `hipfire_arch_qwen35::qwen35::config_from_hfq` parses the
+    /// metadata, branches `arch_id == 5` (dense) vs `arch_id == 6`
+    /// (MoE) for expert-count fields, fills defaults for missing
+    /// keys (e.g. `partial_rott |
+| `redline-dispatch` | Dispatch-DAG record/validate, artifact/kernarg identity, plan compile/selection, retained AQL/PM4 graph construction; HIP and AQL backends | ROCr ABI lifetimes; model admission policy |
+| `redline-rocr` | Dynamically loaded public ROCr/HSA ABI; queues, signals, AQL packets, arch PM4-IB builders | Model scheduling / backend admission |
+| `rdna-compute::replay::ReplayController` | Product integration on `Gpu`: record, prepare, route, poison, reset | A fourth transport crate |
+
+Active retained-PM4 mental model (ordinary HIP launches remain the default path):
+
+```text
+recorder-aware launch site
+  ├─ ordinary HIP → hip-bridge
+  └─ retained replay (ReplayController fork when armed/ready)
+       → retained tape (opcodes, kernargs, geometry, deps, bindings)
+       → arch-specific PM4 lowering
+       → public-HSA command memory
+       → one PM4-IB AQL packet by default (PreparedPm4Graph::Single)
+         or multiple queue/phase packets when explicitly enabled phased
+         multi-queue replay is used (PreparedPm4Graph::Phased)
+       → ROCr queue / doorbell / completion
+```
+
+**Runtime routing/default ≠ admission or certification.** Example runtime
+automatic default (source capability/default fact only, `REDLINE.md`; not an
+admission or certification record): `mq4r_redline_default` — exact GPU arch
+`gfx1100`/`gfx1151`/`gfx1201` + PP=1 + TP=1 + case-insensitive `.mq4r`
+extension configures model default replay backend (model-family agnostic; no
+`arch_id` gate); `gfx1200` and all other arches remain opt-in. Built-in `hip`
+config profile, explicit `HIPFIRE_REPLAY_BACKEND`, or manual capture disables
+the automatic default / opts into broader capability.
+Promotion and performance claims require the certification ladder in
+`REDLINE.md` (parity, timed-arm route proof, matched stationary conditions).
+`ReplayState::Ready` alone is not repository certification. Stitching manual
+capture to product timed-arm proof without that ladder is **blocked**
+([`INDEX.md`](INDEX.md)).
+
+Do not describe Redline as “future only”: retained record/replay and ROCr PM4-IB
+paths are **implemented**; what remains gated is **route certification and
+default product claims**.
+
+## KV cache (shared policy)
+
+Resolved by `hipfire_runtime::kv_mode` per load-site policy (aliases and
+accepted sets differ by carrier). Concrete modes include:
+
+| Mode | Role (summary) |
+|---|---|
+| `q8` | Q8_0 K and V |
+| `fp8` / `bf16` | Native K+V layout (`fp8`: Qwen single-GPU; `bf16`: Qwen quality-control arm, Maple default) |
+| `fwht2` / `fwht3` / `fwht4` | FWHT-rotated K tiers + Q8 V; optional headroom modes |
+| `asym2` / `asym3` / `asym4` | **Legacy** Givens-rotated Lloyd K + Q8 V. On Qwen the bare names alias `fwhtN`; the Givens constructors need `legacy-asymN` |
+
+**Qwen-family `auto` / unset** (arch-aware, Qwen only): native **fp8/fp8** on
+exact `gfx1201` when the load is native-eligible (H24/Hkv4/D256, single GPU,
+no adaptive, no CASK); **q8/q8** everywhere else, gfx1100 and gfx1151
+included. Non-Qwen family defaults are unchanged (Maple BF16, DeepSeek
+compressor F32, Gemma layered policy, …). Full K/V axis overrides (`--kv-k` /
+`--kv-v`) and precedence live in [`CONFIG.md`](CONFIG.md) / [`CLI.md`](CLI.md).
+
+**Backend selection** (`--kv-backend` / `memory.kv_backend`): accept only
+`legacy` \| `vmm`. Omitted request is **automatic** and prefers **VMM** on
+certified combinations; otherwise falls back to legacy once per load with a
+logged reason. Selecting legacy (explicit or automatic) emits exactly one
+stderr warning whose stable token is the contiguous substring
+`HIPFIRE_KV_BACKEND=legacy`. Old spelling `contiguous` is rejected with a
+migration error that names `legacy`. Explicit `vmm` on an unsupported
+combination fails closed before teardown.
+
+**Physical layout:** the legacy backend still backs the trunk KV arena as one
+physically contiguous allocation (stable base pointer for the full
+reservation). VMM instead reserves a virtual address range and maps physiary_factor`), and returns a
+    /// `Qwen35Config` with the full per-layer shape.
+    fn config_from_hfq(hfq: &HfqFile) -> Result<Self::Config, String>;
+
+    /// Load model weights from an HFQ file into GPU memory.
+    ///
+    /// PR 8 note: signature changed from `&mut HfqFile` (PR 7
+    /// scaffold) to `&HfqFile`. The mmap-backed HfqFile is read-only
+    /// at the syscall level and Qwen35::load_weights only reads
+    /// tensor data. Weight-pager state mutations happen on the
+    /// returned Weights object via interior mutability
+    /// (`RefCell<WeightPager>`), not on the file.
+    ///
+    /// # Worked example: Qwen3.5
+    ///
+    /// `hipfire_arch_qwen35::qwen35::load_weights` walks every layer's
+    /// QKV / output / FFN / norm tensors, hands each to
+    /// `WeightTensor::from_hfq_tensor` (which dispatches on the
+    /// HFQ quant_type to upload Q4F16G64 / F16 / F32 to GPU), and
+    /// assembles per-layer `LayerWeights` arrays. The weight pager
+    /// (lazy load + LRU eviction for >VRAM models) is wired through
+    /// `WeightTensor` and is not arch-specific.
+    fn load_weights(
+        hfq: &mut HfqFile,
+        cfg: &Self::Config,
+        gpu: &mut Gpu,
+    ) -> Result<Self::Weights, String>;
+
+    /// Allocate per-decode GPU scratch for this arch.
+    ///
+    /// Returns the `State` object the daemon's generation loop holds
+    /// for the lifetime of a session. Sized by `cfg`.
+    ///
+    /// # Worked examples
+    ///
+    /// - Hybrid LA + FA (`DeltaNetState::new` in
+    ///   `hipfire-arch-qwen35`) — KV cache for FA layers, recurrent
+    ///   state buffers for DeltaNet (LA) layers, plus shared
+    ///   attention scratch.
+    /// - Dense FA-only (`ForwardScratch::new` in
+    ///   `hipfire-runtime::llama`) — KV cache plus attention
+    ///   workspace; no recurrent state.
+    fn new_state(gpu: &mut Gpu, cfg: &Self::Config) -> Result<Self::State, String>;
+
+    // Forward pass shapes are arch-specific; declare the surface but
+    // don't constrain types in this trait — concrete arch crates
+    // expose their own typed forward methods. The runtime's generic
+    // generation loop holds an `impl Architecture`-bound model and
+    // uses arch crate-specific call sites.
+    //
+    // Future PRs may tighten the forward signatures once we see what
+    // the qwen35 / qwen35-vl / llama splits actually need. For PR 7
+    // the trait is intentionally minimal — just enough scaffolding for
+    // a canary arch crate to implement and the runtime to type-check.
+
+
+    /// Override EOS handling for this arch. Default uses ChatML
+    /// `<|im_end|>` plus the `<think>` strip policy from runtime.
+    ///
+    /// Override to add arch-specific stop sequences (e.g. Gemma's
+    /// `<end_of_turn>`) and matching `holdback_prefixes` so the
+    /// stream doesn't leak the marker bytes to the visible output.
+    fn eos_filter_overrides(_cfg: &Self::Config) -> EosFilterOverrides {
+        EosFilterOverrides::default()
+    }
+}
+
+
+/// Per-arch overrides for EOS / end-of-turn filtering.
+///
+/// `hipfire_runtime::eos_filter` owns visible-stream EOS detection.
+/// The default implementation handles ChatML `<|im_end|>` plus
+/// `<think>` strip; per-arch overrides extend to additional markers.
+#[derive(Debug, Clone, Default)]
+pub struct EosFilterOverrides {
+    /// Byte sequences that signal end-of-turn for this arch. Streaming
+    /// stops (and the marker is not emitted) when the decoded byte
+    /// stream contains any sequence here.
+    /// Examples: Gemma4's `<end_of_turn>` (when forward-ported).
+    pub stop_at: Vec<Vec<u8>>,
+    /// Byte prefixes the streamer holds back until disambiguated.
+    /// Required so a partial decode of a `stop_at` marker doesn't leak
+    /// its initial bytes (e.g. holding back `<end_` until we see
+    /// either `<end_of_turn>` to stop or `<end_of_something_else>` to
+    /// flush).
+    pub holdback_prefixes: Vec<Vec<u8>>,
+    /// If `Some`, override whether to strip `<think>...</think>` blocks
+    /// frcal
+pages on demand; both keep graph/retained base pointers stable within their
+model. Private draft caches (DFlash/MTP) are owned separately and do not
+relabel the trunk backend. Exact quant layouts and math:
+[`QUANTIZATION.md`](QUANTIZATION.md). Hybrid linear layers (DeltaNet) use fixed
+recurrent state instead of FA KV for those layers.
+
+**VMM virtual-address lifetime:** a released `VmmArena` unmaps its segments and
+frees its physical handles, but never returns its virtual range to the driver
+(`hipMemAddressFree` is not called). The range stays reserved for the life of
+the process and is counted by `hip_bridge::retired_va_bytes()`. On ROCm 10.0 (HIP 7.15), a VA can
+keep translating to its first backing after `hipMemUnmap` + `hipMemMap` of
+another handle: kernels read stale pages even after `hipDeviceSynchronize`.
+In the 80 × 2 MiB repro that is every page on gfx1201 (R9700), 84% on gfx1100
+(7900 XTX), and none on gfx1151 (Strix Halo). The exact
+trigger is not isolated; a replay of hipfire's own release → re-reserve
+sequence got the same VA back but read no stale pages. A hint-less `hipMemAddressReserve` after a free
+returns exactly the freed range, so without retirement every unload → load in
+one daemon (model swap, serve idle eviction, `max_seq` change, failed-load
+retry) would re-map VAs the GPU had translated before. Retired VA is cheap:
+Qwen3.8-27B at `max_seq` 4096 retires 192 MiB per load (about 8 GiB at 256K).
+New reservations are refused with a restart hint once 64 TiB is retired, half
+of the 128 TiB user VA space. Growth inside a live arena only ever maps
+fresh offsets. A failed access reset in `map_next` poisons the arena instead of
+letting a retry map a new handle at the address it just unmapped.
+
+### Qwen4 session cache and live continuation
+
+Flash-Next (Qwen4) reuses prefill work through the engine-owned session cache
+(`hipfire_runtime::session_cache`; keying, planning, LRU eviction, the memory
+guard, placement and every copy live in the engine, the arch only describes
+its state parts and prefill boundaries). It copies state; it does not alias
+VMM granules or relocate banks. There is no AR-only fallback tier and no
+hipGraph route (Qwen4 replays prepared PM4, below).
+
+- **Snapshots are cold-exact and cross-session.** A prefill snapshots the
+  state at every prefill-chunk multiple it crosses (8192 rows on gfx1151,
+  4096 on gfx1201): GDN, PLE and hyper state, the selections and, with
+  native MTP, the head's state and draft policy whole; of the append-only
+  QSA K/V rows (and the head's) only the rows above the parent snapshot.
+  A snapshot therefore costs one chunk of rows at any depth, and sessions
+  that share a prefix share its links. A hit restores the deepest snapshot
+  of the chain and prefills the rest; it equals a cold prefill of the same
+  prompt. AR and native-MTP snapshots never cross routes.
+- **Commit-gated.** A snapshot is published only after the client commits the
+  turn. Snapshots never depend on live state, so a reset does not drop them.
+- **Eviction and budget.** LRU over leaves; a snapshot with children is
+  pinned. The budget is `memory.session_cache_bytes` /
+  `HIPFIRE_SESSION_CACHE_BYTES` (default 8 GiB, `0` = cache off), a ceiling,
+  not a reservation. Snapshots live in device memory (VRAM, or a unified-memory
+  APU's GTT or carve-out) and yield to context growth. A capture is skipped,
+  or older snapshots are evicted, unless free device memory
+  (`Gpu::device_mem_info`: `hipMemGetInfo`, on a GTT-backed APU clamped to
+  `MemAvailable` plus TTM's page pool) still holds the live state's growth
+  through the prompt in flight plus headroom.
+  When a forward crosses a VMM growth boundary, snapshots are freed (LRU
+  leaves first, then the turn's pending captures) until that growth fits.
+- **Live continuation.** Inside one conversation, a turn whose canonical
+  tokens strictly extend the previous turn's committed consumed history
+  (same route; for native MTP the head is at the same position) preom the visible stream. Default is on for thinking-mode arches.
+    pub strip_think: Option<bool>,
+}
+
+/// Architecture-owned iteration over weights eligible for load-time MMQ
+/// safety screening. Each implementation returns `(safe, unsafe)` counts.
+pub trait MmqScreenable {
+    fn screen_mmq_weights(&self, gpu: &mut Gpu) -> (usize, usize);
+}
+
+/// Screen one weight tensor when its storage layout is accepted by the HFQ4
+/// MMQ reference probe. The dtype guard is load-bearing: probing a different
+/// packed layout can read beyond the tensor buffer.
+pub fn screen_weight_tensor(
+    weight: &WeightTensor,
+    gpu: &mut Gpu,
+    safe: &mut usize,
+    unsafe_count: &mut usize,
+) {
+    if !matches!(weight.gpu_dtype, DType::HFQ4G256 | DType::MQ4G256) {
+        return;
+    }
+    if gpu.mmq_screen_weight(&weight.buf, weight.m, weight.k) {
+        *safe += 1;
+    } else {
+        *unsafe_count += 1;
+    }
+}
+
+/// Apply the current enable/architecture policy and screen an architecture's
+/// weights. Screening remains opt-in; disabled loads return immediately.
+pub fn maybe_screen_mmq(weights: &impl MmqScreenable, gpu: &mut Gpu) {
+    if !gpu.mmq_screen.enabled
+        || !matches!(
+            gpu.arch.as_str(),
+            "gfx906"
+                | "gfx1100"
+                | "gfx1101"
+                | "gfx1102"
+                | "gfx1103"
+                | "gfx1150"
+                | "gfx1151"
+                | "gfx1152"
+        )
+    {
+        return;
+    }
+
+    let started = std::time::Instant::now();
+    let (safe, unsafe_count) = weights.screen_mmq_weights(gpu);
+    eprintln!(
+        "  MMQ screening: {safe} safe, {unsafe_count} unsafe (threshold={:.2}, {:.1}ms)",
+        gpu.mmq_screen.threshold,
+        started.elapsed().as_secs_f64() * 1000.0,
+    );
+}
+
+
+=== crates/hipfire-runtime/src/arch_mapping.rs ===
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// Copyright (c) 2026 Nick Woolmer
+// hipfire — see LICENSE and NOTICE in the project root.
+
+//! Single source of truth for `model_type` / `general.architecture` → `arch_id`.
+//!
+//! Why this table exists: three independent `model_type -> arch_id` maps
+//! drifted (safetensors_source.rs, quantize/src/pipeline.rs,
+//! quantize/src/pipeline_gguf.rs). One silently defaulted to llama (0) on
+//! unknown input, another returned UNCLAIMED, the third lacked entries. This
+//! module is the sole authority; the other sites call [`lookup_model_type`].
+//!
+//! The numeric ids are the HFQ `arch_id` stamped into the file header and
+//! claimed by `Carrier::claims_arch_id`. Changing any assignment is a
+//! wire-format / routing break, so keep them byte-identical.
+
+/// Canonical executable `model_type` (HF) / `general.architecture` (GGUF) →
+/// `arch_id`.
+///
+/// Reserved source-only families live in [`RESERVED_MODEL_TYPE_TO_ARCH_ID`]
+/// instead of this executable registry. Keeping the tables separate lets
+/// source classification retain a reservation without making reset-core and
+/// carrier inventories pretend that a generation route exists.
+///
+/// Covers the union of every string previously recognised by executable
+/// consumers. Strings absent from both tables are *unknown* and must fail
+/// closed (not silently become llama 0). The qwen2 entry is intentionally
+/// `7` (Qwen2Carrier, loads Q/K/V biases); earlier `hipfire-quantize` builds
+/// mapped it to `1` (LLaMA) which dropped those biases — that was a bug and
+/// is corrected here. See `safetensors_source.rs` commit 9002d7f8b.
+///
+/// Sorted by `arch_id` then alphabetically for auditability.
+pub const MODEL_TYPE_TO_ARCH_ID: &[(&str, u32)] = &[
+    // arch 0 — llama family
+    ("llama", 0),
+    ("mistral", 0),
+    // arch 1 — qwen3 (llama-family loader, no bias)
+    ("qwen3", 1),
+    // arch 5 — qwen3.5 dense (qwen3.5/qwen3.6 share the same loader, 5 dense / 6 MoE)
+    ("qwen3.5", 5),
+    ("qwen3.6", 5),
+    ("qwen35", 5),
+    ("qwen3_5", 5),
+    ("qwen3_5_text", 5),
+    ("qwen3_6", 5),
+    // arch 5 — ornith 1.5fills
+  only the suffix in place, with no copy. It is session-exact (the state
+  descends from decode) rather than cold-exact, so a live turn captures no
+  snapshot and the shared cache stays cold-exact. When the live state and the
+  longest snapshot reach equally far, the live state wins; a hit always
+  prefills a non-empty suffix. It needs the session cache attached, so
+  `HIPFIRE_SESSION_CACHE_BYTES=0` also turns it off.
+- **Removed.** The RC3 end-of-prompt checkpoint, the multi-entry radix store
+  with typed PM4 relocation, shared-turn anchors and periodic captures no
+  longer exist for Qwen4; `HIPFIRE_QWEN_PROMPT_CACHE` and
+  `HIPFIRE_QWEN_RADIX_CACHE` do not affect it (Qwen3.5 and dense keep their
+  own conversation cache).
+- **Concurrency.** Queued, not parallel: one request executes at a time per
+  loaded model; HTTP concurrency queues and there is no GPU slot scheduler.
+
+Switch: `HIPFIRE_SESSION_CACHE_BYTES` (see [`env-vars.md`](env-vars.md)).
+
+## Observability hooks
+
+Examples (full list: [`env-vars.md`](env-vars.md)):
+
+- `HIPFIRE_GRAPH` — hipGraph capture (debug; AR-oriented)
+- `HIPFIRE_PROFILE` / rocprof integration — internal vs external timing
+- Daemon log under the serve data dir — load progress, JIT, dispatch decisions
+- `hipfire-detect` — post-hoc JSONL detectors (non-blocking)
+- `hipfire-atlas` — structured bench rows (`--emit-atlas`)
+
+## Where to contribute
+
+| Task | Start here |
+|---|---|
+| New model family | `.agents/skills/hipfire-arch-port/` + `hipfire-arch-toy`; register carrier + id |
+| New GPU arch / WMMA port | arch-port skill; `rdna-compute` + kernel variants |
+| Kernel micro-opt | `kernels/src/<name>.<chip>.hip`; dispatch/family wiring; methodology under `docs/methodology/` |
+| Quant format / encoder | `hipfire-quantize`; [`QUANTIZATION.md`](QUANTIZATION.md) / [`QUANTIZE.md`](QUANTIZE.md) |
+| Retained replay / PM4 | [`REDLINE.md`](REDLINE.md); do not treat `crates/redline` KMD as serve |
+| Validation route | [`VALIDATION.md`](VALIDATION.md) only — no universal GPU gate |
+
+## Related owners
+
+| Concern | Owner |
+|---|---|
+| Arch id table | [`architecture-ids.md`](architecture-ids.md) |
+| Docs lifecycle / truth states | [`INDEX.md`](INDEX.md) |
+| Redline certification | [`REDLINE.md`](REDLINE.md) |
+| Models / VRAM / sidecars | [`MODELS.md`](MODELS.md) |
+| Multi-GPU ops | [`multi-gpu.md`](multi-gpu.md) |
+| Perf claim protocol | [`methodology/perf-benchmarking.md`](methodology/perf-benchmarking.md) |
+
+
+=== docs/BENCHMARKS.md ===
+# Benchmarks
+
+Published **historical** tables only. Every number here is a retained,
+fixture-bound observation from an earlier campaign. None of these rows is a
+live floor, product default, admission, or route certificate. Per
+[`INDEX.md`](INDEX.md), a **measured** claim requires a named fixture, binary
+and model identity, and a measurement date on the same report — these tables
+do not carry that full identity manifest, so this page is **historical** only
+(the inventory date below is not a measurement date).
+
+| Field | Value |
+|---|---|
+| Page state | **historical** (see [`INDEX.md`](INDEX.md)) |
+| Inventory date | 2026-07-19 |
+| Audited source ref | `692a726dde53508cb53de1a74c720e75a7c9f33e` |
+| Comparison base | `origin/beta` @ `9ffb18da9d1377dfbf759db82641ea039b2e522e` |
+
+## How to read this page
+
+1. Treat every table on this page as **historical** only. Do not upgrade a row
+   to **measured** without a complete per-table date, fixture, and
+   binary/model-identity evidence manifest **and** a fresh protocol-compliant
+   run under
+   [`methodology/perf-benchmarking.md`](methodology/perf-benchmarking.md).
+   Measurement and admission are independent: a complete **measured** row is
+   still not a product default or route certificate. Any product-default or
+   admission claim **additionally** requires an explicit row in
+   [`admissions.yml`](admissions.yml) (schema v2; exactly one earned record — fail closed otherwise).
+2. Many older rows used the then-default `asym3` KV mode, now dense (9B). Same loader as qwen3.5 dense (5); a3b MoE variant is 6.
+    ("ornith", 5),
+    ("ornith-1.5", 5),
+    ("ornith1.5", 5),
+    ("ornith_1.5", 5),
+    // arch 6 — qwen3.5 MoE (explicit model_type strings; the safetensors path also
+    // derives 6 from has_experts==true for the qwen3.5/3.6 family)
+    ("qwen3_5_moe", 6),
+    ("qwen3_5_moe_text", 6),
+    ("qwen3moe", 6),
+    // arch 6 — ornith 1.5 MoE (35B-A3B). Mirrors registry_gen arch_id_for ornith-1.5 + a3b.
+    ("ornith_moe", 6),
+    ("ornith-1.5_moe", 6),
+    ("ornith1.5_moe", 6),
+    ("ornith_1.5_moe", 6),
+    ("qwen2", 7),
+    // arch 8 — dots.ocr
+    ("dots_ocr", 8),
+    // arch 9 — deepseek_v4
+    ("deepseek_v4", 9),
+    // arch 10 — minimax_m2
+    ("minimax_m2", 10),
+    // arch 11 — lfm2 (dense) + lfm2_moe (MoE); both route to hipfire-arch-lfm2moe/11
+    ("lfm2", 11),
+    ("lfm2_moe", 11),
+    // lfm2_vl is the vision-language variant; it reuses the arch-11 text backbone
+    // (hipfire-arch-lfm2moe) plus an embedded SigLIP-2 vision tower + projector.
+    ("lfm2_vl", 11),
+    // arch 12 — cohere2_moe
+    ("cohere2_moe", 12),
+    // arch 13 — gemma4 family (dense + MoE unified; text decoder only). The
+    // four strings mirror pipeline.rs; gguf's old `starts_with("gemma4")`
+    // catch-all is intentionally replaced by this exact list so unknown
+    // `gemma4*` variants fail closed instead of silently becoming 13.
+    ("gemma4", 13),
+    ("gemma4_text", 13),
+    ("gemma4_unified", 13),
+    ("gemma4_unified_text", 13),
+    // arch 14 — muse_glimmer dense (52-layer + ViT)
+    ("muse_glimmer", 14),
+    ("muse_glimmer_text", 14),
+    // arch 15 — maple (Maple-Preview 20B-A1B, natively-ternary 256-expert MoE)
+    ("maple", 15),
+    // arch 22 — gemma4 EAGLE drafter (single-block spec-decode head for arch 13)
+    ("gemma4_unified_assistant", 22),
+    // arch 23 — muse_glimmer DFlash drafter
+    ("muse_glimmer_assistant", 23),
+    // arch 40 — flux MMDiT diffusion trunk (image-gen component block 40–47;
+    // high by design so the sequential primary range 17–19 stays free for
+    // future text arches; never a chat-serve trunk — see
+    // docs/architecture-ids.md § Image-generation component ids)
+    ("flux", 40),
+    // arch 45 — flux2 MMDiT diffusion trunk (FLUX.2 Klein; 44 is intentionally
+    // spare). The diffusers `_class_name` strings route through the same two
+    // keys: `derive_arch_id` matches the table as substrings with the longest
+    // key winning, so `Flux2Transformer2DModel` resolves to 45 via "flux2" and
+    // `FluxTransformer2DModel` to 40 via "flux".
+    ("flux2", 45),
+];
+/// Reserved source classifications with no executable carrier or reset owner.
+/// These strings remain accepted by [`lookup_model_type`] so packers and
+/// safetensors probing can preserve the wire id without publishing a route.
+pub const RESERVED_MODEL_TYPE_TO_ARCH_ID: &[(&str, u32)] =
+    &[("qwen4_exp", 16), ("qwen4_exp_text", 16)];
+
+/// Look up an `arch_id` for a `model_type` / GGUF `general.architecture`
+/// string, including reserved source-only classifications.
+///
+/// Returns `None` for unknown inputs — callers must fail closed (error naming
+/// the unrecognised string and listing `supported_model_types()`).
+pub fn lookup_model_type(model_type: &str) -> Option<u32> {
+    MODEL_TYPE_TO_ARCH_ID
+        .iter()
+        .chain(RESERVED_MODEL_TYPE_TO_ARCH_ID)
+        .find_map(|(key, id)| (*key == model_type).then_some(*id))
+}
+
+/// Sorted list of every recognised executable or reserved source string, for
+/// error messages. Computed from both tables so they cannot drift.
+pub fn supported_model_types() -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = MODEL_TYPE_TO_ARCH_ID
+        .iter()
+        .chain(RESERVED_MODEL_TYPE_TO_ARCH_ID)
+        .map(|(key, _)| *key)
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Human-readable, comma-joined list for `eprintln!` diagnostics.
+pub fn supported_model_types_display() -> String {
+    s legacy. Current
+   clean configs resolve `kv_cache=auto` through the model registry and
+   otherwise to the architecture default (Qwen native `fp8` on eligible exact
+   gfx1201, `q8` elsewhere). Do not compare asym3 rows to q8 or fp8 rows as
+   one A/B.
+3. Speed floors used by tooling live in `tests/speed-baselines/<arch>.txt` and
+   are exercised by [`scripts/speed-gate.sh`](../scripts/speed-gate.sh) when that
+   path’s policy applies. Those files are **not** reproduced here.
+4. Validation and promotion routes live only in [`VALIDATION.md`](VALIDATION.md).
+   Retired batteries are **historical reproduction only** — never current
+   acceptance for a bench claim.
+5. Redline-attributed numbers require the certification ladder in
+   [`REDLINE.md`](REDLINE.md). Throughput without timed-arm route proof is not a
+   Redline certification.
+
+## Claim language (fail closed)
+
+| Allowed | Forbidden without fresh evidence |
+|---|---|
+| “On \<date\>, fixture \<id\>, median X tok/s” | “Current baseline is X” |
+| “Historical DFlash genre table (asym3, max_tokens=120)” | “DFlash is 4× on 27B” as a present product fact |
+| “Speed-gate floor in `tests/speed-baselines/…`” | Treating any table below as that floor |
+| Link to a dated `perf-checkpoints/` file | Stitching harness exits into an admission |
+
+A bench number without protocol + identity hashes is **rejected** as promotion
+evidence ([`VALIDATION.md`](VALIDATION.md)).
+
+## Reproducing measurements
+
+Protocol owner: [`methodology/perf-benchmarking.md`](methodology/perf-benchmarking.md)
+(warmup, fresh-process, noise band, prompt MD5 discipline).
+
+```bash
+# Canonical CLI surface (pp/decode matrix depends on flags and model)
+hipfire bench qwen3.5:9b
+
+# Optional speed-floor check when that path’s policy applies
+./scripts/speed-gate.sh --fast
+```
+
+For DFlash genre work, use prompt-MD5-pinned fixtures under
+[`benchmarks/prompts/`](../benchmarks/prompts/). Prompt structure swings τ;
+byte-identical prompts are mandatory across sessions.
+
+Optional A/B tooling: [`scripts/probe_commits.sh`](../scripts/probe_commits.sh)
+(also reachable from `scripts/gates.sh --perf`). Neither script creates an
+admission row.
+
+---
+
+## Historical: autoregressive decode (no spec) — 7900 XTX (gfx1100)
+
+**Truth state:** historical
+**Fixture notes:** then-default engine config (asym3 KV, FlashAttention auto,
+`prompt_normalize=on`). Medians across 5 runs unless noted. Not a current q8
+methodology row. No per-row binary/model hash manifest on this page.
+
+| Model | decode | prefill (peak) | effective BW |
+|---|---:|---:|---:|
+| Qwen 3.5 0.8B MQ4 | **391 tok/s** | **7383 tok/s** | 200 GiB/s |
+| Qwen 3.5 4B MQ4 | **180 tok/s** | **2487 tok/s** | 433 GiB/s |
+| Qwen 3.5 9B MQ4 | **132 tok/s** | **1663 tok/s** | **654 GiB/s** |
+| Qwen 3.5 27B MQ4 | **47 tok/s** | **478 tok/s** | **651 GiB/s** |
+
+Engineering note retained with the snapshot: 9B and 27B decode saturated
+~650 GiB/s of the 7900 XTX’s 960 GB/s peak (~68% BW-efficient end-to-end across
+weights + KV + activations). Prefill on the smaller sizes was WMMA-bound on the
+MQ4 fused projections **under that fixture**.
+
+## Historical: DFlash speculative decode by genre — 7900 XTX
+
+**Truth state:** historical (**superseded methodology**)
+**Do not use as a current DFlash baseline.**
+
+This table used `asym3` KV and `max_tokens=120`. Current DFlash performance
+claims require the protocol in
+[`methodology/perf-benchmarking.md`](methodology/perf-benchmarking.md) (including
+q8 where that is the active KV path, `max_tokens=256` when that is the campaign
+contract, ≥3 fresh-process runs, prompt and binary hashes) plus the claim-class
+route in [`VALIDATION.md`](VALIDATION.md). A retired battery pass is **not**
+acceptance evidence. No per-row
+binary/model hash manifest on this page.
+
+DFlash speedup in this snapshot was **genre-conditional**. Code prompts whose
+target distribution matched the draft won; long-form prose where high-entropy
+continuations diverged could net-lose.
+
+5-run medians under upported_model_types().join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{lookup_model_type, MODEL_TYPE_TO_ARCH_ID, RESERVED_MODEL_TYPE_TO_ARCH_ID};
+
+    #[test]
+    fn qwen4_outer_and_text_model_types_share_reserved_architecture_id() {
+        assert_eq!(lookup_model_type("qwen4_exp"), Some(16));
+        assert_eq!(lookup_model_type("qwen4_exp_text"), Some(16));
+    }
+
+    #[test]
+    fn qwen4_is_reserved_and_not_in_executable_table() {
+        assert!(MODEL_TYPE_TO_ARCH_ID
+            .iter()
+            .all(|(model_type, _)| !model_type.starts_with("qwen4")));
+        assert_eq!(
+            RESERVED_MODEL_TYPE_TO_ARCH_ID,
+            &[("qwen4_exp", 16), ("qwen4_exp_text", 16)]
+        );
+    }
+
+    #[test]
+    fn qwen4_near_misses_fail_closed() {
+        assert_eq!(lookup_model_type("qwen4"), None);
+        assert_eq!(lookup_model_type("qwen4_exp_moe"), None);
+    }
+}
+
+
+=== crates/hipfire-runtime/src/arch_model.rs ===
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+//! The architecture-agnostic view of a loaded model.
+//!
+//! ## Why this exists
+//!
+//! `hipfire_loader::ModelState` is a closed enum with one variant per
+//! architecture. Every crate that needed a scalar off a loaded model therefore
+//! had to name all eleven — including the product entry point, which computed
+//! *three integers* through a seven-arm architecture dispatch:
+//!
+//! ```text
+//! let (dim, layers, vocab) = match m.state.as_ref() {
+//!     Some(ModelState::Qwen35(b)) => (b.config.dim,         b.config.n_layers,          b.config.vocab_size),
+//!     Some(ModelState::Qwen2(b))  => (b.config.hidden_size, b.config.num_hidden_layers, b.config.vocab_size),
+//!     …
+//! ```
+//!
+//! Seven arms, one tuple, and the only real difference is that some configs
+//! spell it `dim`/`n_layers` and others `hidden_size`/`num_hidden_layers`. A
+//! naming inconsistency was being paid for with architecture dispatch in the
+//! daemon.
+//!
+//! Measured before this trait existed: the loader and daemon between them held
+//! 93 `ModelState::` references, but touched only **seven distinct members** of
+//! the bundles they unwrapped — `config` (26 hits, only ever for those three
+//! scalars), `state`, `reset_session_state`, `kv_cache`/`kv`, `dn_state` (since
+//! deleted as vestigial) and `weights` (free-on-unload). That is the whole
+//! surface, and it is what this trait exposes.
+//!
+//! ## Why it lives in `hipfire-runtime`
+//!
+//! `hipfire-loader` depends on every `hipfire-arch-*` crate; the arch crates
+//! must not depend on the loader. A trait that arch crates implement and the
+//! loader consumes therefore cannot live in the loader — that is a cycle. It
+//! also cannot live in `saddle-core`, which sits below the runtime and must not
+//! know about `KvCache`. `hipfire-runtime` is the one layer both sides already
+//! depend on, so it is where the contract belongs.
+//!
+//! ## What this is NOT
+//!
+//! Not a forward-pass abstraction. Generation stays in `hipfire-generate`,
+//! which is the architecture composition root by design and legitimately names
+//! arch crates. This trait exists so that *infrastructure* — load
+//! acknowledgement, session reset, unload — stops branching on architecture.
+
+use crate::llama::KvCache;
+use rdna_compute::Gpu;
+
+/// A loaded model, viewed without knowing its architecture.
+///
+/// Implemented by each architecture's bundle type in its own crate. The loader
+/// stores `Box<dyn ArchModel>` so that adding an architecture does not edit a
+/// closed enum, and the daemon asks questions instead of matching variants.
+pub trait ArchModel: Send + std::any::Any {
+    /// Hidden size. Spelled `dim` by some configs and `hidden_size` by others;
+    /// the implementor resolves that, not the caller.
+    fn dim(&self) -> usize;
+
+    /// Number of decoder layers (`n_layers` / `num_hidden_layers`).
+    fn n_layers(&self) -> usize;
+
+    /// Vocabulary size.
+    fn vocab_size(the historical configuration: asym3 KV, `--no-chatml`,
+`max_tokens=120`, `prompt_normalize=true`:
+
+| Model | genre | AR tok/s | DFlash tok/s | speedup | τ |
+|---|---|---:|---:|---:|---:|
+| Qwen 3.5 27B | code (HumanEval/53) | 44.1 | **196.0** (peak 218.6) | **4.45×** | 9.82 |
+| Qwen 3.5 27B | prose (Rome essay) | 44.0 | 49.6 | 1.13× | 1.67 |
+| Qwen 3.5 27B | instruct (sky-color) | 44.6 | 44.7 | 1.00× | 1.39 |
+| Qwen 3.5 9B | code (HumanEval/53) | 124.0 | **329.1** (peak 346.7) | **2.65×** | 6.76 |
+| Qwen 3.5 9B | code (HumanEval/0) | 121.9 | **372.9** | **3.06×** | 8.23 |
+| Qwen 3.5 9B | instruct (sky-color) | 124.4 | **246.9** | **1.99×** | 4.76 |
+| Qwen 3.5 9B | prose (federalist) | **125.3** | 99.4 | 0.79× ✗ | 1.20 |
+| Qwen 3.5 9B | prose (Rome) | **122.7** | 98.3 | 0.80× ✗ | 1.20 |
+| Qwen 3.6 27B | code (HumanEval/53) | 44.2 | **185.5** | **4.19×** | 9.25 |
+
+**Config context for the snapshot (not a timeless default):** CLI default
+`dflash_mode` is `"off"` (`crates/hipfire-config/src/lib.rs`); DFlash is opt-in until a campaign
+proves a broader win. Enable globally with `hipfire config set dflash_mode auto`
+(dense Qwen 3.5+ on, A3B off unless overridden) or per model with
+`hipfire config qwen3.5:27b set dflash_mode on`. The numbers above were measured
+with DFlash forced on.
+
+## Historical: vs ollama (Q4_K_M GGUF) — 7900 XTX
+
+**Truth state:** historical
+Same-machine snapshot: hipfire MQ4 with asym3 KV and FlashAttention versus
+ollama Q4_K_M through llama.cpp’s ROCm backend. Matched ~140-token and
+~530-token prompts and matched 128-token generation lengths. Ollama numbers from
+its `prompt_eval_duration` / `eval_duration` reporting via `/api/generate` with
+`num_predict=128`. No per-row binary/model hash manifest on this page.
+
+| Model | hf pp128 | oll pp128 | hf pp512 | oll pp512 | hf decode | oll decode | decode× |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Qwen 3.5 0.8B | **10,861** | 4,622 | **12,962** | 7,117 | **353** | 168 | **2.10×** |
+| Qwen 3.5 4B | **3,304** | 1,972 | **3,321** | 2,670 | **165** | 93 | **1.78×** |
+| Qwen 3.5 9B | **1,920** | 1,428 | 1,919 | **1,970** | **122** | 71 | **1.71×** |
+
+The retired comparison harness remains available in git history; the table is
+historical evidence, not a currently runnable route.
+
+## Historical: other arches (decode tok/s)
+
+**Truth state:** historical
+Then-default configuration; not a cross-arch speed-gate matrix and not an
+admission of gfx12 product routes. No per-row binary/model hash manifest on
+this page.
+
+| Arch | Examples | 0.8B | 4B | 9B | 27B |
+|---|---|---:|---:|---:|---:|
+| RDNA2 (gfx1030) | V620 Pro, RX 6800 XT | 250 | — | 65 | 22 |
+| RDNA1 (gfx1010) | RX 5700 XT | 190 | 61 | 43 (HF4) | OOM |
+| APU (gfx1013) | BC-250 | 207 | 77 | 47 | OOM |
+| GCN5 (gfx906) | MI50 / MI60 | 231 | 61 | 59 | 21 |
+| MI300X (gfx942) | datacenter | 850 | 480 | 320 | 130 |
+
+Supporting dated notes (still fixture-bound):
+
+- MI300X is wave64 + MFMA — different kernel family from RDNA WMMA paths.
+- RDNA4 (gfx1200 / gfx1201) has gfx12-specific WMMA paths across fused GEMM,
+  attention, and MoE kernels; operations without a gfx12 sibling still fall
+  through typed dispatch tables. Presence of a kernel path ≠ Redline admission
+  and ≠ a row in [`admissions.yml`](admissions.yml).
+- gfx906 (Vega 20) prefill batch≥16 used the nwarps=4 dp4a MMQ kernel
+  (`docs/plans/gfx906-mmq-prd.md`). Decode batch=1 notes from the 2026-05-05
+  investigation
+  (`docs/perf-checkpoints/2026-05-05-gfx906-decode-investigation.md`): residual
+  GEMV software-pipelined ILP variant (+4.8% on 9B under that fixture) and fused
+  projections pre-quantizing x to Q8_1 with `v_dot4_i32_i8` (+9.3% on 9B).
+  Combined historical row: 50.7 → 58.9 tok/s (+16.2%) on Qwen 3.5 9B. Stock
+  llama.cpp Q4_K_M on the same hardware in that note: 61.55 tok/s; skyne98/iacopPBK
+  fork: 63.48.
+
+## Where new numbers go
+
+| Kind of result | Owner |
+|---|---|
+| How to measure | [`methodology/perf-benchmarking.md`](methodology/perf-benchmarking.md) |&self) -> usize;
+
+    /// Short stable identifier, e.g. `"qwen35"`. Matches the key used by
+    /// [`crate::reset_core`]'s inventory so the two cannot drift.
+    fn arch_key(&self) -> &'static str;
+
+    /// The model's KV cache, when it owns one directly.
+    ///
+    /// `None` is legitimate: some bundles keep the cache elsewhere, and callers
+    /// must treat absence as "not applicable", never as an error.
+    fn kv_cache_mut(&mut self) -> Option<&mut KvCache>;
+
+    /// Drop per-session state so the next turn starts clean — recurrent state,
+    /// conv rings, cache offsets. Position and conversation history are the
+    /// caller's concern, not the model's.
+    ///
+    /// Default is a no-op because a pure-attention model with no recurrent
+    /// state has nothing to reset, and forcing every implementor to write an
+    /// empty body would obscure the ones that genuinely do work here.
+    fn reset_session_state(&mut self, _gpu: &mut Gpu) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Whether a [`crate::session_cache::SessionCache`] is attached, i.e. the
+    /// model reports reusable prompt prefixes itself.
+    fn session_cache_attached(&self) -> bool {
+        false
+    }
+
+    /// Prompt tokens the next prefill on `route` can restore instead of
+    /// computing; 0 when nothing is cached.
+    fn session_plan(&self, _prompt: &[u32], _route: crate::session_cache::SessionRoute) -> usize {
+        0
+    }
+
+    /// Publish the snapshots the last prefill captured. Call once the turn's
+    /// output is committed to the client.
+    fn session_commit(&mut self) {}
+
+    /// Publish this turn's snapshots (as [`Self::session_commit`]) AND keep
+    /// the live state for a continuation whose prompt extends `consumed`, the
+    /// consumed host history (empty = none, e.g. after an unrepaired
+    /// terminal). A live continuation is session-exact (its state descends
+    /// from decode), not cold-exact. The default publishes only.
+    fn session_commit_live(&mut self, _consumed: &[u32]) {
+        self.session_commit()
+    }
+
+    /// Downcast hatch for the architecture composition root.
+    ///
+    /// `hipfire-generate` legitimately needs the concrete bundle to call a
+    /// per-architecture forward pass — that is what a composition root does.
+    /// This exists so it can keep doing that once `ModelState` is replaced by
+    /// `Box<dyn ArchModel>`.
+    ///
+    /// Crucially it borrows only the receiver, so a caller can hold the
+    /// downcast bundle and a disjoint `LoadedModel` field at the same time.
+    /// A whole-struct accessor cannot: that distinction is why the accessor
+    /// experiment converted 15 sites of 154 and this hatch is expected to do
+    /// better.
+
+
+    /// Return every GPU buffer this model owns.
+    ///
+    /// Consumes the box: unload is terminal, and taking `self` by value makes
+    /// use-after-free a compile error rather than a runtime one.
+    fn free_gpu(self: Box<Self>, gpu: &mut Gpu);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A bundle with no recurrent state and no directly-owned cache still
+    /// satisfies the contract without writing either method — that is the point
+    /// of the defaults, and a regression here would force boilerplate into
+    /// every pure-attention arch crate.
+    struct Minimal {
+        dim: usize,
+    }
+
+    impl ArchModel for Minimal {
+        fn dim(&self) -> usize {
+            self.dim
+        }
+        fn n_layers(&self) -> usize {
+            2
+        }
+        fn vocab_size(&self) -> usize {
+            32
+        }
+        fn arch_key(&self) -> &'static str {
+            "minimal"
+        }
+        fn kv_cache_mut(&mut self) -> Option<&mut KvCache> {
+            None
+        }
+        fn free_gpu(self: Box<Self>, _gpu: &mut Gpu) {}
+    }
+
+    #[test]
+    fn defaults_cover_a_stateless_arch() {
+        let m = Minimal { dim: 8 };
+        assert_eq!(m.dim(), 8);
+        assert_eq!(m.arch_key(), "minimal");
+    }
+
+    #[test]
+    fn trait_is_o
+| Bench-suite layout | [`methodology/bench-suite.md`](methodology/bench-suite.md) |
+| Immutable campaign checkpoints | [`perf-checkpoints/`](perf-checkpoints/) (new dated file; do not rewrite old bodies) |
+| Claim → validation route | [`VALIDATION.md`](VALIDATION.md) |
+| Product admission | [`admissions.yml`](admissions.yml) only (schema v2; exactly one earned record) |
+| Redline-attributed claims | [`REDLINE.md`](REDLINE.md) |
+| Speculation capability inventory | [`speculation-support-inventory.md`](speculation-support-inventory.md) (verify in source) |
+
+Do not paste mutable inventory matrices into this page. Do not promote a
+historical row by recency alone.
+
+
+=== docs/CHAT.md ===
+# Chat
+
+hipfire provides two native Rust chat surfaces:
+
+- `hipfire tui` (or bare `hipfire`) opens the full ratatui application and its
+  Chat tab.
+- `hipfire chat [model]` is a lightweight line-oriented multi-turn client for
+  terminals and scripts.
+
+Both use the native OpenAI-compatible service documented in
+[`SERVE.md`](SERVE.md).
+
+## Full terminal UI
+
+```bash
+hipfire
+# or
+hipfire tui
+```
+
+Open the Chat tab, select a downloaded model in Models, or use `/model <tag>`.
+The TUI supports streaming, multiline input (`Ctrl+O`), cancellation, saved
+sessions, model/system/sampling commands, regeneration/edit/copy actions, and
+live serve status. Run `/help` in Chat for the current command list.
+
+The TUI asks the native CLI to start a detached service when the configured
+endpoint is offline. Config, registry, model lifecycle, and HTTP calls all use
+the shared Rust crates; there is no separate script runtime.
+
+## Lightweight chat command
+
+```bash
+hipfire chat qwen3.6:35b-a3b-mq4r
+```
+
+```text
+you> Explain wave32 WMMA briefly.
+assistant> ...
+you> /clear
+you> /exit
+```
+
+Supported local commands are `/clear`, `/exit`, and `/quit`. Flags:
+
+| Flag | Purpose |
+|---|---|
+| `-t, --temp <f>` | Explicit temperature for this session |
+| `--top-p <f>` | Explicit nucleus probability |
+| `-n, --max-tokens <n>` | Per-turn generation cap |
+| `--system <text>` | Initial system message |
+| `--no-color` | Compatibility flag; the line client emits no ANSI color |
+
+If no healthy service exists, the command starts a tracked detached native
+service on the configured host/port with lazy model loading. That service
+remains available after the line client exits; use `hipfire stop` when you want
+to release it.
+
+## Resolution and request behavior
+
+- Model names use the same registry/alias/path resolver as `run` and `serve`.
+- The service resolves load-time KV/speculation/model overrides from
+  `config.toml`, `models.toml`, registry recommendations, and compatible env.
+- Explicit chat sampling flags are sent on every turn. Omitted sampling fields
+  follow the service's per-model/registry/daemon fallback contract.
+- The full `messages` array is sent each turn, so conversation context is
+  preserved by request content rather than hidden client state.
+- Streaming answer and reasoning deltas share the same Rust HTTP client used by
+  the TUI.
+
+## Thinking and model framing
+
+Reasoning models may emit a thinking stream before the answer. The HTTP API
+exposes it as `reasoning_content`; visible answer text remains `content`.
+
+Mode, semantic effort, and hard cap are **independent** — see
+[`CONFIG.md`](CONFIG.md) for keys/defaults and [`SERVE.md`](SERVE.md) for
+per-request HTTP fields (`reasoning_effort`, `enable_thinking`,
+`max_think_tokens`, legacy `thinking_budget`). Effort never maps to a token
+budget. Unsupported or cross-family values are dropped with a warning (server
+log + OpenAI `hipfire` response metadata), not silently reinterpreted.
+
+Chat framing and stop behavior are model-specific. Use the exact registry tag
+and do not assume Qwen `<think>` conventions apply to LFM, Gemma, Glimmer, or
+DeepSeek. The LFM framing smoke route is `scripts/serve_harness.py` with the
+exact `lfm2.5:*` tag; see [`VALIDATION.md`](VALIDATION.md).
+
+## Troubleshooting
+
+| Symptom | Action |
+|---|---|
+| Model not

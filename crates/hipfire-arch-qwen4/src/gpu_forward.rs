@@ -800,6 +800,7 @@ pub(crate) fn layer_desc<'a>(
                 layer_idx: layer.layer as u16,
                 norm_topk_prob: config.norm_topk_prob,
                 row_gather: None,
+                shared_down_out: None,
             })
         }
         _ => {
@@ -906,16 +907,21 @@ impl RoutedExpertWeights for Qwen4MoeLayerRuntime {
     }
 }
 
-/// Gather buffers one EP rank owns: parity `L % 2` over the trunk layers plus
-/// one for the MTP head, each `num_experts_per_tok * hidden` F32.
-pub const QWEN4_EP_GATHER_BUFFERS: usize = 3;
+/// Gather buffers one EP rank owns: parity `L % 2` over the trunk layers and
+/// parity `2 + j % 2` for the MTP head, each `QWEN4_EP_GATHER_MAX_ROWS *
+/// num_experts_per_tok * hidden` F32.
+pub const QWEN4_EP_GATHER_BUFFERS: usize = 4;
+
+/// Most rows a few-row forward (verify / replay / takeover) may carry through
+/// the EP table + row gather; larger chunks run the full (P2P) table.
+pub const QWEN4_EP_GATHER_MAX_ROWS: usize = 8;
 
 /// Which EP gather buffer a MoE invocation uses: trunk layer `L` uses
 /// `L % 2`; the MTP head (a layer index at or past the trunk layer count)
-/// uses buffer 2.
+/// uses `2 + (layer_idx - trunk_layers) % 2`.
 pub(crate) fn qwen4_ep_buffer_index(layer_idx: usize, trunk_layers: usize) -> usize {
     if layer_idx >= trunk_layers {
-        2
+        2 + (layer_idx - trunk_layers) % 2
     } else {
         layer_idx % 2
     }
@@ -1282,6 +1288,15 @@ impl Qwen4EpDummyExpert {
     }
 }
 
+/// The forward's row gather and gather buffers, lent to the rank's MTP head
+/// for one call (buffers `2 + j % 2` carry the head's MoE rows, see
+/// [`qwen4_ep_buffer_index`]).
+#[derive(Clone, Copy)]
+pub(crate) struct MtpEpGather<'a> {
+    pub(crate) hook: &'a (dyn MoeRowGather + Send + Sync),
+    pub(crate) buffers: [&'a GpuTensor; QWEN4_EP_GATHER_BUFFERS],
+}
+
 /// Expert-parallel state of one rank's forward (present iff the bundle's
 /// weights carry an EP placement).
 struct Qwen4ForwardEp {
@@ -1292,7 +1307,7 @@ struct Qwen4ForwardEp {
     moe_full: Vec<Qwen4MoeLayerRuntime>,
     /// Expanded-row exchange buffers, see [`qwen4_ep_buffer_index`].
     buffers: [GpuTensor; QWEN4_EP_GATHER_BUFFERS],
-    /// Row gather the one-row forwards install, once attached.
+    /// Row gather the one-row and few-row forwards install, once attached.
     gather: Option<Arc<dyn MoeRowGather + Send + Sync>>,
 }
 
@@ -1303,9 +1318,9 @@ impl Qwen4ForwardEp {
         placement: Qwen4EpPlacement,
     ) -> Result<Self, Qwen4GpuForwardError> {
         validate_ep_placement(placement, config.num_experts)?;
-        let elements = config
-            .num_experts_per_tok
-            .checked_mul(config.hidden_size)
+        let elements = QWEN4_EP_GATHER_MAX_ROWS
+            .checked_mul(config.num_experts_per_tok)
+            .and_then(|slots| slots.checked_mul(config.hidden_size))
             .ok_or_else(|| invalid("EP gather buffer size overflows"))?;
         let dummy = Qwen4EpDummyExpert::new(gpu, config)?;
         let mut buffers = Vec::with_capacity(QWEN4_EP_GATHER_BUFFERS);
@@ -2253,6 +2268,7 @@ pub(crate) fn seal_moe_decode<'a>(
     input: &'a GpuTensor,
     output: &'a GpuTensor,
     scratch: Qwen4MoeScratch<'a>,
+    row_gather: Option<&'a dyn MoeRowGather>,
 ) -> Result<SealedMoeCall<'a>, Qwen4GpuForwardError> {
     let dtypes = MoeDtypes {
         router: runtime.router.dtype,
@@ -2304,6 +2320,7 @@ pub(crate) fn seal_moe_decode<'a>(
         norm_topk_prob: config.norm_topk_prob,
         x_rot_prerotated: false,
         defer_routed_combine: false,
+        cpu_deferred_experts: false,
         ep_mode: MoeEpMode::None,
         layer_idx: layer_index as u16,
         x_norm: input,
@@ -2340,7 +2357,7 @@ pub(crate) fn seal_moe_decode<'a>(
         topk_indices: scratch.topk_indices,
         topk_weights: scratch.topk_weights,
         down_expanded: scratch.down_expanded,
-        ep_row_gather: None,
+        ep_row_gather: row_gather,
     };
     let bound = BoundMoeExperts::from_cache(&runtime.table, &runtime.cache)
         .map_err(|error| Qwen4GpuForwardError::Dispatch(format!("bound MoE experts: {error:?}")))?;
@@ -3766,16 +3783,32 @@ impl Qwen4GpuForward {
 
     /// The expanded-row gather buffers, indexed by [`qwen4_ep_buffer_index`].
     pub(crate) fn ep_gather_buffers(&self) -> Option<[&GpuTensor; QWEN4_EP_GATHER_BUFFERS]> {
-        self.ep.as_ref().map(|ep| {
-            let [first, second, third] = &ep.buffers;
-            [first, second, third]
+        self.ep
+            .as_ref()
+            .map(|ep| std::array::from_fn(|index| &ep.buffers[index]))
+    }
+
+    /// This rank's EP binding for a head MoE runtime: its placement and the
+    /// zero dummy expert (`None` on the single-device route).
+    pub(crate) fn ep_binding(&self) -> Option<(Qwen4EpPlacement, &Qwen4EpDummyExpert)> {
+        self.ep.as_ref().map(|ep| (ep.placement, &ep.dummy))
+    }
+
+    /// What an EP rank's MTP head borrows from this forward at call time: the
+    /// row gather and the gather buffers (`None` outside EP or before
+    /// `attach_ep`).
+    pub(crate) fn mtp_ep_gather(&self) -> Option<MtpEpGather<'_>> {
+        let ep = self.ep.as_ref()?;
+        Some(MtpEpGather {
+            hook: ep.gather.as_deref()?,
+            buffers: std::array::from_fn(|index| &ep.buffers[index]),
         })
     }
 
     /// After every rank is loaded and P2P is enabled on every rank: build this
     /// rank's full (P2P) chunk tables from all ranks' sources
     /// (`peers[rank][moe_layer]`), take the symmetric-IU4 verdict a single
-    /// device takes at construction, and install the row gather the one-row
+    /// device takes at construction, and install the row gather the one-row and few-row
     /// forwards use.
     pub(crate) fn attach_ep(
         &mut self,
@@ -4664,10 +4697,15 @@ impl Qwen4GpuForward {
         // invariant prefill profile is on); launch extents keep `n`.
         let route_n = gpu.route_rows(n);
         // Expert parallelism picks the MoE table per forward by routing row
-        // count, identically on every rank: one row runs the rank's decode
-        // table with the row gather installed and a parity gather buffer as
-        // the expanded-row scratch; chunks run the full (P2P) table, no gather.
+        // count, identically on every rank: one row, or a few-row forward
+        // (`2..=QWEN4_EP_GATHER_MAX_ROWS` rows that are also the routing rows:
+        // verify / replay / takeover), runs the rank's decode table with the
+        // row gather installed and a parity gather buffer as the expanded-row
+        // scratch; larger chunks run the full (P2P) table, no gather.
         let ep = self.ep.as_ref();
+        let ep_few_rows = ep.is_some()
+            && (2..=QWEN4_EP_GATHER_MAX_ROWS).contains(&route_n)
+            && route_n == n;
         if let Some(ep) = ep {
             if route_n == 1 {
                 if n != 1 {
@@ -4678,17 +4716,24 @@ impl Qwen4GpuForward {
                         "EP decode forward before attach_ep: the row gather is not installed",
                     ));
                 }
+            } else if ep_few_rows {
+                if ep.gather.is_none() {
+                    return Err(invalid(
+                        "EP few-row forward before attach_ep: the row gather is not installed",
+                    ));
+                }
             } else if ep.moe_full.len() != self.moe.len() {
                 return Err(invalid(
                     "EP chunk forward before attach_ep: the full expert tables are not built",
                 ));
             }
         }
+        let ep_gathered = route_n == 1 || ep_few_rows;
         let ep_gather: Option<&dyn MoeRowGather> = ep
-            .filter(|_| route_n == 1)
+            .filter(|_| ep_gathered)
             .and_then(|ep| ep.gather.as_deref().map(|gather| gather as &dyn MoeRowGather));
         let ep_scratches: Option<[Qwen4LayerScratch<'_>; QWEN4_EP_GATHER_BUFFERS]> =
-            ep.filter(|_| route_n == 1).map(|ep| {
+            ep.filter(|_| ep_gathered).map(|ep| {
                 std::array::from_fn(|parity| Qwen4LayerScratch {
                     moe_down_expanded: &ep.buffers[parity],
                     ..layer_scratch(&self.scratch, &router_logits)
@@ -4785,7 +4830,7 @@ impl Qwen4GpuForward {
             }
 
             let layer_moe = match ep {
-                Some(ep) if route_n > 1 => ep.moe_full.get(layer_index),
+                Some(ep) if route_n > 1 && !ep_few_rows => ep.moe_full.get(layer_index),
                 _ => self.moe.get(layer_index),
             };
             let mut description = layer_desc(
@@ -4801,6 +4846,11 @@ impl Qwen4GpuForward {
                 (ep_gather, &mut description.ffn)
             {
                 binding.row_gather = Some(gather);
+                if ep_few_rows {
+                    // The gather buffer is the combine's `down_expanded`; the
+                    // unfused shared down writes the ordinary scratch.
+                    binding.shared_down_out = Some(&self.scratch.moe_down_expanded);
+                }
             }
             let attn_read = &description.attn_hyper.read;
             if steps.len() >= QWEN4_STEP_INLINE_CAPACITY {
@@ -5260,7 +5310,7 @@ impl Qwen4GpuForward {
                     gpu.hip.event_synchronize(&readback.event)?;
                     let mut bytes = [0u8; 4];
                     gpu.hip
-                        .memcpy_dtoh_async(&mut bytes, &token_ids.buf, &readback.stream)?;
+                        .memcpy_dtoh_async(&mut bytes, &token_ids.buf, Some(&readback.stream))?;
                     gpu.hip.stream_synchronize(&readback.stream)?;
                     let token = i32::from_ne_bytes(bytes) as u32;
                     if token as usize >= vocab {
@@ -5902,7 +5952,7 @@ mod ep_table_tests {
     use super::{
         qwen4_ep_buffer_index, qwen4_expert_table_entries, Qwen4EpPlacement, Qwen4ExpertEntry,
         Qwen4ExpertOrigin, Qwen4ExpertTableLayout, Qwen4GpuForwardError, Qwen4PeerExpertSource,
-        QWEN4_EP_GATHER_BUFFERS,
+        QWEN4_EP_GATHER_BUFFERS, QWEN4_EP_GATHER_MAX_ROWS,
     };
 
     const EXPERTS: usize = 512;
@@ -5943,13 +5993,16 @@ mod ep_table_tests {
 
     #[test]
     fn gather_buffer_index_alternates_over_the_trunk_and_isolates_the_mtp_head() {
-        assert_eq!(QWEN4_EP_GATHER_BUFFERS, 3);
+        assert_eq!(QWEN4_EP_GATHER_BUFFERS, 4);
+        assert_eq!(QWEN4_EP_GATHER_MAX_ROWS, 8);
         assert_eq!(qwen4_ep_buffer_index(0, 48), 0);
         assert_eq!(qwen4_ep_buffer_index(1, 48), 1);
         assert_eq!(qwen4_ep_buffer_index(2, 48), 0);
         assert_eq!(qwen4_ep_buffer_index(47, 48), 1);
         assert_eq!(qwen4_ep_buffer_index(48, 48), 2);
-        assert_eq!(qwen4_ep_buffer_index(1000, 48), 2);
+        assert_eq!(qwen4_ep_buffer_index(49, 48), 3);
+        assert_eq!(qwen4_ep_buffer_index(50, 48), 2);
+        assert_eq!(qwen4_ep_buffer_index(1001, 48), 3);
     }
 
     #[test]

@@ -1448,6 +1448,11 @@ fn run_deltanet_moe_layer_slots<D>(
 where
     D: std::ops::Index<usize, Output = DeltaNetState> + ?Sized,
 {
+    // Layer span (opt-in trace only): attention half vs MoE FFN body. Host
+    // wall around work this layer already runs; no new sync, no order change.
+    let trace_on = hipfire_dispatch::moe_trace_enabled();
+    let t_layer = trace_on.then(std::time::Instant::now);
+    let t_attn = trace_on.then(std::time::Instant::now);
     let attn_dtype = require_batchable_deltanet_moe_layer(layer)?;
     require_batchable_moe_ffn(gpu, &layer.ffn)?;
 
@@ -1731,8 +1736,12 @@ where
     // w_down) block — stateless per row, no slot machinery needed. Takes
     // pbs.x_batch as input and accumulates the FFN output residual back
     // into it (same contract as the reference's own call site).
+    let (attn_ns, t_moe) = match (&t_attn, trace_on) {
+        (Some(t), true) => (t.elapsed().as_nanos() as u64, Some(std::time::Instant::now())),
+        _ => (0, None),
+    };
     let ctx = DispatchCtx::new(gpu);
-    prefill_moe_ffn_body_batched(
+    let moe_result = prefill_moe_ffn_body_batched(
         gpu,
         &layer.ffn,
         &layer.ffn_norm,
@@ -1742,7 +1751,22 @@ where
         &ctx,
         weights_moe_has_mq6,
         /*routed_out=*/ None,
-    )
+    );
+    if trace_on {
+        let moe_ns = t_moe.map(|t| t.elapsed().as_nanos() as u64).unwrap_or(0);
+        let total_ns = t_layer.map(|t| t.elapsed().as_nanos() as u64).unwrap_or(0);
+        hipfire_dispatch::moe_layer_trace(
+            layer.ffn.layer_idx as usize,
+            false,
+            hipfire_dispatch::MoeLayerTiming {
+                total_ns,
+                attn_ns,
+                moe_ns,
+                rows: n,
+            },
+        );
+    }
+    moe_result
 }
 
 /// Mirrors the `flash_optin && wmma_ok` gate that
@@ -2694,6 +2718,11 @@ fn run_fullattn_moe_layer_slots(
     weights_moe_has_mq6: bool,
     use_mrope: bool,
 ) -> HipResult<()> {
+    // Layer span (opt-in trace only): attention half vs MoE FFN body. Host
+    // wall around work this layer already runs; no new sync, no order change.
+    let trace_on = hipfire_dispatch::moe_trace_enabled();
+    let t_layer = trace_on.then(std::time::Instant::now);
+    let t_attn = trace_on.then(std::time::Instant::now);
     let attn_dtype = require_batchable_fullattn_moe_layer(layer)?;
     require_batchable_moe_ffn(gpu, &layer.ffn)?;
 
@@ -2906,8 +2935,12 @@ fn run_fullattn_moe_layer_slots(
     }
 
     // 10. Batched MoE FFN — stateless per row, no slot machinery needed.
+    let (attn_ns, t_moe) = match (&t_attn, trace_on) {
+        (Some(t), true) => (t.elapsed().as_nanos() as u64, Some(std::time::Instant::now())),
+        _ => (0, None),
+    };
     let ctx = DispatchCtx::new(gpu);
-    prefill_moe_ffn_body_batched(
+    let moe_result = prefill_moe_ffn_body_batched(
         gpu,
         &layer.ffn,
         &layer.ffn_norm,
@@ -2917,7 +2950,22 @@ fn run_fullattn_moe_layer_slots(
         &ctx,
         weights_moe_has_mq6,
         /*routed_out=*/ None,
-    )
+    );
+    if trace_on {
+        let moe_ns = t_moe.map(|t| t.elapsed().as_nanos() as u64).unwrap_or(0);
+        let total_ns = t_layer.map(|t| t.elapsed().as_nanos() as u64).unwrap_or(0);
+        hipfire_dispatch::moe_layer_trace(
+            layer.ffn.layer_idx as usize,
+            true,
+            hipfire_dispatch::MoeLayerTiming {
+                total_ns,
+                attn_ns,
+                moe_ns,
+                rows: n,
+            },
+        );
+    }
+    moe_result
 }
 
 /// Final output norm + per-slot last-token logits. Gathers only the last
@@ -3413,7 +3461,7 @@ pub fn forward_batch_slots_graphed_opts(
     // The captured step includes the per-slot lm_head `Step::Gemv`, so a spilled
     // model routes it to the CPU (a host sync point) and the graph must not be
     // used — same rule as the dense AR graph in `qwen35/forward.rs`.
-    if hipfire_dispatch::cpu_offload_active(config.i_gpu_start) {
+    if gpu.owns_host_cpu_weights() {
         hipfire_dispatch::log_capture_disabled_once();
         return forward_batch_slots_opts(
             gpu,

@@ -1616,11 +1616,14 @@ impl Qwen4State {
                 .map(|byte| format!("{byte:02x}"))
                 .collect())
         };
+        // A whole tensor: its logical extent (`numel * dtype`), not the
+        // allocation, which a pooled allocator may round up with stale tail
+        // bytes no kernel reads.
         let device = |rows: &mut Vec<(String, String)>,
                           name: String,
                           tensor: &GpuTensor|
          -> Result<(), StateError> {
-            let bytes = tensor.buf.size();
+            let bytes = tensor.byte_size().min(tensor.buf.size());
             let hex = hash_prefix(tensor, bytes)?;
             rows.push((name, format!("{hex} bytes={bytes}")));
             Ok(())

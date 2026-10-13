@@ -287,6 +287,30 @@ PCIe link (27.1 GB/s measured, §7) instead of device DRAM: this is llama.cpp's
   `out` scratch). `weight_gemv_swiglu_residual` — the one op family that fuses a
   GEMV into a kernel the seam cannot see — splits itself: GPU `silu_mul_f32`,
   then the CPU GEMV plus residual.
+- **Async CPU return.** Dense outputs and routed-expert residuals return with
+  `hipMemcpyAsync` from reusable, owned pinned transfer storage on the active
+  GPU stream (default stream when none is active). Dense GEMV writes directly
+  into that storage; no temporary-vector upload or extra output staging copy.
+  The next same-stream D2H batch is enqueued through raw owned extents before
+  exposing host slices. Its existing completion barrier retires the previous
+  upload and makes CPU reuse safe. Normal returns add no host wait or event.
+  Allocation growth, stream/device changes, and teardown retire pending access;
+  a failed drain retains the allocation rather than freeing a live DMA source.
+  Host readback or another GPU stream still needs an explicit dependency.
+  `h2d` timing now measures enqueue API wall time, not DMA completion; judge
+  gains using timing-disabled throughput, not the shorter splice trace alone.
+- **Native MTP with CPU-deferred experts.** Qwen3.5-family MTP is available.
+  Narrow verify and accepted-prefix rollback retain the existing `<=4`-row CPU splice;
+  wider forwards retain the GPU grouped PCIe read. At the CPU-deferred expert
+  handoff, invalidate pointer-keyed FP16 staging before the next layer reuses
+  activation scratch; the omitted GPU routed tail no longer changes that cache
+  key. Shared GPU launchers, kernel arithmetic, CPU accumulation order, Rayon
+  scheduling and placement/dispatch rules are unchanged.
+  Single-token forwards automatically select the CPU-splice-capable executor
+  from the loaded model's `owns_host_cpu_weights` flag, including MTP forced
+  advances, terminal pending-seed flushes and single-row rollback replay.
+  No `HIPFIRE_FORWARD_LOWERED=0` workaround is needed. Device-resident and
+  `pcie`-spilled models keep the lowered route; its CPU-host-read refusal remains.
 - **Two launcher properties the CPU path must reproduce exactly**, both of which
   fail *silently* rather than erroring, and both now pinned by parity arms in
   `crates/hipfire-arch-qwen35/tests/gpu_gemv_parity.rs`: the per-channel **AWQ**
@@ -310,10 +334,11 @@ PCIe link (27.1 GB/s measured, §7) instead of device DRAM: this is llama.cpp's
   omit the CPU-executed steps, and would replay stale activations (§6.7).
 - **Coverage.** Every dense-decode projection of both layer types routes through
   the seam — DeltaNet `in_proj_qkv/z/a/b` and `out_proj`, FullAttn `q/k/v/o`,
-  FFN `gate/up/down` — 7 distinct shapes on the 2B. Formats: **28**, i.e. every
+  FFN `gate/up/down` — 7 distinct shapes on the 2B. Formats: **29**, i.e. every
   dense-capable entry in `docs/quant-formats/qt-register.txt` — qt 1/2/3/16
   element and Q8 blocks, qt 6/7/8/9/10/11/12 HFQ, qt 13/15/17/18/31 flat MQ,
-  qt 19/20/30/51 Lloyd codebooks, qt 40/41 Bonsai ternary/binary, qt 44/45/47/48/49/50
+  qt 19/20/30/51 Lloyd codebooks, qt 34 `MFP4G32E8` (16 B row header + eight 17 B
+  blocks/256, `mfp4g32_e8_row_dot`), qt 40/41 Bonsai ternary/binary, qt 44/45/47/48/49/50
   Magnum V2 + MQ4C. Each is pinned by
   `crates/hipfire-arch-qwen35/tests/gpu_gemv_parity.rs` in **both** arms of the
   rotation contract — `Raw` (both sides rotate once) and `Prerotated` (neither
@@ -327,8 +352,9 @@ PCIe link (27.1 GB/s measured, §7) instead of device DRAM: this is llama.cpp's
   parity test reports rather than silently comparing nothing.
   The exclusions are structural: qt 5 `Q8HFQ` (rows padded to a 128-byte stride),
   qt 14 `MQ8G256` (`RotationPlan::Mq8Internal`: int8-quantized activations),
-  qt 21/24/32-37 HFP4/MFP4(+Lloyd/P/E8) (per-row 16 B header + per-32 block
-  scales/codewords, and an arch-owned upload path), qt 28/29 PARO (Givens
+  qt 21/24/32/33/35/36/37 HFP4/MFP4(+Lloyd/P) (per-row 16 B header + per-32 block
+  scales/codewords, and an arch-owned upload path — qt 34 `MFP4G32E8` is covered
+  above), qt 28/29 PARO (Givens
   rotation on the activation), qt 0/4 GGUF-side formats, and qt 38/39 GL +
   qt 22 `TidI32` (MoE-indexed only, no dense GEMV kernel exists / not a weight).
   Each stays on the GPU over PCIe and is *named* by the load-time line
@@ -338,13 +364,21 @@ PCIe link (27.1 GB/s measured, §7) instead of device DRAM: this is llama.cpp's
   shape's own mean D2H/GEMV/H2D) plus the running counters, whose second number
   ("host-mapped steps still on GPU") must be 0 for a fully covered model — a
   fused launch the guard missed or a call site that bypasses `execute_steps`
-  shows up there instead of as a mystery. The `calls=` field on the line is what
+  shows up there instead of as a mystery. The routed-expert splice line adds
+  coarse `setup` (expert resolve), `middle` (whole SiLU+FWHT loop), `combine`
+  (whole weighted-combine loop), and `total` (splice wall excluding the trace
+  print) means. Per-phase sums reconcile within a splice, but per-quant
+  attribution does not: `quant` is the first selected expert's gate_up format
+  only, `graded=true` collapses gate_up-mixed, down-mixed, and gate_up≠down
+  mixes into one flag, the down quant is never printed, and no worker count is
+  printed. The `calls=` field on the line is what
   makes the number quotable: a shape's first line is its cold first step.
 - **Not covered, deliberately.** The slots/serve body (`forward_batch_slots` →
   `dense_ffn_body_slots`) and prefill run batched GEMM kernels that never enter
   `execute_steps`, so their spilled weights are still read over PCIe; the seam
   covers their per-slot lm_head `Step::Gemv` only. The lm_head itself can never
   be host-mapped — it is part of `largest_fitting_tail`'s always-resident base.
+  **One path that used to fall in this gap is now covered:** on a `memory.moe_expert_budget` spill the AR single-token decode and any `<=4`-row batched forward route their routed experts through the CPU splice (`crates/hipfire-cpu`) instead of the GPU grouped PCIe read, while wider prompt prefill and wider (>4-row) verify keep the real expert pointer tables on the card and run the GPU grouped read. The gate is width-only — `n <= 4`, irrespective of dispatch workload — so the `SpeculativeVerify` narrow verify and the `Standard` tape-disabled accepted-prefix rollback replay both take it, and so does an ordinary very short `<=4`-row prompt prefill. On this route the sealed GPU program keeps only the router, the shared expert and the residual base: the routed GPU FFN is omitted, so no GPU expert pointer (sink, dummy or twin) is bound, and every routed FFN comes from the real host-mapped packed bytes. The splice preserves each format's accumulation order, reuses one f32 partial sum across k-tiles for qt 13/15 (flat MQ), and makes no per-call warm allocation and no activation quantization. Graded (mixed-dtype) packed host experts are supported here — no-AWQ only, per tier, each expert's gate and down decoded in its own dtype with a checked bucket-owner offset; AWQ and unpackable/unsupported host formats stay refused. Native MTP is opt-in on this CPU-deferred route, as on any host-mapped expert spill: `auto` declines it and decodes AR, while an explicit `speculation.mtp=on` / `--spec mtp` (or `dflash_mode=on` on an MTP-only tier) attaches the head, whose narrow verify and accepted-prefix rollback reuse the same `<=4`-row CPU splice. The opt-in `HIPFIRE_MOE_CPU_ORACLE` and `HIPFIRE_MOE_EXPERT_STATS` diagnostics are refused with CPU-deferred experts, because the omitted routed GPU FFN leaves `down_expanded` unwritten; they fail closed rather than read stale bytes.
 - **Numerical contract.** llama.cpp-level, not bit-identity (the same record's
   "Correctness gate"): the two engines are independent implementations with
   different accumulation orders. Acceptance is coherence plus task-correct output

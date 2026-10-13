@@ -1,0 +1,15 @@
+[
+ {
+  "name": "ttft-p16k",
+  "prompt_path": "halofn/p16k.txt",
+  "max_tokens": 8,
+  "thinking_enabled": false,
+  "temperature": 0,
+  "request_extra": {
+   "stream": true,
+   "stream_options": {
+    "include_usage": true
+   }
+  }
+ }
+]

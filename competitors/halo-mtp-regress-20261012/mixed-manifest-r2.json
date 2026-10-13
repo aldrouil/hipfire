@@ -1,0 +1,7 @@
+[
+ {"name":"high-go-http","prompt_path":"/home/kaden/pm-wave/halo-mtp-regress/prompts/high-go-http.txt"},
+ {"name":"halofn-9k","prompt_path":"/home/kaden/pm-wave/halofn/p8k.txt"},
+ {"name":"high-java-redblack","prompt_path":"/home/kaden/pm-wave/halo-mtp-regress/prompts/high-java-redblack.txt"},
+ {"name":"halofn-short","prompt_path":"/home/kaden/pm-wave/halofn/short.txt"},
+ {"name":"high-rust-parser","prompt_path":"/home/kaden/pm-wave/halo-mtp-regress/prompts/high-rust-parser.txt"}
+]

@@ -1,0 +1,4 @@
+[
+ {"name": "bare_factual", "prompt_path": "/home/kaden/pm-wave/halo-mtp-regress/prompts/bare_factual.txt"},
+ {"name": "humaneval_3_below_zero", "prompt_path": "/home/kaden/pm-wave/halo-mtp-regress/prompts/humaneval_3_below_zero.txt", "max_tokens": 256, "thinking_enabled": false}
+]

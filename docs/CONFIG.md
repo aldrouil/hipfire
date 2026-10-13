@@ -94,7 +94,7 @@ Stable/default-on and safety controls:
 | Key | Default | Purpose |
 |---|---:|---|
 | `hardware.allow_mixed_arch` | `false` | Permit heterogeneous multi-GPU topology. |
-| `topology.ep` | `1` | Qwen4 (Flash-Next) expert-parallel degree on gfx1201: `1`, `2` or `4` cards (routed experts shard `e % N`; every card runs the unchanged single-device program; opt-in, ep > 1 refuses MTP/speculation/lanes/PFlash). `HIPFIRE_QWEN4_EP=0` forces `1`. |
+| `topology.ep` | `1` | Qwen4 (Flash-Next) expert-parallel degree on gfx1201: `1`, `2` or `4` cards (routed experts shard `e % N`; every card runs the unchanged single-device program; opt-in). EP admits native MTP only when asked for explicitly (`--spec mtp` / `speculation.mtp = "on"`; `auto` stays AR; the drafter is replicated on every card and greedy output equals single-card MTP); ep > 1 still refuses DFlash/DSpark/n-gram drafting/DDTree/lanes/PFlash and `HIPFIRE_MTP_SAMPLED_MODE=naive`. `HIPFIRE_QWEN4_EP=0` forces `1`. |
 | `hardware.tp_use_rccl` | `true` | RCCL tensor-parallel all-reduce. |
 | `kernel.prefill_batched` | `true` | Batched prefill kernels. |
 | `speculation.draft_f16` | `true` | FP16 DFlash draft activations. |
@@ -550,7 +550,7 @@ Only **one** mechanism runs. Canonical selector:
 
 - **`off`** — AR only.
 - **`auto`** — cascade by availability / eligibility; legacy mode knobs filter each mechanism. Under auto, DSpark can win over in-trunk MTP when a DSpark sidecar is present (CLI comments).
-- Forced mechanism names bypass heuristics; missing prerequisites fall back to AR with a warning.
+- **Forced mechanism names bypass heuristics; missing prerequisites fall back to AR with a warning.** `--spec dflash` / `speculation.mode=dflash` forces `dflash_mode=on`, which is still resolved against the model's declared drafter rather than DFlash alone: an entry with no DFlash draft but an MTP head arms that head (see the `dflash_mode` row below), so the TUI "Spec decode" row enables spec decode on an MTP-only MoE tier instead of refusing the load. `--spec mtp` / `speculation.mode=mtp` is the explicit `mtp_mode=on` spelling of the same request, and is what a host-spilled MoE needs either way.
 
 Legacy one-shot alias: `HIPFIRE_SPECULATION`. CLI: `--spec`.
 
@@ -558,12 +558,12 @@ Legacy one-shot alias: `HIPFIRE_SPECULATION`. CLI: `--spec`.
 
 | Key | Default | Values / range | Notes |
 |---|---|---|---|
-| `dflash_mode` | `"off"` | `on` \| `off` \| `auto` | **Schema default off; one registry-scoped exception.** `auto` enables on dense Qwen3.5-class targets and skips known-loss A3B cases. The registry layer (below the global / per-model / one-shot config, above the schema default) lowers `speculation.dflash = "auto"` for the Qwen3.8-27B trunk tiers that declare a paired `dflash` draft (`qwen3.8:27b`, `qwen3.8:27b-mq3*`, `qwen3.8:27b-mq4*`; not the `-draft-*` sidecar tags, not tiers without a `dflash` declaration). See [Qwen3.8-27B paired DFlash default](#qwen38-27b-paired-dflash-default). |
+| `dflash_mode` | `"off"` | `on` \| `off` \| `auto` | **Schema default off; one registry-scoped exception.** `auto` enables on dense Qwen3.5-class targets and skips known-loss A3B cases. The registry layer (below the global / per-model / one-shot config, above the schema default) lowers `speculation.dflash = "auto"` for the Qwen3.8-27B trunk tiers that declare a paired `dflash` draft (`qwen3.8:27b`, `qwen3.8:27b-mq3*`, `qwen3.8:27b-mq4*`; not the `-draft-*` sidecar tags, not tiers without a `dflash` declaration). See [Qwen3.8-27B paired DFlash default](#qwen38-27b-paired-dflash-default). The spec-decode knob resolves to the drafter the model attaches: a declared DFlash draft, else its MTP head (the registry `mtp` slot or the `<trunk>.mtp` sibling). `on` then arms that head explicitly (`mtp_mode=on`) — `auto` alone would decline it on any host-mapped expert spill (either `offload_exec` seam), so an offloaded MTP-only tier such as `qwen3.6:35b-a3b-mq4p` could otherwise spec nothing while claiming the head. `on` still fails closed for a declared DFlash draft that is not pulled, for a model with no drafter at all, and when `speculation.mtp=off` leaves MTP as no mechanism. |
 | `vision_mode` | `"off"` | `on` \| `off` \| `auto` | **Default off.** Tower sidecar gate — see [Vision tower](#vision-tower). |
 | `dflash_adaptive_b` | `false` | bool | **Opt-in.** Adaptive verify-block width: follows the trailing 8-cycle acceptance depth (τ̂+2), full below 2k context. Not output-identical (window boundaries move; per-position sampling stays target-lossless). Auto-suppressed on retained-PM4 verify loads. `HIPFIRE_DFLASH_ADAPTIVE_B=0` is a kill switch read through the `[developer]` namespace (not a schema env alias): it forces the fixed block even when this is `true`, and cannot enable adaptive. |
 | `dflash_block` | `"auto"` | `"auto"` \| int 4–16 | DFlash2 proposal width L (`speculation.dflash_block`, env `HIPFIRE_DFLASH_BLOCK`). Chosen **per serving configuration, never per live batch**: every request of a load (singleton or batched VMM lane) runs the same L, so batched output stays byte-identical to the singleton and text never depends on server load. **Default `auto`** = 8 when `serve.vmm_batch` is on with `continuous_batch_size` ≥ 4 (a full C8 verify step stays at 64 rows instead of 128), else 16. Measured on Qwen3.8-27B + DFlash2 on one R9700: C4 +20 %, C8 +27 %, BetterBench T0.7 C8 +17 %; a lone request on such a batching serve runs about 6 % slower than at 16; task scores tied (HumanEval 157 = 157, GSM8K 5-shot 1,282 vs 1,280, MMLU-Pro 871 = 871). `16` (or `HIPFIRE_DFLASH_BLOCK=16`) restores the previous fixed width. Greedy text depends on L (different window boundaries). Legacy DFlash drafts always run their declared width. Retained-PM4 verify and dense TP2 need 16. The experimental multi-slot route admits only 16 (`auto` resolves to 16 there). |
 | `dflash_ngram_block` | `"auto"` | `true` \| `false` \| `"auto"` | Verify-path n-gram defense; auto size-gates. |
-| `mtp_mode` | `"auto"` | `off` \| `on` \| `auto` | Built-in MTP when a head is present: the DeepSeek V4 trunk's MTP layer, or for Qwen a bundled `.mq4-mtp` trailer or a `.mtp` sidecar (the registry `mtp` slot; Qwen3.8-27B ships one — [MODELS.md](MODELS.md#dflash-draft-artifacts-registry)). `auto` uses a present head; `on` fails the load without one. |
+| `mtp_mode` | `"auto"` | `off` \| `on` \| `auto` | Built-in MTP when a head is present: the DeepSeek V4 trunk's MTP layer, or for Qwen a bundled `.mq4-mtp` trailer or a `.mtp` sidecar (the registry `mtp` slot; Qwen3.8-27B ships one — [MODELS.md](MODELS.md#dflash-draft-artifacts-registry)). `auto` uses a present head; `on` fails the load without one. On qwen3.5-class MoE, `auto` declines native MTP once routed experts are host-mapped, on **either** seam (`memory.offload_exec=pcie` or `cpu`), and prints one line naming the count, the seam and `opt in with --spec mtp`; `on` (or `--spec mtp`) overrides. The decline belongs to the placement, not the seam: a head that is unverified where its verify actually runs has produced garbled windows (`qwen3.6-35b-a3b.mq6`, 2026-10-12: mtp windows at tau 0.04-0.13 while its single-row AR decodes coherently), and the CPU-seam cells measured 2026-10-11 on `qwen3.6-35b-a3b.mq4p`/gfx1201 (MTP 8/8 vs AR, +28–44%; [perf checkpoint](perf-checkpoints/2026-10-11-cpu-mtp-extended-16cell-narrow.md)) stay reachable by opting in. |
 | `mtp_k` | `"auto"` | `"auto"` \| int 1–10 | MTP draft cap (`speculation.mtp_k`, env `HIPFIRE_MTP_K`). **Default `auto`** = 4 for native Qwen4 MTP (Flash-Next, arch 16) on gfx1151, else 3. An explicit 1–10 overrides on every model; `3` restores the previous gfx1151 cap. |
 | `mtp_sampled` | `true` | bool | Default true. Native Qwen4 MTP uses distribution-preserving speculative rejection sampling for temperature >0, including supported repeat/presence/frequency penalties: target verification and draft probabilities use the same AR history, penalty window and sampling policy. False/`HIPFIRE_MTP_SAMPLED=0` leaves sampled requests on AR; greedy MTP is unchanged. This is distribution preservation, not identical seeded sampled token streams. DFlash/other drafters without this policy still fall back to AR for unsupported penalty requests. |
 | `mtp_ngram` | `"auto"` | `on` \| `off` \| `auto` (also `1` / `0`) | **Default `auto` (0.4.1).** N-gram takeover windows inside native MTP (ngram-mod). `auto` arms native Qwen4 MTP (arch 16, Flash-Next) on gfx1151 and gfx1201 and leaves every other producer off; `on`/`1` arms every MTP producer that supports it; `off`/`0` is the opt-out (kill switch). Env `HIPFIRE_MTP_NGRAM` beats TOML beats default. Eligible requests are greedy and sampled, thinking on or off (Qwen4 and Qwen3.5/3.x). A sampled takeover verifies each candidate with the point-mass draft distribution δ(candidate) through the shared rejection verify: lossless in distribution, not bit-identical to MTP-only output. The pool is request-local (cleared and reseeded from the full prompt every request), so candidates never depend on earlier requests. Triple (`HIPFIRE_NGRAM_MOD_N_MATCH` / `_N_MIN` / `_N_MAX`, overridable per component): 5/3/3 on admitted Qwen4 targets, 24/48/64 elsewhere; on Qwen4 `n_max` is capped at 63 (the 64-row verify). On Qwen4 a pool hit takes the window only when the MTP head's own first draft equals the first candidate and the takeover's measured yield (decayed emitted tokens per takeover window over its verify cost) is at least the native window's best expected rate; otherwise the window is native. The Qwen4 takeover uses the same batched verify executor as native MTP windows (interleaved one-row route under `HIPFIRE_MTP_INCREMENTAL=1`) and appends the consumed rows to the MTP head teacher-forced (token p, hidden p). Load marker: `qwen4 native MTP n-gram: on\|off (n_match=.. n_min=.. n_max=..)`; `HIPFIRE_MTP_TRACE=1` window events carry `source` / `verify_route`. |
@@ -757,6 +757,24 @@ Two checks exist; only one is gated:
 
 `scripts/run-bounded.sh` (`HIPFIRE_MEM_CAP`) remains the hard cgroup backstop.
 
+### Partial GPU offload (`memory.gpu_layer_budget` / `memory.moe_expert_budget` / `memory.offload_exec`)
+
+| Key | Default | Values |
+|---|---|---|
+| `memory.gpu_layer_budget` | unset (fully resident on dense; auto-fit on a Qwen MoE) | int 0–65536 \| `auto`/`-1` |
+| `memory.moe_expert_budget` | unset (auto-fit on a Qwen MoE; all resident on dense) | int 0–65536 \| `auto`/`-1` |
+| `memory.offload_exec` | `pcie` | `pcie` \| `cpu` |
+
+Compat env: `HIPFIRE_GPU_LAYER_BUDGET`, `HIPFIRE_MOE_EXPERT_BUDGET`, `HIPFIRE_OFFLOAD_EXEC`. All three are `ModelLoad`-scoped (`hipfire config set memory.*`, per-model overlay, or env); there is no `--offload` CLI flag.
+
+- **Counting.** Both budgets count layers kept **on** the GPU, not offloaded — `3` on a 64-layer model spills 61. `gpu_layer_budget` spills whole-layer prefixes (`[0 .. n-N)`); `moe_expert_budget` spills only routed experts (llama.cpp `--n-cpu-moe K` is `n_layers - K`). Attention, router, shared expert, embedding, `lm_head` and KV stay resident either way.
+- **Auto-fit default.** `auto`/`-1` places by fit: the smallest spill that loads, **routed experts first**, whole layers only when the expert tier cannot free enough; a model that already fits stays fully resident. Unset resolves to auto-fit on a Qwen MoE (an over-fit MoE spills instead of OOMing mid-load) and to fully resident on dense, so a bad value never forces an offload. Both knobs are hard pins and are never silently widened — a pinned placement that does not fit refuses the load naming the knob.
+- **Scope.** Auto-fit runs only on spillable single-GPU text-trunk loads (`pp == 1`, no paged experts, no REAP keep-map); elsewhere unset stays resident and only an explicit budget is refused. Offload is Qwen3.5-dense/MoE only — any other arch, `tp > 1`, `pp > 1`, EP, a VL tower, paged experts or a REAP keep-map with a configured spill fails the load closed.
+- **Execution.** `memory.offload_exec` decides **who multiplies**, never what spills. `pcie` (default; unset/empty/unknown fall back to it) runs the GPU kernels against host-mapped weights over the link. `cpu` executes those GEMVs on the host, and on a `moe_expert_budget` spill recomputes each selected routed expert's whole FFN on the CPU for AR single-token decode and any `<=4`-row batched forward (narrow speculative verify and accepted-prefix rollback included; wider prefill keeps the GPU grouped PCIe read). `cpu` disables hipGraph capture for the model's lifetime and is refused together with a retained-replay (Redline) backend.
+- **Load lines.** A spill prints `partial offload: {host} of {n} layers host-placed[, routed experts host on {k} layers], device weights {X} MiB of {Y} MiB available` plus the pinned-host report and the `kv reserved:` accounting line; a fit prints `partial offload: model fits - every layer resident`. A `cpu` load adds the `cpu exec: {covered}/{spilled} spilled layers fully covered …; uncovered quants: …` coverage line.
+- **Spec.** Native MTP is opt-in on any host-mapped expert spill — see the `mtp_mode` row. Full write-up: [`env-vars.md`](env-vars.md) offload rows and [`plans/partial-gpu-offload-design.md`](plans/partial-gpu-offload-design.md).
+- **CPU execution route.** Once MTP is enabled on a CPU-spilled Qwen3.5-family model, single-token decode, forced advances and terminal flushes automatically use the CPU-splice-capable executor. No `HIPFIRE_FORWARD_LOWERED=0` override is required. This execution routing does not change the MTP `auto` admission policy above.
+
 ### Prompt / assistant-turn cache
 
 | Key | Default | Values |
@@ -846,6 +864,35 @@ hottest prefix is already read during the load, throttled, by
 warm; the prewarm continues after it. The pages are ordinary clean page
 cache, dropped (never swapped) under memory pressure and not charged in
 admission.
+
+### Qwen4 trunk overlay sidecar
+
+`<model>.trunk-overlay` (for the stock XTS artifact,
+`qwen3.8-flash-next.mq4-xts.trunk-overlay`, ~305 MB) holds pre-encoded QT44
+tensors that replace the base's MQ6 `linear_attn.in_proj_{z,a,b}` matrices at
+load and arm the trunk A4 route default its manifest names
+(`gfx1151-zab-v1`: the GDN Z, alpha and beta projections on exact gfx1151). It
+is an HFQM container whose metadata records the base it was built for, and a
+load binds it before using it: same architecture id, same base file size, same
+sha256 over the base's header and tensor index (the bytes before the data
+section), and every listed tensor present in the base with the recorded
+quant type, size and shape. Each payload's sha256 is verified when it is read
+for upload. A sidecar that fails any check, names an unknown default, is not
+for a Flash-Next profile, or sits next to a base that already carries a trunk
+default marker is refused with one `REFUSED` line on stderr and the base
+weights run; an absent sidecar logs nothing. Like the PLE sidecars, it is looked
+up next to the model file `hipfire serve`/`run` resolve (symlinks followed), so
+a symlinked model needs its sidecar beside the link target.
+
+Env `HIPFIRE_QWEN4_TRUNK_OVERLAY` selects the policy: `auto` (default; also
+unset) applies the sidecar only on the architecture of its default (gfx1151),
+`0` never applies it (kill switch: stock base weights, one log line), `1`
+applies it on any architecture (the A4 route still arms by default only on
+its exact architecture; elsewhere set `HIPFIRE_QWEN4_TRUNK_IU4`). Any other
+value fails the load. `HIPFIRE_QWEN4_TRUNK_IU4=0` keeps the overlay weights
+and disables the A4 route. `hipfire-quantize trunk-overlay` builds the file
+from a directory of QT44 payloads (`--base`, `--qt44-payload-dir`, `--suffix`
+(repeatable), `--trunk-iu4-default`, `--output`).
 
 ---
 
@@ -1052,7 +1099,7 @@ policy and filename/registry discovery.
 
 Note: CLI `ddtree_budget` default is `0` while bare `RuntimeConfig` default is `256` when only env/runtime path is used — CLI load params are the product path for `hipfire run`/`serve`.
 
-Redline eligibility helpers `mq4r_redline_default` and `retained_redline_default` (same file) are **narrow runtime-default predicates** for replay backend selection: exact GPU arch `gfx1100`/`gfx1151`/`gfx1201` + case-insensitive `.mq4r` + pp=tp=1 (model-family agnostic, no `arch_id` gate; `gfx1200` and all other arches remain opt-in), plus Qwen3.5 dense (`qwen3_5`) and Qwen4 (Flash-Next, `qwen4`; MTP-off loads) plain-AR decode on exact `gfx1201` with pp=tp=1 and no drafter. They are not general config keys and not Redline certification/registry admission. `replay.backend = "hip"`, the built-in `hip` config profile or another explicit backend selection disables the automatic default. Policy: [`REDLINE.md`](REDLINE.md).
+Redline eligibility helpers `mq4r_redline_default` and `retained_redline_default` (same file) are **narrow runtime-default predicates** for replay backend selection: exact GPU arch `gfx1100`/`gfx1151`/`gfx1201` + case-insensitive `.mq4r` + pp=tp=1 (model-family agnostic, no `arch_id` gate; `gfx1200` and all other arches remain opt-in), plus Qwen3.5 dense (`qwen3_5`) and Qwen4 (Flash-Next, `qwen4`; MTP-off loads) plain-AR decode on exact `gfx1201` with pp=tp=1 and no drafter. A Qwen3.5-family process with a CPU-executed partial-offload spill (`memory.offload_exec=cpu` plus an explicit layer/routed-expert count, or `auto`/unset on a MoE, which auto-fits) gets no retained default, and an explicit non-`hip` backend there is refused at load. They are not general config keys and not Redline certification/registry admission. `replay.backend = "hip"`, the built-in `hip` config profile or another explicit backend selection disables the automatic default. Policy: [`REDLINE.md`](REDLINE.md).
 
 ---
 
@@ -1089,7 +1136,7 @@ misspelled key is unknown and fails the load with
 
 <!-- lifecycle-table:begin (generated by scripts/check-lifecycle.py --write) -->
 
-**Count:** 284 schema keys, plus the `developer.<name>` namespace.
+**Count:** 285 schema keys, plus the `developer.<name>` namespace.
 
 | Key | Legacy key | Env | Lifecycle |
 |---|---|---|---|
@@ -1286,6 +1333,7 @@ misspelled key is unknown and fails the load with
 | `memory.max_seq` | `max_seq` |  | stable |
 | `memory.mmq.screen` | `mmq_screen` | `HIPFIRE_MMQ_SCREEN` | stable |
 | `memory.mmq.screen_threshold` | `mmq_screen_threshold` | `HIPFIRE_MMQ_SCREEN_THRESHOLD` | stable |
+| `memory.moe_expert_budget` | `moe_expert_budget` | `HIPFIRE_MOE_EXPERT_BUDGET` | stable |
 | `memory.offload_exec` | `offload_exec` | `HIPFIRE_OFFLOAD_EXEC` | stable |
 | `memory.oom_guard` | `oom_guard` | `HIPFIRE_OOM_GUARD` | stable |
 | `memory.ple_format` | `ple_format` | `HIPFIRE_PLE_FORMAT` | stable |

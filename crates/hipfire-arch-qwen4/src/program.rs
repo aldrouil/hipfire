@@ -282,9 +282,14 @@ pub struct Qwen4MoeBinding<'a> {
     pub expert_down_entries: &'a [usize],
     pub layer_idx: u16,
     pub norm_topk_prob: bool,
-    /// Expert-parallel decode row exchange (`None` outside EP): installed into the
-    /// one-row decode MoE so non-owned expanded rows are filled from their owners.
+    /// Expert-parallel row exchange (`None` outside EP): installed into the
+    /// one-row decode MoE and the few-row grouped prefill MoE so non-owned
+    /// expanded rows are filled from their owners.
     pub row_gather: Option<&'a dyn hipfire_dispatch::families::moe::MoeRowGather>,
+    /// Few-row EP prefill only: where the unfused shared down writes its F32
+    /// rows (the layer's `moe_down_expanded` is then a gather buffer). `None`
+    /// everywhere else.
+    pub shared_down_out: Option<&'a GpuTensor>,
 }
 
 /// Family-owned reusable views into the central program's scratch layout.
@@ -930,6 +935,7 @@ fn build_moe_decode<'a>(
         norm_topk_prob: moe.norm_topk_prob,
         x_rot_prerotated: false,
         defer_routed_combine: false,
+        cpu_deferred_experts: false,
         ep_mode: MoeEpMode::None,
         layer_idx: moe.layer_idx,
         x_norm: input,
@@ -1048,6 +1054,7 @@ fn build_moe_prefill<'a>(
         n_exp: moe_dims.num_experts,
         m_total_max,
         force_mq4_grouped_fp16: false,
+        cpu_deferred_experts: false,
         topk_indices: scratch.moe_topk_indices,
         topk_weights: scratch.moe_topk_weights,
         x_batch: scratch.ffn_output,
@@ -1074,6 +1081,9 @@ fn build_moe_prefill<'a>(
         paro_down: None,
         down_awq_scale: None,
         routed_out: None,
+        ep_row_gather: moe.row_gather,
+        shared_down_out: moe.shared_down_out,
+        ep_layer_idx: moe.layer_idx,
     })
 }
 

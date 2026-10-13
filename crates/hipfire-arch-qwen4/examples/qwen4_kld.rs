@@ -133,6 +133,11 @@ impl Model {
         )
         .map_err(|e| format!("qwen4 PLE rows: {e}"))?;
         let receipt = admit_hfqm_artifact(&hfq).map_err(|e| format!("qwen4 admission: {e}"))?;
+        // `<model>.trunk-overlay` (QT44 trunk tensors + the A4 default), bound
+        // to this base while it is open and applied by `attach_forward`.
+        let trunk_overlay =
+            hipfire_arch_qwen4::resolve_trunk_overlay(&hfq, path, &gpu.arch, &receipt.config)
+                .map_err(|e| format!("qwen4 trunk overlay: {e}"))?;
         // A rank-order table is served through its store (no shard
         // descriptors); every other source reads through 128 descriptors.
         let rank_table = receipt.ple_rows.rank_table().is_some();
@@ -246,6 +251,11 @@ impl Model {
             backend,
         )
         .map_err(|e| format!("qwen4 bundle assembly: {e}"))?;
+        if let Some(overlay) = trunk_overlay {
+            bundle
+                .attach_trunk_overlay(overlay)
+                .map_err(|e| format!("qwen4 trunk overlay: {e}"))?;
+        }
         bundle
             .attach_forward(&mut gpu, n_ctx, scratch_mode)
             .map_err(|e| format!("qwen4 forward setup: {e}"))?;

@@ -29,7 +29,7 @@ decode core:
 
 | piece | what it does |
 |---|---|
-| `codes8::<BITS>` | eight `BITS`-wide codes as `i32` lanes. Eight codes are exactly `BITS` bytes, so 1/2/3/4-bit chunks are one broadcast + one `vpsrlvd` + one mask, and the 40/48-bit 5/6-bit chunks use 64-bit lanes with the low dwords compacted back into eight lanes. |
+| `codes8::<BITS>` | eight `BITS`-wide codes as `i32` lanes. The 1/2/4-bit chunks use a broadcast, `vpsrlvd` and mask. Three-bit chunks include a preceding header/payload byte in a 32-bit memory broadcast and discard it with the vector shifts. Six-bit chunks use two such 24-bit halves in separate 128-bit lanes. Only 5-bit chunks use 64-bit lanes with low-dword compaction. |
 | `codes_dot_sum::<BITS, PAYLOAD>` | `(Σ c·x, Σ x)` over a run of chunks — two vector accumulators, one horizontal sum each per group. |
 | `uniform_group_dot::<BITS, PAYLOAD, CHUNKS>` | `scale·Σ(c·x) + zero·Σx` for one `(scale, zero)` header. |
 | `v2_group_dot::<BITS>` | the V2 family's per-128 `fp16` header, each half scored then affinely corrected. |
@@ -46,10 +46,12 @@ Two consequences worth keeping in mind when adding a format:
   the TQ2/BQ1 pair needs no kernel of its own: `(code-1)·d` and `bit ? +d : -d` are
   the affine form with `(d, -d)` and `(2d, -d)`.
 
-`load_le` reads *exactly* a chunk's `BITS` bytes — a wider load would be one
-instruction cheaper and would run up to three bytes past the group on its last
-chunk, which the caller's row slice licenses only for rows that are not the
-tensor's last.
+`load_le` reads exactly the 1/2/4/5-bit chunk's bytes. The 3/6-bit decoder
+instead reads a preceding byte within the same group allocation, never beyond
+the payload's end. Its callers require a nonempty header at compile time;
+even the first chunk follows an 8-byte header or a 16-byte MQ3-Lloyd codebook.
+The prefix is removed by logical vector shifts, with no change to the decoded
+codes, floating-point accumulation order, or single-/multi-row layout.
 
 `Mq4G256` (qt 13) keeps a hand-unrolled nibble group (32 codes per 16-byte load)
 rather than the `codes8` path; its recorded measurements were taken with it.
@@ -82,6 +84,7 @@ grouped quant (plain tensor, 256-element "group").
 | 20 | MQ3G256Lloyd | 112 | 8-entry `fp16` codebook | 3-bit indices | yes | `mq3g256lloyd_row_dot` | AVX2 + FMA + F16C |
 | 30 | MQ4G256Lloyd | 160 | 16-entry `fp16` codebook | nibble indices | yes | `mq4g256lloyd_row_dot` | AVX2 + FMA + F16C |
 | 31 | MQ5G256 | 168 | f32 `scale`+`zero` | 5-bit packs | yes | `mq5g256_row_dot` | AVX2 + FMA |
+| 34 | MFP4G32E8 | 152 | 16 B row header (`fp16` row scale) + eight 17 B blocks/256 (1 B E8 scale + 16 B nibbles) | 4-bit lattice codes | yes | `mfp4g32_e8_row_dot` | AVX2 + FMA + F16C |
 | 40 | TQ2G128 | 34/128 | `fp16` `d` | 2-bit codes, `(code-1)·d` | no | `tq2g128_row_dot` | AVX2 + FMA + F16C |
 | 41 | BQ1G128 | 18/128 | `fp16` `d` | sign bits, `±d` | no | `bq1g128_row_dot` | AVX2 + FMA + F16C |
 | 44 | MQ4G256V2 | 136 | per-128 `fp16` `[s z]×2` | nibbles | yes | `mq4g256v2_row_dot` | AVX2 + FMA + F16C |
@@ -113,8 +116,9 @@ any runner.
   the crate has no decode for them at all (so a step over one stays on the GPU
   over PCIe): qt 0/4 (`Q4F16G64`/`Q4K`, GGUF-side), qt 5 (`Q8HFQ`, padded rows the
   group model cannot express), qt 14 (`MQ8G256`, `RotationPlan::Mq8Internal` —
-  an int8-quantized activation, not a plain FWHT of f32), qt 21/24/32-37
-  (HFP4/MFP4 family: per-row 16 B header + per-32 block scales), qt 28/29
+  an int8-quantized activation, not a plain FWHT of f32), qt 21/24/32/33/35/36/37
+  (HFP4/MFP4 family: per-row 16 B header + per-32 block scales — qt 34 `MFP4G32E8`
+  is covered above), qt 28/29
   (PARO4G128(-T), a Givens rotation on the *activation*), qt 38/39
   (`MQ{2,3}G256GL`, MoE-indexed only). See `quant.rs`'s test module for the
   itemised reasoning.

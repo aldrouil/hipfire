@@ -91,10 +91,12 @@ pub mod slot_batch;
 pub mod spec;
 
 pub mod ngram_mod;
+pub mod offload;
 pub mod spec_ngram;
 pub mod spec_sampling;
 pub mod swap;
 pub mod tp_shard;
+pub mod trunk_overlay;
 #[cfg(feature = "deltanet")]
 pub mod triattn;
 pub mod weight_manifest;

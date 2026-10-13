@@ -2262,6 +2262,76 @@ fn finish_qwen35_load(
     } else {
         None
     };
+    // MTP over a host spill: the `0xac000` SIGABRT recorded in `6273965e7`
+    // (ornith-1.5:35b-a3b + moe_expert_budget=auto) no longer reproduces —
+    // expert-spill (graph on/off) and layer-spill arms load the head and decode.
+    // Upstream candidates in between (unbisected): `3b3d2ab45` MQ6 shared
+    // gate/up alias, graded host-expert offload. So the hard refusal is gone:
+    // explicit `speculation.mtp = "on"` (`--spec mtp`) attaches the head over a
+    // spill. But `auto` still degrades to AR on the PCIe one, where the verify
+    // re-reads host-mapped experts over the link and each extra pass can cost
+    // more than the accepted tokens return. That is the ornith-1.5-35b-a3b
+    // finding — `docs/perf-checkpoints/2026-10-04-mtp-over-trunk-expert-spill.md`
+    // (gfx1201, greedy 9-prompt genre battery: MTP 34.9 vs AR 45.1 tok/s avg;
+    // single merge_sort: 10.7 vs 44.6) and `…-moe-offload-ar-vs-mtp.md`
+    // (MTP 23.4 pcie / 23.5 cpu vs AR 64.2 / 50.5) — both on the pre-CPU-stack
+    // build, and both show the loss on *both* seams. Keyed on the *resolved*
+    // placement (host-mapped count from the loaded weights), not on MoE-ness, so
+    // a MoE that resolves fully resident keeps MTP under `auto`.
+    //
+    // The PCIe decline is therefore fixture-bound to those ornith records, and
+    // the newest same-box record points the other way even there: on
+    // `qwen3.6-35b-a3b.mq4p` (2026-10-11, 16 spilled expert layers) MTP led AR
+    // on 8/8 cells, +13.9-22.4% pcie and +33.4-43.8% cpu. Extending or dropping
+    // the decline needs a re-measure on the affected fixture, not this comment.
+    //
+    // CPU-deferred experts (memory.offload_exec=cpu) were excluded outright — the
+    // splice recomputes the routed FFN on the host instead of re-reading it over
+    // PCIe, and the CPU arms of that same 2026-10-11 record are its fastest MTP
+    // cells. That exception is withdrawn: it armed the head with no opt-in on the
+    // default state of an offloaded MoE, so a drafter that is unverified *on the
+    // loaded placement* — or wrong there, as measured on `qwen3.6-35b-a3b.mq6`
+    // (garbled verify windows at tau 0.04-0.13 while its single-row AR is
+    // coherent) — spec-decoded silently. MTP is a gain only where it works, so
+    // the CPU seam is opt-in like the PCIe one; those 2026-10-11 cells still
+    // exist under `--spec mtp` / `speculation.mtp = "on"`. Resolved from the
+    // loaded placement, not config.
+    let cpu_deferred_moe = bundle.weights.has_cpu_deferred_experts();
+    let (host_mapped_expert_blobs, host_mapped_expert_bytes) =
+        hipfire_arch_qwen35::qwen35::host_mapped_expert_accounting(&bundle.weights.layers);
+    // Same shared policy as the slots arming site: `auto` (typed `None`)
+    // declines over a host-mapped spill, `on` (`Some(true)`) arms, `off`
+    // (`Some(false)`) stays AR via the gate below. qwen35's admitted list is
+    // empty. Worded once in `hipfire_config::mtp_host_spill_decline_line`.
+    let mtp_spill_mode = match ctx.spec.mtp {
+        Some(true) => hipfire_config::MtpMode::On,
+        Some(false) => hipfire_config::MtpMode::Off,
+        None => hipfire_config::MtpMode::Auto,
+    };
+    let mtp_spill_degrade = matches!(arch_id, 5 | 6)
+        && !hipfire_config::mtp_host_spill_policy(
+            mtp_spill_mode,
+            host_mapped_expert_blobs,
+            ctx.gpu.arch.as_str(),
+            &[],
+        )
+        .attach
+        && !matches!(mtp_spill_mode, hipfire_config::MtpMode::Off);
+    if mtp_spill_degrade {
+        eprintln!(
+            "{}",
+            hipfire_config::mtp_host_spill_decline_line(
+                "qwen35",
+                host_mapped_expert_blobs,
+                host_mapped_expert_bytes,
+                if cpu_deferred_moe {
+                    "offload_exec=cpu"
+                } else {
+                    "offload_exec=pcie"
+                },
+            )
+        );
+    }
     // ── qwen35 MTP head (single resolver: bundled .mq4-mtp trailer then .mtp sidecar) ──
     // Precedence: DSpark > DFlash > MTP > n-gram. Gate: only arch 5/6, no adaptive/eviction,
     // and typed mtp != off. Bundled first, then the sidecar the CLI resolved
@@ -2272,6 +2342,7 @@ fn finish_qwen35_load(
         || eviction.is_some()
         || !matches!(arch_id, 5 | 6)
         || ctx.spec.mtp == Some(false)
+        || mtp_spill_degrade
         || dflash.is_some()
         || dspark_speculator.is_some()
     {
@@ -2327,6 +2398,9 @@ fn finish_qwen35_load(
         ),
         _ => None,
     };
+    if mtp_present && ctx.spec.mtp == Some(true) {
+        eprintln!("  qwen35 MTP: armed explicitly (speculation.mtp=on / --spec mtp)");
+    }
     // Pick the arch-generic speculator: a loaded DFlash draft → DflashSpeculator,
     // else an MTP head → MtpSpeculator<Qwen35MtpDrafter>, else (opt-in) the
     // model-free n-gram drafter. `eviction` is borrowed (not moved) here so it is
@@ -4655,6 +4729,9 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
     if let Err(e) = gpu.abort_route_kernel_load() {
         eprintln!("  kernels: route reset on unload: {e}");
     }
+    // The CPU-weights gate is model-scoped: every successful load sets it from
+    // the resolved placement, so clear it here as the model leaves the device.
+    gpu.set_host_cpu_weights(false);
     // EP unload-free. An EP model owns its own `Gpus` (the daemon's single `gpu`
     // is unused for tp>1). Without this branch a SUCCESSFUL EP unload leaked every
     // per-rank weight / state / partial. Free per-rank weights → state → partials
@@ -5195,9 +5272,14 @@ mod ep_admission_tests {
         let before = active.request();
         let mut effects = LoadEffects::default();
         let refusal = attempt_candidate_swap(
-            &candidate, 1, admission::KvBackendRequest::Explicit(hipfire_runtime::kv_backend::KvBackend::Vmm),
-            "gfx1100", &mut active, &mut effects,
-        ).unwrap_err();
+            &candidate,
+            1,
+            admission::KvBackendRequest::Explicit(hipfire_runtime::kv_backend::KvBackend::Vmm),
+            "gfx1100",
+            &mut active,
+            &mut effects,
+        )
+        .unwrap_err();
         assert!(refusal.contains("vmm") && refusal.contains("unsupported"));
         assert_eq!(effects, LoadEffects::default());
         assert_eq!(active.request(), before);

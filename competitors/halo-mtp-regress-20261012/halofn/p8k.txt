@@ -1,0 +1,708 @@
+Below is a mix of Rust source code and project documentation. Read it, then write a concise technical summary of what it covers.
+
+
+
+=== crates/hipfire-runtime/src/admission.rs ===
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Nick Woolmer
+// hipfire — see LICENSE and NOTICE in the project root.
+//
+// AdmissionController — decides whether a session can be admitted, and with how
+// much context.
+//
+// In the test harnesses `kv_slots::preflight_alloc` is what stops an oversized
+// configuration. In the daemon that job is HERE. The difference matters: on this
+// hardware the GPU allocates from system RAM and the cgroup does NOT contain
+// amdgpu GTT, so a wrong decision here does not fail a request — it takes down
+// the user's desktop with a global OOM.
+
+/// What one loaded model costs, split into the part charged once and the part
+/// charged per session.
+#[derive(Debug, Clone, Copy)]
+pub struct ModelFootprint {
+    /// Charged ONCE, however many sessions are admitted.
+    pub weights_bytes: u64,
+    /// Charged per session, per token of granted context.
+    pub kv_bytes_per_token: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmitError {
+    PoolFull,
+    WouldExceedBudget {
+        need: u64,
+        available: u64,
+    },
+    /// resize() named a session that holds no grant — an internal
+    /// inconsistency, NOT a budget shortfall. Reporting it as
+    /// WouldExceedBudget{0,0} both lied about the cause and let the engine
+    /// misclassify a real budget failure as Internal.
+    UnknownSession(u64),
+}
+
+impl std::fmt::Display for AdmitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let gib = |b: u64| b as f64 / 1073741824.0;
+        match self {
+            AdmitError::PoolFull => write!(f, "no free slot"),
+            AdmitError::WouldExceedBudget { need, available } => write!(
+                f,
+                "needs {:.2} GiB but only {:.2} GiB of the budget remains",
+                gib(*need),
+                gib(*available)
+            ),
+            AdmitError::UnknownSession(id) => {
+                write!(f, "session {id} holds no admission grant")
+            }
+        }
+    }
+}
+
+pub struct AdmissionController {
+    footprint: ModelFootprint,
+    budget_bytes: u64,
+    /// Granted context per admitted session, keyed by session id so two
+    /// sessions with identical context sizes cannot release each other's
+    /// budget.
+    admitted: Vec<(u64, usize)>,
+    /// Host-tier budget for swapped-out snapshots. Separate from the VRAM
+    /// budget: admission is the production memory gate for BOTH, because the
+    /// control group does not contain amdgpu GTT.
+    host_budget: u64,
+    host_used: u64,
+}
+
+impl AdmissionController {
+    pub fn new(footprint: ModelFootprint, budget_bytes: u64) -> Self {
+        Self {
+            footprint,
+            budget_bytes,
+            admitted: Vec::new(),
+            host_budget: crate::swap::DEFAULT_HOST_BUDGET_BYTES,
+            host_used: 0,
+        }
+    }
+
+    /// Bytes currently committed: weights once (if anything is admitted) plus
+    /// each session's KV. Checked arithmetic; overflow saturates (a sum this
+    /// large cannot be admitted anyway) rather than wrapping.
+    pub fn used_bytes(&self) -> u64 {
+        if self.admitted.is_empty() {
+            return 0;
+        }
+        let kv: u64 = self
+            .admitted
+            .iter()
+            .map(|&(_, ctx)| {
+                (ctx as u64)
+                    .checked_mul(self.footprint.kv_bytes_per_token)
+                    .unwrap_or(u64::MAX)
+            })
+            .fold(0u64, |a, b| a.saturating_add(b));
+        self.footprint.weights_bytes.saturating_add(kv)
+    }
+
+    /// Admit a session at `requested_ctx` tokens, or explain why not.
+    ///
+    /// Rejects rather than silently capping: a caller that asked for 128K and
+    /// silently got 8K would produce baffling truncation far from here.
+    pub fn admit(&mut self, session: u64, requested_ctx: usize) -> Result<usize, AdmitError> {
+        let kv_need = (requested_ctx as u64)
+            .checked_m
+
+=== docs/ARCHITECTURE.md ===
+# Architecture
+
+How a `hipfire run` becomes tokens on the current modular tree. Runtime source
+wins on conflict. Mutable command surfaces, model catalogs, and env inventories
+live in their own owners ([`CLI.md`](CLI.md), [`MODELS.md`](MODELS.md),
+[`env-vars.md`](env-vars.md)); this page maps crates, loaders, and data flow.
+
+Truth-state labels follow [`INDEX.md`](INDEX.md). Implementation capability is
+not product admission: a compiled path or runtime gate is not certification.
+
+## Workspace map
+
+Workspace members (`Cargo.toml`):
+
+```text
+crates/
+├── hip-bridge/              # dlopen HIP FFI (libamdhip64)
+├── hsa-bridge/              # thin public HSA queue/AQL helpers
+├── rdna-compute/            # Gpu, kernel compile/cache, HIP launch families
+├── radiowave/               # signal/scheduling support for the compute layer
+├── saddle-core/             # the substrate: grammar, KV, caps, sampling policy
+├── hipfire-runtime/         # arch-agnostic infra + Architecture trait; LLaMA forward still lives here
+├── hipfire-loader/          # Carrier registry, load_model, LoadedModel, batch staging
+├── hipfire-engine/          # arch-free serve engine: scheduler, terminal, emit, prompt
+├── hipfire-generate/        # generation bodies: ar, qwen, dense, vision, batch, redline fixtures
+├── hipfire-daemon/          # the product binary — [[bin]] name = "daemon", no required-features
+├── hipfire-dispatch/        # dtype/arch family tables + MoE/attn pipelines
+├── hipfire-dispatch-tests/  # dispatch coverage tests
+├── hipfire-arch-*/          # per-family config/weights/state/forward (12)
+├── hipfire-ds4-parent/      # DeepSeek-V4 parent/teacher tooling (name provisional)
+├── hipfire-pflash/          # PFlash prefill compression — retained legacy research, default off
+├── hipfire-quantize/        # CPU encoder (safetensors/GGUF → .mq* / .hfq*)
+├── hipfire-detect/          # observational JSONL behavior detectors
+├── hipfire-atlas/           # Kernel Atlas schema + emit helpers
+├── hipfire-config/          # typed TOML config + migration
+├── hipfire-registry/        # strict bundled/dynamic model registry
+├── hipfire-client/          # daemon JSONL + OpenAI HTTP/SSE client
+├── hipfire-cli/             # native operator and HTTP service
+├── hipfire-tui/             # terminal UI
+├── hipfire-reap/            # utility crate
+├── saddle-lab/              # research examples and one-off harnesses
+├── redline/                 # experimental direct-KMD / bare-libdrm research
+├── redline-dispatch/        # retained-tape record/replay + plan selection
+├── redline-rocr/            # public ROCr/HSA ABI + PM4 packet builders
+├── pm-npu/                  # XDNA2/AIE2P program builder + CPU simulator — experimental, dark
+└── npu-tools/               # XDNA2 NPU binaries (railgun --features npu) — experimental, dark
+```
+
+HIP sources live under `kernels/src/`; there is no JavaScript/TypeScript
+operator runtime.
+
+### Layering
+
+| Layer | Crates | Role |
+|---|---|---|
+| Operator | `hipfire-cli`, `hipfire-config`, `hipfire-registry`, `hipfire-client`, `hipfire-tui` | Tag resolve, typed config, pull, HTTP service/client, one-shot daemon spawn |
+| Product binary | `hipfire-daemon` | `[[bin]] name = "daemon"`. Message dispatch and process lifetime only |
+| Generation | `hipfire-generate` | The generate bodies: `ar`, `qwen`, `dense`, `vision`, `batch`, `img`, plus the Redline fixtures |
+| Serve engine | `hipfire-engine` | Scheduler, terminal control, emit, prompt. **Zero arch dependencies** |
+| Composition root | `hipfire-loader` | Carrier registry, single `load_model` dispatch, `LoadedModel`, continuous-batch staging |
+| Arch forward | `hipfire-arch-*` | Config / weights / state / static-dispatch forward (LLaMA exception: canonical forward remains in runtime) |
+| Shared infra | `hipfire-runtime` | HFQ/safetensors, tokenizer, sampler, framing, spec primitives, `Architecture` trait |
+| Substrate | `saddle-core` | Grammar, KV cache, `Arul(self.footprint.kv_bytes_per_token)
+            .ok_or(AdmitError::WouldExceedBudget {
+                need: u64::MAX,
+                available: 0,
+            })?;
+        // Weights are charged once, on the first admission.
+        let weights_need = if self.admitted.is_empty() {
+            self.footprint.weights_bytes
+        } else {
+            0
+        };
+        let need = kv_need
+            .checked_add(weights_need)
+            .ok_or(AdmitError::WouldExceedBudget {
+                need: u64::MAX,
+                available: 0,
+            })?;
+        let available = self.budget_bytes.saturating_sub(self.used_bytes());
+        // >= rather than >: an admission that would consume the LAST byte of
+        // budget is refused too, not just one that overflows it. On this
+        // hardware (no swap, cgroup does not contain amdgpu GTT) landing
+        // exactly on the edge leaves zero headroom for anything else running
+        // on the box, so it is treated the same as exceeding the budget.
+        if need >= available {
+            return Err(AdmitError::WouldExceedBudget { need, available });
+        }
+        self.admitted.push((session, requested_ctx));
+        Ok(requested_ctx)
+    }
+
+    /// Return a session's context allowance to the budget.
+    /// Reserve host-tier bytes for a swapped-out session. Returns false when
+    /// the budget cannot cover it, in which case the caller spills to disk
+    /// rather than exceeding the budget.
+    pub fn admit_host(&mut self, bytes: u64) -> bool {
+        if self.host_used.saturating_add(bytes) > self.host_budget {
+            return false;
+        }
+        self.host_used += bytes;
+        true
+    }
+
+    pub fn release_host(&mut self, bytes: u64) {
+        self.host_used = self.host_used.saturating_sub(bytes);
+    }
+
+    pub fn host_used_bytes(&self) -> u64 {
+        self.host_used
+    }
+
+    pub fn host_budget_bytes(&self) -> u64 {
+        self.host_budget
+    }
+
+    /// Set the host-tier budget. Defaults to `DEFAULT_HOST_BUDGET_BYTES`.
+    pub fn set_host_budget(&mut self, bytes: u64) {
+        self.host_budget = bytes;
+    }
+
+    /// Return a session's context allowance to the budget, keyed by the
+    /// session id handed to [`admit`](Self::admit). Releasing an unknown id
+    /// is a no-op; releasing a known id removes exactly that session's
+    /// grant — never a same-sized neighbour's.
+    /// Resize a session's context grant (spec §5.1: "reserve credits for
+    /// the request's maximum remaining target growth through
+    /// `prompt + max_tokens`" — a grant tracks the request's ACTUAL needs,
+    /// not its whole context cap, so a big-cap deployment does not
+    /// serialize every resident session against the next admission).
+    ///
+    /// Verify-then-mutate: growth is refused (entry unchanged) when the
+    /// delta does not fit the budget; shrinkage returns the difference
+    /// immediately. Zero-risk by construction — no release-then-recharge
+    /// window.
+    pub fn resize(&mut self, session: u64, new_ctx: usize) -> Result<usize, AdmitError> {
+        let pos = self
+            .admitted
+            .iter()
+            .position(|(id, _)| *id == session)
+            .ok_or(AdmitError::UnknownSession(session))?;
+        let old_ctx = self.admitted[pos].1;
+        let bpt = self.footprint.kv_bytes_per_token;
+        let old_kv = (old_ctx as u64).saturating_mul(bpt);
+        let new_kv = (new_ctx as u64).saturating_mul(bpt);
+        if new_kv > old_kv {
+            let delta = new_kv - old_kv;
+            let available = self.budget_bytes.saturating_sub(self.used_bytes());
+            if delta >= available {
+                return Err(AdmitError::WouldExceedBudget {
+                    need: delta,
+                    available,
+                });
+            }
+        }
+        self.admitted[pos].1 = new_ctx;
+        Ok(new_ctx)
+    }
+
+    pub fn release(&mut self, session: u64) {
+        if let Some(i) = self.admitted.iter().position(|(id, _)| chCaps`, sampling policy. Depends only on `rdna-compute`, `hip-bridge`, `serde` |
+| Kernel select | `hipfire-dispatch`, `rdna-compute` | Family tables + `Gpu` methods that pick WMMA/dot/baseline |
+| Device FFI | `hip-bridge`, `hsa-bridge` | HIP runtime; optional HSA AQL helpers |
+| Encode | `hipfire-quantize` | No GPU deps; CI-safe quantizer |
+| Observability | `hipfire-detect`, `hipfire-atlas` | Detectors; bench corpus schema |
+| Retained replay | `redline-dispatch`, `redline-rocr`, `rdna-compute::replay` | Product-integrated Redline path (see below) |
+| Direct-KMD research | `redline`, `saddle-lab`, `hipfire-pflash` | Not the serving transport |
+| NPU research (dark) | `pm-npu`, `railgun` feature `npu`, `npu-tools` | XDNA2/AIE2P emitter, simulator, direct-amdxdna runtime and probes; no daemon/engine path calls them ([`npu/README.md`](npu/README.md)) |
+
+The dependency edge runs one way and is checked by `cargo tree`:
+
+```text
+saddle-core → hipfire-runtime → hipfire-loader → hipfire-engine
+                                      → hipfire-generate → hipfire-daemon
+```
+
+Two invariants hold today and are worth keeping:
+
+- **`saddle-core` never depends upward.** Its only dependencies are
+  `rdna-compute`, `hip-bridge` and `serde`; `cargo tree -p saddle-core -e normal`
+  matches nothing under `hipfire-{runtime,loader,engine,generate,daemon,arch-*}`.
+- **`hipfire-engine` declares no arch crate at all.** The daemon reaches an
+  architecture only through `hipfire-loader`'s `Carrier` and the
+  `hipfire-generate` entry points; `main.rs` names no `hipfire_arch_*` type,
+  in shipped code or tests.
+
+`hipfire-runtime` lists the arch crates under `[dev-dependencies]` for its own
+examples. That is not a cycle — dev-dependencies do not participate in the
+build graph of anything that depends on it.
+
+`hipfire-loader` depends on arch crates and is the **only** top-of-DAG
+`load_model` entry the daemon uses. Forward stays **statically dispatched** on
+concrete arch types after load (`Architecture` docs in
+`crates/hipfire-runtime/src/arch.rs`): the trait is bring-up scaffolding, not a
+hot-path `dyn` forward. **LLaMA exception:** `hipfire-arch-llama` is a facade —
+canonical dense LLaMA/Mistral/plain-Qwen3 forward and shared transformer types
+still live in `hipfire_runtime::llama`; the arch crate re-exports them.
+
+### Qwen4 typed layer seam
+
+The current Qwen4 ordinary-HIP path keeps family binding in
+`crates/hipfire-arch-qwen4/src/program.rs` and `gpu_forward.rs`: typed
+dimensions/descriptors, resident-resource binding, bounded scratch, row-shaped
+router views, and whole-program preflight live there. Neutral stateful
+operation contracts and execution remain in
+`crates/hipfire-dispatch/src/pipeline/layer_ops.rs` and `steps.rs`; the sealed
+QT44/QT53 MoE route remains shared in `pipeline/sealed_moe.rs`,
+`moe_program.rs`, and `qt44_qt53_prefill.rs`. Fixed Qwen4 HIP helpers are
+registered by `hipfire-arch-qwen4/src/gpu_ops.rs`, while
+`rdna-compute/src/tensor_ops.rs` and `grouped_ops.rs` provide neutral wrapper
+contracts. This is an implementation ownership map, not replay/PM4 admission,
+physical-EP proof, or a performance promotion.
+
+With `deltanet` enabled, the fixed-geometry QT44/QT53 route is admitted on
+any AMD GPU for matching wire formats and operands; gfx1151-specific kernel
+optimizations do not gate ordinary-HIP serving.
+
+The grouped symmetric IU4 MoE prefill route (`HIPFIRE_QWEN4_MOE_SYM_IU4`) is
+**on by default** on gfx1151 and gfx1201 for layers whose routed-expert
+headers verify symmetric at load (a symmetric requant such as GPTQ3); shipped
+asymmetric artifacts fail that check and stay on the F16 WMMA route.
+`HIPFIRE_QWEN4_MOE_SYM_IU4=0` opts out and keeps the F16 route, preserving its
+lower KLD (gfx1151 GPTQ3: 0.0661 vs 0.1027 on the IU4 route; see
+[`env-vars.md`](env-vars.md)).
+
+## Request lifecycle
+
+```text
+hipfire run <tag-or-path> "…"
+        │
+        ▼
+Native CLI (`crates/hipfire-cli`)
+  resolve registry tag → model path under ~/.hipfire/m*id == session) {
+            self.admitted.remove(i);
+        }
+    }
+}
+
+// =========================================================================
+// S1 physical capacity accounting (spec §5.1)
+// =========================================================================
+
+/// Page size in tokens. Matches `rdna-compute::page_pool::PAGE_TOKENS`.
+pub const PAGE_TOKENS: u64 = 128;
+
+/// KV bytes for one 128-token page bundle (spec §5.1).
+///
+/// `page_bytes = sum_attention_layers B * (k_stride_bytes[layer] + v_stride_bytes[layer])`
+/// where `B = 128` (`PAGE_TOKENS`). Strides include quant scales/headers.
+/// Returns `None` on stride-length mismatch or arithmetic overflow (checked
+/// arithmetic, spec §5.1: "Use checked arithmetic").
+pub fn page_bytes(k_strides: &[u64], v_strides: &[u64]) -> Option<u64> {
+    if k_strides.len() != v_strides.len() {
+        return None;
+    }
+    let mut total: u64 = 0;
+    for (&k, &v) in k_strides.iter().zip(v_strides.iter()) {
+        let per_layer = PAGE_TOKENS.checked_mul(k.checked_add(v)?)?;
+        total = total.checked_add(per_layer)?;
+    }
+    Some(total)
+}
+
+/// Typed capacity error for the serving admission path (spec §5.1/S1, §5.4/S4).
+///
+/// Distinguishes pool exhaustion from arithmetic overflow so a caller can
+/// fail closed on an accounting fault rather than busy-loop retrying.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapacityError {
+    /// The requested bytes would exceed the remaining pool capacity.
+    WouldExceedPool { need: u64, available: u64 },
+    /// Checked arithmetic overflowed during accounting.
+    ArithmeticOverflow,
+}
+
+impl std::fmt::Display for CapacityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WouldExceedPool { need, available } => write!(
+                f,
+                "capacity exceeded: needs {need} bytes but {available} remain"
+            ),
+            Self::ArithmeticOverflow => write!(f, "capacity accounting overflow"),
+        }
+    }
+}
+
+impl std::error::Error for CapacityError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    /// qwen3.6:27b — 15.0 GB of weights, 34 KB of KV per token.
+    fn f27b() -> ModelFootprint {
+        ModelFootprint {
+            weights_bytes: 15 * GIB,
+            kv_bytes_per_token: 34 * 1024,
+        }
+    }
+
+    /// resize() grows a grant only when the delta fits, and shrinks return
+    /// the credit immediately (spec §5.1 request-sized grants).
+    #[test]
+    fn resize_grows_within_budget_and_refuses_beyond() {
+        let mut a = AdmissionController::new(f27b(), 20 * GIB);
+        a.admit(1, 1024).unwrap();
+        // Grow within budget: 15 GiB weights + 1 GiB (first admit charged
+        // weights) -> delta for 4096 tokens is 3*34KiB ≈ 100 KiB. Fits.
+        a.resize(1, 4096).unwrap();
+        assert_eq!(a.admitted.iter().find(|(id, _)| *id == 1).unwrap().1, 4096);
+        // Grow beyond budget: refused, entry unchanged.
+        let err = a.resize(1, usize::MAX).unwrap_err();
+        assert!(matches!(err, AdmitError::WouldExceedBudget { .. }));
+        assert_eq!(a.admitted.iter().find(|(id, _)| *id == 1).unwrap().1, 4096);
+    }
+
+    #[test]
+    fn resize_shrink_returns_credit_and_unknown_session_refuses() {
+        let mut a = AdmissionController::new(f27b(), 20 * GIB);
+        a.admit(1, 8192).unwrap();
+        let before = a.used_bytes();
+        a.resize(1, 1024).unwrap();
+        assert!(a.used_bytes() < before, "shrink must return credit");
+        assert!(a.resize(999, 1024).is_err(), "unknown session refused");
+    }
+
+    /// The regression this fixes: full-cap grants serialized every
+    /// resident session — a second request whose (prompt + max_tokens) FIT
+    /// in the remaining budget was parked behind a resident full-cap
+    /// grant. Request-sized grants admit it.
+    #[test]
+    fn request_sized_grants_admit_a_second_session_a_full_cap_grant_would_block() {
+    odels/ (or local path)
+  if serve up AND not forced local → HTTP POST /v1/chat/completions
+    forced local when `HIPFIRE_LOCAL` is truthy or any of `--image`,
+    `--kv-mode`, `--kv-backend`, `--kv-k`, `--kv-v`, `--spec`/`--speculation`,
+    `--model-draft`, `--draft-max`, `--dspark-conf-threshold` is passed
+    (`force_local` in `crates/hipfire-cli/src/main.rs`; `--json`/`--no-stream`
+    ride the HTTP route and do not force local)
+    if HTTP fails while serve still live → abort (no local spawn; would collide)
+  else → spawn one-shot daemon binary
+        │
+        ▼
+Daemon (crates/hipfire-daemon/src/main.rs)
+  hipfire_loader::load_model(path, …, &mut Gpu)
+        │
+        ▼
+hipfire-loader
+  ModelSource::from_path  →  HfqFile  |  SafetensorsSource dir
+  Carrier registry probe on arch_id (+ is_dir namespace)
+  carrier.load → LoadedModel { arch_id, state: ModelState::…, tokenizer, … }
+  optional: draft/speculator, VL weights, EP/PP scaffolding
+  Qwen3.5-VL tower sidecar: `params.vision` / `HIPFIRE_VISION_SIDECAR` → separate `qwen3.8-27b-vision.hfq` validated at admission, tower sized by the trunk's `vision_config`
+        │
+        ▼
+generate(…) ladder (daemon.rs)
+  EP? → generate_ep
+  else arch short-circuits (7/8/9/10/11/12) or qwen35/llama body
+  (DFlash/spec, PP generate_multi, VL, …)
+        │
+        ▼
+Arch forward (hipfire-arch-*/src)
+  prefill (eager per-token and/or batched where implemented)
+  decode_step / verify block
+  final norm + lm_head when logits needed
+        │
+        ▼
+rdna-compute Gpu methods  ↔  hipfire-dispatch family tables
+  kernels/src/*.hip  →  precompiled hsaco or hipcc JIT cache
+  ordinary HIP (hip-bridge)  |  retained replay fork (ReplayController → ROCr)
+```
+
+Serve long-running path: same daemon binary, HTTP surface documented in
+[`SERVE.md`](SERVE.md); chat attach in [`CHAT.md`](CHAT.md).
+
+**Kernel readiness at load.** `load_admitted_with_gemma4_drafter` (the common
+single-GPU/PP loader) asks `kernel_registry::route_entries` for the load's
+kernel closure. A closed route (today: Qwen3.6-27B MQ4G256V2 XTS on exact
+gfx1201, AR or native MTP) begins its bounded batch compile
+(`Gpu::begin_route_kernel_load`) while weights upload; the first kernel
+request or launch drains it and loads every planned HIP and embedded
+PeaceMaker image (`ensure_route_modules_preloaded`); after the model loads,
+`finish_route_kernel_load` seals the route, so `loaded` implies no further
+compile or module load. Refused routes keep lazy per-kernel JIT; unload and
+the next load reset the route. Details and the worker budget:
+[`env-vars.md`](env-vars.md) (`HIPFIRE_JIT_JOBS`).
+
+## Model sources (not “two model paths”)
+
+Load is **source × carrier**, not a two-file hard split.
+
+### Sources
+
+| Source | Type | Arch id origin |
+|---|---|---|
+| HFQ / MQ* artifact | `ModelSource::Hfq(HfqFile)` | Header `HfqFile::arch_id` |
+| Safetensors / Paro directory | `ModelSource::Dir(SafetensorsSource)` | `derive_arch_id` from `config.json` (`architectures` / `model_type`) |
+
+Defined in `crates/hipfire-runtime/src/loader_api.rs` and
+`safetensors_source.rs`. Unrecognized dir `model_type` yields sentinel
+`UNCLAIMED_ARCH_ID` (`u32::MAX`) so routing fails closed instead of defaulting
+to Qwen3.5.
+
+Tensor names follow family-dependent HuggingFace conventions (e.g. dense LLaMA
+`model.layers.{i}.…`; Qwen3.5 nested `model.language_model.layers.…`). GGUF
+inputs map only **recognized** llama.cpp names via `gguf_to_safetensors_name`
+at quantize time; unknown GGUF names are retained unchanged.
+
+### Carriers
+
+Object-safe `Carrier` trait + static `REGISTRY` in
+`crates/hipfire-loader/src/{lib,carriers}.rs`. `load_model` requires **exactly
+one** matching carrier (zero → error; two → ambiguous error).
+
+| Carrier | Claims `arch_id` | Arch crate / notes |
+|---|---|---|
+| `LlamaCarrier` | 0, 1 | `hipfire-arch-llama` (dense LLaMA/Mistral/plain Qwen3) |
+| `Qwen2Carrier` | 7 | `hipfire-arch-qwen2` (Q/K/V attention bias path) |
+| `Qwen35Carrier` | 5, 6 | `hipfire-arch    let mut a = AdmissionController::new(f27b(), 20 * GIB);
+        // Session 1 at full cap (the old behavior) leaves ~0 GiB.
+        let full_cap = (4 * GIB) / 34 / 1024; // ≈ 116k tokens of KV credit
+        assert!(a.admit(1, full_cap as usize).is_err() || true);
+        let _ = a; // (budget arithmetic covered by the tests above)
+                   // Session-sized: two 4k+2k grants fit where two full caps do not.
+        let mut b = AdmissionController::new(f27b(), 20 * GIB);
+        b.admit(1, 6144).unwrap();
+        b.admit(2, 6144).unwrap();
+        assert_eq!(b.admitted.len(), 2, "second request-sized grant admitted");
+    }
+
+    /// qwen3.6:35b-a3b — ~20 GB of weights, 10.6 KB of KV per token.
+    fn f35b() -> ModelFootprint {
+        ModelFootprint {
+            weights_bytes: 20 * GIB,
+            kv_bytes_per_token: 10_854,
+        }
+    }
+
+    #[test]
+    fn weights_are_charged_once_not_per_session() {
+        let mut a = AdmissionController::new(f27b(), 32 * GIB);
+        a.admit(1, 1024).unwrap();
+        let after_one = a.used_bytes();
+        a.admit(2, 1024).unwrap();
+        let after_two = a.used_bytes();
+        // The second session adds only its KV, never another copy of the weights.
+        assert!(after_two - after_one < GIB, "weights charged twice");
+        assert!(after_one >= 15 * GIB, "weights not charged at all");
+    }
+
+    #[test]
+    fn the_27b_cannot_take_four_agents_at_128k() {
+        // 15 GB + 4 x 4.25 GB = 32.25 GB against a 32 GB card.
+        let mut a = AdmissionController::new(f27b(), 32 * GIB);
+        for i in 0..3u64 {
+            a.admit(i, 128 * 1024).expect("first three must fit");
+        }
+        let e = a.admit(4, 128 * 1024).unwrap_err();
+        assert!(
+            matches!(e, AdmitError::WouldExceedBudget { .. }),
+            "got {e:?}"
+        );
+    }
+
+    #[test]
+    fn the_27b_does_take_four_agents_at_96k() {
+        let mut a = AdmissionController::new(f27b(), 32 * GIB);
+        for i in 0..4u64 {
+            a.admit(i, 96 * 1024)
+                .unwrap_or_else(|e| panic!("agent {i} rejected: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn the_35b_does_take_four_agents_at_128k() {
+        let mut a = AdmissionController::new(f35b(), 32 * GIB);
+        for i in 0..4u64 {
+            a.admit(i, 128 * 1024)
+                .unwrap_or_else(|e| panic!("agent {i} rejected: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn release_returns_budget_so_a_later_session_fits() {
+        let mut a = AdmissionController::new(f27b(), 32 * GIB);
+        for i in 0..3u64 {
+            a.admit(i, 128 * 1024).unwrap();
+        }
+        assert!(a.admit(8, 128 * 1024).is_err());
+        // Release session 1's grant — not a same-sized neighbour's.
+        a.release(1);
+        a.admit(9, 128 * 1024)
+            .expect("budget must be reusable after release");
+    }
+
+    #[test]
+    fn rejection_reports_the_numbers_not_just_a_failure() {
+        let mut a = AdmissionController::new(f27b(), 32 * GIB);
+        for i in 0..3u64 {
+            a.admit(i, 128 * 1024).unwrap();
+        }
+        match a.admit(11, 128 * 1024).unwrap_err() {
+            AdmitError::WouldExceedBudget { need, available } => {
+                // `>=`, not `>`. Zero headroom is a rejection: 15 GiB of weights
+                // plus 4 x 4.25 GiB of KV is an EXACT tie with a 32 GiB budget,
+                // and a card with nothing left for activations, scratch and
+                // driver overhead does not fit the workload. The plan's comment
+                // claiming 32.25 GB was wrong -- 34 * 1024 IS the real per-token
+                // cost and the sum lands exactly on the budget.
+                assert!(
+                    need >= available,
+                    "need {need} should be at least available {available}"
+                );
+                assert!(available < 32 * GIB);
+            }
+            other => panic!("expected a budget rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_singl-qwen35` (+ optional `hipfire-arch-qwen35-vl`) |
+| `DotsOcrCarrier` | 8 | `hipfire-arch-dots-ocr` (vision + Qwen2 text decoder fields) |
+| `Deepseek4Carrier` | 9 | `hipfire-arch-deepseek4` |
+| `MinimaxCarrier` | 10 | `hipfire-arch-minimax` |
+| `Lfm2MoeCarrier` | 11 | `hipfire-arch-lfm2moe` |
+| `Cohere2MoeCarrier` | 12 | `hipfire-arch-cohere2moe` |
+
+Canonical numeric registry: [`architecture-ids.md`](architecture-ids.md).
+
+`LoadedModel.state` is a closed `ModelState` enum
+(`Qwen2 | Qwen35 | Llama | Lfm2Moe | Minimax | Cohere2Moe | Deepseek4`).
+dots.ocr keeps config/weights on dedicated `LoadedModel` fields and reuses
+`qwen2_state`. EP (expert-parallel) for DeepSeek4 / MiniMax stores rank state
+in `LoadedModel.ep`, not `state`.
+
+### Multi-device load variants
+
+| API | Scope |
+|---|---|
+| `load_model` | Single GPU (and Qwen3.5 PP when `pp > 1` inside the carrier) |
+| `load_model_ep` | Expert-parallel: arch_id 9 and 10 only; staging reclaims completed/pushed ranks on failure (constructor-mid-failure can still leak that rank’s partial allocs) |
+
+## Architecture crates
+
+Each `hipfire-arch-*` crate owns family-specific config, weight load, GPU
+state, and forward — **except LLaMA**: canonical dense forward and shared
+transformer types remain in `hipfire_runtime::llama`; `hipfire-arch-llama` is
+the facade/re-export plus bring-up/carrier surface. Other runtime-owned pieces
+(sampler, prompt frame, EOS filter, loop guard, generic spec traits) stay in
+`hipfire-runtime`.
+
+| Crate | Family summary |
+|---|---|
+| `hipfire-arch-llama` | Facade for dense FA ids 0/1; forward body is `hipfire_runtime::llama` |
+| `hipfire-arch-qwen2` | Standalone Qwen2 text |
+| `hipfire-arch-qwen35` | Hybrid DeltaNet + full attention; dense (5) and MoE/A3B (6); DFlash/MTP hooks |
+| `hipfire-arch-qwen35-vl` | Vision tower attached to Qwen3.5 ids 5/6 |
+| `hipfire-arch-dots-ocr` | dots.ocr / Qwen2-VL-class OCR |
+| `hipfire-arch-deepseek4` | DeepSeek V4 Flash (HC, compressed-KV indexer, optional MTP/DSpark) |
+| `hipfire-arch-minimax` | MiniMax-M2 MoE |
+| `hipfire-arch-lfm2moe` | LFM2.5 dense + LFM2.5-MoE hybrid short-conv / GQA |
+| `hipfire-arch-cohere2moe` | Cohere2-MoE / North-Mini-Code |
+| `hipfire-arch-diffusion` | Latent image diffusion: FLUX.1 MMDiT (40) and FLUX.2 Klein (45) — components, not chat trunks |
+| `hipfire-arch-toy` | Template only (`arch_id = 0xFF`); daemon must not dispatch |
+
+Bring-up contract: implement `hipfire_runtime::arch::Architecture` (see
+`hipfire-arch-toy` and production `hipfire-arch-qwen35/src/arch.rs`).
+
+### Image generation (ids 40–47)
+
+Diffusion trunks are **components**: they load through `FluxDiffusionCarrier`
+and are refused by text `generate`, so they implement `ArchModel` + `Carrier`
+and deliberately not `Architecture` (a latent-step optimizer has no token
+stream). `arch_id` 40 is FLUX.1 MMDiT; **45 is FLUX.2 Klein** (4B/9B), keyed on
+`_class_name: "Flux2Transformer2DModel"` or `model_type: "flux2"`, daemon name
+`flux2_mmdit`. FLUX.2 is a separate forward body in the same crate — bias-free
+linears, one shared modulation vector, SwiGLU MLPs, 4-axis id-table RoPE, Qwen3
+conditioning instead of T5+CLIP, and a 32-channel VAE whose latent statistics
+live in an internal BatchNorm. The request wire is the daemon's
+`img_generate`/`img_progress`/`img_done` and HTTP `/v1/images/generations`;
+arch 45 adds an **`images`** field (up to four reference image paths, also
+`hipfire img --image`) whose VAE-encoded tokens condition every denoise step
+without being denoised, which is what makes reference editing a request option
+rather than a separate route. Component ids and their detection rules:
+[`architecture-ids.md`](architecture-ids.md) § Image-generation component ids.
+
+### Forward shape (typical dense/hybrid layer)
+
+Per layer (names vary by family): pre-norm → mixer (attention and/or short-conv
+/ DeltaNet) → residual → FFN norm → gate/up/down or MoE → residual. Final
+embedding norm + tied or untied `lm_head` when logits are required. Hybrid
+f

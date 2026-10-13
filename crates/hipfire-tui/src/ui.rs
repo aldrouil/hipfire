@@ -1798,7 +1798,7 @@ mod render_tests {
 
         let unset = render("");
         assert!(
-            unset.contains("GPU layers all on GPU"),
+            unset.contains("GPU layers auto-fit (MoE) / GPU"),
             "an unset budget must render as a readable state, not a blank cell"
         );
 
