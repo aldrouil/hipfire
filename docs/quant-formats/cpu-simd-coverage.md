@@ -56,6 +56,28 @@ codes, floating-point accumulation order, or single-/multi-row layout.
 `Mq4G256` (qt 13) keeps a hand-unrolled nibble group (32 codes per 16-byte load)
 rather than the `codes8` path; its recorded measurements were taken with it.
 
+### Dense GEMV activation reuse and row granularity
+
+Ordinary dense GEMV prepares the per-group activation sum once for qt 13
+`Mq4G256` and qt 15 `Mq6G256`, instead of reducing the same activation again
+for every output row. It reuses the existing thread-local scratch capacity
+and recomputes sums on every call, including when the activation address is
+unchanged. Each format keeps its incumbent reduction tree, so this does not
+change result bits. Single-row and forced-scalar calls retain their old path.
+
+The output-row Rayon iterators use a minimum split length of 64 rows to avoid
+tiny tasks. This changes task granularity, not row arithmetic, tensor layout,
+weight placement, or the GPU/CPU execution seam.
+
+These changes do not add prepared sums for qt 44 `Mq4G256V2` or qt 20
+`Mq3G256Lloyd`; the latter has no affine zero term.
+
+The 2026-10-13 campaign also tested genuine AVX-512 kernels for qt 13, qt 20,
+and qt 44. None was retained: qt 20 regressed, qt 44 tied on the 27B fixture,
+and qt 13's small gain did not justify changed accumulation arithmetic and
+additional complexity. AVX2 remains the supported x86 vector path.
+
+
 ## Coverage — every `CpuQuant`
 
 Header = per-group affine metadata. Payload = weight encoding, `BITS` bits per code
@@ -137,7 +159,7 @@ qt 49 for `qwen3.8-27b.mq3-xt`.
 
 ## Verification
 
-`cargo test -p hipfire-cpu` (26 tests, GPU-free — the crate is a leaf):
+`cargo test --release -p hipfire-cpu --lib` (GPU-free — the crate is a leaf):
 
 - `every_cpu_decodable_format_has_a_kernel` — the kernel table in `simd::tests`
   names exactly the formats `from_quant_type` maps, and nothing else. A format
@@ -155,6 +177,10 @@ qt 49 for `qwen3.8-27b.mq3-xt`.
   would make every product exact and the comparison vacuous.
 - `gemv_matches_the_f64_reference` — the whole public GEMV path, AVX2 active,
   against an independent f64 oracle over every format.
+- `cached_and_uncached_agree_on_awkward_inputs` — prepared and uncached SIMD
+  rows are bit-identical; ordinary GEMV also agrees while the same activation
+  buffer is mutated across tokens and its active shape grows and shrinks.
+  Input/output tail sentinels guard the shape boundary.
 
 Beyond the crate, `cargo test -p hipfire-arch-qwen35 --test gpu_gemv_parity --
 --ignored` (needs the GPU; run here on gfx1201) compares the **production GPU
