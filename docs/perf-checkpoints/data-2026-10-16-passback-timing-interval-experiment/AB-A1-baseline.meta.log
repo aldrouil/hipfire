@@ -1,0 +1,9 @@
+=== power post ===
+====================================== Temperature =======================================
+GPU[0]		: Temperature (Sensor edge) (C): 49.0
+GPU[0]		: Temperature (Sensor junction) (C): 51.0
+GPU[0]		: Temperature (Sensor memory) (C): 72.0
+GPU[1]		: Temperature (Sensor edge) (C): 7.0
+=================================== Power Consumption ====================================
+=== trace-line check (expect 0) ===
+1

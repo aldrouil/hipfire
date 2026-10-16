@@ -1,0 +1,6 @@
+RAYON screen pin record (screen-only, N=1 each):
+R16a: RAYON_NUM_THREADS=16 (explicit) | R8: RAYON_NUM_THREADS=8 | R4: RAYON_NUM_THREADS=4 | R16b: RAYON_NUM_THREADS=16 (explicit repeat)
+Set as external env prefix on ab_sample.sh invocation (wrapper does not clear RAYON_*; env -u list is TRACE/PROFILE/MEMSET only).
+VERIFICATION GAP: daemon-side pool count never directly observed (no log line exposes rayon worker count).
+The R4 14.5 collapse is an observed negative effect of the env setting, NOT a verified pool-count claim.
+Default (unset) behavior for all A/B arms: shell confirmed clean (no RAYON/taskset/affinity vars); future arms run with RAYON_NUM_THREADS unset (wrapper unchanged, nothing to unset there — the pin was per-invocation prefix only).

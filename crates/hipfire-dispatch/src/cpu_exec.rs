@@ -76,13 +76,12 @@ enum HostExecMode {
 }
 
 fn host_exec_mode() -> HostExecMode {
-    static MODE: LazyLock<HostExecMode> = LazyLock::new(|| {
-        match hipfire_config::memory::offload_exec() {
+    static MODE: LazyLock<HostExecMode> =
+        LazyLock::new(|| match hipfire_config::memory::offload_exec() {
             hipfire_config::memory::OffloadExec::Cpu => HostExecMode::Cpu,
             hipfire_config::memory::OffloadExec::Passback => HostExecMode::Passback,
             hipfire_config::memory::OffloadExec::Pcie => HostExecMode::Pcie,
-        }
-    });
+        });
     *MODE
 }
 
@@ -528,7 +527,7 @@ pub fn run_host_mapped_gemv(
     };
     let step_start = Instant::now();
     let arm = cpu_arm_prepare(gpu, &plan, 0..w.m)?;
-    let (gemv_ns, h2d_ns) = cpu_arm_finish(gpu, &arm)?;
+    let (gemv_ns, h2d_ns) = cpu_arm_finish(gpu, &arm, true)?;
     finish_step(
         arm.q,
         w,
@@ -579,15 +578,16 @@ pub(crate) fn prepare_activation(
 }
 
 /// The CPU arm of a host-executed step: every blocking device read already done
-/// ([`cpu_arm_prepare`]), the multiply and the blocking write-back still pending
+/// ([`cpu_arm_prepare`]), the multiply and the write-back still pending
 /// ([`cpu_arm_finish`]).
 ///
 /// The two phases exist so a pass-back split can interleave a GPU launch
 /// *between* them: a blocking D2H issued after that launch would drain it, so the
-/// read must complete first and the write is the join (stream-ordered after the
-/// GPU arm on the same stream). `memory.offload_exec=cpu` runs the two back to
-/// back, which is the same sequence of device operations as the single-shot form
-/// it replaced.
+/// read must complete first and the write is either the join (completed on a
+/// sampled step) or a queued H2D the stream orders (an unsampled one), in both
+/// cases after the GPU arm on the same stream. `memory.offload_exec=cpu` runs the
+/// two back to back with a blocking write, which is the same sequence of device
+/// operations as the single-shot form it replaced.
 pub(crate) struct CpuArm<'a> {
     /// The weight's CPU decoder.
     pub(crate) q: CpuQuant,
@@ -596,7 +596,9 @@ pub(crate) struct CpuArm<'a> {
     /// pass-back can hand it to [`finish_step`] without keeping the plan alive.
     pub(crate) rotate_input: bool,
     /// Elapsed time of the blocking reads: the activation, plus the accumulator
-    /// when the step is a residual form. The trace's and the scheduler's `d2h`.
+    /// when the step is a residual form. The trace's `d2h`; the controller does
+    /// not see it (it runs before the GPU arm is launched, so it is not part of
+    /// the interval the two arms share).
     pub(crate) d2h_ns: u64,
     w: &'a WeightRef<'a>,
     /// The row range this arm multiplies.
@@ -613,9 +615,25 @@ pub(crate) struct CpuArm<'a> {
     acc_host: Option<Vec<f32>>,
 }
 
+/// Whether `rows` is a *partial* range — the pass-back split's own arm.
+///
+/// [`crate::offload_split::run_with`] is the only caller that hands the CPU arm
+/// a subset (`g..m`, `g > 0`); every other route — the whole-CPU arm, the
+/// seeding probe's activation read, the MoE splice — multiplies all of `0..m`.
+/// The copy choice follows that invariant rather than a caller flag, so the two
+/// routes cannot drift apart.
+fn split_arm(rows: &Range<usize>, m: usize) -> bool {
+    *rows != (0..m)
+}
+
 /// Phase one of the CPU arm: perform every blocking device read for `rows` and
 /// return the arm. MUST complete before any GPU arm of the same step is
 /// enqueued, because the reads drain the stream.
+///
+/// A *split* arm ([`split_arm`]) reads through the reusable pinned staging
+/// allocation instead of the whole-CPU route's blocking pageable copies, so the
+/// split's copy mechanics can be measured and reworked on their own; both paths
+/// block before returning, so the two-phase contract is unchanged.
 pub(crate) fn cpu_arm_prepare<'a>(
     gpu: &Gpu,
     cpu: &CpuStep<'a>,
@@ -623,14 +641,19 @@ pub(crate) fn cpu_arm_prepare<'a>(
 ) -> Result<CpuArm<'a>, DispatchError> {
     let q = host_mapped_quant(gpu, cpu.w)?;
     let t0 = Instant::now();
-    let (x_host, _) = prepare_activation(gpu, cpu.w, cpu.x, cpu.rotate_input)?;
-    let acc_host = match cpu.residual {
-        Some(acc) => Some(download_f32(
-            gpu,
-            &acc.sub_offset(rows.start, rows.len()),
-            rows.len(),
-        )?),
-        None => None,
+    let (x_host, acc_host) = if split_arm(&rows, cpu.w.m) {
+        prepare_split_read(gpu, cpu, &rows)?
+    } else {
+        let (x_host, _) = prepare_activation(gpu, cpu.w, cpu.x, cpu.rotate_input)?;
+        let acc_host = match cpu.residual {
+            Some(acc) => Some(download_f32(
+                gpu,
+                &acc.sub_offset(rows.start, rows.len()),
+                rows.len(),
+            )?),
+            None => None,
+        };
+        (x_host, acc_host)
     };
     Ok(CpuArm {
         q,
@@ -644,14 +667,135 @@ pub(crate) fn cpu_arm_prepare<'a>(
     })
 }
 
-/// Phase two of the CPU arm: the multiply over `rows`, the residual add when
-/// there is one, and the blocking write-back. Returns `(gemv_ns, h2d_ns)`.
+/// The split arm's read, staged through the reusable pinned allocation
+/// ([`with_cpu_transfer`]).
 ///
-/// The write-back is the join of a pass-back split: same stream as the GPU arm, so
-/// it waits for it, and the two arms' rows are disjoint, so nothing else is
-/// needed. For a split step `h2d_ns` therefore also carries the GPU arm's wait,
-/// which is the trace's `join` figure.
-pub(crate) fn cpu_arm_finish(gpu: &Gpu, arm: &CpuArm<'_>) -> Result<(u64, u64), DispatchError> {
+/// Enqueue every region this step needs — the activation, the AWQ scale when it
+/// rotates, the accumulator rows when it accumulates — then one completion on
+/// the arm's stream, and copy the staged bytes into the vectors the CPU
+/// multiply reads. The completion, not the host copy, is the read boundary,
+/// exactly as the blocking pageable `memcpy_dtoh` it replaces was: it drains
+/// prior work on that same stream before any host access to the staging bytes,
+/// so the GPU arm of the step is still launched only after the read is complete.
+///
+/// The pinned lease lives for the duration of this call only: the pass-back
+/// launches its GPU arm with `&mut Gpu` between the two phases, so a
+/// thread-local borrow cannot be held across it.
+fn prepare_split_read(
+    gpu: &Gpu,
+    cpu: &CpuStep<'_>,
+    rows: &Range<usize>,
+) -> Result<(Vec<f32>, Option<Vec<f32>>), DispatchError> {
+    let k = cpu.w.k;
+    // The AWQ divide happens *inside* the rotation, so the scale is read only
+    // when this step rotates — the rule `prepare_activation` follows.
+    let scale = if cpu.rotate_input {
+        cpu.w.awq_scale
+    } else {
+        None
+    };
+    let scale_len = if scale.is_some() { k } else { 0 };
+    let acc_len = if cpu.residual.is_some() {
+        rows.len()
+    } else {
+        0
+    };
+    // Staging layout, in f32 elements: activation | AWQ scale | accumulator rows.
+    let acc_off = k + scale_len;
+    with_cpu_transfer(gpu, acc_off + acc_len, |transfer| {
+        download_transfer(gpu, transfer, cpu.x, 0, k)?;
+        if let Some(scale) = scale {
+            download_transfer(gpu, transfer, scale, k, k)?;
+        }
+        if let Some(acc) = cpu.residual {
+            let acc_rows = acc.sub_offset(rows.start, rows.len());
+            download_transfer(gpu, transfer, &acc_rows, acc_off, rows.len())?;
+        }
+        transfer
+            .complete(&gpu.hip)
+            .map_err(|e| cpu_err(&format!("D2H complete: {e}")))?;
+        let staged = transfer_values(transfer, acc_off + acc_len);
+        let (x, rest) = staged.split_at_mut(k);
+        let (scale_host, acc_host) = rest.split_at_mut(scale_len);
+        // The same two transforms `prepare_activation` applies, in the same
+        // order, on the same bytes.
+        let mut x_host = x.to_vec();
+        if scale.is_some() {
+            divide_by_awq_scale(&mut x_host, scale_host);
+        }
+        if cpu.rotate_input {
+            rotate_x(&mut x_host);
+        }
+        Ok((x_host, cpu.residual.map(|_| acc_host.to_vec())))
+    })
+}
+
+/// The CPU arm's write-back: the whole-CPU route's blocking pageable upload, or
+/// — for a split arm — a staged upload through the same reusable pinned
+/// allocation.
+///
+/// `wait` is the caller's return policy for a *split* arm and is ignored by the
+/// whole-CPU route, whose pageable upload is always blocking:
+///
+/// * `true` completes the H2D on this call — the blocking join the pass-back's
+///   sampled steps and every whole-CPU caller take.
+/// * `false` only *enqueues* the owned pinned H2D on the arm's stream and
+///   returns. That stream orders it before every later consumer on the same
+///   stream, and the pinned owner keeps the bytes off-limits to the host until a
+///   later enqueue's `complete` drains them, its `Drop` retires them, or a
+///   stream change drains them in `begin`. This is the asynchronous return the
+///   pass-back's unsampled steps use.
+fn upload_arm_result(
+    gpu: &Gpu,
+    target: &GpuTensor,
+    values: &[f32],
+    split: bool,
+    wait: bool,
+) -> Result<(), DispatchError> {
+    if !split {
+        return upload_f32(gpu, target, values);
+    }
+    with_cpu_transfer(gpu, values.len(), |transfer| {
+        transfer_values(transfer, values.len()).copy_from_slice(values);
+        upload_transfer(gpu, transfer, target, 0, values.len())?;
+        if !wait {
+            // Asynchronous return: the H2D stays queued on this stream, ordered
+            // after the GPU arm just launched and before the consumer of these
+            // rows. No host wait, no event, no second stream. The owner's
+            // `pending` flag keeps the storage off-limits to the host until the
+            // next enqueue's `complete` drains it (same stream) or its
+            // destructor / the stream-change drain in `begin` retires it.
+            return Ok(());
+        }
+        // The join: the GPU arm of this step was launched on the same stream,
+        // so this waits for it exactly as the blocking pageable upload did. The
+        // arms' rows are disjoint, so nothing further is needed.
+        transfer
+            .complete(&gpu.hip)
+            .map_err(|e| cpu_err(&format!("H2D complete: {e}")))
+    })
+}
+
+/// Phase two of the CPU arm: the multiply over `rows`, the residual add when
+/// there is one, and the write-back. Returns `(gemv_ns, h2d_ns)`.
+///
+/// The write-back is the join of a *sampled* pass-back split: same stream as the
+/// GPU arm, so it waits for it, and the two arms' rows are disjoint, so nothing
+/// else is needed. For such a step `h2d_ns` therefore also carries the GPU arm's
+/// wait, which is the trace's `return` figure. A split arm's upload is staged
+/// through the pinned allocation; the whole-CPU route's stays a blocking
+/// pageable copy.
+///
+/// `wait_for_return` selects whether the write-back completes on this call
+/// ([`upload_arm_result`]). Every whole-CPU caller passes `true`; the pass-back
+/// passes `false` on its unsampled steps, where the H2D is only enqueued and
+/// `h2d_ns` is then the *enqueue* wall (the pinned copy plus the launch), not a
+/// join — see [`StepTiming`].
+pub(crate) fn cpu_arm_finish(
+    gpu: &Gpu,
+    arm: &CpuArm<'_>,
+    wait_for_return: bool,
+) -> Result<(u64, u64), DispatchError> {
     let rows = arm.rows.clone();
     let bytes = gpu
         .host_bytes(arm.w.buf)
@@ -665,13 +809,14 @@ pub(crate) fn cpu_arm_finish(gpu: &Gpu, arm: &CpuArm<'_>) -> Result<(u64, u64), 
     let gemv_ns = t1.elapsed().as_nanos() as u64;
     let t2 = Instant::now();
     let target = arm.target.sub_offset(rows.start, rows.len());
+    let split = split_arm(&rows, arm.w.m);
     match arm.acc_host.as_ref() {
         Some(acc_host) => {
             let mut acc = acc_host.clone();
             residual_add(&mut acc, &y);
-            upload_f32(gpu, &target, &acc)?;
+            upload_arm_result(gpu, &target, &acc, split, wait_for_return)?;
         }
-        None => upload_f32(gpu, &target, &y)?,
+        None => upload_arm_result(gpu, &target, &y, split, wait_for_return)?,
     }
     let h2d_ns = t2.elapsed().as_nanos() as u64;
     Ok((gemv_ns, h2d_ns))
@@ -703,7 +848,7 @@ pub fn run_host_mapped_gemv_residual(
     };
     let step_start = Instant::now();
     let arm = cpu_arm_prepare(gpu, &plan, 0..w.m)?;
-    let (gemv_ns, h2d_ns) = cpu_arm_finish(gpu, &arm)?;
+    let (gemv_ns, h2d_ns) = cpu_arm_finish(gpu, &arm, true)?;
     finish_step(
         arm.q,
         w,
@@ -897,7 +1042,8 @@ pub fn moe_cpu_experts<'a>(
     // The splice's whole wall time, started after validation and stopped just
     // before the trace print (which is not part of the call's cost).
     let t_total = Instant::now();
-    gpu.bind_thread().map_err(|e| cpu_err(&format!("bind: {e}")))?;
+    gpu.bind_thread()
+        .map_err(|e| cpu_err(&format!("bind: {e}")))?;
     let stage_bytes = n_x
         .checked_add(slots)
         .and_then(|n| n.checked_mul(8))
@@ -941,7 +1087,8 @@ pub fn moe_cpu_experts<'a>(
             download_transfer(gpu, transfer, residual, n_x + 2 * slots, n_x)?;
             timing.d2h_enqueue_ns = t_enqueue.elapsed().as_nanos() as u64;
             let t_complete = Instant::now();
-            transfer.complete(&gpu.hip)
+            transfer
+                .complete(&gpu.hip)
                 .map_err(|e| cpu_err(&format!("D2H completion: {e}")))?;
             timing.d2h_complete_ns = t_complete.elapsed().as_nanos() as u64;
             let values = transfer_values(transfer, stage_bytes / 4);
@@ -980,7 +1127,17 @@ pub fn moe_cpu_experts<'a>(
                 timing.dn_mix[di] = timing.dn_mix[di].saturating_add(1);
             }
             moe_cpu_experts_host(
-                dim, mi, rows, top_k, experts, x, ti, tw, acc, &mut scratch, &mut timing,
+                dim,
+                mi,
+                rows,
+                top_k,
+                experts,
+                x,
+                ti,
+                tw,
+                acc,
+                &mut scratch,
+                &mut timing,
             )?;
             let t_h2d = Instant::now();
             upload_transfer(gpu, transfer, residual, n_x + 2 * slots, n_x)?;
@@ -1232,8 +1389,7 @@ pub(crate) fn finish_step(
     match exec {
         HostExec::Cpu => {
             CPU_STEPS.fetch_add(1, Ordering::Relaxed);
-            CPU_STEP_WALL_NS
-                .fetch_add(step_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            CPU_STEP_WALL_NS.fetch_add(step_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
         HostExec::Split { gpu_rows } => {
             SPLIT_STEPS.fetch_add(1, Ordering::Relaxed);
@@ -1348,7 +1504,9 @@ fn trace_moe_step(
     let Ok(mut shapes) = MOE_SHAPES.lock() else {
         return;
     };
-    let stats = shapes.entry((q as u8, dim, mi, k, rows, graded)).or_default();
+    let stats = shapes
+        .entry((q as u8, dim, mi, k, rows, graded))
+        .or_default();
     stats.calls += 1;
     stats.d2h_enqueue_ns += timing.d2h_enqueue_ns;
     stats.d2h_complete_ns += timing.d2h_complete_ns;
@@ -1736,7 +1894,7 @@ pub(crate) fn reads_host_mapped_weight(gpu: &Gpu, step: &Step) -> bool {
 pub(crate) fn run_step(gpu: &Gpu, plan: &CpuStep) -> Result<(), DispatchError> {
     let step_start = Instant::now();
     let arm = cpu_arm_prepare(gpu, plan, 0..plan.w.m)?;
-    let (gemv_ns, h2d_ns) = cpu_arm_finish(gpu, &arm)?;
+    let (gemv_ns, h2d_ns) = cpu_arm_finish(gpu, &arm, true)?;
     finish_step(
         arm.q,
         plan.w,
@@ -1786,10 +1944,30 @@ fn download_into_f32(
         "cpu exec: buffer has {} elements, need {n}",
         out.len()
     );
+    // `memcpy_dtoh_auto` copies on the legacy null stream, which a
+    // `hipStreamNonBlocking` `active_stream` does *not* synchronize with: a
+    // consumer enqueued there (e.g. the residual `add_inplace` that produced
+    // this accumulator) can still be in flight, so the blocking copy would read
+    // stale bytes. Drain the actual producer stream first. With no active
+    // stream the blocking copy already carries the null-stream ordering, so the
+    // default/null path is untouched.
+    //
+    // Under hipGraph capture `active_stream` is the capturing stream and
+    // synchronizing it is illegal; skip the drain and let `memcpy_dtoh_auto`
+    // refuse the step (a CPU read is a host sync point and cannot be captured)
+    // instead of issuing an invalid sync before the error.
+    if !gpu.graphs.capture_mode {
+        if let Some(stream) = gpu.active_stream.as_ref() {
+            gpu.bind_thread()
+                .map_err(|e| cpu_err(&format!("bind: {e}")))?;
+            gpu.hip
+                .stream_synchronize(stream)
+                .map_err(|e| cpu_err(&format!("D2H producer drain: {e}")))?;
+        }
+    }
     // Safety: `out[..n]` is a live `n`-element f32 buffer; the slice covers
     // exactly those bytes and does not outlive the call.
-    let bytes =
-        unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, n * 4) };
+    let bytes = unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, n * 4) };
     gpu.memcpy_dtoh_auto(bytes, &t.buf)
         .map_err(|e| cpu_err(&format!("D2H: {e}")))
 }
@@ -1809,25 +1987,44 @@ fn upload_f32(gpu: &Gpu, t: &GpuTensor, v: &[f32]) -> Result<(), DispatchError> 
 /// Reuse owned pinned storage across CPU steps. Growth/device transitions
 /// drop an owner that drains pending accesses; the warm same-stream path has
 /// no return-side host wait, event record, or extra staging copy.
+///
+/// An asynchronous split return ([`upload_arm_result`] with `wait == false`)
+/// leaves this owner `pending` — the queued H2D still reads the storage — and
+/// returns. The next use is safe by construction: a same-stream enqueue is
+/// ordered after that H2D and its `complete` drains both before the host reads
+/// the staging bytes; a growth or a stream change drops/`begin`-drains the
+/// owner (a device synchronize) first; and `PinnedTransferBuffer::as_bytes_mut`
+/// asserts `!pending`, so a host access that slipped ahead of a completion
+/// fails loudly instead of silently racing the device.
 fn with_cpu_transfer<R>(
     gpu: &Gpu,
     values: usize,
     run: impl FnOnce(&mut hip_bridge::PinnedTransferBuffer) -> Result<R, DispatchError>,
 ) -> Result<R, DispatchError> {
     if gpu.graphs.capture_mode || gpu.replay.is_recording() {
-        return Err(cpu_err("CPU transfer cannot run during capture or retained recording"));
+        return Err(cpu_err(
+            "CPU transfer cannot run during capture or retained recording",
+        ));
     }
-    gpu.bind_thread().map_err(|e| cpu_err(&format!("bind: {e}")))?;
-    let bytes = values.checked_mul(4)
+    gpu.bind_thread()
+        .map_err(|e| cpu_err(&format!("bind: {e}")))?;
+    let bytes = values
+        .checked_mul(4)
         .ok_or_else(|| cpu_err("CPU transfer extent overflows"))?;
     CPU_TRANSFER.with(|cell| {
         let mut owner = cell.borrow_mut();
-        if owner.as_ref().is_none_or(|b| b.size() < bytes || b.device() != gpu.device_id) {
+        if owner
+            .as_ref()
+            .is_none_or(|b| b.size() < bytes || b.device() != gpu.device_id)
+        {
             // Retire the old allocation before binding/allocating the new one.
             // Its destructor restores this caller's current device.
             drop(owner.take());
-            *owner = Some(gpu.hip.transfer_buffer(bytes)
-                .map_err(|e| cpu_err(&format!("pinned transfer stage: {e}")))?);
+            *owner = Some(
+                gpu.hip
+                    .transfer_buffer(bytes)
+                    .map_err(|e| cpu_err(&format!("pinned transfer stage: {e}")))?,
+            );
         }
         let result = run(owner.as_mut().expect("stage allocated above"));
         // Earlier enqueues can survive a later error. Protect their device
@@ -1856,7 +2053,14 @@ fn download_transfer(
     if tensor.numel() < n {
         return Err(cpu_err("D2H tensor extent too small"));
     }
-    transfer.download_async(&gpu.hip, &tensor.buf, offset * 4, n * 4, gpu.active_stream.as_ref())
+    transfer
+        .download_async(
+            &gpu.hip,
+            &tensor.buf,
+            offset * 4,
+            n * 4,
+            gpu.active_stream.as_ref(),
+        )
         .map_err(|e| cpu_err(&format!("D2H enqueue: {e}")))
 }
 
@@ -1870,15 +2074,25 @@ fn upload_transfer(
     if tensor.numel() < n {
         return Err(cpu_err("H2D tensor extent too small"));
     }
-    transfer.upload_async(&gpu.hip, &tensor.buf, offset * 4, n * 4, gpu.active_stream.as_ref())
+    transfer
+        .upload_async(
+            &gpu.hip,
+            &tensor.buf,
+            offset * 4,
+            n * 4,
+            gpu.active_stream.as_ref(),
+        )
         .map_err(|e| cpu_err(&format!("H2D enqueue: {e}")))
 }
 
 /// One step's own wall-time split, handed to [`trace_step`].
 ///
-/// For a pass-back split step `h2d_ns` is the *join* (the blocking H2D, which
-/// waits for the concurrently launched GPU arm), and `gemv_ns` is the CPU arm's
-/// multiply — which is what the scheduler's `observe` samples.
+/// For a pass-back split step `gemv_ns` is the CPU arm's multiply — what the
+/// scheduler's `observe` samples — and `h2d_ns` is the write-back wall: the
+/// *join* (the completed H2D, which waits for the concurrently launched GPU arm)
+/// on a **sampled** step, or merely the enqueue wall (the pinned copy plus the
+/// launch) on an **unsampled** one, whose H2D is left queued for the stream to
+/// order and is never observed.
 pub(crate) struct StepTiming {
     pub(crate) d2h_ns: u64,
     pub(crate) gemv_ns: u64,
@@ -2029,7 +2243,9 @@ fn moe_layer_trace_inner(layer_idx: usize, is_full_attn: bool, timing: MoeLayerT
     let Ok(mut layers) = MOE_LAYERS.lock() else {
         return;
     };
-    let stats = layers.entry((layer_idx, is_full_attn, timing.rows)).or_default();
+    let stats = layers
+        .entry((layer_idx, is_full_attn, timing.rows))
+        .or_default();
     stats.calls += 1;
     stats.total_ns += timing.total_ns;
     stats.attn_ns += timing.attn_ns;
@@ -2139,14 +2355,15 @@ fn moe_step_trace_inner(timing: MoeStepTime) {
 /// 0 for a model the CPU covers, so a shape that silently never reaches the seam
 /// shows up as a number rather than as a mystery.
 ///
-/// A pass-back shape prints its own line instead (`split: …`): for it `join` is
-/// the blocking H2D, `copy + max(0, gpu_ns - cpu_ns)`. What the scheduler's
-/// controller reads is the join's excess over the shape's own **no-wait floor**
-/// (the smallest join seen), so `gpu samples` on that line says how often the
-/// GPU rate its share rests on was actually observed: zero means the share is
-/// still being pushed up because every join so far sat at the floor, and
-/// `gpu≥GB/s` is then a lower bound that says nothing about the real rate (which
-/// is why it is printed as a bound).
+/// A pass-back shape prints its own line instead (`split: …`). For it `return`
+/// is the mean write-back wall over the shape's steps: the completed H2D join on
+/// a sampled step, just the host enqueue on an unsampled one, so the mean mixes
+/// enqueues with joins and is not by itself a join. The controller is fed both
+/// arms' own durations, and only from the sampled steps — each one's multiply and
+/// its bracketed GPU-arm elapsed — so `N sampled` counts the steps that measured
+/// them and `cpu`/`gpu` are the same contended rates the share rests on. A shape
+/// that has not sampled yet prints `gpu=—`: no arm has been measured, so there is
+/// no GPU rate to show.
 fn trace_step(
     q: CpuQuant,
     w: &WeightRef,
@@ -2191,24 +2408,24 @@ fn trace_step(
     // ns -> ms, averaged over *this shape's* calls so far.
     let per_ms = |ns: u64| ns as f64 / 1e6 / stats.calls as f64;
     if stats.split {
-        // The CPU arm runs while the GPU arm streams the *same* host pages: `cpu`
-        // is the contended rate and `gpu≥` the lower bound the controller samples
-        // (see `offload_split`). bytes/ns is GB/s numerically.
+        // The CPU arm runs while the GPU arm streams the *same* host pages, so
+        // `cpu` is the arm's multiply rate over the arm's own rows — the interval
+        // the scheduler's controller samples, since the blocking D2H precedes the
+        // GPU arm and the H2D join follows it. bytes/ns is GB/s numerically. The
+        // GPU rate is the scheduler's measured one: the arm's rows over its own
+        // bracketed elapsed time, present once a sampled step has measured it.
         let row_bytes = (w.buf.buf.size() / w.m.max(1)) as f64;
-        let cpu_arm_ns = (stats.d2h_ns + stats.gemv_ns).max(1) as f64;
-        let whole_ns = (stats.d2h_ns + stats.gemv_ns + stats.h2d_ns).max(1) as f64;
+        let cpu_arm_ns = stats.gemv_ns.max(1) as f64;
         let cpu_gbs = stats.split_cpu_rows as f64 * row_bytes / cpu_arm_ns;
-        let gpu_gbs = stats.split_gpu_rows as f64 * row_bytes / whole_ns;
         let (share, control) = match crate::offload_split::shape_state(w.dtype, w.k) {
             Some(s) => (
                 format!("{:.3}", s.share),
                 format!(
-                    " (gpu samples {}, floor={}, last waited={}, target={}, {} applied, {} reopens{})",
-                    s.gpu_samples,
-                    s.min_join_ns
-                        .map(|ns| format!("{:.2}ms", ns as f64 / 1e6))
+                    " (gpu={}, {} sampled, target={}, {} applied, {} reopens{})",
+                    s.gpu_bytes_per_s
+                        .map(|b| format!("{:.1}GB/s", b / 1e9))
                         .unwrap_or_else(|| "—".into()),
-                    s.last_waited,
+                    s.samples,
                     s.last_target
                         .map(|t| format!("{t:.3}"))
                         .unwrap_or_else(|| "—".into()),
@@ -2223,7 +2440,7 @@ fn trace_step(
             "split: step gemv m={m} k={k} quant={q:?} gpu_rows={:.0}/{m} share={share}{control} \
              rotated={rotated} residual={residual} awq={} | {} calls | {total} steps ({splits} \
              split), {on_gpu} host-mapped steps still on GPU | mean per split step: \
-             d2h={:.2}ms gemv={:.2}ms join={:.2}ms | cpu={cpu_gbs:.1}GB/s gpu\u{2265}{gpu_gbs:.1}GB/s",
+             d2h={:.2}ms gemv={:.2}ms return={:.2}ms | cpu={cpu_gbs:.1}GB/s",
             stats.split_gpu_rows as f64 / stats.calls as f64,
             w.awq_scale.is_some(),
             stats.calls,
@@ -2266,8 +2483,9 @@ mod moe_splice_tests {
             CpuQuant::Mq4G256 => b[..8].copy_from_slice(&f32x2(0.03125, -0.5)),
             CpuQuant::Mq6G256 => b[..8].copy_from_slice(&f32x2(0.0078125, -0.125)),
             CpuQuant::Mq3G256Lloyd => {
-                const CB: [u16; 8] =
-                    [0xbc00, 0xb800, 0xb400, 0xb000, 0x3000, 0x3400, 0x3800, 0x3c00];
+                const CB: [u16; 8] = [
+                    0xbc00, 0xb800, 0xb400, 0xb000, 0x3000, 0x3400, 0x3800, 0x3c00,
+                ];
                 for (k, v) in CB.iter().enumerate() {
                     b[2 * k..2 * k + 2].copy_from_slice(&v.to_le_bytes());
                 }
@@ -2444,7 +2662,14 @@ mod moe_splice_tests {
                 let s = t * top_k + j;
                 let e = idx[s];
                 let mut gv = vec![0.0f32; 2 * mi];
-                gemv(gu_q[e], &gu[e], 2 * mi, dim, &x[t * dim..(t + 1) * dim], &mut gv);
+                gemv(
+                    gu_q[e],
+                    &gu[e],
+                    2 * mi,
+                    dim,
+                    &x[t * dim..(t + 1) * dim],
+                    &mut gv,
+                );
                 let mut hid = vec![0.0f32; mi];
                 silu_mul(&gv, &mut hid);
                 if dn_q[e].is_fwht_g256() {
@@ -2508,21 +2733,19 @@ mod moe_splice_tests {
         }];
         let mut scratch = MoeScratch::default();
         // rows=2, top_k=1 needs 2 experts; only 1 supplied.
-        assert!(
-            moe_cpu_experts_host(
-                dim,
-                mi,
-                2,
-                1,
-                &experts,
-                &vec![0.0f32; 2 * dim],
-                &[id_bits(0), id_bits(0)],
-                &[1.0, 1.0],
-                &mut vec![0.0f32; 2 * dim],
-                &mut scratch,
-                &mut MoeStepTiming::default()
-            )
-            .is_err()
-        );
+        assert!(moe_cpu_experts_host(
+            dim,
+            mi,
+            2,
+            1,
+            &experts,
+            &vec![0.0f32; 2 * dim],
+            &[id_bits(0), id_bits(0)],
+            &[1.0, 1.0],
+            &mut vec![0.0f32; 2 * dim],
+            &mut scratch,
+            &mut MoeStepTiming::default()
+        )
+        .is_err());
     }
 }

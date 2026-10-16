@@ -37,7 +37,7 @@ use std::path::PathBuf;
 use hipfire_cpu::gemv::gemv as cpu_gemv;
 use hipfire_cpu::quant::{divide_by_awq_scale, rotate_x, CpuQuant};
 use hipfire_dispatch::context::DispatchCtx;
-use hipfire_dispatch::families::gemv::{GemvFamily, GemvParams, WeightRef};
+use hipfire_dispatch::families::gemv::{GemvFamily, GemvParams, RotateInputs, WeightRef};
 use hipfire_dispatch::types::GemvVariant;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::weight_backend::load_awq_scale_for;
@@ -667,7 +667,10 @@ fn gpu_cpu_gemv_parity_per_format() {
 #[test]
 #[ignore = "requires HIP GPU and HIPFIRE_OFFLOAD_EXEC=cpu"]
 fn cpu_offload_return_stream_and_reuse_parity() -> Result<(), Box<dyn std::error::Error>> {
-    assert!(hipfire_dispatch::cpu_exec_enabled(), "run with HIPFIRE_OFFLOAD_EXEC=cpu");
+    assert!(
+        hipfire_dispatch::cpu_exec_enabled(),
+        "run with HIPFIRE_OFFLOAD_EXEC=cpu"
+    );
     let mut gpu = Gpu::init()?;
     for stream_case in 0..3 {
         if stream_case != 0 {
@@ -741,8 +744,11 @@ fn cpu_offload_return_stream_and_reuse_parity() -> Result<(), Box<dyn std::error
                     Some(stream) => gpu.hip.stream_synchronize(stream)?,
                     None => gpu.hip.stream_synchronize_default()?,
                 }
-                assert_eq!(gpu.download_f32(&out)?, want_out,
-                    "{q:?} stream {stream_case} k={k}: GPU consumer saw a stale CPU output");
+                assert_eq!(
+                    gpu.download_f32(&out)?,
+                    want_out,
+                    "{q:?} stream {stream_case} k={k}: GPU consumer saw a stale CPU output"
+                );
                 assert_eq!(gpu.download_f32(&acc)?, want_acc,
                     "{q:?} stream {stream_case} k={k}: residual return/storage reuse changed arithmetic");
                 gpu.free_tensor(w)?;
@@ -806,6 +812,30 @@ fn read_f32(gpu: &Gpu, t: &GpuTensor, n: usize) -> Vec<f32> {
     out
 }
 
+/// The scheduler's sampled-step count for `(dtype, k)`, read through the public
+/// snapshot. Lets a test prove the asynchronous return path (a completed H2D is
+/// the only thing that increments this) was actually taken.
+fn shape_samples(dtype: DType, k: usize) -> u64 {
+    hipfire_dispatch::scheduler_snapshot()
+        .into_iter()
+        .find(|s| s.dtype == dtype && s.k == k)
+        .map(|s| s.samples)
+        .unwrap_or(0)
+}
+
+/// The step's input form: `Raw` hands both engines the unrotated activation,
+/// which each must transform (AWQ divide inside the rotation) by the dtype's own
+/// rule; `Prerotated` hands both the finished form and neither may touch it
+/// again. The split's CPU arm reads and transforms the activation itself, so the
+/// two forms exercise different staging layouts.
+fn input_form(raw: bool, x: &GpuTensor) -> hipfire_dispatch::pipeline::GemvInput<'_> {
+    if raw {
+        hipfire_dispatch::pipeline::GemvInput::Raw(x)
+    } else {
+        hipfire_dispatch::pipeline::GemvInput::Prerotated(x)
+    }
+}
+
 /// Every row of a split step's output, compared bit for bit against the whole-step
 /// path it was cut from.
 ///
@@ -815,6 +845,11 @@ fn read_f32(gpu: &Gpu, t: &GpuTensor, n: usize) -> Vec<f32> {
 /// `[g, m)` come from the CPU over `&bytes[g*row_bytes..]`, and their equality
 /// *also* proves the GPU arm did not write past `g` — i.e. that the two arms'
 /// regions are disjoint, which is why the join needs no synchronization.
+///
+/// `raw`/`awq` select the step's input form (see [`input_form`]): with `awq` the
+/// CPU arm additionally stages and applies the per-channel AWQ scale, and the
+/// accumulator region of a residual step then sits behind it in the staging
+/// buffer rather than at its base.
 #[allow(clippy::too_many_arguments)]
 fn split_case(
     gpu: &mut Gpu,
@@ -827,8 +862,10 @@ fn split_case(
     bytes: &[u8],
     m: usize,
     k: usize,
+    raw: bool,
+    awq: Option<&GpuTensor>,
 ) -> bool {
-    use hipfire_dispatch::pipeline::{GemvInput, Step};
+    use hipfire_dispatch::pipeline::Step;
 
     // The gate's correctness-critical invariant: the byte length is exactly
     // `m * row_bytes`, which is what makes a byte view the CPU arm's row `g`.
@@ -850,11 +887,23 @@ fn split_case(
         .upload_raw_host(bytes, &[bytes.len()])
         .expect("upload host-mapped w");
     assert!(gpu.host_located(&w), "{label}: weight is not host-mapped");
-    let mut x_rot = activation(k, m);
+    // The activation the CPU arm must end up multiplying: `prepare_activation`'s
+    // rule — a `Raw` input is AWQ-divided inside the rotation, a `Prerotated` one
+    // is used exactly as stored.
+    let raw_x = activation(k, m);
+    let mut cpu_x = raw_x.clone();
     if q.is_fwht_g256() {
-        rotate_x(&mut x_rot);
+        if raw {
+            if let Some(scale) = awq {
+                divide_by_awq_scale(&mut cpu_x, &read_f32(gpu, scale, k));
+            }
+        }
+        rotate_x(&mut cpu_x);
     }
-    let x_dev = gpu.upload_f32(&x_rot, &[k]).expect("upload x");
+    // The bytes the step carries: the raw form for a `Raw` step (both engines
+    // transform it), the finished rotation for a `Prerotated` one.
+    let wire = if raw { &raw_x } else { &cpu_x };
+    let x_dev = gpu.upload_f32(wire, &[k]).expect("upload x");
     let wr = WeightRef {
         buf: &w,
         dtype,
@@ -862,7 +911,7 @@ fn split_case(
         k,
         row_stride: 0,
         rotation: None,
-        awq_scale: None,
+        awq_scale: awq,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
         lloyd_lut_c16: None,
@@ -876,7 +925,7 @@ fn split_case(
         ctx,
         &Step::Gemv {
             w: &wr,
-            input: GemvInput::Prerotated(&x_dev),
+            input: input_form(raw, &x_dev),
             out: &out_split,
         },
         opts,
@@ -888,24 +937,45 @@ fn split_case(
     let g = (after.1 - before.1) as usize;
     assert!(g > 0 && g < m, "{label}: split offset {g} of {m}");
     assert_eq!(g % 8, 0, "{label}: split offset {g} is not 8-row aligned");
+    let form = if raw { "Raw" } else { "Prerotated" };
+
+    // A real GPU consumer queued *immediately*, before any host sync: the step
+    // may have returned its CPU rows asynchronously (its H2D only enqueued), in
+    // which case this `add_inplace_f32` on the same stream is the ordering
+    // proof. Both arms' references below get the identical add, so a split that
+    // read a row before its upload, or ordered the consumer before it, shows up
+    // as a wrong number rather than as a bookkeeping difference. The activation
+    // has no sentinel tail here; the residual arm carries that.
+    let consumer_vals = activation(m, 4242);
+    let consumer = gpu
+        .upload_f32(&consumer_vals, &[m])
+        .expect("upload consumer");
+    gpu.add_inplace_f32(&out_split, &consumer)
+        .expect("queued consumer add");
 
     let out_full = gpu.alloc_tensor(&[m], DType::F32).expect("alloc ref");
-    gemv.run(
-        ctx,
-        gpu,
-        &GemvParams {
-            w: &wr,
-            x: &x_dev,
-            y: &out_full,
-            variant: GemvVariant::Prerotated,
-            residual: None,
-            gate: None,
-            up: None,
-        },
-    )
-    .unwrap_or_else(|e| panic!("{label}: reference launch failed: {e:?}"));
+    // The whole-step reference over all `m` rows: the same engine the split's GPU
+    // arm runs, which self-rotates a `Raw` step through `run_auto`.
+    let launched = if raw {
+        gemv.run_auto(ctx, gpu, &wr, &x_dev, &out_full)
+    } else {
+        gemv.run(
+            ctx,
+            gpu,
+            &GemvParams {
+                w: &wr,
+                x: &x_dev,
+                y: &out_full,
+                variant: GemvVariant::Prerotated,
+                residual: None,
+                gate: None,
+                up: None,
+            },
+        )
+    };
+    launched.unwrap_or_else(|e| panic!("{label}: reference launch failed: {e:?}"));
     let mut cpu_full = vec![0.0f32; m];
-    cpu_gemv(q, bytes, m, k, &x_rot, &mut cpu_full);
+    cpu_gemv(q, bytes, m, k, &cpu_x, &mut cpu_full);
 
     let split = read_f32(gpu, &out_split, m);
     let full = read_f32(gpu, &out_full, m);
@@ -915,7 +985,10 @@ fn split_case(
     // agreed bitwise would be a mixture in name only (and this is the reference
     // against which the requirement "coherent output, plus a measured divergence"
     // is met at the element level rather than at the token level).
-    let arm_scale = cpu_full.iter().fold(0.0f32, |a, b| a.max(b.abs())).max(1e-30);
+    let arm_scale = cpu_full
+        .iter()
+        .fold(0.0f32, |a, b| a.max(b.abs()))
+        .max(1e-30);
     let arm_delta = full
         .iter()
         .zip(&cpu_full)
@@ -925,27 +998,27 @@ fn split_case(
     for row in 0..g {
         assert_eq!(
             split[row].to_bits(),
-            full[row].to_bits(),
-            "{label}: GPU row {row} differs from a full Prerotated launch \
+            (full[row] + consumer_vals[row]).to_bits(),
+            "{label}: GPU row {row} differs from a full {form} launch \
              (g={g}, m={m})"
         );
     }
     for row in g..m {
         assert_eq!(
             split[row].to_bits(),
-            cpu_full[row].to_bits(),
+            (cpu_full[row] + consumer_vals[row]).to_bits(),
             "{label}: CPU row {row} differs from a whole-weight CPU gemv \
              (g={g}, m={m})"
         );
     }
+    gpu.free_tensor(consumer).ok();
 
     // ── the residual arm: `acc += W·x`, rows [0, g) GPU, [g, m) CPU ──────────
     // Only dtypes whose GPU residual arm exists can be split at all
     // (`dispatch_residual`'s set is `for_gemv_residual`'s): the gate must refuse
     // the rest rather than fail to launch, because the whole-CPU step handles
     // every format the CPU decodes.
-    let residual_covered =
-        hipfire_dispatch::types::KernelKey::for_gemv_residual(dtype).is_ok();
+    let residual_covered = hipfire_dispatch::types::KernelKey::for_gemv_residual(dtype).is_ok();
     // +8 rows of sentinel past `m`, so an over-long offset launch is caught.
     let mut seed = activation(m, 7919);
     seed.extend_from_slice(&[999.0f32; 8]);
@@ -956,7 +1029,7 @@ fn split_case(
             ctx,
             &Step::GemvResidual {
                 w: &wr,
-                input: GemvInput::Prerotated(&x_dev),
+                input: input_form(raw, &x_dev),
                 residual: &acc,
                 out: &acc,
             },
@@ -990,7 +1063,7 @@ fn split_case(
         ctx,
         &Step::GemvResidual {
             w: &wr,
-            input: GemvInput::Prerotated(&x_dev),
+            input: input_form(raw, &x_dev),
             // Production aliases `out` with `residual` on this arm (the residual
             // form never writes `out`); mirror that.
             residual: &resid_split,
@@ -999,27 +1072,54 @@ fn split_case(
         opts,
     )
     .unwrap_or_else(|e| panic!("{label}: residual split failed: {e:?}"));
-    assert!(ran, "{label}: the pass-back refused a covered residual shape");
+    assert!(
+        ran,
+        "{label}: the pass-back refused a covered residual shape"
+    );
     let after = hipfire_dispatch::split_counters();
     assert_eq!(
         (after.1 - before.1) as usize,
         g,
         "{label}: the residual arm's offset differs from the plain arm's"
     );
-    gemv.run(
-        ctx,
-        gpu,
-        &GemvParams {
-            w: &wr,
-            x: &x_dev,
-            y: &resid_full,
-            variant: GemvVariant::WithResidual,
-            residual: None,
-            gate: None,
-            up: None,
-        },
-    )
-    .unwrap_or_else(|e| panic!("{label}: residual reference launch failed: {e:?}"));
+    // `launch_gemv`'s `(Raw, Some(residual))` form: the launcher rotates the
+    // activation itself (the fused kernel accumulates, it does not rotate), so
+    // the whole-step reference is that same rotate followed by the same
+    // accumulate over all `m` rows.
+    if raw {
+        let rotated = gemv
+            .rotate(ctx, gpu, &wr, &x_dev, &RotateInputs::default())
+            .unwrap_or_else(|e| panic!("{label}: residual rotate failed: {e:?}"));
+        gemv.run(
+            ctx,
+            gpu,
+            &GemvParams {
+                w: &wr,
+                x: &rotated.into_buf(),
+                y: &resid_full,
+                variant: GemvVariant::WithResidual,
+                residual: None,
+                gate: None,
+                up: None,
+            },
+        )
+        .unwrap_or_else(|e| panic!("{label}: residual reference launch failed: {e:?}"));
+    } else {
+        gemv.run(
+            ctx,
+            gpu,
+            &GemvParams {
+                w: &wr,
+                x: &x_dev,
+                y: &resid_full,
+                variant: GemvVariant::WithResidual,
+                residual: None,
+                gate: None,
+                up: None,
+            },
+        )
+        .unwrap_or_else(|e| panic!("{label}: residual reference launch failed: {e:?}"));
+    }
 
     let acc_split = read_f32(gpu, &resid_split, m + 8);
     let acc_full = read_f32(gpu, &resid_full, m + 8);
@@ -1027,8 +1127,8 @@ fn split_case(
         assert_eq!(
             acc_split[row].to_bits(),
             acc_full[row].to_bits(),
-            "{label}: residual GPU row {row} differs from a full WithResidual \
-             launch (g={g}, m={m})"
+            "{label}: residual GPU row {row} differs from the full {form} \
+             residual launch (g={g}, m={m})"
         );
     }
     for row in g..m {
@@ -1046,6 +1146,133 @@ fn split_case(
             "{label}: row {row} past m={m} was written by the offset launch"
         );
     }
+
+    // ── asynchronous return + immediately queued consumer ───────────────────
+    // Most split steps return their CPU rows asynchronously: the pinned H2D is
+    // only *enqueued*, and the stream must order it before the consumer. Queue a
+    // real GPU consumer over the full valid m-row view *before any host sync* and
+    // chain the steps — each iteration's CPU arm D2Hs the accumulator the
+    // previous iteration's consumer just updated — so a premature host read, a
+    // staged read of stale bytes, or the pinned buffer being reused while the GPU
+    // still read it all land as wrong rows rather than as a bookkeeping
+    // difference. The +8 sentinel tail catches an over-long consumer.
+    //
+    // The reference is the *same sequence of operations* the split performs: for
+    // rows `[0, g)` the GPU residual kernel over all `m` rows followed by the
+    // same consumer add (both on the same stream), and for rows `[g, m)` the
+    // identical host f32 adds the CPU arm performs. Comparing bit for bit, rather
+    // than by a tolerance, is what makes a row read before its upload — or a
+    // consumer ordered ahead of it — impossible to hide in the rounding.
+    const TAIL: usize = 8;
+    let mut consumer_vals = activation(m, 5150);
+    consumer_vals.extend_from_slice(&[0.0f32; TAIL]);
+    let consumer = gpu
+        .upload_f32(&consumer_vals, &[m + TAIL])
+        .expect("upload chained consumer");
+    let async_acc = gpu
+        .upload_f32(&seed, &[m + TAIL])
+        .expect("upload chained acc");
+    let ref_acc = gpu
+        .upload_f32(&seed, &[m + TAIL])
+        .expect("upload chained ref");
+
+    // The activation the GPU residual reference consumes: the same rotate the
+    // split's `Raw` step self-applies, or the stored `Prerotated` buffer.
+    let chained_rotate;
+    let ref_x: &GpuTensor = if raw {
+        chained_rotate = gemv
+            .rotate(ctx, gpu, &wr, &x_dev, &RotateInputs::default())
+            .unwrap_or_else(|e| panic!("{label}: chained rotate failed: {e:?}"));
+        chained_rotate.buf()
+    } else {
+        &x_dev
+    };
+
+    let async_steps = 8usize;
+    let samples_before = shape_samples(dtype, k);
+    let mut want = seed.clone();
+    for _ in 0..async_steps {
+        let ran = hipfire_dispatch::offload_split::run_with(
+            gpu,
+            ctx,
+            &Step::GemvResidual {
+                w: &wr,
+                input: input_form(raw, &x_dev),
+                residual: &async_acc,
+                out: &async_acc,
+            },
+            opts,
+        )
+        .unwrap_or_else(|e| panic!("{label}: chained residual split failed: {e:?}"));
+        assert!(
+            ran,
+            "{label}: the pass-back refused a covered chained residual shape"
+        );
+        // Immediately queued, with no host sync between the split and this
+        // consumer: on an asynchronous return this is the ordering proof.
+        gpu.add_inplace_f32(&async_acc, &consumer)
+            .expect("queued chained consumer add");
+        // The GPU rows' reference: the same residual kernel and consumer, over
+        // all `m` rows (only `[0, g)` is compared, the range the split's GPU arm
+        // owns).
+        gemv.run(
+            ctx,
+            gpu,
+            &GemvParams {
+                w: &wr,
+                x: ref_x,
+                y: &ref_acc,
+                variant: GemvVariant::WithResidual,
+                residual: None,
+                gate: None,
+                up: None,
+            },
+        )
+        .unwrap_or_else(|e| panic!("{label}: chained residual reference failed: {e:?}"));
+        gpu.add_inplace_f32(&ref_acc, &consumer)
+            .expect("queued chained reference consumer add");
+        // The CPU rows' reference: the same two host adds, in the same order the
+        // arm and the consumer apply them.
+        for row in g..m {
+            want[row] += cpu_full[row];
+            want[row] += consumer_vals[row];
+        }
+    }
+    let samples_after = shape_samples(dtype, k);
+    let got = read_f32(gpu, &async_acc, m + TAIL);
+    let rgot = read_f32(gpu, &ref_acc, m + TAIL);
+    for row in 0..g {
+        assert_eq!(
+            got[row].to_bits(),
+            rgot[row].to_bits(),
+            "{label}: asynchronously returned GPU row {row} differs from the chained \
+             reference (g={g}, m={m})"
+        );
+    }
+    for row in g..m {
+        assert_eq!(
+            got[row].to_bits(),
+            want[row].to_bits(),
+            "{label}: asynchronously returned CPU row {row} differs from the chained \
+             reference (g={g}, m={m})"
+        );
+    }
+    for row in m..m + TAIL {
+        assert_eq!(
+            got[row], 999.0,
+            "{label}: the chained consumer wrote past m={m} at row {row}"
+        );
+    }
+    // The cadence must have skipped at least one completion over these steps, or
+    // the asynchronous path this section exists to exercise was never taken.
+    assert!(
+        samples_after - samples_before < async_steps as u64,
+        "{label}: every one of {async_steps} steps completed the return H2D — the \
+         asynchronous path was never exercised"
+    );
+    gpu.free_tensor(consumer).ok();
+    gpu.free_tensor(async_acc).ok();
+    gpu.free_tensor(ref_acc).ok();
 
     eprintln!(
         "{label:44} m={m:<6} k={k:<6} row_bytes={row_bytes:<6} g={g:<6} \
@@ -1103,7 +1330,8 @@ fn passback_row_offset_equivalence() {
         share: PassbackShare::Share(0.5),
     };
     let dir = models_dir();
-    let mut cases: Vec<(String, CpuQuant, DType, Vec<u8>, usize, usize)> = Vec::new();
+    // (label, quant, dtype, weight bytes, m, k, `Raw` input with an AWQ scale)
+    let mut cases: Vec<(String, CpuQuant, DType, Vec<u8>, usize, usize, bool)> = Vec::new();
 
     // Real fixture tensors: the strongest evidence (real strides, real group
     // counts), and the natural shape plus the smallest odd row count that still
@@ -1129,20 +1357,42 @@ fn passback_row_offset_equivalence() {
         else {
             continue;
         };
-        let (_, bytes) = hfq.tensor_data_vec(&name).expect("tensor bytes");
+        let (_, mut bytes) = hfq.tensor_data_vec(&name).expect("tensor bytes");
         let row_bytes = bytes.len() / m;
+        // MFP4's MoE expert matrices are ~1 MiB, below `MIN_SPLIT_BYTES`, so the
+        // gate declines them as a whole-CPU step. The split's unit is the row, so
+        // tile the real rows until the case clears the floor — the bytes stay real
+        // fixture rows at the real stride, and grown cases are labelled `tiled-m=`.
+        let natural_len = bytes.len();
+        while bytes.len() < MIN_SPLIT_BYTES {
+            let n = bytes.len();
+            bytes.extend_from_within(..n);
+        }
+        let m = bytes.len() / row_bytes;
+        let tiled = bytes.len() != natural_len;
         let short = name.rsplit('.').nth(1).unwrap_or(&name).to_string();
-        cases.push((format!("{file} {short}"), *q, *dtype, bytes.clone(), m, k));
+        let label = if tiled {
+            format!("{file} {short} tiled-m={m}")
+        } else {
+            format!("{file} {short}")
+        };
+        cases.push((label, *q, *dtype, bytes.clone(), m, k, false));
         let min_rows = MIN_SPLIT_BYTES.div_ceil(row_bytes) | 1;
         if min_rows < m {
             let rows = min_rows;
+            let label = if tiled {
+                format!("{file} {short} odd-m={rows} tiled")
+            } else {
+                format!("{file} {short} odd-m={rows}")
+            };
             cases.push((
-                format!("{file} {short} odd-m={rows}"),
+                label,
                 *q,
                 *dtype,
                 bytes[..rows * row_bytes].to_vec(),
                 rows,
                 k,
+                false,
             ));
         }
     }
@@ -1168,21 +1418,90 @@ fn passback_row_offset_equivalence() {
             synth_weights(*q, m, k),
             m,
             k,
+            false,
+        ));
+    }
+
+    // The input form the `Prerotated` matrix above does not reach: a `Raw` step
+    // with an AWQ sidecar. That is what the split's CPU arm transforms itself
+    // (the divide happens inside the rotation), and it is what puts the AWQ
+    // scale region — and, for the residual arm, the accumulator region behind
+    // it — into the staging buffer. MQ4G256 has an FWHT-G256 plan and a fused
+    // residual kernel, so both arms run.
+    {
+        let q = CpuQuant::Mq4G256;
+        let dtype = DType::MQ4G256;
+        let k = 4096usize;
+        let row_bytes = hipfire_cpu::gemv::row_bytes(q, k);
+        let m = MIN_SPLIT_BYTES.div_ceil(row_bytes) | 1;
+        cases.push((
+            format!("synthetic raw+awq {q:?}"),
+            q,
+            dtype,
+            synth_weights(q, m, k),
+            m,
+            k,
+            true,
         ));
     }
 
     assert!(
         !cases.is_empty(),
-        "no fixture or synthetic case was available — pull qwen3.5:2b"
+        "no fixture or synthetic case was available — pull qwen3.5-2b"
     );
-    let differing_arms = cases
-        .iter()
-        .filter(|(label, q, dtype, bytes, m, k)| {
-            split_case(
-                &mut gpu, &gemv, &ctx, &opts, label, *q, *dtype, bytes, *m, *k,
-            )
-        })
-        .count();
+    // The whole case list runs once per copy-mechanics configuration, in the
+    // order the pass-back meets them: the null stream, a real non-blocking
+    // stream, then the null stream again with the pinned staging allocation
+    // already warm from the other stream (the stream transition
+    // `PinnedTransferBuffer` has to handle). Every assert in `split_case` runs
+    // under all three, over the same real fixture and synthetic shapes, so a
+    // staged copy that read the buffer before it was filled, at the wrong
+    // offset, or with a previous step's bytes shows up here as wrong rows — the
+    // same way it would in the model — and not as a difference in bookkeeping.
+    let mut differing_arms = 0usize;
+    for stream_case in 0..3 {
+        match stream_case {
+            0 => eprintln!("— stream case 0: null (default) stream"),
+            1 => {
+                gpu.active_stream = Some(gpu.hip.stream_create_non_blocking().expect("stream"));
+                eprintln!("— stream case 1: non-blocking stream");
+            }
+            _ => {
+                if let Some(stream) = gpu.active_stream.take() {
+                    gpu.hip.stream_destroy(stream).expect("destroy stream");
+                }
+                eprintln!("— stream case 2: null stream again, staging allocation warm");
+            }
+        }
+        for (label, q, dtype, bytes, m, k, raw) in &cases {
+            let scale = if *raw {
+                let scales: Vec<f32> = (0..*k).map(|i| 0.75 + (i % 7) as f32 * 0.125).collect();
+                Some(gpu.upload_f32(&scales, &[*k]).expect("upload awq scale"))
+            } else {
+                None
+            };
+            let arms_differ = split_case(
+                &mut gpu,
+                &gemv,
+                &ctx,
+                &opts,
+                label,
+                *q,
+                *dtype,
+                bytes,
+                *m,
+                *k,
+                *raw,
+                scale.as_ref(),
+            );
+            if let Some(scale) = scale {
+                gpu.free_tensor(scale).ok();
+            }
+            if arms_differ {
+                differing_arms += 1;
+            }
+        }
+    }
     // The two engines are independent implementations with different
     // accumulation orders, so their *numbers* must differ somewhere in the matrix
     // even when the greedy token stream matches: a split whose arms agreed bitwise
@@ -1193,8 +1512,8 @@ fn passback_row_offset_equivalence() {
          would be a no-op mixture"
     );
     eprintln!(
-        "\npass-back row-offset equivalence: {} case(s) bit-exact on {}; \
-         {differing_arms} of them mix numerically different engines",
+        "\npass-back row-offset equivalence: {} case(s) × 3 stream configurations \
+         bit-exact on {}; {differing_arms} of them mix numerically different engines",
         cases.len(),
         gpu.arch
     );

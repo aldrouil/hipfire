@@ -1,0 +1,29 @@
+{
+  "base_commit": "12daf4fe99017a88242469f60853b860609c20ab",
+  "build_command": "cargo build --release",
+  "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)\nbinary: rustc\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\ncommit-date: 2026-09-01\nhost: x86_64-unknown-linux-gnu\nrelease: 1.98.1\nLLVM version: 22.1.8\n",
+  "source_patch_sha256": "d0a5db1f57c83130d9229fa8b3a8a4edba2fcf4abce1362412d4f87b2c47f330",
+  "binary_md5": {
+    "hipfire": "23181d5ba45c532ec6910b0801ea1492",
+    "daemon": "98265d8b809d3b40245f05382b3d9d44"
+  },
+  "modified_tracked_files": [
+    "CHANGELOG.md",
+    "crates/hipfire-arch-qwen35/tests/gpu_gemv_parity.rs",
+    "crates/hipfire-dispatch/src/cpu_exec.rs",
+    "crates/hipfire-dispatch/src/offload_split.rs",
+    "crates/rdna-compute/map.md",
+    "crates/rdna-compute/src/dispatch.rs",
+    "crates/rdna-compute/src/lib.rs",
+    "docs/plans/partial-gpu-offload-design.md"
+  ],
+  "verification": {
+    "dispatch_lib": "410 passed,1 ignored",
+    "gpu_oracles": "passback row-offset/streams/consumers/reuse + CPU stream/reuse: PASS",
+    "no_gpu_ci": "PASS",
+    "pre_commit_ci": "PASS",
+    "release_build": "PASS",
+    "full_log": "artifact://904"
+  },
+  "retained": "C4 asynchronous owned returns + C5 direct sampled GPU timing; C6 reverted"
+}

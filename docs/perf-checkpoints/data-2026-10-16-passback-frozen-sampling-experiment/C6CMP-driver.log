@@ -1,0 +1,57 @@
+=== START .codeinsight+research/passback-opt/raw/C6CMP-A1-c5 2026-10-16T22:37:56Z ===
+  [prose]t1  finish=length ctx=59     cached=0      gen=128  (think 0/ans 70w) prefill=13650.4ms/4.3tok/s decode=8.9tok/s tau=None !RUNAWAY | '```python\ndef longest_substring(s: str) -> int:\n    """\n    Returns the length of the long'
+  [prose]t2  finish=length ctx=59     cached=0      gen=128  (think 0/ans 70w) prefill=588.0ms/100.3tok/s decode=20.7tok/s tau=None !RUNAWAY | '```python\ndef longest_substring(s: str) -> int:\n    """\n    Returns the length of the long'
+  [prose]t3  finish=length ctx=59     cached=0      gen=128  (think 0/ans 70w) prefill=595.0ms/99.2tok/s decode=20.9tok/s tau=None !RUNAWAY | '```python\ndef longest_substring(s: str) -> int:\n    """\n    Returns the length of the long'
+  [prose]t4  finish=length ctx=59     cached=0      gen=128  (think 0/ans 70w) prefill=596.8ms/98.9tok/s decode=20.7tok/s tau=None !RUNAWAY | '```python\ndef longest_substring(s: str) -> int:\n    """\n    Returns the length of the long'
+[qwen3.5-9b.mq4|off|battery DONE] turns=4 runaway=4 empty=0 attractor=0 retrieval_miss=0 avg_prefill=75.7tok/s avg_decode=17.8tok/s
+=== END .codeinsight+research/passback-opt/raw/C6CMP-A1-c5 rc=0 2026-10-16T22:39:02Z ===
+=== START .codeinsight+research/passback-opt/raw/C6CMP-B1-c6 2026-10-16T22:39:02Z ===
+  [prose]t1  finish=length ctx=59     cached=0      gen=128  (think 0/ans 70w) prefill=13607.8ms/4.3tok/s decode=8.5tok/s tau=None !RUNAWAY | '```python\ndef longest_substring(s: str) -> int:\n    """\n    Returns the length of the long'
+  [prose]t2  finish=length ctx=59     cached=0      gen=128  (think 0/ans 70w) prefill=614.2ms/96.1tok/s decode=19.7tok/s tau=None !RUNAWAY | '```python\ndef longest_substring(s: str) -> int:\n    """\n    Returns the length of the long'
+  [prose]t3  finish=length ctx=59     cached=0      gen=128  (think 0/ans 70w) prefill=604.4ms/97.6tok/s decode=19.6tok/s tau=None !RUNAWAY | '```python\ndef longest_substring(s: str) -> int:\n    """\n    Returns the length of the long'
+  [prose]t4  finish=length ctx=59     cached=0      gen=128  (think 0/ans 70w) prefill=611.5ms/96.5tok/s decode=19.9tok/s tau=None !RUNAWAY | '```python\ndef longest_substring(s: str) -> int:\n    """\n    Returns the length of the long'
+[qwen3.5-9b.mq4|off|battery DONE] turns=4 runaway=4 empty=0 attractor=0 retrieval_miss=0 avg_prefill=73.6tok/s avg_decode=16.9tok/s
+=== END .codeinsight+research/passback-opt/raw/C6CMP-B1-c6 rc=0 2026-10-16T22:40:07Z ===
+=== START .codeinsight+research/passback-opt/raw/C6CMP-B2-c6 2026-10-16T22:40:07Z ===
+  [prose]t1  finish=length ctx=59     cached=0      gen=128  (think 0/ans 70w) prefill=13531.3ms/4.4tok/s decode=8.6tok/s tau=None !RUNAWAY | '```python\ndef longest_substring(s: str) -> int:\n    """\n    Returns the length of the long'
+  [prose]t2  finish=length ctx=59     cached=0      gen=128  (think 0/ans 70w) prefill=589.0ms/100.2tok/s decode=20.2tok/s tau=None !RUNAWAY | '```python\ndef longest_substring(s: str) -> int:\n    """\n    Returns the length of the long'
+  [prose]t3  finish=length ctx=59     cached=0      gen=128  (think 0/ans 70w) prefill=586.1ms/100.7tok/s decode=20.3tok/s tau=None !RUNAWAY | '```python\ndef longest_substring(s: str) -> int:\n    """\n    Returns the length of the long'
+  [prose]t4  finish=length ctx=59     cached=0      gen=128  (think 0/ans 70w) prefill=602.3ms/97.9tok/s decode=20.7tok/s tau=None !RUNAWAY | '```python\ndef longest_substring(s: str) -> int:\n    """\n    Returns the length of the long'
+[qwen3.5-9b.mq4|off|battery DONE] turns=4 runaway=4 empty=0 attractor=0 retrieval_miss=0 avg_prefill=75.8tok/s avg_decode=17.4tok/s
+=== END .codeinsight+research/passback-opt/raw/C6CMP-B2-c6 rc=0 2026-10-16T22:41:12Z ===
+=== START .codeinsight+research/passback-opt/raw/C6CMP-A2-c5 2026-10-16T22:41:12Z ===
+  [prose]t1  finish=length ctx=59     cached=0      gen=128  (think 0/ans 70w) prefill=13403.0ms/4.4tok/s decode=9.0tok/s tau=None !RUNAWAY | '```python\ndef longest_substring(s: str) -> int:\n    """\n    Returns the length of the long'
+  [prose]t2  finish=length ctx=59     cached=0      gen=128  (think 0/ans 70w) prefill=592.5ms/99.6tok/s decode=19.3tok/s tau=None !RUNAWAY | '```python\ndef longest_substring(s: str) -> int:\n    """\n    Returns the length of the long'
+  [prose]t3  finish=length ctx=59     cached=0      gen=128  (think 0/ans 70w) prefill=594.5ms/99.2tok/s decode=20.7tok/s tau=None !RUNAWAY | '```python\ndef longest_substring(s: str) -> int:\n    """\n    Returns the length of the long'
+  [prose]t4  finish=length ctx=59     cached=0      gen=128  (think 0/ans 70w) prefill=583.1ms/101.2tok/s decode=20.9tok/s tau=None !RUNAWAY | '```python\ndef longest_substring(s: str) -> int:\n    """\n    Returns the length of the long'
+[qwen3.5-9b.mq4|off|battery DONE] turns=4 runaway=4 empty=0 attractor=0 retrieval_miss=0 avg_prefill=76.1tok/s avg_decode=17.5tok/s
+=== END .codeinsight+research/passback-opt/raw/C6CMP-A2-c5 rc=0 2026-10-16T22:42:15Z ===
+=== START .codeinsight+research/passback-opt/raw/C6CMP-A3-c5 2026-10-16T22:42:15Z ===
+  [prose]t1  finish=length ctx=59     cached=0      gen=128  (think 0/ans 70w) prefill=13191.2ms/4.5tok/s decode=9.0tok/s tau=None !RUNAWAY | '```python\ndef longest_substring(s: str) -> int:\n    """\n    Returns the length of the long'
+  [prose]t2  finish=length ctx=59     cached=0      gen=128  (think 0/ans 70w) prefill=584.3ms/101.0tok/s decode=21.2tok/s tau=None !RUNAWAY | '```python\ndef longest_substring(s: str) -> int:\n    """\n    Returns the length of the long'
+  [prose]t3  finish=length ctx=59     cached=0      gen=128  (think 0/ans 70w) prefill=604.5ms/97.6tok/s decode=19.8tok/s tau=None !RUNAWAY | '```python\ndef longest_substring(s: str) -> int:\n    """\n    Returns the length of the long'
+  [prose]t4  finish=length ctx=59     cached=0      gen=128  (think 0/ans 70w) prefill=588.3ms/100.3tok/s decode=20.5tok/s tau=None !RUNAWAY | '```python\ndef longest_substring(s: str) -> int:\n    """\n    Returns the length of the long'
+[qwen3.5-9b.mq4|off|battery DONE] turns=4 runaway=4 empty=0 attractor=0 retrieval_miss=0 avg_prefill=75.8tok/s avg_decode=17.6tok/s
+=== END .codeinsight+research/passback-opt/raw/C6CMP-A3-c5 rc=0 2026-10-16T22:43:19Z ===
+=== START .codeinsight+research/passback-opt/raw/C6CMP-B3-c6 2026-10-16T22:43:19Z ===
+  [prose]t1  finish=length ctx=59     cached=0      gen=128  (think 0/ans 70w) prefill=13742.9ms/4.3tok/s decode=8.9tok/s tau=None !RUNAWAY | '```python\ndef longest_substring(s: str) -> int:\n    """\n    Returns the length of the long'
+  [prose]t2  finish=length ctx=59     cached=0      gen=128  (think 0/ans 70w) prefill=589.0ms/100.2tok/s decode=20.5tok/s tau=None !RUNAWAY | '```python\ndef longest_substring(s: str) -> int:\n    """\n    Returns the length of the long'
+  [prose]t3  finish=length ctx=59     cached=0      gen=128  (think 0/ans 70w) prefill=599.4ms/98.4tok/s decode=20.5tok/s tau=None !RUNAWAY | '```python\ndef longest_substring(s: str) -> int:\n    """\n    Returns the length of the long'
+  [prose]t4  finish=length ctx=59     cached=0      gen=128  (think 0/ans 70w) prefill=588.0ms/100.3tok/s decode=20.2tok/s tau=None !RUNAWAY | '```python\ndef longest_substring(s: str) -> int:\n    """\n    Returns the length of the long'
+[qwen3.5-9b.mq4|off|battery DONE] turns=4 runaway=4 empty=0 attractor=0 retrieval_miss=0 avg_prefill=75.8tok/s avg_decode=17.5tok/s
+=== END .codeinsight+research/passback-opt/raw/C6CMP-B3-c6 rc=0 2026-10-16T22:44:23Z ===
+=== START .codeinsight+research/passback-opt/raw/C6CMP-B4-c6 2026-10-16T22:44:23Z ===
+  [prose]t1  finish=length ctx=59     cached=0      gen=128  (think 0/ans 70w) prefill=13239.5ms/4.5tok/s decode=8.9tok/s tau=None !RUNAWAY | '```python\ndef longest_substring(s: str) -> int:\n    """\n    Returns the length of the long'
+  [prose]t2  finish=length ctx=59     cached=0      gen=128  (think 0/ans 70w) prefill=580.8ms/101.6tok/s decode=20.1tok/s tau=None !RUNAWAY | '```python\ndef longest_substring(s: str) -> int:\n    """\n    Returns the length of the long'
+  [prose]t3  finish=length ctx=59     cached=0      gen=128  (think 0/ans 70w) prefill=588.2ms/100.3tok/s decode=20.3tok/s tau=None !RUNAWAY | '```python\ndef longest_substring(s: str) -> int:\n    """\n    Returns the length of the long'
+  [prose]t4  finish=length ctx=59     cached=0      gen=128  (think 0/ans 70w) prefill=588.5ms/100.3tok/s decode=21.0tok/s tau=None !RUNAWAY | '```python\ndef longest_substring(s: str) -> int:\n    """\n    Returns the length of the long'
+[qwen3.5-9b.mq4|off|battery DONE] turns=4 runaway=4 empty=0 attractor=0 retrieval_miss=0 avg_prefill=76.7tok/s avg_decode=17.6tok/s
+=== END .codeinsight+research/passback-opt/raw/C6CMP-B4-c6 rc=0 2026-10-16T22:45:27Z ===
+=== START .codeinsight+research/passback-opt/raw/C6CMP-A4-c5 2026-10-16T22:45:27Z ===
+  [prose]t1  finish=length ctx=59     cached=0      gen=128  (think 0/ans 70w) prefill=13151.3ms/4.5tok/s decode=9.1tok/s tau=None !RUNAWAY | '```python\ndef longest_substring(s: str) -> int:\n    """\n    Returns the length of the long'
+  [prose]t2  finish=length ctx=59     cached=0      gen=128  (think 0/ans 70w) prefill=593.8ms/99.4tok/s decode=20.9tok/s tau=None !RUNAWAY | '```python\ndef longest_substring(s: str) -> int:\n    """\n    Returns the length of the long'
+  [prose]t3  finish=length ctx=59     cached=0      gen=128  (think 0/ans 70w) prefill=593.5ms/99.4tok/s decode=20.4tok/s tau=None !RUNAWAY | '```python\ndef longest_substring(s: str) -> int:\n    """\n    Returns the length of the long'
+  [prose]t4  finish=length ctx=59     cached=0      gen=128  (think 0/ans 70w) prefill=598.2ms/98.6tok/s decode=19.2tok/s tau=None !RUNAWAY | '```python\ndef longest_substring(s: str) -> int:\n    """\n    Returns the length of the long'
+[qwen3.5-9b.mq4|off|battery DONE] turns=4 runaway=4 empty=0 attractor=0 retrieval_miss=0 avg_prefill=75.5tok/s avg_decode=17.4tok/s
+=== END .codeinsight+research/passback-opt/raw/C6CMP-A4-c5 rc=0 2026-10-16T22:46:30Z ===
+=== ALL DONE 2026-10-16T22:46:30Z ===

@@ -482,18 +482,19 @@ product claim.)*
   restricted to `[g, m)` (`cpu_arm_prepare` / `cpu_arm_finish`). No third engine and
   no new numerics, which is what makes the GPU arm bit-identical, row for row, to a
   full `pcie` launch and `share = 0` byte-identical to `cpu`.
-- **Ordering, not streams.** Today's step is `D2H(x) → CPU GEMV → H2D(y)`. The
-  overlap is an ordering result: issue the blocking D2H *before* enqueueing the GPU
-  arm (so it drains only the step's producer, never the arm), enqueue the GPU arm
-  async, run the CPU multiply while it executes, then do the blocking H2D of the
-  CPU's rows — stream-ordered after the GPU arm because both are on the same
-  (default) stream. The copies are `k*4` bytes down and `(m-g)*4` up (~30 KB at 9B
-  shapes) against tens of MB of weight bytes, so a second stream plus an event pair
-  would buy the overlap of a ~2 µs copy. If a measurement ever shows a split step's
-  copies stalling, the fix is pre-decided: one non-blocking stream, an event recorded
-  on the current stream right after the producer, `stream_wait_event(aux, ev)`, the
-  D2H on `aux`, and an event pair back before the H2D — `hip-bridge` already exposes
-  all of it. Not built speculatively.
+- **Owned, same-stream ordering.** Split transfers use `hipMemcpyAsync` with
+  reusable, owned pinned storage. Enqueue the activation, optional AWQ scale and
+  residual D2H batch, then complete it before CPU access and before launching the
+  GPU arm. Launch rows `[0, g)`, multiply `[g, m)` on the CPU concurrently, then
+  enqueue the CPU rows' H2D on that same active stream (default when none is active).
+  Later GPU consumers are ordered after the upload without a host wait. Only a
+  controller sample completes the return immediately; otherwise the next
+  same-stream input batch completes it before exposing host slices again.
+  The transfer owner retains pending storage across steps; growth, stream/device
+  changes and teardown drain outstanding work before reuse or release, retaining
+  storage if a safe drain fails. No auxiliary stream is introduced. Whole-CPU
+  execution and `share = 0` keep their blocking return path; CPU input reads also
+  explicitly order an active non-default producer stream.
 - **Covered shapes (4).** `Gemv{Raw}`, `Gemv{Prerotated}`,
   `GemvResidual{Prerotated}`, and `GemvResidual{Raw}` when the dtype has a fused
   residual kernel. The mechanism is that every covered kernel indexes its weight as
@@ -516,20 +517,27 @@ product claim.)*
   count, AVX2), so no constant is load-bearing. The first split-eligible step of each
   `(dtype, k)` seeds itself by timing both engines on that step's *own* weight buffer
   (median of 3 reps; the GPU arm through a scratch-output probe, so a residual probe
-  cannot be double-counted by the following real arm) and every split step then
-  refines the share from its own arm timings. The join is `copy + max(0, gpu_ns −
-  cpu_ns)`, and the controller reads it **relative to the shape's own no-wait floor**
-  — the smallest join it has seen, i.e. what the copy costs when the GPU arm finished
-  first — with a hysteresis margin (10 µs, or a quarter of the floor). Only the excess
-  over `floor + margin` can be a wait: when there is one, `r_gpu` is sampled as
-  `rows_gpu·row_bytes / (cpu_ns + excess)` and the share moves toward the balance
-  point; when there is not, the CPU is the straggler and the share rises. Both an
-  absolute microsecond threshold (the measured copy alone is 30–50 µs for the ~30 KB
-  this mode copies back, so any threshold below that samples on *every* step) and the
-  raw join (`cpu_ns + join` is the *CPU's* duration whenever the CPU is the straggler,
-  which reports a GPU rate an order of magnitude too low and pins the split to its
-  floor with both engines idle in turn) are wrong here; the floor is measured, not
-  assumed. Shares are clamped to `[0.05, 0.50]`, adjusted every 4 steps (step 0.3 of
+  cannot be double-counted by the following real arm). Only sampled steps refine the
+  online schedule: the first split is always sampled and later samples are
+  aperiodic. A sampled step hands the controller **both arms' own concurrent
+  durations**, never anything derived from the join the two produce: the CPU arm's
+  multiply (`gemv_ns` — the interval that actually runs alongside the GPU arm, since
+  the arm's blocking D2H precedes the launch and its H2D join follows it) and the GPU
+  arm's own elapsed time, bracketed by a reusable pair of stream-ordered markers
+  (`Gpu::span_begin` / `Gpu::span_end`, read with `Gpu::span_elapsed_ns`) on the same
+  stream the arm and its H2D both run on. Both rates are that one step's real
+  measurements, so they already carry the contention the arms put on each other —
+  nothing infers one arm's duration from the other's, from the join they produce, or
+  from a host constant, and there is no no-wait floor to measure against. The elapsed
+  time is read only *after* the sampled step's completed H2D, which is stream-ordered
+  behind both markers, so the measurement needs no event synchronization and adds no
+  fence to the step. Unsampled steps record no markers at all; the pair is created
+  lazily on first use and reused per device rather than allocated per step, and
+  teardown drains it — retaining it if even that drain fails — so no per-step event is
+  created or destroyed. Every marker failure (create, record or read) is reported to
+  the caller, which fails its sampled step instead of skipping the measurement: the
+  pair is a measurement, and neither the controller nor the trace may be left with a
+  step that looks sampled but fed nothing. Shares are clamped to `[0.05, 0.50]`, adjusted every 4 sampled steps (step 0.3 of
   the way toward `r_gpu/(r_gpu+r_cpu)`), and latched once a shape has applied 64
   adjustments with the last four all under 0.005. The latch is **not permanent**: a
   latched shape keeps measuring (the rate EWMAs never stop), and re-opens — re-tracking
@@ -539,7 +547,7 @@ product claim.)*
   it holds a 2× margin over the freeze band (`FREEZE_EPS` = 0.005, the largest proposal a
   just-latched shape can be holding), which is the hysteresis that keeps it from
   thrashing. The same-direction run is the other half: one out-of-band proposal can come
-  from a host-load transient or a single badly sampled join, and unlatching on it hands
+  from a host-load transient or a single badly sampled arm duration, and unlatching on it hands
   the controller the noise the latch exists to reject. The original `0.02` was a
   `0.02 / ALPHA ≈ 0.067` dead zone — it tripped on a *step* change but let a slow
   host-load *drift* slide the optimum by 6.7 points before the latch noticed; `0.01`
@@ -556,27 +564,28 @@ product claim.)*
   freeze guarantees is under `FREEZE_EPS`, so a scatter-derived band would land at the
   freeze band with no margin — where the model shows a clean static plant re-opening nine
   times in 1024 steps.
-- **Known estimator limitations (not latch defects, not fixed here).** They feed the
-  reopen signal, so they are the next work in this path:
-  - `min_join_ns` is a monotone running *minimum* that never rises. Once host/PCIe
-    contention lifts the true no-wait floor above the fastest join ever seen, every later
-    join reads as a wait and its reconstructed `r_gpu` reads low — biasing the balance
-    point, and hence the reopen comparison, downward. A decayed or windowed percentile
-    floor would track the regime.
-  - `r_gpu` is refreshed only on a *waited* join. A shape whose joins sit at the floor
-    carries a dead anchor (the live trace showed `m=4096 k=12288` with ~655 `gpu samples`
-    over 6400 steps and `last waited=false`), so any reopen for it is CPU-rate drift
-    measured against a stale GPU rate — the likely mechanism behind the model's
-    static-optimum-under-±300 µs-host-jitter scenario, where the share parked at ~0.24
-    against a ~0.34 optimum. The same
-    estimate feeds the `!gpu_waited` upward ratchet, which has no downward counterpart.
-    (The ratchet is latent, not a live bug: a shape pinned at `SHARE_MAX` only stays
-    there while the GPU is genuinely faster — the cap is right there — and if the balance
-    moves against it, joins start waiting, `r_gpu` reappears and the both-rates branch
-    reopens it.) None of this is where this fixture's gap is: the share already sits
-    where the probe says it should (perf-gap § 5), and the skipped-step wall term measures
-    3.7–6.3 %
-    ([`2026-10-02-offload-passback-coverage-phase0.md`](../perf-checkpoints/2026-10-02-offload-passback-coverage-phase0.md)).
+- **Estimator history: the join-floor inference and its censoring are gone.** Until the
+  both-arms measurement above, the controller inferred the GPU arm's duration from the
+  completed H2D join — `copy + max(0, gpu_ns − cpu_ns)` — read relative to the shape's
+  own smallest join, so the GPU rate was observable only on a *waited* join (one that
+  overran that floor). That inference had two live limitations: `min_join_ns` was a
+  monotone running *minimum* that never rose, so once host/PCIe contention lifted the
+  true no-wait floor every later join read as a wait and its reconstructed `r_gpu` read
+  low — biasing the balance point, and hence the reopen comparison, downward; and a shape
+  whose joins sat at the floor carried a dead GPU anchor (the live trace showed
+  `m=4096 k=12288` with ~655 `gpu samples` over 6400 steps and `last waited=false`), so
+  any reopen for it was CPU-rate drift measured against a stale GPU rate. The same stale
+  rate fed an upward ratchet (`share += 0.02` while no GPU rate had been seen and the
+  join did not wait) with no downward counterpart. The both-arms measurement removes all
+  three at once — each sampled step now carries a real GPU duration, so there is no floor
+  to infer from, no wait to gate the GPU sample on, and no ratchet. The dated
+  investigations that examined the old estimator — that trace, and the model's
+  static-optimum-under-±300 µs-host-jitter scenario where the share parked at ~0.24
+  against a ~0.34 optimum — remain the historical provenance for the change and are
+  intentionally unchanged. The fixture's own gap was never in the estimator: the share
+  already sat where the probe says it should (perf-gap § 5), and the skipped-step wall
+  term measures 3.7–6.3 %
+  ([`2026-10-02-offload-passback-coverage-phase0.md`](../perf-checkpoints/2026-10-02-offload-passback-coverage-phase0.md)).
 - **Output determinism (expected cross-mode divergence, and pass-back's own).** The
   modes are not interchangeable byte-wise: `cpu` and `pcie` run a layer's GEMV on
   different engines, so they need not agree (measured on the 2B: `cpu` 2046 B vs
@@ -592,13 +601,18 @@ product claim.)*
 - **Accounting and diagnostics.** A split step is *not* charged to the CPU-idle
   numerator (its wall contains GPU work, so it would inflate the lower bound §6.2.1
   documents) and gets its own `split: …` trace line under
-  `HIPFIRE_CPU_EXEC_TRACE=1`, whose `join` is the blocking H2D
-  (`copy + max(0, gpu_ns − cpu_ns)`): the line also prints the controller's own state
-  (`gpu samples`, `floor`, the last `waited`, the last `target`, `applied`, `reopens`,
-  `frozen`), so a share
-  nobody can explain is diagnosable from one run.
-  `gpu≥GB/s` is a lower bound by construction (it divides the GPU's bytes by the *whole*
-  step wall) and is printed as a bound for that reason. `hipfire offload-bench` measures
+  `HIPFIRE_CPU_EXEC_TRACE=1`. Its `return` column mixes enqueue wall time on
+  unsampled steps with completed H2D wall time on sampled steps; it is neither a
+  DMA-duration measurement nor a GPU-rate bound. The `cpu` column is the arm's
+  multiply rate over its own rows (`gemv_ns`) — the blocking D2H precedes the GPU
+  launch, so it is not part of the interval the two arms share — and the `gpu`
+  column is the controller's measured GPU rate over the arm's rows and its
+  bracketed elapsed time, printed as `gpu=—` until a sampled step has measured it.
+  The sampled-step count, target, applied count, reopens and frozen flag print with
+  them. Only completed samples feed
+  the controller, whose state is printed alongside the split's share and arm
+  timings. The old whole-step `gpu≥GB/s` bound is no longer printed.
+  `hipfire offload-bench` measures
   the host independently (its own `--format`/`--buffer-mb`/`--reps`, `--json`, and
   `--write` to persist the recommended share), and refuses while a daemon pid file
   names a live process.

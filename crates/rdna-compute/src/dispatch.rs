@@ -1335,6 +1335,12 @@ pub struct Gpu {
     /// when a sync times out. Scratch-helper converts and the optional CK
     /// path bypass this funnel and are deliberately not tracked here.
     last_kernel: Option<String>,
+    /// Reusable start/stop marker pair for one GPU span measurement on this
+    /// device ([`Gpu::span_begin`] / [`Gpu::span_end`] / [`Gpu::span_elapsed_ns`],
+    /// see `crate::span_timer`). Created on first use and kept for the `Gpu`'s
+    /// lifetime, so a per-step caller allocates no event; drained (if a span is
+    /// unresolved) and destroyed with the `Gpu`.
+    pub(crate) span_timer: Option<crate::span_timer::SpanTimer>,
     /// Scratch buffers for FWHT rotation, FP16/FP8 activation conversion, etc.
     pub scratch: crate::scratch::ScratchState,
     /// Model-scoped Redline warmup recorder and fail-closed backend gate.
@@ -2180,6 +2186,7 @@ impl Gpu {
             router_fault: None,
             active_stream: None,
             last_kernel: None,
+            span_timer: None,
             scratch: crate::scratch::ScratchState {
                 mq_signs1: None,
                 mq_signs2: None,
@@ -8380,6 +8387,38 @@ impl Drop for Gpu {
             return;
         }
         self.bind_thread_or_warn();
+        if let Some(timer) = self.span_timer.take() {
+            // `bind_thread_or_warn` only warns, so verify the bind before the
+            // drain and the destroy: releasing an event on the wrong device is
+            // the unsafe teardown this guard exists to prevent. Verified by
+            // asking the runtime, not by trusting the thread-local bind cache.
+            let confirmed = match self.hip.current_device() {
+                Ok(current) if current == self.device_id => true,
+                Ok(current) => {
+                    eprintln!(
+                        "[rdna-compute] GPU span timer retained during Gpu drop: device {current} \
+                         is bound, not {}",
+                        self.device_id
+                    );
+                    false
+                }
+                Err(err) => {
+                    eprintln!(
+                        "[rdna-compute] GPU span timer retained during Gpu drop: current device \
+                         unknown: {err}"
+                    );
+                    false
+                }
+            };
+            if confirmed {
+                timer.teardown(&self.hip);
+            }
+            // else: retained, not destroyed — an event handle must not be released
+            // on a device that could not be confirmed as its owner. Nothing needs
+            // `mem::forget` to keep it: neither `SpanTimer` nor the raw
+            // `hipEvent_t` wrapper (`Event`) has a `Drop`, so letting `timer` fall
+            // out of scope drops the wrappers without destroying the handles.
+        }
         if let Err(err) = self.release_registered_vmm() {
             eprintln!("[rdna-compute] failed to release VMM arena during Gpu drop: {err}");
         }

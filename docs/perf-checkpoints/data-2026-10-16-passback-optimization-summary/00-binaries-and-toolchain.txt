@@ -1,0 +1,23 @@
+# Frozen binaries + toolchain (hash proof; NO executables committed)
+# baseline = original HEAD 12daf4fe99017a88242469f60853b860609c20ab (pre-change) build
+# final    = retained C4(asynchronous owned returns)+C5(direct sampled GPU timing), C6 reverted (post-change) build
+date_utc=2026-10-16T23:41:23Z
+# path|role|md5|bytes
+.codeinsight+research/passback-opt/baseline-bin/hipfire-12daf4fe|c9feb2095ffe043c7e93477a7ec02a9a|47336152
+.codeinsight+research/passback-opt/baseline-bin/daemon-12daf4fe|c1da18f268129005c6e827ea85ceff49|88582088
+.codeinsight+research/passback-opt/final-bin/hipfire|23181d5ba45c532ec6910b0801ea1492|47340216
+.codeinsight+research/passback-opt/final-bin/daemon|98265d8b809d3b40245f05382b3d9d44|88583272
+# source patch sha256 (final): d0a5db1f57c83130d9229fa8b3a8a4edba2fcf4abce1362412d4f87b2c47f330
+# build command: cargo build --release (NOT -p)
+# toolchain:
+#   rustc 1.98.1 (48a229cea 2026-09-01)
+#   binary: rustc
+#   commit-hash: 48a229ceaefd4985c50990b14116b6d856af0985
+#   commit-date: 2026-09-01
+#   host: x86_64-unknown-linux-gnu
+#   release: 1.98.1
+#   LLVM version: 22.1.8
+#   
+# model 9B : ~/.hipfire/models/qwen3.5-9b.mq4 md5=296092bf1e6a45d78c1acf815eb93366 bytes=5313750016
+# model 27B: ~/.hipfire/models/qwen3.8-27b.mq4 md5=d1292b4d5bd6046693604201a6ca8074 bytes=15662615552
+# prompt canary: benchmarks/prompts/gpu_offload_probe.txt md5=5835c71e471849b4a72e1dc8e39695e7 bytes=215

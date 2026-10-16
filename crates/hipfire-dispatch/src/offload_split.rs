@@ -41,14 +41,24 @@
 //!   [`crate::cpu_exec::cpu_arm_finish`]). No third engine and no new numerics,
 //!   which is also why a share of `0` is byte-identical to
 //!   `memory.offload_exec=cpu`.
-//! * **No second stream and no events.** The overlap is an ordering result:
+//! * **No second stream.** The overlap is an ordering result:
 //!   issue the blocking D2H *before* enqueueing the GPU arm (so it drains only
 //!   the step's producer), enqueue the GPU arm (async), run the CPU multiply
-//!   while that kernel executes, then do the blocking H2D of the CPU's rows —
-//!   which is stream-ordered after the GPU arm because both are on the same
-//!   (default) stream. The copies are `k*4` bytes down and `(m-g)*4` up (~30 KB
-//!   at 9B shapes) against tens of MB of weight bytes, so a two-stream design
-//!   would buy the overlap of a ~2 µs copy.
+//!   while that kernel executes, then enqueue the H2D of the CPU's rows —
+//!   stream-ordered after the GPU arm because both are on the same (default)
+//!   stream. The copies are `k*4` bytes down and `(m-g)*4` up (~30 KB at 9B
+//!   shapes) against tens of MB of weight bytes, so a two-stream design would
+//!   buy the overlap of a ~2 µs copy. The only events in the mode are the reused
+//!   span markers that bracket the GPU arm on that same stream (below).
+//!
+//! On a **sampled** step (about one in four, see below) that H2D is *completed*
+//! on the same call — the join, and the point at which the GPU arm's own
+//! duration becomes readable; on an **unsampled** one the H2D is merely enqueued
+//! and the step returns, the stream ordering it before the next consumer. Both
+//! the read and the write use the pinned transfer owner, which keeps the staged
+//! bytes off-limits to the host until the next enqueue's completion drains them,
+//! so an unsampled step's queued H2D is retired by the next step's D2H
+//! completion, by a stream change, or by teardown — never raced.
 //!
 //! The **share** `g` is scheduled, not hardcoded: the optimum is a property of
 //! the host (link width, DRAM peak, core count, AVX2), so the first
@@ -57,15 +67,32 @@
 //! from its own arm timings. No host constant is load-bearing: the probe
 //! accelerates convergence and the online controller corrects it.
 //!
-//! The controller reads the blocking H2D (`join`) relative to the shape's own
-//! no-wait floor — the smallest join it has seen, i.e. what the copy costs when
-//! the GPU arm finished first. Only the excess over that floor can be a wait for
-//! the GPU arm; when there is one, `cpu_ns + excess` recovers the arm's duration
-//! and the share moves toward the balance point. When there is not (the common
-//! regime: a CPU multiply of hundreds of microseconds against a
-//! tens-of-microseconds copy) the CPU is the straggler and the share rises.
-//! Reading the raw join as a GPU duration in that regime is how a split ends up
-//! pinned to its own floor with both engines idle in turn.
+//! On a sampled step the controller is fed both arms' **own concurrent
+//! durations**: the CPU arm's multiply (`gemv_ns`, the interval that actually
+//! overlaps the GPU arm — the arm's blocking D2H precedes the launch and its H2D
+//! join follows it) and the GPU arm's elapsed time, bracketed by a reusable pair
+//! of stream-ordered markers ([`Gpu::span_begin`] / [`Gpu::span_end`], read with
+//! [`Gpu::span_elapsed_ns`]) on the same stream the arm and its H2D run on.
+//! Neither duration is inferred from the join the two arms produce: the join is
+//! `copy + max(0, arm_ns - gemv_ns)`, so recovering the arm's duration from it
+//! needs the copy's own cost as a baseline — and the concurrent load the share
+//! exists to trade is exactly what moves that baseline, which is how a shape
+//! whose CPU arm is the straggler can read as GPU-bound and stay pinned.
+//!
+//! The elapsed time is read only after the sampled step's *completed* H2D, which
+//! is stream-ordered behind both markers, so the measurement needs no event
+//! synchronization and adds no fence to the step. Unsampled steps record no
+//! markers at all, and the marker pair is reused per device rather than
+//! allocated per step. A marker that cannot be created, recorded or read fails
+//! the sampled step rather than being skipped: the pair is a measurement, and
+//! neither the controller nor the trace may be left with a step that looks
+//! sampled but fed nothing.
+//!
+//! So a step's sampling is decided by an aperiodic per-shape cadence
+//! ([`ShapeState::take_sample`]), not by a fixed modulus that would sample the
+//! same projection every time the model revisits a `(dtype, k)` key on a short
+//! period. Unsampled steps feed the controller nothing: there is no measurement
+//! to feed it, and a fabricated one would be worse than none.
 //!
 //! Scope is the dense qwen3.5 seam only (the step lists that carry
 //! `qkv_via_execute_steps`, `qkvza_via_execute_steps`,
@@ -148,13 +175,14 @@ const REOPEN_EPS: f64 = 0.01;
 
 /// Consecutive out-of-band proposals, in the same direction, a latched shape must
 /// produce before it unlatches. One is not enough: a host-load transient or a
-/// single badly-sampled join can push one proposal past the band, and unlatching
-/// on it hands the controller the noise it was latched to reject. A genuine move
-/// drives the balance point one way for many adjustments, while noise flips sign,
-/// so requiring a same-sign run separates the two without a bigger dead zone.
-/// It is insurance, not a win: the model's genuine-move scenarios cost ~1–2 µs of
-/// extra reopen latency per move and no measured throughput change, while it
-/// removes the reopens a noisy static host produced without it.
+/// single badly-sampled arm duration can push one proposal past the band, and
+/// unlatching on it hands the controller the noise it was latched to reject. A
+/// genuine move drives the balance point one way for many adjustments, while
+/// noise flips sign, so requiring a same-sign run separates the two without a
+/// bigger dead zone. It is insurance, not a win: the model's genuine-move
+/// scenarios cost ~1–2 µs of extra reopen latency per move and no measured
+/// throughput change, while it removes the reopens a noisy static host produced
+/// without it.
 const REOPEN_CONFIRM: i32 = 3;
 
 /// `enabled` + `share` supplied by the caller, so the parity test and the
@@ -245,36 +273,33 @@ struct Ewma {
 }
 
 impl Ewma {
-    fn new(sample: f64) -> Self {
-        Ewma { value: sample }
-    }
-
-    /// The first sample *is* the state; later samples move it by [`EWMA_ALPHA`].
-    fn update(&mut self, sample: f64) {
-        self.value += EWMA_ALPHA * (sample - self.value);
+    /// Fold a sample into `current`: the first sample *is* the state, later
+    /// samples move it by [`EWMA_ALPHA`].
+    fn fold(current: Option<Ewma>, sample: f64) -> Ewma {
+        match current {
+            Some(mut ewma) => {
+                ewma.value += EWMA_ALPHA * (sample - ewma.value);
+                ewma
+            }
+            None => Ewma { value: sample },
+        }
     }
 }
 
-/// A shape's split state: the share in force, the two engines' contended rates,
-/// and the convergence bookkeeping.
+/// A shape's split state: the share in force, the two engines' concurrent
+/// measured rates, and the convergence bookkeeping.
 struct ShapeState {
     share: f64,
     r_cpu: Option<Ewma>,
     r_gpu: Option<Ewma>,
+    /// Sampled steps of this shape: the ones that completed the return H2D and
+    /// measured both arms. Each counts exactly once, in [`observe`], because the
+    /// count is also the input to [`ShapeState::take_sample`]'s first-step rule.
+    /// Printed with the shape, and the count the hardware oracle reads to prove
+    /// the asynchronous return path was taken.
     samples: u64,
-    /// Steps whose join exceeded the shape's no-wait floor plus the margin — the
-    /// only ones `r_gpu` is sampled from. Printed with the shape so an operator can
-    /// see whether the GPU rate the share rests on was ever actually observed.
-    gpu_samples: u64,
-    /// The smallest blocking-H2D time seen for this shape: the step's own
-    /// no-wait floor, i.e. what the copy costs when the GPU arm finished first.
-    /// Every larger join is measured *against* it, so the controller needs no
-    /// host constant for the copy (the measured one is 30–50 µs for the ~30 KB
-    /// this mode copies back — above any threshold guessed from the link rate).
-    min_join_ns: Option<u64>,
-    /// The last adjustment's proposal and whether that step's join had waited.
+    /// The last adjustment's proposal.
     last_target: Option<f64>,
-    last_waited: bool,
     applied: u32,
     /// Times this shape has unlatched (frozen -> unfrozen). Nonzero proves the
     /// fixture actually exercised the re-open path, which a `frozen` flag alone
@@ -282,13 +307,21 @@ struct ShapeState {
     /// after latching.
     reopens: u32,
     /// The last four adjustment magnitudes, seeded above the freeze threshold so
-    /// a shape cannot freeze on its first few no-op adjustments.
+    /// a shape cannot freeze on its first few adjustments.
     deltas: [f64; 4],
     frozen: bool,
     /// Consecutive out-of-band proposals while latched, signed by direction
     /// (positive = the balance point moved up). Reset whenever a proposal lands
     /// back inside the band.
     reopen_streak: i32,
+    /// The aperiodic sampling cadence state, advanced once per split step of this
+    /// shape by [`ShapeState::take_sample`]. One u32 LCG rather than a step
+    /// counter modulo a fixed period: a modulus would sample the *same*
+    /// projection every time if the model revisits this `(dtype, k)` key on a
+    /// period dividing the modulus, while the LCG's top bits are the least
+    /// correlated with that low-bit period, so the sampled steps do not
+    /// phase-lock to the layer/projection sequence.
+    sample_ctr: u32,
 }
 
 impl ShapeState {
@@ -298,16 +331,30 @@ impl ShapeState {
             r_cpu: None,
             r_gpu: None,
             samples: 0,
-            gpu_samples: 0,
-            min_join_ns: None,
             last_target: None,
-            last_waited: false,
             applied: 0,
             reopens: 0,
             deltas: [f64::MAX; 4],
             frozen: false,
             reopen_streak: 0,
+            sample_ctr: 0,
         }
+    }
+
+    /// Whether this split step completes the return H2D (the blocking join) and
+    /// therefore measures the two arms, or returns it asynchronously. About one
+    /// in four, read from the top two bits of this shape's LCG; the shape's
+    /// *first* step is always sampled so the rate EWMAs start from a real
+    /// observation rather than from nothing. The low bits of an LCG have a short
+    /// period, which is exactly why the top bits are used — see
+    /// [`ShapeState::sample_ctr`].
+    fn take_sample(&mut self) -> bool {
+        let first = self.samples == 0;
+        self.sample_ctr = self
+            .sample_ctr
+            .wrapping_mul(1_664_525)
+            .wrapping_add(1_013_904_223);
+        first || self.sample_ctr >> 30 == 0
     }
 }
 
@@ -342,17 +389,17 @@ pub struct ShapeSnapshot {
     pub dtype: DType,
     pub k: usize,
     pub share: f64,
+    /// The CPU arm's concurrent multiply rate: its rows' bytes over the multiply
+    /// it overlapped the GPU arm with. `None` until a sampled step measured it.
     pub cpu_bytes_per_s: Option<f64>,
+    /// The GPU arm's own rate: its rows' bytes over the elapsed time between the
+    /// markers that bracketed its launches on a sampled step. `None` until one
+    /// measured it.
     pub gpu_bytes_per_s: Option<f64>,
+    /// Sampled steps so far: the ones that completed the return H2D and measured
+    /// both arms (see `ShapeState::samples`).
     pub samples: u64,
-    /// Steps whose join exceeded the shape's no-wait floor plus the margin — the
-    /// only ones the GPU rate above can come from.
-    pub gpu_samples: u64,
-    /// The smallest blocking-H2D time seen for this shape: the no-wait floor the
-    /// controller measures every join against, and the reason a "wait" needs no
-    /// host constant.
-    pub min_join_ns: Option<u64>,
-    pub last_waited: bool,
+    /// The last adjustment's proposal, on the share axis.
     pub last_target: Option<f64>,
     pub applied: u32,
     pub frozen: bool,
@@ -398,9 +445,6 @@ fn shape_of(((dtype, k), state): (&(DType, usize), &ShapeState)) -> ShapeSnapsho
         cpu_bytes_per_s: state.r_cpu.map(|e| e.value),
         gpu_bytes_per_s: state.r_gpu.map(|e| e.value),
         samples: state.samples,
-        gpu_samples: state.gpu_samples,
-        min_join_ns: state.min_join_ns,
-        last_waited: state.last_waited,
         last_target: state.last_target,
         applied: state.applied,
         frozen: state.frozen,
@@ -460,65 +504,60 @@ fn scheduled_share(key: (DType, usize)) -> f64 {
         .unwrap_or(DEFAULT_GPU_SHARE)
 }
 
-/// Hysteresis on the join, in nanoseconds: an excess over the shape's no-wait
-/// floor smaller than this is host-timer noise around the copy, not a wait.
+/// Whether this split step completes the return H2D (a sampled step) or returns
+/// it asynchronously, advancing the shape's aperiodic cadence exactly once.
 ///
-/// Needed because the floor is the *minimum* join ever seen, so most joins exceed
-/// it by a few microseconds; without the margin nearly every step would read as a
-/// wait and the samples would be noise. Ten microseconds is well above that jitter
-/// and far below the waits this mode acts on (hundreds of microseconds to
-/// milliseconds). It is a timer-resolution constant, not a host performance one.
-const JOIN_MARGIN_NS: u64 = 10_000;
-
-/// The excess of `join_ns` over the shape's no-wait floor that can be a wait: the
-/// hysteresis margin, or a quarter of the floor for a host whose copy is itself
-/// slow (the copy's own jitter scales with it).
-fn waited_extra_ns(join_ns: u64, floor_ns: Option<u64>) -> u64 {
-    let Some(floor) = floor_ns else {
-        return 0;
+/// A missing shape or a poisoned lock counts as sampled: *waiting* is always the
+/// correct fallback (it is what every step did before this cadence existed), and
+/// the alternative would silently starve the controller of its only real
+/// measurements.
+fn sample_due(key: (DType, usize)) -> bool {
+    let Ok(mut scheduler) = SCHEDULER.lock() else {
+        return true;
     };
-    let margin = JOIN_MARGIN_NS.max(floor / 4);
-    join_ns.saturating_sub(floor.saturating_add(margin))
-}
-
-/// The controller's proposal after one step's measurements.
-///
-/// With both rates present, move toward the balance point
-/// `r_gpu / (r_gpu + r_cpu)`. With no GPU rate yet and a join that sat at the
-/// shape's no-wait floor — the common regime, where the H2D of the CPU's rows
-/// costs tens of microseconds against a CPU multiply of hundreds — the CPU is the
-/// straggler, so raise the share. Otherwise the step carries no usable signal and
-/// the share is unchanged.
-fn next_share(cur: f64, r_cpu: Option<f64>, r_gpu: Option<f64>, gpu_waited: bool) -> f64 {
-    match (r_cpu, r_gpu) {
-        (Some(cpu), Some(gpu)) if cpu + gpu > 0.0 => {
-            clamp_share(cur + ALPHA * (clamp_share(gpu / (gpu + cpu)) - cur))
-        }
-        _ if !gpu_waited => clamp_share(cur + 0.02),
-        _ => cur,
+    match scheduler.shapes.get_mut(&key) {
+        Some(state) => state.take_sample(),
+        None => true,
     }
 }
 
-/// One split step's measurements. Rates are bytes per **second**, matching
-/// [`SplitCalibration`]; the controller only uses them as a ratio.
+/// The controller's proposal after one sampled step's measurements.
 ///
-/// `cpu_ns` is the CPU arm's own duration (the blocking D2H plus the multiply) and
-/// `join_ns` the blocking H2D, which is `copy + max(0, gpu_ns - cpu_ns)`.
+/// Both arms' rates come from that step's own concurrent durations, so the
+/// proposal is the balance point `r_gpu / (r_gpu + r_cpu)`: the share at which
+/// the CPU's remaining rows and the GPU's rows take the same time. Below it the
+/// GPU idles while the CPU is still multiplying; above it the reverse. A share
+/// with no usable measurement (`r_cpu + r_gpu == 0`, unreachable from [`observe`])
+/// is left alone rather than guessed at.
+fn next_share(cur: f64, r_cpu: f64, r_gpu: f64) -> f64 {
+    if !(r_cpu + r_gpu > 0.0) {
+        return cur;
+    }
+    clamp_share(cur + ALPHA * (clamp_share(r_gpu / (r_gpu + r_cpu)) - cur))
+}
+
+/// One sampled split step's measurements. Rates are bytes per **second**,
+/// matching [`SplitCalibration`]; the controller only uses them as a ratio.
 ///
-/// The join is read relative to the shape's own no-wait floor ([`min_join_ns`]),
-/// never against an absolute threshold: only the excess over that floor can be a
-/// wait for the GPU arm, and in that case `cpu_ns + excess` recovers the arm's
-/// duration. Treating the raw join as a GPU duration in the other regime — the
-/// common one, where the CPU multiply is hundreds of microseconds against a
-/// tens-of-microseconds copy — reports a GPU rate an order of magnitude too low
-/// and drags the share to its floor with both engines idle in turn.
+/// `gemv_ns` is the CPU arm's multiply over its `rows_cpu` rows — the interval
+/// that actually runs concurrently with the GPU arm, since the arm's blocking D2H
+/// precedes the GPU launch and its H2D join follows it — and `gpu_ns` is the GPU
+/// arm's own elapsed time over its `rows_gpu` rows, measured between the markers
+/// that bracket its launches. Both are that one step's real durations, so the two
+/// rates already carry the contention the arms put on each other; nothing here
+/// infers one arm's duration from the other's, from the join the two produce, or
+/// from a host constant.
+///
+/// `observe` is reached only from a sampled step, so both durations are always
+/// measurements — never an enqueue wall from an asynchronous return, and never a
+/// join.
 fn observe(
     key: (DType, usize),
     rows_cpu: usize,
     rows_gpu: usize,
     row_bytes: usize,
-    cpu_ns: u64,
-    join_ns: u64,
+    gemv_ns: u64,
+    gpu_ns: u64,
 ) {
     let Ok(mut scheduler) = SCHEDULER.lock() else {
         return;
@@ -526,55 +565,21 @@ fn observe(
     let Some(state) = scheduler.shapes.get_mut(&key) else {
         return;
     };
-    if cpu_ns > 0 {
-        let sample = bytes_per_s(rows_cpu as f64 * row_bytes as f64, cpu_ns);
-        state.r_cpu = Some(match state.r_cpu {
-            Some(mut ewma) => {
-                ewma.update(sample);
-                ewma
-            }
-            None => Ewma::new(sample),
-        });
-    }
-    // The join is `copy + max(0, gpu_ns - cpu_ns)`, and only its excess over this
-    // shape's own smallest join can be a wait for the GPU arm. Measuring against
-    // that floor (rather than a fixed microsecond threshold, or the CPU's own
-    // multiply) is what makes the sample honest on a host where the copy alone
-    // costs more than the link rate suggests: at the floor the CPU is the
-    // straggler and the share rises; above it the excess *is* the GPU arm's
-    // overrun and its duration is recoverable as `cpu_ns + excess`.
-    let baseline = state.min_join_ns;
-    state.min_join_ns = Some(baseline.map_or(join_ns, |m| m.min(join_ns)));
-    let waited_extra = waited_extra_ns(join_ns, baseline);
-    let gpu_waited = waited_extra > 0;
-    if gpu_waited && cpu_ns + waited_extra > 0 {
-        let sample = bytes_per_s(
-            rows_gpu as f64 * row_bytes as f64,
-            cpu_ns + waited_extra,
-        );
-        state.r_gpu = Some(match state.r_gpu {
-            Some(mut ewma) => {
-                ewma.update(sample);
-                ewma
-            }
-            None => Ewma::new(sample),
-        });
-        state.gpu_samples += 1;
-    }
+    let r_cpu = Ewma::fold(
+        state.r_cpu,
+        bytes_per_s(rows_cpu as f64 * row_bytes as f64, gemv_ns),
+    );
+    let r_gpu = Ewma::fold(
+        state.r_gpu,
+        bytes_per_s(rows_gpu as f64 * row_bytes as f64, gpu_ns),
+    );
+    state.r_cpu = Some(r_cpu);
+    state.r_gpu = Some(r_gpu);
     state.samples += 1;
-    state.last_waited = gpu_waited;
     if state.samples % APPLY_EVERY != 0 {
         return;
     }
-    // Mirrors `next_share`'s two signal branches: only an adjustment that had
-    // information counts toward freezing the shape.
-    let had_signal = (state.r_cpu.is_some() && state.r_gpu.is_some()) || !gpu_waited;
-    let next = next_share(
-        state.share,
-        state.r_cpu.map(|e| e.value),
-        state.r_gpu.map(|e| e.value),
-        gpu_waited,
-    );
+    let next = next_share(state.share, r_cpu.value, r_gpu.value);
     // A latched shape keeps *measuring* — the rate EWMAs above never stop — so it
     // can notice that the balance point has moved. If the fresh proposal departs
     // from the latched share by more than the re-open band, and does so in the
@@ -599,9 +604,6 @@ fn observe(
     let delta = (next - state.share).abs();
     state.share = next;
     state.last_target = Some(next);
-    if !had_signal {
-        return;
-    }
     state.applied += 1;
     state.deltas.rotate_left(1);
     state.deltas[3] = delta;
@@ -984,16 +986,41 @@ pub fn run_with(
     let Some(g) = plan_rows(w.m, row_bytes, share) else {
         return Ok(false);
     };
+    // Whether this step completes the return H2D (a sampled step) or leaves it
+    // queued (an unsampled one). Decided once, after the seeding step above has
+    // ensured the shape's state exists.
+    let sample = sample_due(key);
 
     // The ordering *is* the mechanism: prepare (blocking D2H) before the GPU arm,
-    // GPU arm async, CPU multiply, then the blocking H2D of the CPU's rows as the
-    // join.
+    // GPU arm async, CPU multiply, then the H2D of the CPU's rows — completed as
+    // the join on a sampled step, merely enqueued on an unsampled one, where the
+    // stream orders it before every later consumer.
     let step_start = Instant::now();
     let arm = cpu_exec::cpu_arm_prepare(gpu, &plan, g..w.m)?;
+    // The GPU arm's own duration, bracketed by this device's reusable marker pair
+    // on the stream the arm and its H2D both run on. Only a sampled step records
+    // them, and every failure here fails the step: the pair is a measurement, not
+    // an optional extra, so a marker that cannot be created or recorded is
+    // reported rather than silently leaving the controller (and the trace) with a
+    // step that looks sampled but fed nothing.
+    if sample {
+        gpu.span_begin().map_err(hip_err)?;
+    }
     launch_op_rows(gpu, ctx, step, Some(0..g))?;
-    let (gemv_ns, join_ns) = cpu_exec::cpu_arm_finish(gpu, &arm)?;
-    let cpu_ns = arm.d2h_ns + gemv_ns;
-    observe(key, w.m - g, g, row_bytes, cpu_ns, join_ns);
+    if sample {
+        gpu.span_end().map_err(hip_err)?;
+    }
+    let (gemv_ns, h2d_ns) = cpu_exec::cpu_arm_finish(gpu, &arm, sample)?;
+    if sample {
+        // Read only now: the completed H2D above is stream-ordered behind both
+        // markers, so both have completed and the elapsed time is this step's own
+        // GPU arm. Reading it before the join would need a synchronization this
+        // path must not add (and would time a kernel still in flight), while the
+        // CPU interval the controller is handed is the multiply alone — the part
+        // that actually ran alongside the arm.
+        let arm_ns = gpu.span_elapsed_ns().map_err(hip_err)?;
+        observe(key, w.m - g, g, row_bytes, gemv_ns, arm_ns);
+    }
     cpu_exec::finish_step(
         arm.q,
         w,
@@ -1004,7 +1031,7 @@ pub fn run_with(
         StepTiming {
             d2h_ns: arm.d2h_ns,
             gemv_ns,
-            h2d_ns: join_ns,
+            h2d_ns,
         },
     );
     Ok(true)
@@ -1038,90 +1065,54 @@ mod tests {
                     continue;
                 };
                 assert_eq!(g % ROW_ALIGN, 0, "m={m} share={share} g={g}");
-                assert!(g >= ROW_ALIGN && g <= m - ROW_ALIGN, "m={m} share={share} g={g}");
+                assert!(
+                    g >= ROW_ALIGN && g <= m - ROW_ALIGN,
+                    "m={m} share={share} g={g}"
+                );
             }
         }
     }
 
     #[test]
-    fn next_share_moves_toward_the_balance_point() {
-        // CPU at 52 GB/s, GPU at 27.3 GB/s -> balance 0.344; from 0.375 it moves
-        // down by ALPHA times the gap.
-        let moved = next_share(0.375, Some(52e9), Some(27.3e9), true);
-        let target = 27.3 / (27.3 + 52.0);
-        assert!(moved < 0.375 && moved > target, "moved={moved}");
-        assert!((moved - (0.375 + ALPHA * (target - 0.375))).abs() < 1e-12);
-        // A join that did not outlast the CPU's multiply means the CPU is the
-        // straggler: the share rises by 0.02 ...
-        assert!(
-            (next_share(0.2, Some(52e9), None, false) - 0.22).abs() < 1e-12,
-            "the push-up branch must fire on the common no-wait regime"
-        );
-        // ... and clamps at the ceiling.
-        assert_eq!(next_share(SHARE_MAX, Some(52e9), None, false), SHARE_MAX);
-        // A join that waited with no GPU rate yet is no information: unchanged.
-        assert_eq!(next_share(0.3, Some(52e9), None, true), 0.3);
-        // With both rates the balance point wins even when the join waited.
-        let up = next_share(SHARE_MIN, Some(1.0), Some(1e12), true);
-        assert!(up > SHARE_MIN && up <= SHARE_MAX, "up={up}");
-        assert!((up - (SHARE_MIN + ALPHA * (SHARE_MAX - SHARE_MIN))).abs() < 1e-12);
-    }
-
-    #[test]
-    fn observe_raises_the_share_at_the_join_floor_and_samples_above_it() {
+    fn observe_moves_the_share_toward_the_measured_balance_point() {
         // A distinct key so the process-global scheduler cannot interfere with
         // the other tests in this binary.
         let key = (DType::Q8_0, 1234);
         seed_shape(key, 0.375);
 
-        // A join that sits at the shape's own floor is a copy, not a wait: the
-        // CPU is the straggler, no GPU rate is observable, and the share rises.
-        for _ in 0..4 {
-            observe(key, 3072, 1024, 2176, 500_000, 40_000);
+        // 3072 CPU rows multiplied in 500 µs (13.4 GB/s) against 1024 GPU rows
+        // streamed in 250 µs (8.9 GB/s): the balance point is 0.4, so the share
+        // must walk up to it from the seeded 0.375.
+        for _ in 0..80 {
+            observe(key, 3072, 1024, 2176, 500_000, 250_000);
         }
-        let floor = shape_state(key.0, key.1).expect("seeded");
-        assert_eq!(floor.gpu_samples, 0, "no wait, no GPU sample");
+        let up = shape_state(key.0, key.1).expect("seeded");
         assert!(
-            floor.share > 0.375,
-            "the share must rise while every join sits at the floor, got {}",
-            floor.share
+            up.share > 0.375 && (up.share - 0.4).abs() < 1e-3,
+            "the share must land on the measured balance point, got {}",
+            up.share
         );
+        assert_eq!(up.samples, 80, "every observe is a sampled step");
+        // The rates are each arm's *own* bytes over its *own* measured duration —
+        // the CPU's multiply and the GPU's bracketed elapsed — not anything
+        // recovered from the join the two produce.
+        let cpu = up.cpu_bytes_per_s.expect("sampled");
+        assert!((cpu - 3072.0 * 2176.0 * 1e9 / 500_000.0).abs() / cpu < 1e-12);
+        let gpu = up.gpu_bytes_per_s.expect("sampled");
+        assert!((gpu - 1024.0 * 2176.0 * 1e9 / 250_000.0).abs() / gpu < 1e-12);
 
-        // A join *at* the floor, or within the hysteresis margin of it, is still
-        // noise: no sample, and the share keeps rising.
-        for _ in 0..4 {
-            observe(key, 3072, 1024, 2176, 500_000, 45_000);
+        // A GPU arm ten times slower is the straggler: its measured rate falls to
+        // 2.2 GB/s, the balance point with it, and the share follows it down.
+        for _ in 0..160 {
+            observe(key, 3072, 1024, 2176, 500_000, 1_000_000);
         }
-        let noise = shape_state(key.0, key.1).expect("seeded");
-        assert_eq!(
-            noise.gpu_samples, 0,
-            "an excess inside the margin is not a wait"
-        );
-        assert!(noise.share > floor.share, "the share keeps rising");
-
-        // A join that *exceeds* the floor by more than the margin is a wait: the
-        // GPU arm's duration is recoverable as `cpu_ns + excess`, and its (slow)
-        // rate pulls the share toward the balance point it implies.
-        for _ in 0..4 {
-            observe(key, 3072, 1024, 2176, 500_000, 600_000);
-        }
-        let waited = shape_state(key.0, key.1).expect("seeded");
-        assert!(waited.gpu_samples > 0, "a wait must yield a GPU sample");
+        let down = shape_state(key.0, key.1).expect("seeded");
         assert!(
-            waited.share < noise.share,
-            "a slow GPU arm must pull the share down ({} -> {})",
-            noise.share,
-            waited.share
+            down.share < up.share && (down.share - 0.1429).abs() < 1e-3,
+            "a slower GPU arm must pull the share down ({} -> {})",
+            up.share,
+            down.share
         );
-        // 1024 rows * 2176 B over (500 µs CPU arm + 550 µs excess over floor +
-        // margin) = 2.12 GB/s: the sample is the excess, not the raw join.
-        let r_gpu = waited.gpu_bytes_per_s.expect("sampled");
-        let expected = 1024.0 * 2176.0 * 1e9 / 1_050_000.0;
-        assert!(
-            (r_gpu - expected).abs() / expected < 0.01,
-            "sampled {r_gpu:e}, expected {expected:e}"
-        );
-        assert!(waited.cpu_bytes_per_s.is_some());
     }
 
     #[test]
@@ -1129,13 +1120,11 @@ mod tests {
         // A distinct key so the process-global scheduler cannot interfere.
         let key = (DType::Q8_0, 4242);
         seed_shape(key, 0.246);
-        // First join sets the shape's no-wait floor; later joins overrun it by
-        // 10 µs, so `r_gpu` is sampled and the balance point is
-        // 1024·2176/(500 µs + 10 µs) over that plus the CPU arm — 0.2463, i.e.
-        // the seeded share, so the shape converges and latches.
-        observe(key, 3072, 1024, 2176, 500_000, 40_000);
+        // 3072 CPU rows multiplied in 500 µs against 1024 GPU rows streamed in
+        // 510.84 µs is a balance point of 0.246 — the seeded share — so the shape
+        // converges and latches without ever moving.
         for _ in 0..(APPLY_EVERY as usize * (FROZEN_APPLIED as usize + 8)) {
-            observe(key, 3072, 1024, 2176, 500_000, 60_000);
+            observe(key, 3072, 1024, 2176, 500_000, 510_840);
         }
         let latched = shape_state(key.0, key.1).expect("seeded");
         assert!(
@@ -1145,15 +1134,18 @@ mod tests {
         );
         let before = latched.share;
 
-        // The GPU arm is given four times the rows: the balance point jumps to
-        // ~0.57, far outside the re-open band. The latch must re-open and track it
-        // — this is the long-context / changed-host-load case the latch exists to
-        // not miss.
+        // The GPU arm is given four times the rows at the same elapsed time: its
+        // measured rate quadruples, the balance point jumps past the ceiling, and
+        // the latch must re-open and track it — this is the changed-host-load case
+        // the latch exists to not miss.
         for _ in 0..(APPLY_EVERY as usize * 8) {
-            observe(key, 3072, 4096, 2176, 500_000, 60_000);
+            observe(key, 3072, 4096, 2176, 500_000, 510_840);
         }
         let after = shape_state(key.0, key.1).expect("seeded");
-        assert!(!after.frozen, "a moved balance point must re-open the latch");
+        assert!(
+            !after.frozen,
+            "a moved balance point must re-open the latch"
+        );
         assert!(
             after.share > before + 0.05,
             "the share must follow the move: {before} -> {}",
@@ -1166,36 +1158,43 @@ mod tests {
     // A latch can only be exercised by a *moving* balance point, which no static
     // fixture produces, so `simulate` drives the real `observe` /
     // `scheduled_share` / `plan_rows` path over a scripted host-load schedule.
-    // The plant is the one the module documents: `join = copy + max(0, gpu_ns -
-    // cpu_ns)`, with deterministic jitter so joins cross the no-wait floor.
+    // The plant is the one the module documents: each arm costs its own rows'
+    // bytes over its own rate — the CPU arm's multiply and the GPU arm's elapsed
+    // time, measured independently of each other — with deterministic jitter on
+    // each so the measured rates cross the way a real host's do.
     struct Plant {
         m: usize,
         rb: usize,
-        copy_ns: u64,
         jitter: u64,
         seed: u64,
     }
     impl Plant {
         fn noise(&mut self) -> i64 {
-            self.seed = self.seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.seed = self
+                .seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let x = (self.seed >> 33) as i64;
             (x % (2 * self.jitter as i64 + 1)) - self.jitter as i64
         }
-        /// `(cpu_ns, join_ns)`, both carrying deterministic jitter so joins
-        /// cross the shape's no-wait floor the way they do on a real host.
+        /// `(gemv_ns, arm_ns)`: the two arms' own durations under deterministic
+        /// jitter, at the rates in force on this step.
         fn measure(&mut self, g: usize, r_cpu: f64, r_gpu: f64) -> (u64, u64) {
             let cpu = ((self.m - g) as f64 * self.rb as f64 * 1e9 / r_cpu) as i64 + self.noise();
             let gpu = (g as f64 * self.rb as f64 * 1e9 / r_gpu) as i64 + self.noise();
-            let cpu = cpu.max(1) as u64;
-            let gpu = gpu.max(1) as u64;
-            (cpu, self.copy_ns + gpu.saturating_sub(cpu))
+            (cpu.max(1) as u64, gpu.max(1) as u64)
         }
     }
 
-    /// The field 9B shape: `m=12288 k=4096` at 2176 B/row, a ~40 µs no-wait
-    /// floor and ±60 µs host jitter (the checkpoint's `d2h=0.03 / join=0.04ms`).
+    /// The field 9B shape: `m=12288 k=4096` at 2176 B/row with ±60 µs host
+    /// jitter on each arm's own duration.
     fn plant(seed: u64) -> Plant {
-        Plant { m: 12288, rb: 2176, copy_ns: 40_000, jitter: 60_000, seed }
+        Plant {
+            m: 12288,
+            rb: 2176,
+            jitter: 60_000,
+            seed,
+        }
     }
 
     /// Drive a shape through the real `observe`/`scheduled_share`/`plan_rows`
@@ -1217,13 +1216,13 @@ mod tests {
             share = scheduled_share(key);
             let g = plan_rows(plant.m, plant.rb, share).expect("splittable");
             let (r_cpu, r_gpu) = rates(step);
-            let (cpu_ns, join_ns) = plant.measure(g, r_cpu, r_gpu);
+            let (gemv_ns, arm_ns) = plant.measure(g, r_cpu, r_gpu);
             let frozen = shape_state(key.0, key.1).expect("seeded").frozen;
             if was_frozen && !frozen {
                 reopens += 1;
             }
             was_frozen = frozen;
-            observe(key, plant.m - g, g, plant.rb, cpu_ns, join_ns);
+            observe(key, plant.m - g, g, plant.rb, gemv_ns, arm_ns);
         }
         (reopens, share)
     }
@@ -1244,7 +1243,10 @@ mod tests {
             "the trace-visible re-open counter must agree"
         );
         let optimum = 18.0 / (35.0 + 18.0);
-        assert!((end - optimum).abs() < 0.05, "share {end} vs optimum {optimum}");
+        assert!(
+            (end - optimum).abs() < 0.05,
+            "share {end} vs optimum {optimum}"
+        );
     }
 
     #[test]
@@ -1259,7 +1261,10 @@ mod tests {
             "the trace-visible re-open counter must move with the latch"
         );
         let optimum = 18.0 / (22.0 + 18.0);
-        assert!((end - optimum).abs() < 0.03, "share {end} vs optimum {optimum}");
+        assert!(
+            (end - optimum).abs() < 0.03,
+            "share {end} vs optimum {optimum}"
+        );
     }
 
     #[test]
@@ -1273,9 +1278,15 @@ mod tests {
             (35e9 - 13e9 * t, 18e9)
         };
         let (reopens, end) = simulate((DType::Q8_0, 9103), plant(31), 0.36, 4096, &ramp);
-        assert!(reopens >= 2, "a slow drift left the latch shut: reopens={reopens}");
+        assert!(
+            reopens >= 2,
+            "a slow drift left the latch shut: reopens={reopens}"
+        );
         let optimum = 18.0 / (18.0 + 22.0);
-        assert!(end > optimum - 0.05, "the share did not track the drift: {end} vs {optimum}");
+        assert!(
+            end > optimum - 0.05,
+            "the share did not track the drift: {end} vs {optimum}"
+        );
     }
 
     #[test]
@@ -1283,29 +1294,21 @@ mod tests {
         assert_eq!(advance_reopen_streak(0, 0.001), 0, "in band clears the run");
         assert_eq!(advance_reopen_streak(0, 0.03), 1);
         assert_eq!(advance_reopen_streak(1, 0.03), 2, "a same-sign run extends");
-        assert_eq!(advance_reopen_streak(1, -0.03), -1, "noise flips sign, the run restarts");
+        assert_eq!(
+            advance_reopen_streak(1, -0.03),
+            -1,
+            "noise flips sign, the run restarts"
+        );
         assert_eq!(advance_reopen_streak(-2, -0.03), -3);
         assert_eq!(advance_reopen_streak(-2, 0.001), 0);
-    }
-
-    #[test]
-    fn ewma_seeds_on_the_first_sample() {
-        let mut e = Ewma::new(10.0);
-        assert_eq!(e.value, 10.0);
-        e.update(20.0);
-        assert_eq!(e.value, 10.0 + EWMA_ALPHA * 10.0);
-        e.update(0.0);
-        assert!(e.value > 0.0 && e.value < 20.0);
     }
 
     #[test]
     fn share_always_lands_inside_the_ceiling_and_floor() {
         for start in [0.0f64, 0.05, 0.375, 0.5, 0.9] {
             for (cpu, gpu) in [(1e9, 1e12), (1e12, 1e9), (1.0, 1.0)] {
-                for waited in [true, false] {
-                    let s = next_share(start, Some(cpu), Some(gpu), waited);
-                    assert!((SHARE_MIN..=SHARE_MAX).contains(&s), "s={s}");
-                }
+                let s = next_share(start, cpu, gpu);
+                assert!((SHARE_MIN..=SHARE_MAX).contains(&s), "s={s}");
             }
         }
     }

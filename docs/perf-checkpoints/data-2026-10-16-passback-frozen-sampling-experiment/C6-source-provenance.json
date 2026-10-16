@@ -1,0 +1,15 @@
+{
+  "base_commit": "12daf4fe99017a88242469f60853b860609c20ab",
+  "build_command": "cargo build --release",
+  "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)\nbinary: rustc\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\ncommit-date: 2026-09-01\nhost: x86_64-unknown-linux-gnu\nrelease: 1.98.1\nLLVM version: 22.1.8\n",
+  "source_patch_sha256": "ec155f6b1be63cd7294aafdc41003e3948635d48c6026993199feb37c82e5919",
+  "binary_md5": {
+    "hipfire": "03ba4e18c59b53d4996972fe6a3a760b",
+    "daemon": "32c19e1c1887d34a0ad03c8d33db51ea"
+  },
+  "verification": {
+    "dispatch_lib": "411 passed,1 ignored;artifact://819",
+    "gpu_oracles": "passback and CPU stream/reuse passed;artifact://821",
+    "build_log": "artifact://821"
+  }
+}

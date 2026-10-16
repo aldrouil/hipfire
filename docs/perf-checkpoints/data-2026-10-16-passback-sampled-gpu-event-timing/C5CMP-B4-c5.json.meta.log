@@ -1,0 +1,48 @@
+=== env allowlist ===
+HIPFIRE_DPM_WARMUP_SECS=10 HIPFIRE_OFFLOAD_EXEC=passback HIPFIRE_GPU_LAYER_BUDGET=16 HIPFIRE_OFFLOAD_PASSBACK_SHARE=auto
+CLI md5: 23181d5ba45c532ec6910b0801ea1492  DAEMON md5: 98265d8b809d3b40245f05382b3d9d44
+unset check (must be empty): []
+RAYON check (must be unset): [unset]
+RAYON unset-command: env -u RAYON_NUM_THREADS (applied to serve env below)
+=== power pre (sysfs card1) ===
+power1_average_uW=47000000
+power1_cap_uW=374000000
+temp_edge_mC=50000
+temp_junction_mC=52000
+temp_mem_mC=74000
+sclk_Hz=41000000
+mclk_Hz=1258000000
+perf_level=auto
+pp_sclk_star=S: 41Mhz *
+throttle_log=0000:03:00.0: thermal throttling logging enabled, with interval 60 seconds
+vram_used_B=1467609088
+vram_total_B=17095983104
+gtt_used_B=216903680
+gpu_busy_pct=13
+mem_busy_pct=0
+host_MemAvailable_kB=16481244
+=== power post (sysfs card1) ===
+power1_average_uW=141000000
+power1_cap_uW=374000000
+temp_edge_mC=53000
+temp_junction_mC=55000
+temp_mem_mC=76000
+sclk_Hz=1475000000
+mclk_Hz=1258000000
+perf_level=auto
+pp_sclk_star=S: 55Mhz *
+throttle_log=0000:03:00.0: thermal throttling logging enabled, with interval 60 seconds
+vram_used_B=5410766848
+vram_total_B=17095983104
+gtt_used_B=223252480
+gpu_busy_pct=4
+mem_busy_pct=0
+host_MemAvailable_kB=16263600
+====================================== Temperature =======================================
+GPU[0]		: Temperature (Sensor edge) (C): 53.0
+GPU[0]		: Temperature (Sensor junction) (C): 55.0
+GPU[0]		: Temperature (Sensor memory) (C): 76.0
+GPU[1]		: Temperature (Sensor edge) (C): 10.0
+=================================== Power Consumption ====================================
+=== trace-line check (expect 0) ===
+1

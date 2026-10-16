@@ -1,0 +1,66 @@
+=== FIN sample: OUT=.codeinsight+research/passback-opt/raw/FIN9B/R3-fin-pcie HN=r3-finpcie HOME=/tmp/FIN-home-r3-finpcie ===
+date_utc=2026-10-16T23:12:55Z
+cli_md5=23181d5ba45c532ec6910b0801ea1492 daemon_md5=98265d8b809d3b40245f05382b3d9d44
+model_md5=296092bf1e6a45d78c1acf815eb93366 model_bytes=5313750016
+prompt_md5=5835c71e471849b4a72e1dc8e39695e7 prompt_bytes=215
+commit=12daf4fe99017a88242469f60853b860609c20ab dirty=[ M CHANGELOG.md; M crates/hipfire-arch-qwen35/tests/gpu_gemv_parity.rs; M crates/hipfire-dispatch/src/cpu_exec.rs; M crates/hipfire-dispatch/src/offload_split.rs; M crates/rdna-compute/map.md;]
+RAYON=[unset]
+HIPFIRE_OFFLOAD_EXEC=pcie HIPFIRE_GPU_LAYER_BUDGET=16 HIPFIRE_OFFLOAD_PASSBACK_SHARE=[]
+unset-check: []
+=== power pre ===
+power1_average_uW=48000000
+power1_cap_uW=374000000
+temp_edge_mC=50000
+temp_junction_mC=52000
+temp_mem_mC=74000
+sclk_Hz=56000000
+mclk_Hz=1258000000
+perf_level=auto
+pp_sclk_star=1: 1386Mhz *
+throttle_log=0000:03:00.0: thermal throttling logging enabled, with interval 60 seconds
+vram_used_B=2036068352
+vram_total_B=17095983104
+gtt_used_B=254160896
+gpu_busy_pct=3
+mem_busy_pct=0
+host_MemAvailable_kB=17186852
+host_MemAvailable_pre_kB=17186852
+rc=0 date_utc=2026-10-16T23:13:47Z
+=== power post ===
+power1_average_uW=64000000
+power1_cap_uW=374000000
+temp_edge_mC=55000
+temp_junction_mC=57000
+temp_mem_mC=76000
+sclk_Hz=55000000
+mclk_Hz=1258000000
+perf_level=auto
+pp_sclk_star=1: 1478Mhz *
+throttle_log=0000:03:00.0: thermal throttling logging enabled, with interval 60 seconds
+vram_used_B=5827416064
+vram_total_B=17095983104
+gtt_used_B=239480832
+gpu_busy_pct=100
+mem_busy_pct=18
+host_MemAvailable_kB=16734124
+host_MemAvailable_post_kB=16734124
+=== daemon proof ===
+WRAP-INVOCATION daemon_md5=98265d8b809d3b40245f05382b3d9d44 cli_md5=23181d5ba45c532ec6910b0801ea1492
+=== loaded/kv/samples from JSON ===
+loaded.arch='qwen3_5'
+loaded.layers=32
+loaded.kv_mode='q8'
+loaded.kv_backend='vmm'
+loaded.kv_backend_request='explicit'
+loaded.kv_backend_reason=None
+loaded.kv_backend_legacy=False
+loaded.max_seq=4096
+loaded.max_seq_bound='user'
+loaded.max_seq_reason=None
+loaded.model_ctx=262144
+loaded.card_cap=675579
+samples.decode= [12.8, 12.8, 12.3]
+samples.prefill= [100.0, 100.0, 99.1]
+samples.ttft_ms= [589.8, 590.2, 595.5]
+prompt_tokens= 59 prompt_md5= 5835c71e471849b4a72e1dc8e39695e7 warnings= ['prompt is 59 tokens; prefill_tok_s at this length measures launch overhead, not prefill throughput — use --prompt-file with ≥256 tokens for a prefill number']
+decode_stats= {'median': 12.8, 'mean': 12.633333333333335, 'min': 12.3, 'max': 12.8, 'stdev': 0.23570226039551584} prefill_stats= {'median': 100.0, 'mean': 99.7, 'min': 99.1, 'max': 100.0, 'stdev': 0.4242640687119312} wall= {'median': 12.1, 'mean': 11.933333333333332, 'min': 11.6, 'max': 12.1, 'stdev': 0.23570226039551584} ttft= {'median': 590.2, 'mean': 591.8333333333334, 'min': 589.8, 'max': 595.5, 'stdev': 2.597862369119831}

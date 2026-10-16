@@ -1,0 +1,18 @@
+[
+ {
+  "genre": "prose",
+  "prompt": "Write a Python function `longest_substring(s)` that returns the length of the longest substring without repeating characters. Include a brief docstring and one example call in an `if __name__ == \"__main__\":` block.\n"
+ },
+ {
+  "genre": "prose",
+  "prompt": "Write a Python function `longest_substring(s)` that returns the length of the longest substring without repeating characters. Include a brief docstring and one example call in an `if __name__ == \"__main__\":` block.\n"
+ },
+ {
+  "genre": "prose",
+  "prompt": "Write a Python function `longest_substring(s)` that returns the length of the longest substring without repeating characters. Include a brief docstring and one example call in an `if __name__ == \"__main__\":` block.\n"
+ },
+ {
+  "genre": "prose",
+  "prompt": "Write a Python function `longest_substring(s)` that returns the length of the longest substring without repeating characters. Include a brief docstring and one example call in an `if __name__ == \"__main__\":` block.\n"
+ }
+]

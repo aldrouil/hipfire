@@ -75,6 +75,7 @@ pub mod sampling;
 pub mod scratch;
 pub mod select_regrid;
 pub mod slab_moe;
+mod span_timer;
 pub mod spec_sampling_cpu_ar;
 pub mod tape_copy;
 pub mod verify_twins;

@@ -1,0 +1,20 @@
+=== env allowlist ===
+HIPFIRE_DPM_WARMUP_SECS=10 HIPFIRE_OFFLOAD_EXEC=passback HIPFIRE_GPU_LAYER_BUDGET=16 HIPFIRE_OFFLOAD_PASSBACK_SHARE=auto
+CLI md5: e3f6cc8d24f05a3f5fdcae0d263f4405  DAEMON md5: 73de751f05c929e5115e6ca3eefd8dd7
+unset check (must be empty): []
+=== power pre ===
+====================================== Temperature =======================================
+GPU[0]		: Temperature (Sensor edge) (C): 47.0
+GPU[0]		: Temperature (Sensor junction) (C): 49.0
+GPU[0]		: Temperature (Sensor memory) (C): 70.0
+GPU[1]		: Temperature (Sensor edge) (C): 7.0
+=================================== Power Consumption ====================================
+=== power post ===
+====================================== Temperature =======================================
+GPU[0]		: Temperature (Sensor edge) (C): 51.0
+GPU[0]		: Temperature (Sensor junction) (C): 53.0
+GPU[0]		: Temperature (Sensor memory) (C): 74.0
+GPU[1]		: Temperature (Sensor edge) (C): 9.0
+=================================== Power Consumption ====================================
+=== trace-line check (expect 0) ===
+1
