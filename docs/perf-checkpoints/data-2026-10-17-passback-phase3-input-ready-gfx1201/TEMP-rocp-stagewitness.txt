@@ -1,0 +1,20 @@
+tight begin/mid marker pairs: 405
+residual steps with own GEMV kernel (no launch between wait and begin): 405
+of those, own-kernel start < mid-marker start: 105
+--- FIRST WITNESS ---
+step wait: sync api-row 167 start=4798737691218 end=4798738264655
+step prefix launch: api-row 166 corr=167 start=4798737686668
+begin marker: api-row 168 start=4798738266175; mid marker: api-row 169 start=4798738268215
+prefix kernel: csv-row 64 gemv_hfq4g256_residual dispatch=65 corr=167 start=4798738266967 end=4798738394128
+kstart < midstart: True by 1.2us
+intervening launches between own launch and wait: 0
+=== STEP CONTEXT api-rows 160-172 (first witness) ===
+rows 160-162: three launches (corr 161-163) = earlier-step tails/consumer adds
+rows 163-164: two hipMemcpyAsync = this step D2H copies (activation + scale/residual)
+row 165: hipEventRecord = input-ready MARK (after D2H enqueues, before launch)
+row 166: hipModuleLaunchKernel corr167 = OWN PREFIX LAUNCH (after mark: new order proven in API sequence)
+row 167: hipEventSynchronize = INPUT-READY WAIT (after launch: new order; 573us window)
+rows 168-169: hipGetDevice begin + mid markers (1.2us/1.0us; zero HIP calls between)
+row 170: hipMemcpyAsync = H2D return (after CPU GEMV)
+=== DECISIVE COUNTS ===
+residual steps mapped: 405; own-prefix start < mid-marker start: 105; own-prefix start < wait end: 3

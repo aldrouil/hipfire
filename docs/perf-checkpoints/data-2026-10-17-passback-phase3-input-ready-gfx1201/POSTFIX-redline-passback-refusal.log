@@ -1,0 +1,18 @@
+[gpu-lock] directory=/tmp/hipfire-locks
+[hip-bridge] GPU_PINNED_MIN_XFER_SIZE=100000: pageable weight copies staged out of reclaim
+[gpu-lock] reserved /tmp/hipfire-locks/gpu-GPU-0c088c33052923ba.lock
+[gpu-lock] reserved /tmp/hipfire-locks/gpu-pci-0000:14:00.0.lock
+[devices] logical 0: HIP gfx1201 0000:03:00.0 = index 0 GPU-0c088c33052923ba
+[devices] logical 1: HIP gfx1036 0000:14:00.0 = index 1 pci-0000:14:00.0
+GPU dev 0: gfx1201 (17.1 GB VRAM, HIP 7.2)
+  pre-compiled kernels: /home/avery/.hipfire_kernels/gfx1201
+  kernels: compiling kernels on first use (one-time, cached afterwards)… [no closed route plan: UnsupportedRoute("non-default feature flags on gfx1201")]
+  KV cache: requested mode=q8, effective K=q8, effective V=q8
+  partial offload: 16 of 32 layers host-placed, device weights 3299 MiB of 10413 MiB available
+  kv reserved: 262144 tokens x 17408 B = 4352 MiB; pbs floor 1286 MiB; draft 0 MiB; slack 128 MiB; weight budget 10413 MiB of 16180 MiB free
+  partial offload: 16 of 32 layers host-placed; pinned host 1753 MiB; device weights 3299 MiB
+  DeltaNet state: Q8
+passback: memory.offload_exec=passback is non-deterministic by design — its CPU/GPU row split is scheduled per process, so generated tokens may change across runs; choose cpu or pcie for reproducible output
+cpu exec: 16/16 spilled layers fully covered by the CPU seam; uncovered quants: none
+passback: 16/16 spilled layers splittable; share 0.5; min step 2 MiB
+{"type":"error","message":"load failed: qwen35: memory.offload_exec=passback conflicts with the retained-replay (Redline) backend: the replay tape records GPU launches and does not execute the CPU-executed steps, so a replayed route would compute from stale activations. Set memory.offload_exec=pcie (HIPFIRE_OFFLOAD_EXEC=pcie) or replay.backend=hip. GPU: gfx1201 (16180 MB free / 16304 MB total); no model loaded (the prior model was unloaded before this load)","class":"gpu","retryable":false,"rolled_back":false,"attempt_id":0}

@@ -1,0 +1,31 @@
+CAUSAL WITNESS: GEMV execution overlapping the input-ready host wait (one case)
+Trace: FINAL2-rocp-oracle/trace/ (oracle binary, FINAL2 build, graceful exit)
+Timebase: rocprofiler SDK unified timebase (HSA system clock for dispatch times;
+HIP API CLOCK_BOOTTIME equated to HSA ReadSystemClock; SDK skew-adjusted).
+No host-Instant comparison anywhere in this analysis.
+
+WITNESS KERNEL (kernel-trace csv-row 18):
+  name=gemv_hfq4g256_residual dispatch=19 correlation=92 thread=93497 stream=0
+  Start_Timestamp=4420755647329 End_Timestamp=4420756338892 (685us execution)
+  launched by hipModuleLaunchKernel api-row 91 (corr 92,
+  start=4420755607362 end=4420755610152), same thread, ~13.7us before the wait.
+
+WITNESS SYNC (hip-api-trace api-row 97):
+  hipEventSynchronize corr=98 thread=93497
+  start=4420755637751 end=4420756360666 (723us host wait)
+  context on same thread: record95 -> prefix-launch96 -> SYNC97 -> H2D-memcpy98,
+  matching production run_with order (enqueue/mark/launch/wait/stage/H2D),
+  so this is the waiting step's input-ready wait (not the H2D join, which
+  follows the CPU GEMV and precedes different neighbors).
+
+ORDERING (same timebase):
+  kernel start 4420755647329 is AFTER sync start 4420755637751 and
+  kernel end 4420756338892 is BEFORE sync end 4420756360666:
+  the 685us GEMV execution lies fully inside the 723us host wait window.
+  The waiting step's own prefix (dispatch 23, corr 97) starts at
+  4420756363092, 2426ns after the wait ends.
+
+READING: GPU prefix-family execution overlapped the host readiness wait.
+NOT CLAIMED: the waiting step's own prefix did NOT start before its wait
+ended here (2426ns after); no per-step ownership proof for kernel18 beyond
+same-thread/same-stream GEMV family; no 310-mapping; no speedup in ns.

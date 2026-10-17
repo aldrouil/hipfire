@@ -1,0 +1,4 @@
+commit=b236099f64779b0291f5b48ff4ec0aa68d872b40
+tree: HEAD + restored 4-file production (whitespace-only delta vs POSTFIX, zero fmt debt, grep clean)
+restored_production_patch_sha256=592cd96e0e164a69375daa82ca72f3a54fecb0ef590fdf5b3af7378e04b4e0e2
+cli_md5=faa9fb239b2b04fd14ddf769211065bb daemon_md5=1130b4d513e34f5ca15113e04af099d6

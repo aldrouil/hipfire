@@ -1,0 +1,31 @@
+CAUSAL SAME-STEP WITNESS (parent-verified; correlation-ID addressed)
+Trace: TEMP-rocp-oracle/trace/ (TEMP stage-marker build, graceful oracle exit)
+Thread 99511, stream 0. Correlation IDs (stable across CSVs; api-row labels are
+1-based tool lines, kernel csv-rows 0-based — use corr IDs, not row offsets).
+
+API chain (hip-api corr):
+  4627/4628: D2H copies (activation + scale/residual enqueue)
+  4629: hipEventRecord = input-ready MARK (after D2H, before launch)
+  4630: C5 span_begin record
+  4631: hipModuleLaunchKernel = OWN PREFIX LAUNCH
+  4632: C5 span_end record
+  4633: hipEventSynchronize = INPUT-READY WAIT, End=4799003018577
+  4634: hipGetDevice = begin marker (after wait, before pinned read)
+  4635: hipGetDevice = MID marker, Start=4799003021997 (after xcopy/AWQ/FWHT,
+        before residual acc copy; real prep still pending)
+  4636: hipMemcpyAsync H2D (after CPU GEMV)
+
+PREFIX KERNEL (kernel-trace corr 4631):
+  gemv_hfq4g256_residual dispatch=2457
+  Start_Timestamp=4799002987214 End_Timestamp=4799003028654
+
+ORDERING (profiler unified timebase):
+  kernel start 4799002987214 < wait end 4799003018577 (lead 31363ns:
+  kernel executing while host still inside readiness wait)
+  < mid-marker start 4799003021997 (host prep still unfinished: residual
+  copy + CPU GEMV pending)
+  < kernel end 4799003028654.
+
+READING: own-prefix GPU execution overlapped the host readiness wait AND
+host prep (FWHT done, residual copy/GEMV pending) on one timebase.
+NOT CLAIMED: any speedup, any per-token budget, generality beyond observed steps.

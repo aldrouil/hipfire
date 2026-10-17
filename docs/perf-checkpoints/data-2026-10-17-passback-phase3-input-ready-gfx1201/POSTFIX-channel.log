@@ -1,0 +1,39 @@
+[hip-bridge] GPU_PINNED_MIN_XFER_SIZE=100000: pageable weight copies staged out of reclaim
+GPU dev 0: gfx1201 (17.1 GB VRAM, HIP 7.2)
+  pre-compiled kernels: /home/avery/.hipfire_kernels/gfx1201
+GPU: gfx1201 (17.1 GB VRAM)
+
+--- Basic ops ---
+  alloc + free                                       OK (0.0ms)
+  upload + download f32                              OK (17.9ms)
+  add_inplace_f32                                    OK (1.0ms)
+  rmsnorm_f32                                        OK (0.7ms)
+  softmax_f32                                        OK (1.1ms)
+  MoE down unscatter canonical slots                 OK (3.2ms)
+
+--- Attention kernels ---
+  attention_f32 hd=128 h=8 kv=2                      OK (0.9ms)
+  attention_f32 hd=256 h=16 kv=4                     OK (1.5ms)
+  attention_f32 hd=256 h=10 kv=2                     OK (0.2ms)
+
+--- Q8 KV kernels ---
+  q8 write+attn hd=128 kv=8                          OK (1.6ms)
+  q8 write+attn hd=256 kv=4                          OK (0.3ms)
+  q8 write+attn hd=256 kv=2                          OK (0.3ms)
+
+--- GDN (tiled LDS) ---
+  gdn_q8 h=32 hd=128 (9B DeltaNet)                   OK (1.5ms)
+  gdn_q8 h=16 hd=128 (4B DeltaNet)                   OK (0.2ms)
+
+--- Vision encoder kernels ---
+  gemm_f16 (vision GEMM)                             OK (0.7ms)
+  layernorm_batched                                  OK (1.3ms)
+  transpose_f32                                      OK (0.7ms)
+
+--- Qwen4 symmetric IU4 MoE (fn-moe-sym) ---
+  qwen4 sym IU4 QT53 K640 exact fold                 SKIP (gfx1151-only route)
+
+--- Summary ---
+  Passed:  17
+  Failed:  0
+  Skipped: 1

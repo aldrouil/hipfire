@@ -1,0 +1,9 @@
+=== P3 sample: OUT=docs/perf-checkpoints/data-2026-10-17-passback-phase3-input-ready-gfx1201/PRE-9B-s05-R1 HN=p3pre-r1 HOME=/tmp/P3-home-p3pre-r1 ===
+date_utc=2026-10-17T12:11:34Z
+cli_md5=c7e8baf005f64531b08a9c1001f75fcb daemon_md5=fb3f99c250f6c1d7e38b4639f8bf9f75
+model_md5=296092bf1e6a45d78c1acf815eb93366 model_bytes=5313750016
+prompt_md5=5835c71e471849b4a72e1dc8e39695e7
+commit=b236099f64779b0291f5b48ff4ec0aa68d872b40 dirty=[?? docs/perf-checkpoints/data-2026-10-17-passback-phase3-input-ready-gfx1201/;]
+HIPFIRE_OFFLOAD_EXEC=passback HIPFIRE_GPU_LAYER_BUDGET=16 HIPFIRE_OFFLOAD_PASSBACK_SHARE=0.5
+unset-check: []
+rc=0 date_utc=2026-10-17T12:12:15Z

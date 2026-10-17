@@ -1,0 +1,41 @@
+{
+ "trace": "FINAL2-rocp-oracle/trace/orc_kernel_trace.csv + orc_hip_api_trace.csv",
+ "timebase": "rocprofiler SDK unified (HSA system clock for dispatch times; HIP API CLOCK_BOOTTIME equated to HSA ReadSystemClock; skew-adjusted). No host Instant comparison.",
+ "witness_kernel": {
+  "csv_row": 18,
+  "name": "gemv_hfq4g256_residual",
+  "dispatch": 19,
+  "correlation": 92,
+  "thread": "93497",
+  "stream": "0",
+  "start": 4420755647329,
+  "end": 4420756338892
+ },
+ "witness_sync": {
+  "api_row": 97,
+  "function": "hipEventSynchronize",
+  "correlation": 98,
+  "thread": "93497",
+  "start": 4420755637751,
+  "end": 4420756360666
+ },
+ "launch_of_kernel": {
+  "api_row": 91,
+  "function": "hipModuleLaunchKernel",
+  "correlation": 92,
+  "start": 4420755607362,
+  "end": 4420755610152
+ },
+ "step_context": {
+  "record_api_row": 95,
+  "record_corr": 96,
+  "prefix_launch_api_row": 96,
+  "prefix_launch_corr": 97,
+  "prefix_kernel_dispatch": 23,
+  "prefix_kernel_start": 4420756363092,
+  "h2d_api_row": 98
+ },
+ "ordering": "kernel18 start (4420755647329) > sync97 start (4420755637751) and kernel18 end (4420756338892) < sync97 end (4420756360666): kernel execution fully inside host wait window. Prefix kernel22 of the waiting step starts 2426ns after wait end.",
+ "causal_reading": "sync97 is the waiting step's input-ready wait: same thread 93497, preceded on-thread by record95+prefix-launch96, followed by H2D memcpy98; matches production run_with order enqueue/mark/launch/wait/stage/H2D. kernel18 is a GEMV prefix-family kernel launched 13.7us earlier on the same stream whose 685us execution overlaps the wait. Ownership caveat: exact per-step kernel attribution needs source mapping; the overlap of GEMV execution with the readiness wait on one timebase is directly observed.",
+ "not_claimed": "This does not prove the WAITING step's own prefix started before its wait ended (it started 2426ns after); no nanosecond speedup; no all-310 mapping."
+}

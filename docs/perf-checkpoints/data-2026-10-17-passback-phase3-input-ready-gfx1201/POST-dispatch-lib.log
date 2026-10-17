@@ -1,0 +1,785 @@
+   Compiling hip-bridge v0.4.3 (/home/avery/Documents/vibecoding/hipfire-special/hipfire-passback-opt/crates/hip-bridge)
+warning: method `replay_and_wait_inner` is never used
+   --> crates/redline-dispatch/src/aql/replay.rs:667:15
+    |
+ 91 | impl SingleQueuePm4Ib {
+    | --------------------- method in this implementation
+...
+667 |     unsafe fn replay_and_wait_inner(&mut self) -> Result<(), ReplayError> {
+    |               ^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `mq4g256_row_dot_scalar` is never used
+   --> crates/hipfire-cpu/src/gemv.rs:571:15
+    |
+571 | pub(crate) fn mq4g256_row_dot_scalar(row: &[u8], k: usize, x: &[f32]) -> f32 {
+    |               ^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `redline-dispatch` (lib) generated 1 warning
+warning: `hipfire-cpu` (lib) generated 1 warning
+   Compiling rdna-compute v0.4.3 (/home/avery/Documents/vibecoding/hipfire-special/hipfire-passback-opt/crates/rdna-compute)
+warning: unused import: `std::ffi::c_void`
+  --> crates/rdna-compute/src/qwen35_fa_batch.rs:19:5
+   |
+19 | use std::ffi::c_void;
+   |     ^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `Gpu`
+  --> crates/rdna-compute/src/qwen35_fa_batch.rs:21:23
+   |
+21 | use crate::dispatch::{Gpu, GpuTensor};
+   |                       ^^^
+
+warning: unused import: `hip_bridge::HipResult`
+  --> crates/rdna-compute/src/qwen35_fa_batch.rs:22:5
+   |
+22 | use hip_bridge::HipResult;
+   |     ^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused variable: `func`
+     --> crates/rdna-compute/src/attention.rs:16615:13
+      |
+16615 |         let func = &self.functions["kv_cache_write"];
+      |             ^^^^ help: if this is intentional, prefix it with an underscore: `_func`
+      |
+      = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unnecessary `unsafe` block
+    --> crates/rdna-compute/src/dispatch.rs:6862:9
+     |
+6862 |         unsafe { self.hip.memcpy_htod(&tensor.buf, bytes)? }
+     |         ^^^^^^ unnecessary `unsafe` block
+     |
+     = note: `#[warn(unused_unsafe)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+    --> crates/rdna-compute/src/dispatch.rs:6859:13
+     |
+6859 |         let mut tensor = self.alloc_host_mapped_tensor(byte_size, shape, DType::F32)?;
+     |             ----^^^^^^
+     |             |
+     |             help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+    --> crates/rdna-compute/src/dispatch.rs:7057:13
+     |
+7057 |         let mut tensor = self.alloc_host_mapped_tensor(data.len(), shape, DType::Raw)?;
+     |             ----^^^^^^
+     |             |
+     |             help: remove this `mut`
+
+warning: unused variable: `func`
+     --> crates/rdna-compute/src/gemm.rs:32967:13
+      |
+32967 |         let func = &self.functions["gemv_q8_0_moe_gate_up_k8_indexed"];
+      |             ^^^^ help: if this is intentional, prefix it with an underscore: `_func`
+
+warning: variable does not need to be mutable
+     --> crates/rdna-compute/src/gemm.rs:35598:13
+      |
+35598 |         let mut yg_tmp = self.alloc_tensor(&[n_padded, gate_m], DType::F32)?;
+      |             ----^^^^^^
+      |             |
+      |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+     --> crates/rdna-compute/src/gemm.rs:35599:13
+      |
+35599 |         let mut yu_tmp = self.alloc_tensor(&[n_padded, up_m], DType::F32)?;
+      |             ----^^^^^^
+      |             |
+      |             help: remove this `mut`
+
+warning: unused variable: `force_baseline`
+   --> crates/rdna-compute/src/kernels.rs:392:5
+    |
+392 |     force_baseline: bool,
+    |     ^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_force_baseline`
+
+warning: unused variable: `force_baseline`
+   --> crates/rdna-compute/src/kernels.rs:409:5
+    |
+409 |     force_baseline: bool,
+    |     ^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_force_baseline`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:474:9
+    |
+474 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:499:9
+    |
+499 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:524:9
+    |
+524 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:543:9
+    |
+543 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:848:9
+    |
+848 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:875:9
+    |
+875 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:902:9
+    |
+902 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:922:9
+    |
+922 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `func`
+    --> crates/rdna-compute/src/norm.rs:1099:13
+     |
+1099 |         let func = &self.functions["rope_f32"];
+     |             ^^^^ help: if this is intentional, prefix it with an underscore: `_func`
+
+warning: unused variable: `func`
+    --> crates/rdna-compute/src/norm.rs:6306:13
+     |
+6306 |         let func = &self.functions["bias_add_f32"];
+     |             ^^^^ help: if this is intentional, prefix it with an underscore: `_func`
+
+warning: variable does not need to be mutable
+    --> crates/rdna-compute/src/replay.rs:6096:13
+     |
+6096 |         let mut dynamic_gdn_frames = Vec::new();
+     |             ----^^^^^^^^^^^^^^^^^^
+     |             |
+     |             help: remove this `mut`
+
+warning: constant `N_TILE` is never used
+    --> crates/rdna-compute/src/attention.rs:5851:15
+     |
+5851 |         const N_TILE: usize = 16;
+     |               ^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `refcount` is never used
+   --> crates/rdna-compute/src/page_pool.rs:621:19
+    |
+358 | impl PagePool {
+    | ------------- method in this implementation
+...
+621 |     pub(crate) fn refcount(&self, phys: u32) -> u32 {
+    |                   ^^^^^^^^
+
+warning: field `pgm_rsrc2` is never read
+   --> crates/rdna-compute/src/profiler.rs:443:5
+    |
+441 | struct RawKernelMeta {
+    |        ------------- field in this struct
+442 |     pgm_rsrc1: u32,
+443 |     pgm_rsrc2: u32,
+    |     ^^^^^^^^^
+
+warning: method `synthesized_position_bindings` is never used
+    --> crates/rdna-compute/src/replay.rs:4285:19
+     |
+4282 | impl ReplayController {
+     | --------------------- method in this implementation
+...
+4285 |     pub(crate) fn synthesized_position_bindings(&self) -> &[(usize, ReplayKernargBinding)] {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `replay_and_wait_profiled` is never used
+    --> crates/rdna-compute/src/replay.rs:4858:15
+     |
+4854 | impl PreparedPm4Graph {
+     | --------------------- method in this implementation
+...
+4858 |     unsafe fn replay_and_wait_profiled(&mut self) -> Result<GpuMultiQueueTiming, String> {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `use_blob_path` is never used
+    --> crates/rdna-compute/src/scratch.rs:1021:15
+     |
+1021 | pub(crate) fn use_blob_path(is_recording: bool, capture_mode: bool, force_blob_path: bool) -> bool {
+     |               ^^^^^^^^^^^^^
+
+warning: unused `Result` that must be used
+     --> crates/rdna-compute/src/gemv.rs:17107:9
+      |
+17107 |         crate::profile::end_timer(&self.hip, timer);
+      |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = note: this `Result` may be an `Err` variant, which should be handled
+      = note: `#[warn(unused_must_use)]` (part of `#[warn(unused)]`) on by default
+help: use `let _ = ...` to ignore the resulting value
+      |
+17107 |         let _ = crate::profile::end_timer(&self.hip, timer);
+      |         +++++++
+
+warning: `rdna-compute` (lib) generated 30 warnings (run `cargo fix --lib -p rdna-compute` to apply 22 suggestions)
+   Compiling hipfire-dispatch v0.4.3 (/home/avery/Documents/vibecoding/hipfire-special/hipfire-passback-opt/crates/hipfire-dispatch)
+warning: unused imports: `Bf16ScaledAdd` and `bf16_scaled_add`
+  --> crates/hipfire-dispatch/src/pipeline/mod.rs:13:32
+   |
+13 | use rdna_compute::tensor_ops::{bf16_scaled_add, Bf16ScaledAdd};
+   |                                ^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `crate::cpu_exec`
+    --> crates/hipfire-dispatch/src/pipeline/steps.rs:2010:9
+     |
+2010 |     use crate::cpu_exec;
+     |         ^^^^^^^^^^^^^^^
+
+warning: unused imports: `guard_gate_up_hfq4g256`, `guard_gate_up_hfq6g256`, `guard_gate_up_mq3g256lloyd`, and `guard_qkv_mq3g256lloyd`
+    --> crates/hipfire-dispatch/src/tests.rs:1792:5
+     |
+1792 |     guard_gate_up_hfq4g256, guard_gate_up_hfq6g256, guard_gate_up_mq3g256lloyd,
+     |     ^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^
+1793 |     guard_gate_up_mq4g256lloyd, guard_gate_up_mq4g256v2, guard_qkv_hfq4g256, guard_qkv_hfq6g256,
+1794 |     guard_qkv_mq3g256lloyd, guard_qkv_mq4g256lloyd, guard_qkv_mq4g256v2, guard_qkvza_mq4g256v2,
+     |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unreachable statement
+    --> crates/hipfire-dispatch/src/pipeline/mod.rs:4907:13
+     |
+4901 | /             return Err(DispatchError::UnsupportedVariant {
+4902 | |                 family: "moe",
+4903 | |                 variant: "sigmoid-host-experts-require-deltanet",
+4904 | |                 arch: "",
+4905 | |                 quant: "",
+4906 | |             });
+     | |______________- any code following this expression is unreachable
+4907 |               run_host_weight_gemv_residual(ctx, gpu, gemv, &down_w, &hid_view, p.x_residual)?;
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ unreachable statement
+     |
+     = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: unreachable pattern
+    --> crates/hipfire-dispatch/src/families/attention.rs:3062:19
+     |
+3048 |                 | KvWriteFp8E4m3Batched
+     |                   --------------------- matches all the relevant values
+...
+3062 |                 | KvWriteFp8E4m3Batched
+     |                   ^^^^^^^^^^^^^^^^^^^^^ no value can reach this
+     |
+     = note: `#[warn(unreachable_patterns)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `is_mq4v2`
+   --> crates/hipfire-dispatch/src/families/fused_qkv.rs:107:9
+    |
+107 |     let is_mq4v2 = is_fused_mq4v2_key(key);
+    |         ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_is_mq4v2`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `mu`
+    --> crates/hipfire-dispatch/src/families/fused_qkv.rs:1305:22
+     |
+1305 |             let [mg, mu] =
+     |                      ^^ help: if this is intentional, prefix it with an underscore: `_mu`
+
+warning: variable does not need to be mutable
+    --> crates/hipfire-dispatch/src/pipeline/layer_ops.rs:4924:25
+     |
+4924 |                     let mut streams = || {
+     |                         ----^^^^^^^
+     |                         |
+     |                         help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> crates/hipfire-dispatch/src/pipeline/mod.rs:623:13
+    |
+623 |         let mut assert_rejected = |dtypes: &MoeDtypes<'_>| {
+    |             ----^^^^^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: unused variable: `ctx`
+    --> crates/hipfire-dispatch/src/pipeline/mod.rs:2555:5
+     |
+2555 |     ctx: &DispatchCtx,
+     |     ^^^ help: if this is intentional, prefix it with an underscore: `_ctx`
+
+warning: variable does not need to be mutable
+   --> crates/hipfire-dispatch/src/tests.rs:299:9
+    |
+299 |     let mut reg = KernelRegistry::new();
+    |         ----^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: type `AfterClear` is more private than the item `execute_sealed_after_clear`
+    --> crates/hipfire-dispatch/src/pipeline/sealed_moe.rs:2500:1
+     |
+2500 | / pub(crate) fn execute_sealed_after_clear(
+2501 | |     gpu: &mut Gpu,
+2502 | |     call: &SealedMoeCall<'_>,
+2503 | |     clear: &super::layer_ops::ClearOp<'_>,
+...    |
+2508 | |     )>,
+2509 | | ) -> Result<moe_program::AfterClear, DispatchError> {
+     | |___________________________________________________^ function `execute_sealed_after_clear` is reachable at visibility `pub(crate)`
+     |
+note: but type `AfterClear` is only usable at visibility `pub(in crate::pipeline)`
+    --> crates/hipfire-dispatch/src/pipeline/moe_program.rs:1776:1
+     |
+1776 | pub(super) struct AfterClear {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     = note: `#[warn(private_interfaces)]` on by default
+
+warning: function `dp4a_variant` is never used
+  --> crates/hipfire-dispatch/src/tests.rs:72:4
+   |
+72 | fn dp4a_variant(key: KernelKey) -> KernelVariant {
+   |    ^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `hipfire-dispatch` (lib test) generated 13 warnings (run `cargo fix --lib -p hipfire-dispatch --tests` to apply 9 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 11.93s
+     Running unittests src/lib.rs (target/debug/deps/hipfire_dispatch-c600f01aa999b4b6)
+
+running 411 tests
+test coverage_tests::attention_keys_resolve_on_fleet_archs ... ok
+test coverage_tests::confirmed_oproj_dtypes_have_a_plan ... ok
+test coverage_tests::f16_full_attention_rejected_on_non_wmma_archs ... ok
+test coverage_tests::fleet_dtypes_resolve_on_every_target_arch ... ok
+test coverage_tests::fleet_ops_have_a_dispatch_plan ... ok
+test coverage_tests::full_attention_keys_resolve_on_fleet_archs ... ok
+test coverage_tests::fused_qkv_keys_resolve_on_fleet_archs ... ok
+test coverage_tests::moe_decode_pre_guard_admits_fallback_and_rejects_invalid ... ok
+test coverage_tests::mq4v2_verify_exact_keys_resolve_on_gfx1201_only ... ok
+test coverage_tests::mqv2_admitted_route_kinds_are_exact ... ok
+test coverage_tests::mqv2_fused_and_gemm_keys_resolve_on_gfx11_gfx12 ... ok
+test coverage_tests::mqv2_mixed_routes_have_exact_tags_and_admission ... ok
+test coverage_tests::mqv2_uniform_dense_keys_are_exact_not_v1 ... ok
+test coverage_tests::mqv2_uniform_moe_routes_are_indexable_and_exact ... ok
+test coverage_tests::non_k8_and_q8_routed_moe_has_a_dispatch_plan ... ok
+test coverage_tests::prerotated_covers_rotation_free_dtypes ... ok
+test coverage_tests::q8_and_paro_dispatchable_in_all_used_variants ... ok
+test coverage_tests::scalar_floors_resolve_on_non_wmma_archs ... ok
+test coverage_tests::w4_lloyd_fused_keys_un_bricked_on_rdna2_not_cdna ... ok
+test coverage_tests::w4_mq3_lloyd_resolve_on_rdna1_and_rdna2 ... ok
+test coverage_tests::w4_mq3_lloyd_routing_byte_identical_on_rdna3_rdna4 ... ok
+test coverage_tests::w4_mq3_lloyd_still_rejected_on_cdna_wave64 ... ok
+test cpu_exec::moe_splice_tests::expert_count_mismatch_is_an_error ... ok
+test cpu_exec::moe_splice_tests::graded_multirow_matches_per_expert_gemv ... ok
+test cpu_exec::moe_splice_tests::short_expert_span_is_an_error ... ok
+test cpu_exec::moe_splice_tests::uniform_multirow_matches_run_experts ... ok
+test families::attention::tests::all_registered_tile_variants_have_dispatch_arms ... ok
+test families::attention::tests::ck_packed_prefill_requires_exact_contiguous_prefix_extent ... ok
+test families::attention::tests::dispatch_attend_has_arms_for_all_registered_keys ... ok
+test families::attention::tests::dispatch_kv_write_has_arms_for_all_registered_keys ... ok
+test families::attention::tests::dispatched_full_attention_keys_cover_all_variants ... ok
+test families::attention::tests::gfx1100_split_verify_model_envelope_is_fail_closed ... ok
+test families::attention::tests::gfx1100_split_verify_route_checks_q8_batch_context_and_workspace ... ok
+test families::attention::tests::gfx1100_split_verify_threshold_clamps_to_measured_crossover ... ok
+test families::attention::tests::gfx12_query16_arch_default_admits_only_measured_r9700_target ... ok
+test families::attention::tests::gfx12_query16_default_envelope_is_conservative ... ok
+test families::attention::tests::gfx12_query16_never_routes_speculative_verify ... ok
+test families::attention::tests::hipfire_flash_prefill_zero_disables_both_native_and_ck ... ok
+test families::attention::tests::native_asym4_wmma_requires_complete_rows_and_one_tile_of_partials ... ok
+test families::fused_qkv::dispatch_tests::v2_fused_keys_never_hfq4 ... ok
+test families::gemm::tests::mq4v2_verify_exact_keys_are_gfx1201_only_and_never_dtype_selected ... ok
+test families::gemm::tests::packed_gemm_never_changes_default_resolution ... ok
+test families::gemm::tests::packed_gemm_registry_preserves_wire_format_and_epilogue ... ok
+test families::gemm::tests::v2_plain_resolves_exact_not_hfq4 ... ok
+test families::gemm::tests::v2_residual_run_key_not_hfq4 ... ok
+test families::kv_tier::tests::asym2_fwht ... ok
+test families::kv_tier::tests::asym2_givens ... ok
+test families::kv_tier::tests::asym3_fwht ... ok
+test families::kv_tier::tests::asym3_givens ... ok
+test families::kv_tier::tests::asym4_fwht ... ok
+test families::kv_tier::tests::asym4_givens ... ok
+test families::kv_tier::tests::batched_asym2_causal ... ok
+test families::kv_tier::tests::batched_asym2_fwht_tree_rejected ... ok
+test families::kv_tier::tests::batched_asym2_tree_rejected ... ok
+test families::kv_tier::tests::batched_asym3 ... ok
+test families::kv_tier::tests::batched_asym3_fwht ... ok
+test families::kv_tier::tests::batched_asym4 ... ok
+test families::kv_tier::tests::batched_asym4_fwht ... ok
+test families::kv_tier::tests::batched_f32_returns_single_token_keys ... ok
+test families::kv_tier::tests::batched_q8 ... ok
+test families::kv_tier::tests::batched_q8_tree ... ok
+test families::kv_tier::tests::bf16_plain_caller_takes_plain_keys ... ok
+test families::kv_tier::tests::bf16_tier_classifies_and_excludes_the_quant_tiers ... ok
+test families::kv_tier::tests::bf16_windowed_caller_keeps_windowed_keys ... ok
+test families::kv_tier::tests::bf16_write_and_attend_keys_pass_the_drift_guard ... ok
+test families::kv_tier::tests::boundary_batched_pins_q8_batched ... ok
+test families::kv_tier::tests::boundary_pins_q8_regardless_of_tier ... ok
+test families::kv_tier::tests::classify_carries_fwht_bit ... ok
+test families::kv_tier::tests::f32_flash_gqa_long_non128 ... ok
+test families::kv_tier::tests::f32_flash_non_gqa_long ... ok
+test families::kv_tier::tests::f32_flash_short_ctx ... ok
+test families::kv_tier::tests::f32_gqa_fused ... ok
+test families::kv_tier::tests::f32_gqa_fused_needs_gqa ... ok
+test families::kv_tier::tests::f32_gqa_warp_head128_long ... ok
+test families::kv_tier::tests::f32_tier ... ok
+test families::kv_tier::tests::fp8_derive_emits_paired_native_keys ... ok
+test families::kv_tier::tests::fp8_rejects_boundary_windowed_and_mixed_v ... ok
+test families::kv_tier::tests::hfq4_tier ... ok
+test families::kv_tier::tests::hfq8_tier ... ok
+test families::kv_tier::tests::int8c_tier ... ok
+test families::kv_tier::tests::ktier_queries ... ok
+test families::kv_tier::tests::q4_tier ... ok
+test families::kv_tier::tests::q8_flash_capture_mode ... ok
+test families::kv_tier::tests::q8_flash_long_context ... ok
+test families::kv_tier::tests::q8_flash_mode_2 ... ok
+test families::kv_tier::tests::q8_non_flash_flash_mode_1_short ... ok
+test families::kv_tier::tests::q8_non_flash_short_context ... ok
+test families::kv_tier::tests::q8_non_flash_very_long_context ... ok
+test families::kv_tier::tests::q8_windowed_bypasses_flash_heuristic ... ok
+test families::kv_tier::tests::tiers_match_int8c_hfq8 ... ok
+test families::kv_tier::tests::tiers_match_rejects_cross_tier ... ok
+test families::kv_tier::tests::tiers_match_valid_pairs ... ok
+test families::kv_tier::tests::v_mode_bits_passed_through ... ok
+test families::moe::tests::fp8_b128_decode_resolution_is_a_typed_refusal_state ... ok
+test families::moe::tests::fp8_b128_prefill_resolution_disables_every_path ... ok
+test families::moe::tests::fp8_capability_predicates_are_disjoint_from_qt44 ... ok
+test families::moe::tests::has_mq6_projection_recognizes_v1_and_v2 ... ok
+test families::moe::tests::mixed_supported_tiers_include_v1_and_v2_affine ... ok
+test families::moe::tests::narrow_window_extent_lower_bound_is_two ... ok
+test families::moe::tests::non_fp8_resolution_has_no_refusal_state ... ok
+test families::moe::tests::prefill_host_spill_mixed_narrow_verify_keeps_grouped_route ... ok
+test families::moe::tests::prefill_host_spill_narrow_verify_keeps_indexed_policy ... ok
+test families::moe::tests::prefill_host_spill_uniform_mq4_gfx1201_narrow_readmits_path2 ... ok
+test families::moe::tests::prefill_resident_verify_mixed_experts_matches_legacy_all_fields ... ok
+test families::moe::tests::prefill_resident_verify_uniform_matches_legacy_all_fields ... ok
+test families::moe::tests::qwen_gate_prerotation_requires_exact_v1_or_ornith_v2_quartet ... ok
+test families::moe::tests::resolve_empty_per_expert_table_is_not_mixed_and_does_not_panic ... ok
+test families::moe::tests::resolve_mq6_v1_still_indexable_without_mq6v2 ... ok
+test families::moe::tests::resolve_mq6v2_k_ne_8_disables_gpu_topk ... ok
+test families::moe::tests::resolve_mq6v2_mixed_with_v1_is_not_indexable ... ok
+test families::moe::tests::resolve_mq6v2_uniform_is_indexable ... ok
+test families::moe::tests::resolve_none_per_expert_is_not_mixed ... ok
+test families::moe::tests::resolve_some_per_expert_all_same_is_not_mixed ... ok
+test families::moe::tests::resolve_some_per_expert_with_varied_tiers_is_mixed ... ok
+test families::moe_buckets::tests::mixed_layer_partitions_by_tier_preserving_rank ... ok
+test families::moe_buckets::tests::out_of_range_expert_id_is_err_not_panic ... ok
+test families::moe_buckets::tests::uniform_layer_is_single_bucket ... ok
+test offload_split::tests::a_latched_shape_follows_a_slow_drift ... ok
+test offload_split::tests::a_latched_shape_follows_a_sustained_move ... ok
+test offload_split::tests::a_latched_shape_holds_through_a_noisy_static_host ... ok
+test offload_split::tests::a_latched_shape_reopens_when_the_balance_point_moves ... ok
+test offload_split::tests::a_reopen_needs_a_same_sign_run ... ok
+test offload_split::tests::observe_moves_the_share_toward_the_measured_balance_point ... ok
+test offload_split::tests::plan_rows_balances_and_refuses ... ok
+test offload_split::tests::plan_rows_is_aligned_and_inside_its_bounds ... ok
+test offload_split::tests::share_always_lands_inside_the_ceiling_and_floor ... ok
+test pipeline::draft_head::tests::policy_parses_copy_tier_and_rescore_suffix ... ok
+test pipeline::draft_head::tests::ranking_orders_front_special_tail_and_holds_full_vocab ... ok
+test pipeline::fp8_route_tests::absent_or_foreign_policy_refuses_qt55_generically ... ok
+test pipeline::fp8_route_tests::fp8_route_rejects_noncanonical_geometry_formats_and_operands ... ok
+test pipeline::fp8_route_tests::gfx942_qt55_canonical_selects_fp8_route ... ok
+test pipeline::fp8_route_tests::non_fp8_layers_are_untouched_by_the_fp8_selector ... ok
+test pipeline::fp8_route_tests::non_gfx942_qt55_refuses ... ok
+test pipeline::fp8_route_tests::typed_fp8_route_may_share_only_bf16_router_and_shared_stages ... ok
+test pipeline::layer_ops::tests::dense_ffn_geometry_validation ... ok
+test pipeline::layer_ops::tests::dense_ffn_scratch_validation ... ok
+test pipeline::layer_ops::tests::embedding_dispatch_preserves_bf16_and_routed_mqv2_contracts ... ok
+test pipeline::layer_ops::tests::embedding_dispatch_rejects_unadmitted_dtype ... ok
+test pipeline::layer_ops::tests::gdn_accepts_bf16_metadata_and_rejects_f32_metadata ... ok
+test pipeline::layer_ops::tests::gdn_core_windows_continue_the_ring_cursor_and_requantize_at_chunk_ends ... ok
+test pipeline::layer_ops::tests::gdn_projection_phases_refuse_a_row_capture ... ok
+test pipeline::layer_ops::tests::gdn_projection_phases_skip_the_core_metadata_checks ... ok
+test pipeline::layer_ops::tests::grouped_depthwise_validates_embedding_width ... ok
+test pipeline::layer_ops::tests::indexed_attention_next_lengths_follow_mode ... ok
+test pipeline::layer_ops::tests::indexed_attention_projection_phases_skip_state_checks ... ok
+test pipeline::layer_ops::tests::indexed_attention_reuse_validation_refuses_stale_or_multirow_selection ... ok
+test pipeline::layer_ops::tests::indexed_attention_rotary_validation ... ok
+test pipeline::layer_ops::tests::indexed_attention_split_phase_refuses_reuse_and_append_modes ... ok
+test pipeline::layer_ops::tests::output_projection_carrying_the_hyper_write_is_bytewise_the_unfused_pair ... ok
+test pipeline::layer_ops::tests::qsa_core_windows_compose_to_the_whole_launch ... ok
+test pipeline::layer_ops::trunk_arena_dispatch_tests::g942_trunk_bf16_projection_route_is_every_row_mfma ... ok
+test pipeline::layer_ops::trunk_arena_dispatch_tests::g942_trunk_gemv_opt_out_restores_only_the_one_row_arm ... ok
+test pipeline::layer_ops::trunk_arena_dispatch_tests::only_explicit_core_views_select_arena_consumers ... ok
+test pipeline::layer_ops::trunk_arena_dispatch_tests::partial_views_preserve_native_sources_per_family ... ok
+test pipeline::layer_ops::trunk_arena_dispatch_tests::trunk_projection_route_geometry_uses_live_rows ... ok
+test pipeline::mixed_dispatch_tests::all_one_tier_is_identity_permutation ... ok
+test pipeline::mixed_dispatch_tests::decode_expanded_down_never_aliases_v2_to_v1 ... ok
+test pipeline::mixed_dispatch_tests::deepseek4_i8_moe_is_exact_gfx1151_only ... ok
+test pipeline::mixed_dispatch_tests::frozen_mixed_tags_7_to_18_are_v2_identities ... ok
+test pipeline::mixed_dispatch_tests::gate_up_varies_is_exact_dtype_equality ... ok
+test pipeline::mixed_dispatch_tests::grouped_gemm_admits_mq6v2 ... ok
+test pipeline::mixed_dispatch_tests::grouped_path2_preserves_tags_on_v1_v2_variation ... ok
+test pipeline::mixed_dispatch_tests::mixed_dispatch_bucketing_equivalence ... ignored, GPU-deferred: requires device; see NOTE — multi-bucket (5×MQ4 + 3×MQ6) bucketing-equivalence numeric gate
+test pipeline::mixed_dispatch_tests::mixed_down_path1_tag_aware_uses_mixed_when_tagged ... ok
+test pipeline::mixed_dispatch_tests::mixed_gate_precedence_before_representative_v1_v2_arms ... ok
+test pipeline::mixed_dispatch_tests::mixed_table_is_contiguous_partition ... ok
+test pipeline::mixed_dispatch_tests::ninepath_d3_is_hfq4_only_and_v2_uses_native_d4 ... ok
+test pipeline::mixed_dispatch_tests::ninepath_d4_separates_v1_and_v2_families ... ok
+test pipeline::mixed_dispatch_tests::path1_batched_admits_mq4v2_and_mq6v2 ... ok
+test pipeline::mixed_dispatch_tests::shared_dense_v2_never_uses_v1_sigmoid_scaled ... ok
+test pipeline::mixed_dispatch_tests::unrotated_dtype_still_skips_rotation ... ok
+test pipeline::moe_program::tests::cpu_topk_disables_router_shared_fuse ... ok
+test pipeline::qt44_qt53_prefill::scratch_tests::a_separate_shared_down_output_leaves_down_expanded_to_the_routed_rows ... ok
+test pipeline::qt44_qt53_prefill::scratch_tests::buffers_short_by_one_word_are_rejected_naming_the_buffer ... ok
+test pipeline::qt44_qt53_prefill::scratch_tests::combine_order_alone_is_eighty_bytes_per_row ... ok
+test pipeline::qt44_qt53_prefill::scratch_tests::compact_capacities_admit_the_proven_routes ... ok
+test pipeline::qt44_qt53_prefill::scratch_tests::compact_scratch_refuses_fallback_arms_above_the_cap ... ok
+test pipeline::qt44_qt53_prefill::scratch_tests::extents_that_overflow_are_errors ... ok
+test pipeline::qt44_qt53_prefill::scratch_tests::f32_grouped_arms_keep_todays_full_sizes ... ok
+test pipeline::qt44_qt53_prefill::scratch_tests::fp8_expert_strides_are_the_qt55_block_strides ... ok
+test pipeline::qt44_qt53_prefill::scratch_tests::fp8_extents_that_overflow_are_errors ... ok
+test pipeline::qt44_qt53_prefill::scratch_tests::fp8_requirement_ignores_the_legacy_arm_flags_and_charges_shared_down_only_when_owed ... ok
+test pipeline::qt44_qt53_prefill::scratch_tests::fp8_route_needs_descriptor_f32_grouped_rows_and_the_bf16_activation_at_1536_rows ... ok
+test pipeline::qt44_qt53_prefill::scratch_tests::fp8_route_needs_full_f32_grouped_scratch ... ok
+test pipeline::qt44_qt53_prefill::scratch_tests::fp8_route_needs_the_same_buffers_at_decode_m1 ... ok
+test pipeline::qt44_qt53_prefill::scratch_tests::full_width_buffers_always_pass ... ok
+test pipeline::qt44_qt53_prefill::scratch_tests::indexed_down_and_path1_need_the_batch_buffers ... ok
+test pipeline::qt44_qt53_prefill::scratch_tests::shared_down_fallback_is_owed_beyond_the_combine_order ... ok
+test pipeline::qt44_qt53_prefill::scratch_tests::symmetric_route_needs_bf16_grouped_rows_and_the_shared_down_fallback ... ok
+test pipeline::qt44_qt53_prefill::scratch_tests::tensor_bytes_takes_the_smaller_of_shape_and_allocation ... ok
+test pipeline::qt44_qt53_prefill::scratch_tests::wmma_arms_store_bf16_grouped_rows ... ok
+test pipeline::qwen4_route_tests::qwen4_route_accepts_canonical_shared_down_bf16 ... ok
+test pipeline::qwen4_route_tests::qwen4_route_admits_q8_shared_expert_only_as_a_matched_pair ... ok
+test pipeline::qwen4_route_tests::qwen4_route_rejects_missing_shared_operands ... ok
+test pipeline::qwen4_route_tests::qwen4_route_rejects_noncanonical_geometry_and_wire_dtype ... ok
+test pipeline::qwen4_route_tests::qwen4_route_rejects_q53_on_generic_moe ... ok
+test pipeline::qwen4_route_tests::qwen4_route_rejects_q53_outside_shared_down_or_canonical_pair ... ok
+test pipeline::qwen4_route_tests::route_accepts_canonical_contract_and_rejects_sidecars_or_shape ... ok
+test pipeline::qwen4_route_tests::route_rejects_false_or_unsupported_declaration ... ok
+test pipeline::sandwich::tests::batched_projection_formats_are_explicit ... ok
+test pipeline::sandwich::tests::exact_wide_q8_gemm_matches_the_wide_gemv_boundary ... ok
+test pipeline::sealed_moe::retained_route_identity_tests::every_input_field_moves_a_slab_identity_and_a_rebuilt_table_is_unbound ... ok
+test pipeline::sealed_moe::retained_route_identity_tests::legacy_layers_keep_their_one_pair ... ok
+test pipeline::sealed_moe::retained_route_identity_tests::slab_identity_moves_with_codec_arena_generation_and_layer ... ok
+test pipeline::sealed_moe::retained_route_identity_tests::tier_host_bit_is_any_host_not_expert_zero ... ok
+test pipeline::sealed_moe::retained_route_identity_tests::tier_identity_rejects_malformed_tables ... ok
+test pipeline::sealed_moe::retained_route_identity_tests::tier_layers_move_identity_with_generation_digest_host_bit_and_content ... ok
+test pipeline::sealed_moe::tests::aliases_are_range_checked_and_combine_policy_is_explicit ... ok
+test pipeline::sealed_moe::tests::binding_identity_rejects_invalid_rank_and_device_before_launch ... ok
+test pipeline::sealed_moe::tests::bound_construction_rejects_a_swapped_same_capacity_table_generation ... ok
+test pipeline::sealed_moe::tests::bound_construction_rejects_an_unbound_cache ... ok
+test pipeline::sealed_moe::tests::compact_bind_rank0_and_rank1_succeed_with_slot_ordered_lists ... ok
+test pipeline::sealed_moe::tests::compact_bind_rejects_misordered_local_experts ... ok
+test pipeline::sealed_moe::tests::compact_bind_rejects_missing_local_expert ... ok
+test pipeline::sealed_moe::tests::compact_bind_rejects_non_owned_non_dummy_pointer ... ok
+test pipeline::sealed_moe::tests::compact_bind_rejects_owned_pointer_mismatch ... ok
+test pipeline::sealed_moe::tests::compact_bind_rejects_wrong_device_and_stale_table ... ok
+test pipeline::sealed_moe::tests::compact_bind_rejects_wrong_dummy_layout ... ok
+test pipeline::sealed_moe::tests::compact_bind_same_mapping_retains_same_fingerprint ... ok
+test pipeline::sealed_moe::tests::decode_grammar_matrix_single_and_root_routed ... ok
+test pipeline::sealed_moe::tests::decode_lowering_emits_owner_assign_exactly_when_the_gather_asks ... ok
+test pipeline::sealed_moe::tests::decode_lowering_emits_row_gather_exactly_when_installed ... ok
+test pipeline::sealed_moe::tests::decode_lowering_refuses_a_gather_off_the_grouped_route ... ok
+test pipeline::sealed_moe::tests::decode_shared_policy_is_explicit_and_launch_free ... ok
+test pipeline::sealed_moe::tests::execution_contract_fingerprint_and_root_routed_predicate ... ok
+test pipeline::sealed_moe::tests::fp8_decode_and_prefill_lower_the_same_grouped_stages_without_path2 ... ok
+test pipeline::sealed_moe::tests::grouped_prefill_capacity_accepts_just_fit_and_rejects_one_row_small ... ok
+test pipeline::sealed_moe::tests::live_validation_accepts_the_bound_table_and_rejects_a_third_table ... ok
+test pipeline::sealed_moe::tests::live_validation_allows_reuse_of_the_exact_bound_resources ... ok
+test pipeline::sealed_moe::tests::live_validation_rejects_swapped_same_capacity_expert_buffer ... ok
+test pipeline::sealed_moe::tests::live_validation_rejects_swapped_same_capacity_pointer_table ... ok
+test pipeline::sealed_moe::tests::local_expert_ids_follow_local_slot_order_not_global_order ... ok
+test pipeline::sealed_moe::tests::mixed_dtypes_allow_an_independent_down_basis_but_gate_up_basis_must_match ... ok
+test pipeline::sealed_moe::tests::owner_gather_off_the_grouped_route_still_refuses ... ok
+test pipeline::sealed_moe::tests::paro_separate_gate_up_uses_each_half_of_fused_rows ... ok
+test pipeline::sealed_moe::tests::prefill_adopt_binds_nonroot_receipt_with_provenance ... ok
+test pipeline::sealed_moe::tests::prefill_ep_seal_admits_compact_partial_only ... ok
+test pipeline::sealed_moe::tests::prefill_lowering_emits_owner_assign_exactly_when_the_gather_asks ... ok
+test pipeline::sealed_moe::tests::prefill_lowering_emits_row_gather_exactly_when_installed ... ok
+test pipeline::sealed_moe::tests::prefill_lowering_emits_tile_stages_exactly_when_installed_on_the_f16_wmma_route ... ok
+test pipeline::sealed_moe::tests::prefill_lowering_emits_tile_stages_exactly_when_installed_on_the_symmetric_route ... ok
+test pipeline::sealed_moe::tests::prefill_lowering_refuses_a_gather_off_the_grouped_route_or_into_a_partial ... ok
+test pipeline::sealed_moe::tests::prefill_lowering_refuses_a_tile_exchange_off_the_grouped_qt44_qt53_route ... ok
+test pipeline::sealed_moe::tests::public_decode_rejects_precomputed_routed_contrib_bypass ... ok
+test pipeline::sealed_moe::tests::qt53_resource_header_requires_exact_stride_extent_and_mixed_tag_capacity ... ok
+test pipeline::sealed_moe::tests::route_producer_proof_rejects_non_root_calls ... ok
+test pipeline::sealed_moe::tests::route_receipt_binds_grammar_dimensions_and_buffers_without_gpu_work ... ok
+test pipeline::sealed_moe::tests::route_receipt_rejects_another_invocation_and_buffer_pair ... ok
+test pipeline::sealed_moe::tests::routed_contrib_rejects_role_layer_contract_and_shape_mismatch ... ok
+test pipeline::sealed_moe::tests::routed_contrib_seal_binds_proof_to_nonroot_call ... ok
+test pipeline::sealed_moe::tests::shape_and_capacity_checks_are_checked_without_gpu_work ... ok
+test pipeline::sealed_moe::tests::sigmoid_decode_refuses_before_publication_without_deltanet ... ok
+test pipeline::sealed_moe::tests::slab_mixed_tag_allocation_carries_the_i32_owner_table_behind_the_u8_table ... ok
+test pipeline::sealed_moe::tests::tier_bind_refuses_wrong_codec_and_pointer_entries_off_the_live_tensors ... ok
+test pipeline::sealed_moe::tests::tier_binding_validates_generation_content_and_keeps_owners_alive ... ok
+test pipeline::slab_route::tests::capacity_does_not_widen_narrow_fallback_groups ... ok
+test pipeline::slab_route::tests::launcher_contract_is_the_k1_contract ... ok
+test pipeline::slab_route::tests::union_scratch_words_match_the_descriptor_layout ... ok
+test pipeline::step_graph::tests::alias_forward_and_self_refused ... ok
+test pipeline::step_graph::tests::alias_out_of_range_refused ... ok
+test pipeline::step_graph::tests::alias_target_numel_overflow_refused ... ok
+test pipeline::step_graph::tests::alias_valid_view_accepted ... ok
+test pipeline::step_graph::tests::dense_ids_follow_insertion_order ... ok
+test pipeline::step_graph::tests::op_kind_ids_frozen ... ok
+test pipeline::step_graph::tests::op_rule_operand_must_be_declared ... ok
+test pipeline::step_graph::tests::op_unknown_resource_refused ... ok
+test pipeline::step_graph::tests::project_weight_must_be_weight_class ... ok
+test pipeline::step_graph::tests::rules_without_operands_accept_any_declared_set ... ok
+test pipeline::steps::tests::mq4g256v2_lloyd_guards_admit_gfx1151 ... ok
+test pipeline::steps::tests::mq4g256v2_lloyd_guards_force_unfused_still_wins_on_gfx1151 ... ok
+test pipeline::steps::tests::mq4g256v2_lloyd_guards_refuse_gfx1150_and_gfx1152 ... ok
+test pipeline::steps::tests::mq4g256v2_lloyd_guards_still_admit_gfx1100_and_gfx1201 ... ok
+test pipeline::steps::tests::paro_fused_table_arch_coverage ... ok
+test pipeline::steps::tests::paro_fused_table_entries_exist ... ok
+test pipeline::steps::tests::paro_guards_reject_force_unfused ... ok
+test pipeline::steps::tests::paro_guards_require_raw_input_and_alignment ... ok
+test pipeline::steps::tests::q4k_q8_0_fused_table_entries_exist ... ok
+test pipeline::steps::tests::q4k_q8_0_guards_reject_force_unfused ... ok
+test pipeline::steps::tests::q4k_q8_0_guards_reject_wrong_length ... ok
+test pipeline::steps::tests::qkvza_fused_table_arch_coverage ... ok
+test pipeline::steps::tests::qkvza_fused_table_entries_exist ... ok
+test pipeline::steps::tests::qkvza_fused_table_no_paro_q4_or_q8_entries ... ok
+test pipeline::steps::tests::qkvza_guards_reject_force_unfused ... ok
+test pipeline::steps::tests::qkvza_guards_reject_short_slices ... ok
+test pipeline::steps::tests::qkvza_no_paro_or_q8_fused_entries ... ok
+test pipeline::superop::tests::lower_walk_all_unfused_keeps_each_step ... ok
+test pipeline::superop::tests::lower_walk_collapses_fused_and_passes_through_unfused ... ok
+test pipeline::superop::tests::lower_walk_single_cluster_spans_to_end ... ok
+test pipeline::superop::tests::lower_walk_zero_span_does_not_stall ... ok
+test tests::arch_always_passes_on_all_archs ... ok
+test tests::arch_gemv_dp4a_gfx906_only ... ok
+test tests::arch_has_dp4a_requires_rdna1p1_or_newer ... ok
+test tests::arch_has_mmq_on_rdna3_or_rdna4 ... ok
+test tests::arch_has_wave32_admits_all_rdna_excludes_cdna ... ok
+test tests::arch_has_wmma_requires_rdna3_or_rdna4 ... ok
+test tests::codebook_grouped_gemm_kernarg_contract_is_the_uniform_nine ... ok
+test tests::codebook_grouped_gemm_legs_name_real_kernels ... ok
+test tests::cpu_exec_redline_conflict_is_exactly_the_conjunction ... ok
+test tests::cpu_quant_refuses_unimplemented_formats ... ok
+test tests::cpu_quant_rotation_agrees_with_plan ... ok
+test tests::dtype_needs_rotation_false_for_hfq_and_scalar ... ok
+test tests::dtype_needs_rotation_true_for_mq_family ... ok
+test tests::for_gemv_plain_maps_all_scalar_dtypes ... ok
+test tests::for_gemv_prerotated_falls_back_to_plain_for_non_rotated ... ok
+test tests::for_gemv_prerotated_maps_mq_family ... ok
+test tests::for_gemv_rejects_unsupported_variant_combo ... ok
+test tests::for_gemv_residual_maps_hfq_and_mq ... ok
+test tests::for_gemv_swiglu_residual_maps_hfq_and_mq ... ok
+test tests::fused_qkv_hfq6_resolves_cross_arch ... ok
+test tests::fused_qkv_variant_for_key_classifies_by_family ... ok
+test tests::gemm_mq4v2_mq4c_keys_resolve_gfx12_only ... ok
+test tests::gemm_q8_0_batched_wide_exact_resolves_on_wmma_only ... ok
+test tests::gemv_family_resolves_f32_on_all_archs ... ok
+test tests::gemv_family_resolves_hfq4_on_all_archs ... ok
+test tests::gemv_family_resolves_mq3_prerotated_on_all_wave32_archs_not_cdna ... ok
+test tests::gemv_steps_rotation_matches_plan ... ok
+test tests::gl_dtypes_are_fwht_g256 ... ok
+test tests::gl_dtypes_have_no_dense_gemv_key ... ok
+test tests::guard_gate_up_mq4g256lloyd_fires ... ok
+test tests::guard_qkv_hfq4g256_covers_hfq4g256 ... ok
+test tests::guard_qkv_hfq4g256_covers_mq4g256 ... ok
+test tests::guard_qkv_hfq6g256_dp4a_decoupled ... ok
+test tests::guard_qkv_mq4g256lloyd_fires ... ok
+test tests::guard_qkv_mq4g256lloyd_rejects_awq_scale ... ok
+test tests::guard_qkv_mq4g256lloyd_rejects_force_unfused ... ok
+test tests::guard_qkv_mq4g256lloyd_rejects_wrong_dtype ... ok
+test tests::guard_qkv_rejects_mixed_gemv_input ... ok
+test tests::match_fused_prefix_admits_exact_mq4g256v2_gate_up ... ok
+test tests::match_fused_prefix_admits_exact_mq4g256v2_qkv ... ok
+test tests::match_fused_prefix_admits_exact_mq4g256v2_qkvza ... ok
+test tests::match_fused_prefix_rejects_mixed_v1_v2_mq4_window ... ok
+test tests::match_fused_prefix_rejects_mq4g256v2_on_unsupported_arch ... ok
+test tests::match_prefix_empty_table_never_fires ... ok
+test tests::match_prefix_guard_false_blocks_match ... ok
+test tests::match_prefix_guard_receives_correct_window ... ok
+test tests::match_prefix_no_pattern_longer_than_steps ... ok
+test tests::match_prefix_picks_longest ... ok
+test tests::match_prefix_single_op_consumes_one ... ok
+test tests::mixed_v1_v2_gate_precedence_requires_exact_variation ... ok
+test tests::moe_decode_oplist_prefix_matches_gate_side ... ok
+test tests::moe_prefill_resolution_codebook_pair_no_path2_without_wmma ... ok
+test tests::moe_prefill_resolution_codebook_pair_uses_path2_on_wmma ... ok
+test tests::moe_prefill_resolution_gfx1151_mixed_mq6_fences_mq4_i8 ... ok
+test tests::moe_prefill_resolution_grouped_gemm_opt_out ... ok
+test tests::moe_prefill_resolution_mq4_gfx11_still_path2 ... ok
+test tests::moe_prefill_resolution_mq6_gfx1151_uses_path2 ... ok
+test tests::moe_prefill_resolution_mq6_gfx11_uses_path2 ... ok
+test tests::moe_prefill_resolution_mq6_gfx12_uses_path2 ... ok
+test tests::moe_prefill_resolution_paro_i8_opt_out ... ok
+test tests::moe_prefill_resolution_path0_gfx906 ... ok
+test tests::moe_prefill_resolution_path0_gfx942 ... ok
+test tests::moe_prefill_resolution_path1_gfx1030 ... ok
+test tests::moe_prefill_resolution_path2_gfx1151_paro_i8 ... ok
+test tests::moe_prefill_resolution_path2_gfx11_mq4 ... ok
+test tests::moe_prefill_resolution_path2_gfx11_paro ... ok
+test tests::moe_prefill_resolution_path2_gfx12_mq4 ... ok
+test tests::moe_prefill_resolution_path2_gfx12_mq6 ... ok
+test tests::moe_res_all_mq4_k8_uses_gpu_topk_and_xrot ... ok
+test tests::moe_res_all_mq4v2_gate_quartet_is_fusable_mq4v2 ... ok
+test tests::moe_res_gl_gate_up_with_nonlloyd_down_not_indexable ... ok
+test tests::moe_res_gl_routed_indexable ... ok
+test tests::moe_res_k6_disables_gpu_topk_even_when_indexable ... ok
+test tests::moe_res_lloyd_gate_up_with_nonlloyd_down_not_indexable ... ok
+test tests::moe_res_mixed_lloyd_routed_indexable ... ok
+test tests::moe_res_mixed_rotated_and_unrotated_experts_is_not_indexable ... ok
+test tests::moe_res_mixed_v1_v2_gate_quartet_is_not_fusable ... ok
+test tests::moe_res_mq2_lloyd_rotated_sibling_still_rotates ... ok
+test tests::moe_res_mq2_lloyd_u_is_indexable_but_never_rotates ... ok
+test tests::moe_res_mq4v2_mixed_with_qt13_is_not_indexable ... ok
+test tests::moe_res_mq4v2_routed_indexable ... ok
+test tests::moe_res_mq5_routed_indexable ... ok
+test tests::moe_res_mq6_routed_indexable ... ok
+test tests::moe_res_mq6v2_k_ne_8_disables_gpu_topk ... ok
+test tests::moe_res_mq6v2_mixed_with_v1_is_not_indexable ... ok
+test tests::moe_res_mq6v2_routed_indexable ... ok
+test tests::moe_res_paro_needs_sidecar ... ok
+test tests::moe_res_q8_router_still_gpu_topk ... ok
+test tests::moe_res_shipped_ornith15_takes_the_indexed_path ... ok
+test tests::mq4g128v2_is_explicitly_rejected_by_generic_dispatch_families ... ok
+test tests::ninepath_d3_restricts_v2_to_native_gate_and_d4 ... ok
+test tests::pipeline_empty_satisfies_any_request ... ok
+test tests::pipeline_exact_match_satisfies ... ok
+test tests::pipeline_longer_than_request_fails ... ok
+test tests::pipeline_prefix_mismatch_fails ... ok
+test tests::pipeline_prefix_satisfies_longer_request ... ok
+test tests::pipeline_single_op_self_satisfies ... ok
+test tests::qwen35_and_cohere_k8_preserve_gpu_topk_routed_decode ... ok
+test tests::registry_all_keys_returns_registered_keys ... ok
+test tests::registry_resolve_arch_gate_fails_returns_missing_impl ... ok
+test tests::registry_resolve_arch_gate_passes_on_capable_arch ... ok
+test tests::registry_resolve_falls_through_to_second_variant ... ok
+test tests::registry_resolve_happy_path ... ok
+test tests::registry_resolve_shape_gate_fallback_to_ungated_variant ... ok
+test tests::registry_resolve_shape_gate_passes_when_shape_matches ... ok
+test tests::registry_resolve_shape_gate_skips_when_shape_mismatches ... ok
+test tests::registry_resolve_shape_none_bypasses_shape_gate ... ok
+test tests::registry_resolve_unregistered_key_returns_not_found ... ok
+test tests::registry_validate_succeeds_on_populated_registry ... ok
+test tests::resolve_honors_shape_gate ... ok
+test tests::shape_batch_gt_fails_when_equal ... ok
+test tests::shape_batch_gt_fails_when_less ... ok
+test tests::shape_batch_gt_passes_when_strictly_greater ... ok
+test tests::shape_head_dim_eq_fails_on_mismatch ... ok
+test tests::shape_head_dim_eq_passes_on_match ... ok
+test tests::shape_m_lt_fails_when_equal ... ok
+test tests::shape_m_lt_fails_when_greater ... ok
+test tests::shape_m_lt_passes_when_strictly_less ... ok
+test tests::unrotated_dtype_skips_both_rotations ... ok
+test types::tests::bq1g128_resolves_to_gemv_key ... ok
+test types::tests::mq4g256v2lloyd_reuses_v2_keys_never_v1_lloyd ... ok
+test types::tests::tq2g128_resolves_to_gemv_key ... ok
+
+test result: ok. 410 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.73s
+

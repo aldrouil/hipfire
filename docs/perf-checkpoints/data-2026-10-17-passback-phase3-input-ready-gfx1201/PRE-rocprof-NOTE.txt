@@ -1,0 +1,12 @@
+PRE rocprof attempts (2026-10-17, baseline b236099f, 9B share0.5):
+- PRE-9B-s05-rocprof (.json/.stderr.log): rocprof-wrap.sh around CLI process.
+  Result: rc=0 bench OK, but trace dir empty (no trace_kernel_stats.csv).
+  Reason: kernels execute in the daemon process, not the CLI.
+- PRE-9B-s05-rocprofD (.json/.stderr.log, trace/ empty): rocprof-wrap.sh around
+  daemon via HIPFIRE_DAEMON_BIN wrap. Result: rc=0 bench OK, trace/ still empty.
+  Wrapper's documented path is in-process bench_qwen35_mq4 (HIPFIRE_PROFILE=1 +
+  HIPFIRE_ROCPROF_CSV), which has no passback/offload path.
+Conclusion: no device timestamps obtained pre-change; ordering rests on
+enqueue-order code + host phase profile only. Post-change proof needs owner
+temp gated diag (joint start-SUCCESS + stop-NOT_READY) and/or a working
+device-timestamp path. Not a product fault.

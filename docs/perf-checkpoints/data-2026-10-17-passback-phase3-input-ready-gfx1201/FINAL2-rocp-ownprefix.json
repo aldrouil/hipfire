@@ -1,0 +1,15 @@
+{
+ "condition": "own-kernel-start < own-wait-end (incl. already-executing)",
+ "syncs": 459,
+ "hits": 1,
+ "hit": {
+  "sync_row": 2966,
+  "launch_row": 2965,
+  "kernel": "gemv_hfq4g256_residual",
+  "dispatch": 1762,
+  "kstart": 4420925811619,
+  "wait_end": 4420925812441,
+  "lead_ns": 822
+ },
+ "verdict": "single 822ns tail case; no systematic own-prefix lead; actual kernel-start lead unproven"
+}

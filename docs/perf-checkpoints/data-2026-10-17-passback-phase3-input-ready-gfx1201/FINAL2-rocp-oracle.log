@@ -1,0 +1,79 @@
+W20261017 09:01:31.164384 140149671670464 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.002031 sec
+W20261017 09:01:31.164436 140149671670464 simple_timer.cpp:55] [rocprofv3] './target/release/deps/gpu_gemv_parity-83895f636cda944d --ignored --nocapture passback_row_offset' ::     0.000000 sec
+
+running 1 test
+[hip-bridge] GPU_PINNED_MIN_XFER_SIZE=100000: pageable weight copies staged out of reclaim
+W20261017 09:01:31.167272 140149421729472 tool.cpp:2423] HIP (runtime) version 7.2.0 initialized (instance=0)
+W20261017 09:01:31.180093 140149421729472 tool.cpp:2423] HSA version 1.18.0 initialized (instance=0)
+GPU dev 0: gfx1201 (17.1 GB VRAM, HIP 7.2)
+  pre-compiled kernels: /home/avery/.hipfire_kernels/gfx1201
+— stream case 0: null (default) stream
+qwen3.5-2b.mq4 up_proj                       m=6144   k=2048   row_bytes=1088   g=3072   (m-g=3072) exact; arm delta 1.490e-7 (rel 1.45e-7)
+qwen3.5-2b.mq4 up_proj odd-m=1929            m=1929   k=2048   row_bytes=1088   g=960    (m-g=969) exact; arm delta 1.192e-7 (rel 1.35e-7)
+qwen3.5-2b.mq3 up_proj                       m=6144   k=2048   row_bytes=896    g=3072   (m-g=3072) exact; arm delta 1.192e-7 (rel 1.25e-7)
+qwen3.5-2b.mq3 up_proj odd-m=2341            m=2341   k=2048   row_bytes=896    g=1168   (m-g=1173) exact; arm delta 1.341e-7 (rel 1.52e-7)
+qwen3.5-2b.mq6 up_proj                       m=6144   k=2048   row_bytes=1600   g=3072   (m-g=3072) exact; arm delta 2.384e-7 (rel 2.27e-7)
+qwen3.5-2b.mq6 up_proj odd-m=1311            m=1311   k=2048   row_bytes=1600   g=648    (m-g=663) exact; arm delta 1.490e-7 (rel 1.64e-7)
+qwen3.5-2b.hf6 up_proj                       m=6144   k=2048   row_bytes=1600   g=3072   (m-g=3072) exact; arm delta 1.192e-7 (rel 1.14e-7)
+qwen3.5-2b.hf6 up_proj odd-m=1311            m=1311   k=2048   row_bytes=1600   g=648    (m-g=663) exact; arm delta 1.192e-7 (rel 1.30e-7)
+qwen3.5-9b.mq4 up_proj                       m=12288  k=4096   row_bytes=2176   g=6144   (m-g=6144) exact; arm delta 3.576e-7 (rel 2.28e-7)
+qwen3.5-9b.mq4 up_proj odd-m=965             m=965    k=4096   row_bytes=2176   g=480    (m-g=485) exact; arm delta 2.384e-7 (rel 2.02e-7)
+qwen3.6-35b-a3b.mfp4 gate_up_proj tiled-m=2048 m=2048   k=2048   row_bytes=1104   g=1024   (m-g=1024) exact; residual arm refused (no GPU residual kernel); arm delta 1.267e-7 (rel 1.45e-7)
+qwen3.6-35b-a3b.mfp4 gate_up_proj odd-m=1901 tiled m=1901   k=2048   row_bytes=1104   g=944    (m-g=957) exact; residual arm refused (no GPU residual kernel); arm delta 1.788e-7 (rel 2.14e-7)
+synthetic qt=44 Mq4G256V2                    m=965    k=4096   row_bytes=2176   g=480    (m-g=485) exact; arm delta 1.526e-5 (rel 1.53e-7)
+synthetic qt=45 Mq4CG256                     m=965    k=4096   row_bytes=2176   g=480    (m-g=485) exact; arm delta 0.000e0 (rel 0.00e0)
+synthetic qt=49 Mq3G256V2                    m=1261   k=4096   row_bytes=1664   g=624    (m-g=637) exact; arm delta 7.629e-6 (rel 1.37e-7)
+synthetic qt=6 Hfq4G256                      m=965    k=4096   row_bytes=2176   g=480    (m-g=485) exact; arm delta 0.000e0 (rel 0.00e0)
+synthetic qt=3 Q8F16                         m=483    k=4096   row_bytes=4352   g=240    (m-g=243) exact; residual arm refused (no GPU residual kernel); arm delta 0.000e0 (rel 0.00e0)
+synthetic raw+awq Mq4G256                    m=965    k=4096   row_bytes=2176   g=480    (m-g=485) exact; arm delta 2.861e-6 (rel 4.76e-7)
+— stream case 1: non-blocking stream
+qwen3.5-2b.mq4 up_proj                       m=6144   k=2048   row_bytes=1088   g=3072   (m-g=3072) exact; arm delta 1.490e-7 (rel 1.45e-7)
+qwen3.5-2b.mq4 up_proj odd-m=1929            m=1929   k=2048   row_bytes=1088   g=960    (m-g=969) exact; arm delta 1.192e-7 (rel 1.35e-7)
+qwen3.5-2b.mq3 up_proj                       m=6144   k=2048   row_bytes=896    g=3072   (m-g=3072) exact; arm delta 1.192e-7 (rel 1.25e-7)
+qwen3.5-2b.mq3 up_proj odd-m=2341            m=2341   k=2048   row_bytes=896    g=1168   (m-g=1173) exact; arm delta 1.341e-7 (rel 1.52e-7)
+qwen3.5-2b.mq6 up_proj                       m=6144   k=2048   row_bytes=1600   g=3072   (m-g=3072) exact; arm delta 2.384e-7 (rel 2.27e-7)
+qwen3.5-2b.mq6 up_proj odd-m=1311            m=1311   k=2048   row_bytes=1600   g=648    (m-g=663) exact; arm delta 1.490e-7 (rel 1.64e-7)
+qwen3.5-2b.hf6 up_proj                       m=6144   k=2048   row_bytes=1600   g=3072   (m-g=3072) exact; arm delta 1.192e-7 (rel 1.14e-7)
+qwen3.5-2b.hf6 up_proj odd-m=1311            m=1311   k=2048   row_bytes=1600   g=648    (m-g=663) exact; arm delta 1.192e-7 (rel 1.30e-7)
+qwen3.5-9b.mq4 up_proj                       m=12288  k=4096   row_bytes=2176   g=6144   (m-g=6144) exact; arm delta 3.576e-7 (rel 2.28e-7)
+qwen3.5-9b.mq4 up_proj odd-m=965             m=965    k=4096   row_bytes=2176   g=480    (m-g=485) exact; arm delta 2.384e-7 (rel 2.02e-7)
+qwen3.6-35b-a3b.mfp4 gate_up_proj tiled-m=2048 m=2048   k=2048   row_bytes=1104   g=1024   (m-g=1024) exact; residual arm refused (no GPU residual kernel); arm delta 1.267e-7 (rel 1.45e-7)
+qwen3.6-35b-a3b.mfp4 gate_up_proj odd-m=1901 tiled m=1901   k=2048   row_bytes=1104   g=944    (m-g=957) exact; residual arm refused (no GPU residual kernel); arm delta 1.788e-7 (rel 2.14e-7)
+synthetic qt=44 Mq4G256V2                    m=965    k=4096   row_bytes=2176   g=480    (m-g=485) exact; arm delta 1.526e-5 (rel 1.53e-7)
+synthetic qt=45 Mq4CG256                     m=965    k=4096   row_bytes=2176   g=480    (m-g=485) exact; arm delta 0.000e0 (rel 0.00e0)
+synthetic qt=49 Mq3G256V2                    m=1261   k=4096   row_bytes=1664   g=624    (m-g=637) exact; arm delta 7.629e-6 (rel 1.37e-7)
+synthetic qt=6 Hfq4G256                      m=965    k=4096   row_bytes=2176   g=480    (m-g=485) exact; arm delta 0.000e0 (rel 0.00e0)
+synthetic qt=3 Q8F16                         m=483    k=4096   row_bytes=4352   g=240    (m-g=243) exact; residual arm refused (no GPU residual kernel); arm delta 0.000e0 (rel 0.00e0)
+synthetic raw+awq Mq4G256                    m=965    k=4096   row_bytes=2176   g=480    (m-g=485) exact; arm delta 2.861e-6 (rel 4.76e-7)
+— stream case 2: null stream again, staging allocation warm
+qwen3.5-2b.mq4 up_proj                       m=6144   k=2048   row_bytes=1088   g=3072   (m-g=3072) exact; arm delta 1.490e-7 (rel 1.45e-7)
+qwen3.5-2b.mq4 up_proj odd-m=1929            m=1929   k=2048   row_bytes=1088   g=960    (m-g=969) exact; arm delta 1.192e-7 (rel 1.35e-7)
+qwen3.5-2b.mq3 up_proj                       m=6144   k=2048   row_bytes=896    g=3072   (m-g=3072) exact; arm delta 1.192e-7 (rel 1.25e-7)
+qwen3.5-2b.mq3 up_proj odd-m=2341            m=2341   k=2048   row_bytes=896    g=1168   (m-g=1173) exact; arm delta 1.341e-7 (rel 1.52e-7)
+qwen3.5-2b.mq6 up_proj                       m=6144   k=2048   row_bytes=1600   g=3072   (m-g=3072) exact; arm delta 2.384e-7 (rel 2.27e-7)
+qwen3.5-2b.mq6 up_proj odd-m=1311            m=1311   k=2048   row_bytes=1600   g=648    (m-g=663) exact; arm delta 1.490e-7 (rel 1.64e-7)
+qwen3.5-2b.hf6 up_proj                       m=6144   k=2048   row_bytes=1600   g=3072   (m-g=3072) exact; arm delta 1.192e-7 (rel 1.14e-7)
+qwen3.5-2b.hf6 up_proj odd-m=1311            m=1311   k=2048   row_bytes=1600   g=648    (m-g=663) exact; arm delta 1.192e-7 (rel 1.30e-7)
+qwen3.5-9b.mq4 up_proj                       m=12288  k=4096   row_bytes=2176   g=6144   (m-g=6144) exact; arm delta 3.576e-7 (rel 2.28e-7)
+qwen3.5-9b.mq4 up_proj odd-m=965             m=965    k=4096   row_bytes=2176   g=480    (m-g=485) exact; arm delta 2.384e-7 (rel 2.02e-7)
+qwen3.6-35b-a3b.mfp4 gate_up_proj tiled-m=2048 m=2048   k=2048   row_bytes=1104   g=1024   (m-g=1024) exact; residual arm refused (no GPU residual kernel); arm delta 1.267e-7 (rel 1.45e-7)
+qwen3.6-35b-a3b.mfp4 gate_up_proj odd-m=1901 tiled m=1901   k=2048   row_bytes=1104   g=944    (m-g=957) exact; residual arm refused (no GPU residual kernel); arm delta 1.788e-7 (rel 2.14e-7)
+synthetic qt=44 Mq4G256V2                    m=965    k=4096   row_bytes=2176   g=480    (m-g=485) exact; arm delta 1.526e-5 (rel 1.53e-7)
+synthetic qt=45 Mq4CG256                     m=965    k=4096   row_bytes=2176   g=480    (m-g=485) exact; arm delta 0.000e0 (rel 0.00e0)
+synthetic qt=49 Mq3G256V2                    m=1261   k=4096   row_bytes=1664   g=624    (m-g=637) exact; arm delta 7.629e-6 (rel 1.37e-7)
+synthetic qt=6 Hfq4G256                      m=965    k=4096   row_bytes=2176   g=480    (m-g=485) exact; arm delta 0.000e0 (rel 0.00e0)
+synthetic qt=3 Q8F16                         m=483    k=4096   row_bytes=4352   g=240    (m-g=243) exact; residual arm refused (no GPU residual kernel); arm delta 0.000e0 (rel 0.00e0)
+synthetic raw+awq Mq4G256                    m=965    k=4096   row_bytes=2176   g=480    (m-g=485) exact; arm delta 2.861e-6 (rel 4.76e-7)
+
+pass-back row-offset equivalence: 18 case(s) × 3 stream configurations bit-exact on gfx1201; 45 of them mix numerically different engines
+test passback_row_offset_equivalence ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.83s
+
+W20261017 09:01:31.990901 140149671670464 simple_timer.cpp:55] [rocprofv3] './target/release/deps/gpu_gemv_parity-83895f636cda944d --ignored --nocapture passback_row_offset' ::     0.826464 sec
+E20261017 09:01:31.994671 140149671670464 output_stream.cpp:111] Opened result file: ./docs/perf-checkpoints/data-2026-10-17-passback-phase3-input-ready-gfx1201/FINAL2-rocp-oracle/trace/orc_kernel_trace.csv
+E20261017 09:01:32.009237 140149671670464 output_stream.cpp:111] Opened result file: ./docs/perf-checkpoints/data-2026-10-17-passback-phase3-input-ready-gfx1201/FINAL2-rocp-oracle/trace/orc_hip_api_trace.csv
+E20261017 09:01:32.027849 140149671670464 output_stream.cpp:111] Opened result file: ./docs/perf-checkpoints/data-2026-10-17-passback-phase3-input-ready-gfx1201/FINAL2-rocp-oracle/trace/orc_memory_copy_trace.csv
+E20261017 09:01:32.029241 140149671670464 output_stream.cpp:111] Opened result file: ./docs/perf-checkpoints/data-2026-10-17-passback-phase3-input-ready-gfx1201/FINAL2-rocp-oracle/trace/orc_agent_info.csv
+W20261017 09:01:32.029511 140149671670464 simple_timer.cpp:55] [rocprofv3] output generation ::     0.036710 sec
+W20261017 09:01:32.029545 140149671670464 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.036788 sec

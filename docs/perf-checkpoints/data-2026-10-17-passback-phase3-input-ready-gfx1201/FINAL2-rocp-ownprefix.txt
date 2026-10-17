@@ -1,0 +1,27 @@
+OWN-PREFIX SCAN, CORRECTED CONDITION (existing FINAL2 oracle trace; no new runs)
+Condition (parent-corrected): own-kernel start < own-wait END — includes kernels
+already executing when the wait API was entered (kernelStart < wait.Start),
+not only starts inside [wait.Start, wait.End].
+
+Method: per hipEventSynchronize S, nearest same-thread hipModuleLaunchKernel L
+before S.start; kernels K launched by L (correlation match); count GEMV K
+with K.start < S.end.
+
+RESULT: 1 hit in 459 syncs.
+  sync api-row 2966 (corr 2967): start 4420923861826 end 4420925812441 (~1.95ms;
+  long CPU multiply+staging on this step).
+  launch api-row 2965 (corr 2966): start 4420923856716; record2964 precedes it,
+  H2D memcpy2967 follows the sync — this step's own prefix sequence.
+  kernel: gemv_hfq4g256_residual dispatch 1762, start 4420925811619
+  end 4420926330741.
+  Lead: kernel start 822ns before wait end. The kernel was NOT already
+  executing when the wait began (start > wait.Start by ~1.95ms); device
+  queue delay dominates everywhere else (next-best pair +2.8us median lag).
+
+VERDICT: exactly one own-prefix-before-own-wait-end instance at 822ns lead —
+a single short-wait tail, NOT systematic earlier execution (458/459 pairs
+start after wait end). Actual kernel-start lead REMAINS effectively
+UNPROVEN on device timestamps; the 822ns case is recorded, not generalized.
+A same-run CPU staging marker would be needed to bound own-prefix vs prep;
+parent coordinates minimal TEMP instrumentation with owner if pursued.
+Prior previous-prefix overlap witness stands as observed (different claim).

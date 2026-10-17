@@ -1,0 +1,13 @@
+== P3 pre-change baseline identity ==
+date_utc=2026-10-17T12:14:46Z
+commit=b236099f64779b0291f5b48ff4ec0aa68d872b40
+status=[?? docs/perf-checkpoints/data-2026-10-17-passback-phase3-input-ready-gfx1201/;]
+cli_md5=c7e8baf005f64531b08a9c1001f75fcb
+daemon_md5=fb3f99c250f6c1d7e38b4639f8bf9f75
+rustc=rustc 1.98.1 (48a229cea 2026-09-01)
+hipcc=HIP version: 7.2.53211-3d9ef42
+model_md5=296092bf1e6a45d78c1acf815eb93366
+model_bytes=5313750016
+prompt_md5=5835c71e471849b4a72e1dc8e39695e7
+gpu_arch=gfx1201 (from PRE-9B-s05-R1.stderr.log: "GPU dev 0: gfx1201 (17.1 GB VRAM, HIP 7.2)" and oracle "bit-exact on gfx1201"; rocminfo query mislabeled CPU line and is NOT GPU evidence)
+rocm_env: HIPFIRE_LOCAL=1 HIPFIRE_NO_REGISTRY_FETCH=1 HIPFIRE_DPM_WARMUP_SECS=10 RAYON_UNSET

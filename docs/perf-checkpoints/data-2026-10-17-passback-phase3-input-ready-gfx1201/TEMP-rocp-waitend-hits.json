@@ -1,0 +1,68 @@
+[
+ {
+  "sync_row": 3257,
+  "launch_row": 3256,
+  "kernel": "gemv_hfq6g256_residual",
+  "dispatch": "1706",
+  "kstart": "4798911226528",
+  "wait_start": "4798911119946",
+  "wait_end": "4798911229406",
+  "mid_row": 3258,
+  "mid_start": "4798911230186"
+ },
+ {
+  "sync_row": 3257,
+  "launch_row": 3256,
+  "kernel": "gemv_hfq6g256_residual",
+  "dispatch": "1706",
+  "kstart": "4798911226528",
+  "wait_start": "4798911119946",
+  "wait_end": "4798911229406",
+  "mid_row": 3259,
+  "mid_start": "4798911232506"
+ },
+ {
+  "sync_row": 4632,
+  "launch_row": 4630,
+  "kernel": "gemv_hfq4g256_residual",
+  "dispatch": "2457",
+  "kstart": "4799002987214",
+  "wait_start": "4799002866738",
+  "wait_end": "4799003018577",
+  "mid_row": 4633,
+  "mid_start": "4799003020387"
+ },
+ {
+  "sync_row": 4632,
+  "launch_row": 4630,
+  "kernel": "gemv_hfq4g256_residual",
+  "dispatch": "2457",
+  "kstart": "4799002987214",
+  "wait_start": "4799002866738",
+  "wait_end": "4799003018577",
+  "mid_row": 4634,
+  "mid_start": "4799003021997"
+ },
+ {
+  "sync_row": 5644,
+  "launch_row": 5642,
+  "kernel": "gemv_hfq4g256_residual",
+  "dispatch": "2948",
+  "kstart": "4799060006407",
+  "wait_start": "4799058811854",
+  "wait_end": "4799060014018",
+  "mid_row": 5645,
+  "mid_start": "4799060018647"
+ },
+ {
+  "sync_row": 5644,
+  "launch_row": 5642,
+  "kernel": "gemv_hfq4g256_residual",
+  "dispatch": "2948",
+  "kstart": "4799060006407",
+  "wait_start": "4799058811854",
+  "wait_end": "4799060014018",
+  "mid_row": 5646,
+  "mid_start": "4799060020477"
+ }
+]

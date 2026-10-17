@@ -1,0 +1,15 @@
+{
+ "witness": "corr-chain 4627-4636",
+ "kernel": {
+  "corr": 4631,
+  "dispatch": 2457,
+  "name": "gemv_hfq4g256_residual",
+  "start": 4799002987214,
+  "end": 4799003028654
+ },
+ "wait_end": 4799003018577,
+ "mid_start": 4799003021997,
+ "lead_over_wait_ns": 31363,
+ "thread": "99511",
+ "stream": "0"
+}

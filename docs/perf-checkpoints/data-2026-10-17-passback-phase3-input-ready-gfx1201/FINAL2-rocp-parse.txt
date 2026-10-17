@@ -1,0 +1,8 @@
+kernel rows: 3485 api rows: 5783 mem rows: 237
+non-copy (compute) kernels: 1731 copyBuffer: 1754
+hipEventSynchronize intervals: 459
+compute kernels overlapping an EventSynchronize interval: 722/1731
+sync intervals containing >=1 compute kernel start: 310
+GEMV kernels overlapping a sync interval: 329/918
+mem directions: Counter({'MEMORY_COPY_HOST_TO_DEVICE': 120, 'MEMORY_COPY_DEVICE_TO_HOST': 117})
+mem kinds: Counter({'MEMORY_COPY': 237})

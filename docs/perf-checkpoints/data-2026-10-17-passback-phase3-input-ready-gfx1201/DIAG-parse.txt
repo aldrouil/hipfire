@@ -1,0 +1,12 @@
+total split-diag lines: 19912
+steps: 1900
+true monotonic violations (any stamp out of order): 0
+steps with any query error (must be 0): 0
+not_sampled stamps (unsampled steps, excluded from span claims): 8132
+sampled-current steps: 456
+sampled steps with input_ready=true at every ready_wait_return: 456
+sampled steps with joint start=true+stop=false during prep/GEMV: 454
+exceptions: [545, 595]
+sampled steps with span_stop=true at sampled return: 456
+host staging window ready_wait_return->stage_done: n=456 median=19.4us min=16.8 max=151.0
+record<prefix<wait<stage<gemv violations: 0

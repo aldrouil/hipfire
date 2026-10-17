@@ -1,0 +1,9 @@
+commit=b236099f64779b0291f5b48ff4ec0aa68d872b40
+status:
+ M crates/hip-bridge/src/ffi.rs
+ M crates/hipfire-arch-qwen35/tests/gpu_gemv_parity.rs
+ M crates/hipfire-dispatch/src/cpu_exec.rs
+ M crates/hipfire-dispatch/src/offload_split.rs
+?? docs/perf-checkpoints/data-2026-10-17-passback-phase3-input-ready-gfx1201/
+production_patch_sha256=76c8057d43523d57e207a1b819fa685114f06ff49232143414457aaafed1f641
+cli_md5=0a5ecb96a58ff0a2fbbc776968d4b034 daemon_md5=28a5054ffd2f726c187cf1afe2ef64a7

@@ -1,0 +1,4 @@
+commit=b236099f64779b0291f5b48ff4ec0aa68d872b40
+FINAL3: authorized scoped rustfmt (edition 2021, skip_children) on 4 Rust files only; map.md+CHANGELOG separate
+production_4rust_sha256=7b1f55a470c4a20a32a026cce9f963cd7b2feca08b815625fcd768096bcfea09  -
+cli_md5=f6a608cd59b577fe201fb661bf4260d0 daemon_md5=4c5285dfbd96de9e30468c6b29c4f7d2

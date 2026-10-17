@@ -1,0 +1,48 @@
+W20261017 08:45:11.002047 140574325001920 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.001551 sec
+W20261017 08:45:11.002090 140574325001920 simple_timer.cpp:55] [rocprofv3] './target/release/examples/test_kernels' ::     0.000000 sec
+[hip-bridge] GPU_PINNED_MIN_XFER_SIZE=100000: pageable weight copies staged out of reclaim
+W20261017 08:45:11.017726 140574325001920 tool.cpp:2423] HSA version 1.18.0 initialized (instance=0)
+GPU dev 0: gfx1201 (17.1 GB VRAM, HIP 7.2)
+  pre-compiled kernels: /home/avery/.hipfire_kernels/gfx1201
+GPU: gfx1201 (17.1 GB VRAM)
+
+--- Basic ops ---
+  alloc + free                                       OK (0.0ms)
+  upload + download f32                              OK (23.4ms)
+  add_inplace_f32                                    OK (0.5ms)
+  rmsnorm_f32                                        OK (0.5ms)
+  softmax_f32                                        OK (0.4ms)
+  MoE down unscatter canonical slots                 OK (0.5ms)
+
+--- Attention kernels ---
+  attention_f32 hd=128 h=8 kv=2                      OK (0.6ms)
+  attention_f32 hd=256 h=16 kv=4                     OK (1.6ms)
+  attention_f32 hd=256 h=10 kv=2                     OK (0.2ms)
+
+--- Q8 KV kernels ---
+  q8 write+attn hd=128 kv=8                          OK (1.7ms)
+  q8 write+attn hd=256 kv=4                          OK (0.4ms)
+  q8 write+attn hd=256 kv=2                          OK (0.4ms)
+
+--- GDN (tiled LDS) ---
+  gdn_q8 h=32 hd=128 (9B DeltaNet)                   OK (0.8ms)
+  gdn_q8 h=16 hd=128 (4B DeltaNet)                   OK (0.3ms)
+
+--- Vision encoder kernels ---
+  gemm_f16 (vision GEMM)                             OK (1.2ms)
+  layernorm_batched                                  OK (1.4ms)
+  transpose_f32                                      OK (1.2ms)
+
+--- Qwen4 symmetric IU4 MoE (fn-moe-sym) ---
+  qwen4 sym IU4 QT53 K640 exact fold                 SKIP (gfx1151-only route)
+
+--- Summary ---
+  Passed:  17
+  Failed:  0
+  Skipped: 1
+W20261017 08:45:11.300877 140574325001920 simple_timer.cpp:55] [rocprofv3] './target/release/examples/test_kernels' ::     0.298787 sec
+E20261017 08:45:11.304766 140574325001920 output_stream.cpp:111] Opened result file: ./docs/perf-checkpoints/data-2026-10-17-passback-phase3-input-ready-gfx1201/rocp-direct/rocp_kernel_trace.csv
+E20261017 08:45:11.307223 140574325001920 output_stream.cpp:111] Opened result file: ./docs/perf-checkpoints/data-2026-10-17-passback-phase3-input-ready-gfx1201/rocp-direct/rocp_memory_copy_trace.csv
+E20261017 08:45:11.308353 140574325001920 output_stream.cpp:111] Opened result file: ./docs/perf-checkpoints/data-2026-10-17-passback-phase3-input-ready-gfx1201/rocp-direct/rocp_agent_info.csv
+W20261017 08:45:11.308512 140574325001920 simple_timer.cpp:55] [rocprofv3] output generation ::     0.005857 sec
+W20261017 08:45:11.308530 140574325001920 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.005906 sec
