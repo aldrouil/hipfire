@@ -1,0 +1,14 @@
+FINAL2 isolated-worktree provenance
+base_commit=b236099f64779b0291f5b48ff4ec0aa68d872b40
+worktree=/home/avery/Documents/vibecoding/hipfire-special/hipfire-passback-final2 (detached HEAD, `git worktree add --detach ... b236099f...`)
+patch_archive=docs/perf-checkpoints/data-2026-10-17-passback-phase3-input-ready-gfx1201/FINAL2-production.patch
+patch_sha256(archive+applied diff)=f855d7b92c919e454ee4c364f903e3f762d7ede264b48c80c2f6bc45639d30e0
+  verified: `git diff -- <4 files> | sha256sum` in worktree == archive sha256; `patch -p1` dry-run OK, apply with 0 rejects/skips
+patch file set: crates/hip-bridge/src/ffi.rs, crates/hipfire-arch-qwen35/tests/gpu_gemv_parity.rs, crates/hipfire-dispatch/src/cpu_exec.rs, crates/hipfire-dispatch/src/offload_split.rs
+diagnostic grep (HIPFIRE_SPLIT_DIAG|stagewitness|TEMP-rocp|waitend-hit|stage marker) in 3 production files: no hits
+build_cmd=`cargo build --release` (cwd=worktree), log=FINAL2WT-build.log, BUILD_RC=0
+toolchain: rustc 1.98.1 (48a229cea 2026-09-01); cargo 1.98.1; HIP 7.2.53211-3d9ef42; amd clang 22.0.0git
+binaries: /home/avery/Documents/vibecoding/hipfire-special/hipfire-passback-final2/target/release/hipfire md5=72ab7a028cf4dfe4adb6638741b84a83; daemon md5=fb71e7d781a26671c8d8cb5ae6885e50
+vs Step1 FINAL2 recorded: cli 19cddd8b4b1dd6caa8190f139c93bebc differs; daemon fb71e7d781a26671c8d8cb5ae6885e50 IDENTICAL
+explanation: exact same 4-file source (digest-verified); CLI md5 drift is build-path/artifact-layout effect (different absolute worktree path / fresh target dir), not a source difference. Daemon byte-identity corroborates. No rebuild of live tree; live tree untouched (FINAL3).
+retained A arm: .codeinsight+research/passback-phase2/baseline-bin/hipfire-a5a87e6cd md5=3413c7bdfe10a1b79abbe63d4f3db452; daemon-a5a87e6cd md5=f6cb5fec835e6fede7bbddf28ff5b828

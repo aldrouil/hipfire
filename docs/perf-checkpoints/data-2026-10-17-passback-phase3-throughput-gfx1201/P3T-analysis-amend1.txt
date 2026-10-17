@@ -1,0 +1,25 @@
+# P3T amendment 1 — .45 verification + block-sign correction (no new runs)
+## .45 raw precision (decode tok/s): bench reports 1-decimal; medians exact ties
+9B-S045 A: r1 [20.1,20.2,20.1] r2 [20.1,20.2,20.1] r3 [20.1,20.1,20.1] r4 [20.1,20.2,20.1] -> medians 20.1x4, cell range 0.00
+9B-S045 B: r1 [20.8,20.9,20.9] r2 [20.9,20.9,20.9] r3 [20.9,20.9,20.7] r4 [20.9,20.9,20.9] -> medians 20.9x4, cell range 0.00
+  gap +0.80 (+4.0%) with zero within-cell process spread; block means identical both halves (A 20.10/20.10, B 20.90/20.90).
+M27B-S045 A medians 16.8x4 (samples: one 16.7 in r1, rest 16.8) range 0.00; B medians 17.1x4 all-samples-17.1 range 0.00; gap +0.30 (+1.8%), block means identical both halves.
+Order (serialized, from sweep stdout log): 9B-S045 ran 14:22:25-14:27:38Z as A-r1,B-r1,B-r2,A-r2,B-r3,A-r3,A-r4,B-r4 (ABBA+BAAB); M27B-S045 ran 14:36:05-14:43:30Z same order. All rc=0.
+## .45 confounder sweep: none found in receipts
+kv 9B q8/VMM all 8, 27B fp8/VMM all 8; max_seq 4096; spec off; model/prompt/binary md5s per-arm exact (8+8 cross-checked); wall tracks decode (9B A 18.4-18.5 vs B 19.0-19.1; 27B A 16.5x4 vs B 16.8x4); prefill/TTFT overlap across arms (9B prefill 98-102, TTFT 581-601 mixed; 27B prefill ~481-484, TTFT ~122 both); throttle_pct unavailable (no >10% flag possible); stderr clean. No .45-specific confounder identified in available receipts — but zero observed spread is a resolution/sampling property (1-decimal bench medians over 3 internal runs), not proof of zero noise. Do not overclaim: per-cell rule bars comparing a +0.8 gap against a 0.00 range as automatic decisive evidence; the gap reproduced in both blocks, which is the supporting fact.
+## block-sign correction (replaces unsupported "15/16" line)
+Block-half means B>A in 16/16 block-halves (verified table: 9B-S05 b1 +0.60/b2 +1.50; 9B-AUTO b1 +0.60/b2 +0.60; 9B-S0375 +0.35/+0.40; 9B-S045 +0.80/+0.80; M27B-S05 +0.40/+0.25; M27B-AUTO +0.20/+0.30; M27B-S0375 +0.25/+0.20; M27B-S045 +0.30/+0.30). Per-cell medians B>A 8/8. The earlier "15/16 ... outlier breaks tightness not sign" sentence was wrong as written: 9B-S05-B-b2's 19.2 outlier does not flip any sign — both its block-half mean and cell median favor B. Retract "15/16"; correct figures are 16/16 block-halves, 8/8 cells.
+## per-cell rule restatement (no cross-cell spread propagation)
+9B-auto's +2.4 both-arm block shift stays inside 9B-AUTO only; it does not widen other 9B cells' spreads. Per-cell verdicts: 9B-S05 gap +0.80 vs A-range 0.50/B-range 1.50 (gap within B spread — magnitude not separable); 9B-S0375 +0.30 vs ranges 0.30/0.20 (at/above spread); 9B-S045 +0.80 vs 0.00/0.00 (gap exceeds observed spread, both blocks identical — strongest 9B cell, subject to resolution caveat above); 27B-S05 +0.40 vs 0.40/0.30 (threshold equality — not decisive alone); 27B-AUTO +0.30 vs 0.10/0.10; 27B-S0375 +0.25 vs 0.10/0.10; 27B-S045 +0.30 vs 0.00/0.00. Retention still requires parent's both-bucket reproducibility judgment; this amendment corrects magnitudes/sign accounting only, no new retention claim.
+
+## wall_tok_s extraction (existing receipts only, no new runs)
+9B-S05 A 15.7/15.85/16.0 | B 16.4/16.55/17.7 | d +4.4% (decode +4.7%)
+9B-AUTO A 17.3/18.50/19.5 | B 17.7/19.10/20.1 | d +3.2% (decode +3.5%, same block-confounding)
+9B-S0375 A 19.2/19.35/19.4 | B 19.6/19.60/19.7 | d +1.3% (decode +1.4%)
+9B-S045 A 18.4/18.40/18.5 | B 19.0/19.10/19.1 | d +3.8% (decode +4.0%)
+M27B-S05 A 15.6/15.60/15.9 | B 15.8/16.00/16.1 | d +2.6% (decode +2.5%)
+M27B-AUTO A 17.0/17.10/17.1 | B 17.2/17.30/17.3 | d +1.2% (decode +1.7%)
+M27B-S0375 A 17.3/17.40/17.5 | B 17.5/17.55/17.6 | d +0.9% (decode +1.4%)
+M27B-S045 A 16.5x4 | B 16.8x4 | d +1.8% (decode +1.8%)
+Direction: wall agrees with decode sign in 8/8 cells; magnitudes track within ~0.5pt. Wall spreads mirror decode spreads (9B-auto block-confounded; 9B-S05-B carries the same 17.7 outlier; .45 cells tight).
+Decoded-text scope: this native benchmark campaign carries no decoded output and inspected none — decoded serving evidence is Step 1's reused record for the exact source (FINAL2-serve-9B-battery.json et al.), not this campaign.

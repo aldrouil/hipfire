@@ -1,0 +1,23 @@
+# P3T s05/auto+sweep analysis (FINAL2-exact B vs retained-C4C5 A)
+
+Comparison rule: median of 4 process medians per cell; min/median/max + block(b1=r1r2, b2=r3r4-reversed) sensitivity; delta < observed cell spread = inconclusive, not a win. Retention needs reproducible benefit across both model buckets. 64 valid processes (32 s05/auto + 32 sweep), all rc=0, serialized GPU, trace/diag off. Bench: --runs 3 --warmups 3 --spec off --backend noslots --workload stateless --max-tokens 128 --max-seq 4096 --kv-mode auto --kv-backend vmm --prompt-file benchmarks/prompts/gpu_offload_probe.txt --json; thinking default off; DPM warmup 10; Rayon unset; 9B budget16 q8/VMM; 27B budget56 fp8/VMM; prompt md5 5835c71e471849b4a72e1dc8e39695e7.
+
+## process medians (decode tok/s), analysis unit = process median; within-process samples[3] retained in JSON
+9B-S05 A [16.9,17.0,17.3,17.4] med 17.15 rng .50 (b1 16.95/b2 17.35) | B [17.7,17.9,18.0,19.2] med 17.95 rng 1.50 (b1 17.80/b2 18.60) | d +4.7%
+9B-AUTO A [18.9,19.1,21.4,21.4] med 20.25 rng 2.50 (b1 19.00/b2 21.40) | B [19.3,19.9,22.0,22.0] med 20.95 rng 2.70 (b1 19.60/b2 22.00) | d +3.5% CONFOUNDED (both arms +2.4 block shift dominates arm gap)
+9B-S0375 A [21.0,21.2,21.3,21.3] med 21.25 rng .30 | B [21.5,21.5,21.6,21.7] med 21.55 rng .20 | d +1.4%
+9B-S045 A [20.1,20.1,20.1,20.1] med 20.10 rng .00 | B [20.9,20.9,20.9,20.9] med 20.90 rng .00 | d +4.0%
+M27B-S05 A [15.8,15.8,15.9,16.2] med 15.85 rng .40 (b1 15.80/b2 16.05) | B [16.1,16.1,16.4,16.4] med 16.25 rng .30 (b1 16.10/b2 16.40) | d +2.5%
+M27B-AUTO A [17.3,17.3,17.3,17.4] med 17.30 rng .10 | B [17.5,17.6,17.6,17.6] med 17.60 rng .10 | d +1.7%
+M27B-S0375 A [17.6,17.6,17.7,17.7] med 17.65 rng .10 | B [17.8,17.9,17.9,17.9] med 17.90 rng .10 | d +1.4%
+M27B-S045 A [16.8x4] med 16.80 rng .00 | B [17.1x4] med 17.10 rng .00 | d +1.8%
+
+## paired/order-group reading (scope-limited, no causal attribution)
+- Sign consistent B>A in all 8 cells and in 15/16 block-halves (only 9B-S05-B-b2 outlier 19.2 breaks tightness, not sign).
+- 9B-S05 B range (1.5) exceeds its own arm gap (0.8); 9B-AUTO block shift (+2.4 both arms) exceeds arm gap (0.7). 9B cells: direction consistent, magnitude not separable from session spread.
+- 27B cells: gaps (+0.25..+0.40) meet-or-exceed cell ranges (0.0..0.4); M27B-AUTO gap +0.30 vs range 0.10 both arms is the cleanest; M27B-S05 gap +0.40 equals A range 0.40 (threshold equality — not decisive alone).
+- Share-best on restricted tested grid {0.5,.375,.45,auto}: 9B A/B both .375 (21.25/21.55); 27B A/B both .375 (17.65/17.90). Auto beats .5 on both models/arms but loses to .375. Grid-restricted only; no optimality claim.
+- Overhead NOT isolated: aggregate result measures net boundary tradeoff only (record+fence+wait vs overlap); no event-cost subtraction, no profiler causality inference.
+- Auto selected-share evidence: not exposed in bench JSON without trace — explicitly unavailable.
+- Config uniformity: 9B all q8/VMM (32/32), 27B all fp8/VMM (32/32); spec off 65/65 (incl smoke); throttle_pct unavailable 65/65 (thermal-throttle logging notes only, no >10% flag possible); stderr error/fail/panic scan clean; no decoded-text anomalies (bench JSON carries no decoded text; Step 1 decoded serving evidence reused for exact source, no revalidation per authorization).
+- Order: P3T-run-s05-auto.stdout.log (9B blocks then M27B-S05/A-r1,B-r1,B-r2 @13:48–14:03Z, interrupted) + P3T-resume.stdout.log (M27B-S05/A-r2 → M27B-AUTO @14:03–14:17Z) + P3T-run-sweep.stdout.log (.375/.45 @14:17–14:43Z). Quarantined FINAL3-arm partials excluded entirely.
