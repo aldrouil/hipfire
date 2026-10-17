@@ -1518,3 +1518,140 @@ fn passback_row_offset_equivalence() {
         gpu.arch
     );
 }
+
+/// The input-ready marker's ownership edges, driven through the raw bridge the
+/// pass-back's split read uses: the wait is the host's read boundary, a spent
+/// record cannot release bytes again (the next enqueue retires it), and a full
+/// completion or a stream change retires one too — while a host read before the
+/// boundary is a loud failure, not a race.
+///
+/// Needs a GPU. Run:
+///
+///   cargo test -p hipfire-arch-qwen35 --release --test gpu_gemv_parity \
+///     -- --ignored --nocapture pinned_input_ready
+#[test]
+#[ignore = "requires HIP GPU"]
+fn pinned_input_ready_marker_semantics() -> Result<(), Box<dyn std::error::Error>> {
+    let mut gpu = Gpu::init()?;
+    let n = 64usize;
+    let bytes = n * 4;
+    let xa = activation(n, 1);
+    let xb = activation(n, 2);
+    let a = gpu.upload_f32(&xa, &[n])?;
+    let b = gpu.upload_f32(&xb, &[n])?;
+    let mut stage = gpu.hip.transfer_buffer(bytes)?;
+    let staged_bytes = |stage: &mut hip_bridge::PinnedTransferBuffer| -> Vec<u8> {
+        stage.as_bytes_mut()[..bytes].to_vec()
+    };
+    let as_bytes = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_ne_bytes()).collect() };
+
+    // Neither half of the boundary is meaningful without the other: a wait with
+    // no record has nothing to order a host read behind, and a record with no
+    // queued copy has nothing to be the boundary of.
+    assert!(
+        stage.wait_input_ready(&gpu.hip).is_err(),
+        "wait with no record"
+    );
+    assert!(
+        stage.mark_input_ready(&gpu.hip).is_err(),
+        "record with no queued copy"
+    );
+
+    // The supported sequence: enqueue, record, wait, read.
+    stage.download_async(&gpu.hip, &a.buf, 0, bytes, gpu.active_stream.as_ref())?;
+    stage.mark_input_ready(&gpu.hip)?;
+    stage.wait_input_ready(&gpu.hip)?;
+    assert_eq!(
+        staged_bytes(&mut stage),
+        as_bytes(&xa),
+        "the wait released the wrong bytes"
+    );
+    assert!(
+        stage.wait_input_ready(&gpu.hip).is_err(),
+        "a spent marker must not wait twice"
+    );
+
+    // A host read while a copy is still queued is the logic error the owner's
+    // assert exists to make loud: the expected panic below is caught here.
+    stage.download_async(&gpu.hip, &a.buf, 0, bytes, gpu.active_stream.as_ref())?;
+    let pending_read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = stage.as_bytes_mut();
+    }));
+    assert!(
+        pending_read.is_err(),
+        "as_bytes_mut on a queued copy must panic"
+    );
+    stage.mark_input_ready(&gpu.hip)?;
+    stage.wait_input_ready(&gpu.hip)?;
+    assert_eq!(
+        staged_bytes(&mut stage),
+        as_bytes(&xa),
+        "staging after the caught panic"
+    );
+
+    // A record that has completed is spent, and the next enqueue retires it: the
+    // device synchronize below makes that deterministic (the owner admits the
+    // copy only because `hipEventQuery` reports the record complete), the retired
+    // record can no longer release bytes, and a fresh record releases the *new*
+    // copy rather than the one the spent record covered.
+    stage.download_async(&gpu.hip, &b.buf, 0, bytes, gpu.active_stream.as_ref())?;
+    stage.mark_input_ready(&gpu.hip)?;
+    gpu.hip.device_synchronize()?;
+    stage.download_async(&gpu.hip, &a.buf, 0, bytes, gpu.active_stream.as_ref())?;
+    assert!(
+        stage.wait_input_ready(&gpu.hip).is_err(),
+        "the enqueue above must have retired the spent record"
+    );
+    stage.mark_input_ready(&gpu.hip)?;
+    stage.wait_input_ready(&gpu.hip)?;
+    assert_eq!(
+        staged_bytes(&mut stage),
+        as_bytes(&xa),
+        "the fresh record released stale bytes"
+    );
+
+    // A full completion drains the stream, so the record it completed is spent
+    // and the next copy may be queued and recorded.
+    stage.download_async(&gpu.hip, &b.buf, 0, bytes, gpu.active_stream.as_ref())?;
+    stage.mark_input_ready(&gpu.hip)?;
+    stage.complete(&gpu.hip)?;
+    stage.download_async(&gpu.hip, &a.buf, 0, bytes, gpu.active_stream.as_ref())?;
+    stage.mark_input_ready(&gpu.hip)?;
+    stage.wait_input_ready(&gpu.hip)?;
+    assert_eq!(
+        staged_bytes(&mut stage),
+        as_bytes(&xa),
+        "re-use after a full completion"
+    );
+
+    // A stream change drains the owning device, which retires an outstanding
+    // record with it: the enqueue on the other stream is admitted, and that
+    // stream's own record releases its bytes.
+    stage.download_async(&gpu.hip, &b.buf, 0, bytes, gpu.active_stream.as_ref())?;
+    stage.mark_input_ready(&gpu.hip)?;
+    let other = gpu.hip.stream_create_non_blocking()?;
+    stage.download_async(&gpu.hip, &b.buf, 0, bytes, Some(&other))?;
+    stage.mark_input_ready(&gpu.hip)?;
+    stage.wait_input_ready(&gpu.hip)?;
+    assert_eq!(
+        staged_bytes(&mut stage),
+        as_bytes(&xb),
+        "read on the switched stream"
+    );
+    gpu.hip.stream_synchronize(&other)?;
+
+    // Teardown with a record in flight must drain and destroy it rather than free
+    // an event the device may still use; the runtime stays usable after.
+    stage.download_async(&gpu.hip, &a.buf, 0, bytes, Some(&other))?;
+    stage.mark_input_ready(&gpu.hip)?;
+    drop(stage);
+    gpu.hip.device_synchronize()?;
+    gpu.hip.stream_destroy(other)?;
+    assert_eq!(
+        gpu.download_f32(&a)?,
+        xa,
+        "runtime usable after a teardown with a record set"
+    );
+    eprintln!("PINNED_INPUT_READY_MARKER_SEMANTICS PASS");
+    Ok(())
+}

@@ -577,17 +577,16 @@ pub(crate) fn prepare_activation(
     Ok((host, t0.elapsed().as_nanos() as u64))
 }
 
-/// The CPU arm of a host-executed step: every blocking device read already done
+/// The CPU arm of a host-executed step: the device reads enqueued
 /// ([`cpu_arm_prepare`]), the multiply and the write-back still pending
 /// ([`cpu_arm_finish`]).
 ///
-/// The two phases exist so a pass-back split can interleave a GPU launch
-/// *between* them: a blocking D2H issued after that launch would drain it, so the
-/// read must complete first and the write is either the join (completed on a
-/// sampled step) or a queued H2D the stream orders (an unsampled one), in both
-/// cases after the GPU arm on the same stream. `memory.offload_exec=cpu` runs the
-/// two back to back with a blocking write, which is the same sequence of device
-/// operations as the single-shot form it replaced.
+/// The phases exist so a pass-back split can interleave a GPU launch between
+/// them: the read is enqueued first, the GPU arm is launched on the same stream,
+/// and only then is the host's read boundary crossed ([`cpu_arm_stage`]) — the
+/// write being the join (sampled) or a queued H2D the stream orders (unsampled),
+/// in both cases after the arm. `memory.offload_exec=cpu` runs the phases back to
+/// back with a blocking write.
 pub(crate) struct CpuArm<'a> {
     /// The weight's CPU decoder.
     pub(crate) q: CpuQuant,
@@ -595,10 +594,9 @@ pub(crate) struct CpuArm<'a> {
     /// launcher would have self-rotated this input. Mirrored here so the
     /// pass-back can hand it to [`finish_step`] without keeping the plan alive.
     pub(crate) rotate_input: bool,
-    /// Elapsed time of the blocking reads: the activation, plus the accumulator
-    /// when the step is a residual form. The trace's `d2h`; the controller does
-    /// not see it (it runs before the GPU arm is launched, so it is not part of
-    /// the interval the two arms share).
+    /// Host time spent making the read ready: a whole-CPU arm's blocking copies,
+    /// or a split arm's enqueue plus (added in [`cpu_arm_stage`]) the input-ready
+    /// wait and staging. The trace's `d2h`; the controller does not see it.
     pub(crate) d2h_ns: u64,
     w: &'a WeightRef<'a>,
     /// The row range this arm multiplies.
@@ -608,11 +606,16 @@ pub(crate) struct CpuArm<'a> {
     /// arms in `steps.rs`).
     target: &'a GpuTensor,
     /// The activation for `rows`, already rotated and AWQ-divided exactly as the
-    /// launcher's rotate step would have done.
+    /// launcher's rotate step would have done. Empty until [`cpu_arm_stage`]
+    /// materializes it for a split arm.
     x_host: Vec<f32>,
     /// The accumulator read back for the residual form, *before* the multiply, so
     /// a concurrently executing GPU arm cannot race this read.
     acc_host: Option<Vec<f32>>,
+    /// A split arm whose copies are queued but not read: [`cpu_arm_stage`] waits
+    /// the read's marker and fills `x_host`/`acc_host`. `None` means staged
+    /// already — the whole-CPU route, which never queues.
+    pending_stage: Option<PendingStage>,
 }
 
 /// Whether `rows` is a *partial* range — the pass-back split's own arm.
@@ -626,14 +629,15 @@ fn split_arm(rows: &Range<usize>, m: usize) -> bool {
     *rows != (0..m)
 }
 
-/// Phase one of the CPU arm: perform every blocking device read for `rows` and
-/// return the arm. MUST complete before any GPU arm of the same step is
-/// enqueued, because the reads drain the stream.
+/// Phase one of the CPU arm: enqueue every device read for `rows` and return the
+/// arm.
 ///
-/// A *split* arm ([`split_arm`]) reads through the reusable pinned staging
-/// allocation instead of the whole-CPU route's blocking pageable copies, so the
-/// split's copy mechanics can be measured and reworked on their own; both paths
-/// block before returning, so the two-phase contract is unchanged.
+/// The whole-CPU route's reads are blocking pageable copies that complete before
+/// returning. A *split* arm ([`split_arm`]) reads through the reusable pinned
+/// staging allocation instead, and returns with a queued read plus an input-ready
+/// marker record set: [`cpu_arm_stage`] crosses the host's read boundary, so a
+/// GPU arm enqueued in between — the pass-back's prefix, on the same stream — is
+/// not drained by the readiness wait and runs concurrently with the host staging.
 pub(crate) fn cpu_arm_prepare<'a>(
     gpu: &Gpu,
     cpu: &CpuStep<'a>,
@@ -641,8 +645,12 @@ pub(crate) fn cpu_arm_prepare<'a>(
 ) -> Result<CpuArm<'a>, DispatchError> {
     let q = host_mapped_quant(gpu, cpu.w)?;
     let t0 = Instant::now();
-    let (x_host, acc_host) = if split_arm(&rows, cpu.w.m) {
-        prepare_split_read(gpu, cpu, &rows)?
+    let (x_host, acc_host, pending_stage) = if split_arm(&rows, cpu.w.m) {
+        (
+            Vec::new(),
+            None,
+            Some(prepare_split_enqueue(gpu, cpu, &rows)?),
+        )
     } else {
         let (x_host, _) = prepare_activation(gpu, cpu.w, cpu.x, cpu.rotate_input)?;
         let acc_host = match cpu.residual {
@@ -653,7 +661,7 @@ pub(crate) fn cpu_arm_prepare<'a>(
             )?),
             None => None,
         };
-        (x_host, acc_host)
+        (x_host, acc_host, None)
     };
     Ok(CpuArm {
         q,
@@ -664,28 +672,38 @@ pub(crate) fn cpu_arm_prepare<'a>(
         target: cpu.residual.unwrap_or(cpu.out),
         x_host,
         acc_host,
+        pending_stage,
     })
 }
 
-/// The split arm's read, staged through the reusable pinned allocation
-/// ([`with_cpu_transfer`]).
+/// The extent and layout of a split arm's queued read, in f32 elements:
+/// activation | AWQ scale | accumulator rows. Kept so [`cpu_arm_stage`] can
+/// re-lease the same staging allocation and split it at the same offsets.
+struct PendingStage {
+    values: usize,
+    k: usize,
+    scale_len: usize,
+    acc_len: usize,
+}
+
+/// The split arm's read: enqueue the activation, the AWQ scale when it rotates
+/// and the accumulator rows when it accumulates into the reusable pinned
+/// allocation ([`with_cpu_transfer`]), then record the owner's input-ready marker
+/// behind them.
 ///
-/// Enqueue every region this step needs — the activation, the AWQ scale when it
-/// rotates, the accumulator rows when it accumulates — then one completion on
-/// the arm's stream, and copy the staged bytes into the vectors the CPU
-/// multiply reads. The completion, not the host copy, is the read boundary,
-/// exactly as the blocking pageable `memcpy_dtoh` it replaces was: it drains
-/// prior work on that same stream before any host access to the staging bytes,
-/// so the GPU arm of the step is still launched only after the read is complete.
+/// The record, not a stream drain, is the read boundary: the device completes the
+/// copies in stream order, and waiting that marker ([`cpu_arm_stage`]) releases
+/// the staged bytes to the host. Nothing else is enqueued on this stream in
+/// between, so a GPU arm queued after the record is untouched by the wait.
 ///
-/// The pinned lease lives for the duration of this call only: the pass-back
-/// launches its GPU arm with `&mut Gpu` between the two phases, so a
-/// thread-local borrow cannot be held across it.
-fn prepare_split_read(
+/// The pinned lease lives for this call only — the pass-back launches its GPU arm
+/// with `&mut Gpu` between the phases — so the marker lives in the owner, which is
+/// why the stage phase re-leases the *same* allocation.
+fn prepare_split_enqueue(
     gpu: &Gpu,
     cpu: &CpuStep<'_>,
     rows: &Range<usize>,
-) -> Result<(Vec<f32>, Option<Vec<f32>>), DispatchError> {
+) -> Result<PendingStage, DispatchError> {
     let k = cpu.w.k;
     // The AWQ divide happens *inside* the rotation, so the scale is read only
     // when this step rotates — the rule `prepare_activation` follows.
@@ -701,8 +719,9 @@ fn prepare_split_read(
         0
     };
     // Staging layout, in f32 elements: activation | AWQ scale | accumulator rows.
+    let values = k + scale_len + acc_len;
     let acc_off = k + scale_len;
-    with_cpu_transfer(gpu, acc_off + acc_len, |transfer| {
+    with_cpu_transfer(gpu, values, |transfer| {
         download_transfer(gpu, transfer, cpu.x, 0, k)?;
         if let Some(scale) = scale {
             download_transfer(gpu, transfer, scale, k, k)?;
@@ -712,22 +731,74 @@ fn prepare_split_read(
             download_transfer(gpu, transfer, &acc_rows, acc_off, rows.len())?;
         }
         transfer
-            .complete(&gpu.hip)
-            .map_err(|e| cpu_err(&format!("D2H complete: {e}")))?;
-        let staged = transfer_values(transfer, acc_off + acc_len);
+            .mark_input_ready(&gpu.hip)
+            .map_err(|e| cpu_err(&format!("D2H input-ready record: {e}")))
+    })?;
+    Ok(PendingStage {
+        values,
+        k,
+        scale_len,
+        acc_len,
+    })
+}
+
+/// The split arm's read boundary: wait the marker its queued copies were recorded
+/// behind, then materialize the vectors the multiply reads.
+///
+/// The caller enqueues its GPU arm on the same stream before this call, so the
+/// wait covers the copies alone and the arm runs while the host copies and
+/// transforms. That whole wall time is added to the arm's `d2h_ns`, keeping the
+/// trace's `d2h` "the host's cost of the read" without the interleaved launch,
+/// which is not part of that cost.
+pub(crate) fn cpu_arm_stage(gpu: &Gpu, arm: &mut CpuArm<'_>) -> Result<(), DispatchError> {
+    let Some(stage) = arm.pending_stage.take() else {
+        return Ok(());
+    };
+    let rotate = arm.rotate_input;
+    let PendingStage {
+        values,
+        k,
+        scale_len,
+        acc_len,
+    } = stage;
+    let t_stage = Instant::now();
+    let (x_host, acc_host) = with_cpu_transfer(gpu, values, |transfer| {
+        transfer
+            .wait_input_ready(&gpu.hip)
+            .map_err(|e| cpu_err(&format!("D2H input-ready wait: {e}")))?;
+        let staged = transfer_values(transfer, values);
         let (x, rest) = staged.split_at_mut(k);
         let (scale_host, acc_host) = rest.split_at_mut(scale_len);
         // The same two transforms `prepare_activation` applies, in the same
         // order, on the same bytes.
         let mut x_host = x.to_vec();
-        if scale.is_some() {
+        if scale_len > 0 {
             divide_by_awq_scale(&mut x_host, scale_host);
         }
-        if cpu.rotate_input {
+        if rotate {
             rotate_x(&mut x_host);
         }
-        Ok((x_host, cpu.residual.map(|_| acc_host.to_vec())))
-    })
+        Ok((x_host, (acc_len > 0).then(|| acc_host.to_vec())))
+    })?;
+    arm.d2h_ns += t_stage.elapsed().as_nanos() as u64;
+    arm.x_host = x_host;
+    arm.acc_host = acc_host;
+    Ok(())
+}
+
+/// Abandon a split arm's queued read after a failure between its enqueue and its
+/// stage: drain the reusable staging owner so the marker's record is retired
+/// instead of left unresolved for the next step's enqueue to refuse. Error path
+/// only, and the arm holds no host state yet, so nothing else is released.
+pub(crate) fn cpu_arm_abort(gpu: &Gpu, arm: &mut CpuArm<'_>) {
+    if arm.pending_stage.take().is_none() {
+        return;
+    }
+    let _ = with_cpu_transfer(gpu, 1, |transfer| {
+        transfer
+            .complete(&gpu.hip)
+            .map_err(|e| cpu_err(&format!("D2H drain: {e}")))
+    });
 }
 
 /// The CPU arm's write-back: the whole-CPU route's blocking pageable upload, or
@@ -776,8 +847,10 @@ fn upload_arm_result(
     })
 }
 
-/// Phase two of the CPU arm: the multiply over `rows`, the residual add when
-/// there is one, and the write-back. Returns `(gemv_ns, h2d_ns)`.
+/// The CPU arm's last phase: the multiply over `rows`, the residual add when
+/// there is one, and the write-back. Returns `(gemv_ns, h2d_ns)`. Requires the
+/// arm to be staged ([`cpu_arm_stage`]) — the vectors this reads are empty until
+/// then.
 ///
 /// The write-back is the join of a *sampled* pass-back split: same stream as the
 /// GPU arm, so it waits for it, and the two arms' rows are disjoint, so nothing
@@ -797,6 +870,13 @@ pub(crate) fn cpu_arm_finish(
     wait_for_return: bool,
 ) -> Result<(u64, u64), DispatchError> {
     let rows = arm.rows.clone();
+    // The multiply reads the vectors `cpu_arm_stage` materialized: a split arm
+    // that reached here unstaged has no activation, and this is the seam that
+    // must never read it silently.
+    debug_assert!(
+        arm.pending_stage.is_none(),
+        "split arm reached the multiply before `cpu_arm_stage` waited its read"
+    );
     let bytes = gpu
         .host_bytes(arm.w.buf)
         .ok_or_else(|| cpu_err("weight tensor is host-mapped but has no host pointer"))?;
@@ -1984,18 +2064,21 @@ fn upload_f32(gpu: &Gpu, t: &GpuTensor, v: &[f32]) -> Result<(), DispatchError> 
         .map_err(|e| cpu_err(&format!("H2D: {e}")))
 }
 
-/// Reuse owned pinned storage across CPU steps. Growth/device transitions
-/// drop an owner that drains pending accesses; the warm same-stream path has
-/// no return-side host wait, event record, or extra staging copy.
+/// Reuse owned pinned storage across CPU steps. Growth/device transitions drop an
+/// owner that drains pending accesses; the warm same-stream path has no
+/// return-side host wait and no extra staging copy — the forward read records the
+/// owner's one reusable input-ready marker instead of draining the stream.
 ///
-/// An asynchronous split return ([`upload_arm_result`] with `wait == false`)
-/// leaves this owner `pending` — the queued H2D still reads the storage — and
-/// returns. The next use is safe by construction: a same-stream enqueue is
-/// ordered after that H2D and its `complete` drains both before the host reads
-/// the staging bytes; a growth or a stream change drops/`begin`-drains the
-/// owner (a device synchronize) first; and `PinnedTransferBuffer::as_bytes_mut`
-/// asserts `!pending`, so a host access that slipped ahead of a completion
-/// fails loudly instead of silently racing the device.
+/// A split step's queued read ([`prepare_split_enqueue`]) leaves that record set;
+/// [`cpu_arm_stage`] waits it before the host touches the bytes. An asynchronous
+/// split return ([`upload_arm_result`] with `wait == false`) then leaves the owner
+/// `pending` — the queued H2D still reads the storage — and returns. The next use
+/// is safe by construction: a same-stream enqueue is ordered after that H2D, and
+/// the marker wait or `complete` drains both before the host reads the staging
+/// bytes; a growth or a stream change drops/`begin`-drains the owner (a device
+/// synchronize) first; and `PinnedTransferBuffer::as_bytes_mut` asserts
+/// `!pending`, so a host access that slipped ahead of a completion fails loudly
+/// instead of silently racing the device.
 fn with_cpu_transfer<R>(
     gpu: &Gpu,
     values: usize,
@@ -2410,7 +2493,7 @@ fn trace_step(
     if stats.split {
         // The CPU arm runs while the GPU arm streams the *same* host pages, so
         // `cpu` is the arm's multiply rate over the arm's own rows — the interval
-        // the scheduler's controller samples, since the blocking D2H precedes the
+        // the scheduler's controller samples, since the D2H enqueue precedes the
         // GPU arm and the H2D join follows it. bytes/ns is GB/s numerically. The
         // GPU rate is the scheduler's measured one: the arm's rows over its own
         // bracketed elapsed time, present once a sampled step has measured it.

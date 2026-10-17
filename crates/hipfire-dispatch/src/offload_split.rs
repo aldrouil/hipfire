@@ -41,24 +41,27 @@
 //!   [`crate::cpu_exec::cpu_arm_finish`]). No third engine and no new numerics,
 //!   which is also why a share of `0` is byte-identical to
 //!   `memory.offload_exec=cpu`.
-//! * **No second stream.** The overlap is an ordering result:
-//!   issue the blocking D2H *before* enqueueing the GPU arm (so it drains only
-//!   the step's producer), enqueue the GPU arm (async), run the CPU multiply
-//!   while that kernel executes, then enqueue the H2D of the CPU's rows —
-//!   stream-ordered after the GPU arm because both are on the same (default)
-//!   stream. The copies are `k*4` bytes down and `(m-g)*4` up (~30 KB at 9B
-//!   shapes) against tens of MB of weight bytes, so a two-stream design would
-//!   buy the overlap of a ~2 µs copy. The only events in the mode are the reused
-//!   span markers that bracket the GPU arm on that same stream (below).
+//! * **No second stream.** The overlap is an ordering result: enqueue the D2H of
+//!   the CPU arm's rows, record a reusable *input-ready* marker behind it,
+//!   enqueue the GPU arm (async), wait that marker — not the stream — and
+//!   stage/transform the staged bytes on the host while the arm executes, then
+//!   enqueue the H2D of the CPU's rows, stream-ordered after the GPU arm because
+//!   both are on the same (default) stream. The record sits after the copies and
+//!   before the launch, so the host's read boundary no longer waits for the arm:
+//!   that is the whole overlap. The copies are `k*4` bytes down and `(m-g)*4` up
+//!   (~30 KB at 9B shapes) against tens of MB of weight bytes, so a two-stream
+//!   design would buy the overlap of a ~2 µs copy. The only events in the mode
+//!   are that reusable marker and the reused span markers bracketing the arm.
 //!
 //! On a **sampled** step (about one in four, see below) that H2D is *completed*
 //! on the same call — the join, and the point at which the GPU arm's own
 //! duration becomes readable; on an **unsampled** one the H2D is merely enqueued
 //! and the step returns, the stream ordering it before the next consumer. Both
-//! the read and the write use the pinned transfer owner, which keeps the staged
-//! bytes off-limits to the host until the next enqueue's completion drains them,
-//! so an unsampled step's queued H2D is retired by the next step's D2H
-//! completion, by a stream change, or by teardown — never raced.
+//! the read and the write use the pinned transfer owner: the input-ready wait is
+//! what releases the staged bytes to the host for the read, and the write leaves
+//! them off-limits until the next enqueue's completion drains them, so an
+//! unsampled step's queued H2D is retired by the next step's read, by a stream
+//! change, or by teardown — never raced.
 //!
 //! The **share** `g` is scheduled, not hardcoded: the optimum is a property of
 //! the host (link width, DRAM peak, core count, AVX2), so the first
@@ -69,9 +72,10 @@
 //!
 //! On a sampled step the controller is fed both arms' **own concurrent
 //! durations**: the CPU arm's multiply (`gemv_ns`, the interval that actually
-//! overlaps the GPU arm — the arm's blocking D2H precedes the launch and its H2D
-//! join follows it) and the GPU arm's elapsed time, bracketed by a reusable pair
-//! of stream-ordered markers ([`Gpu::span_begin`] / [`Gpu::span_end`], read with
+//! overlaps the GPU arm — the arm's D2H enqueue precedes the launch, its
+//! input-ready read boundary follows it, and its H2D join follows that) and the
+//! GPU arm's elapsed time, bracketed by a reusable pair of stream-ordered markers
+//! ([`Gpu::span_begin`] / [`Gpu::span_end`], read with
 //! [`Gpu::span_elapsed_ns`]) on the same stream the arm and its H2D run on.
 //! Neither duration is inferred from the join the two arms produce: the join is
 //! `copy + max(0, arm_ns - gemv_ns)`, so recovering the arm's duration from it
@@ -540,7 +544,7 @@ fn next_share(cur: f64, r_cpu: f64, r_gpu: f64) -> f64 {
 /// matching [`SplitCalibration`]; the controller only uses them as a ratio.
 ///
 /// `gemv_ns` is the CPU arm's multiply over its `rows_cpu` rows — the interval
-/// that actually runs concurrently with the GPU arm, since the arm's blocking D2H
+/// that actually runs concurrently with the GPU arm, since the arm's D2H enqueue
 /// precedes the GPU launch and its H2D join follows it — and `gpu_ns` is the GPU
 /// arm's own elapsed time over its `rows_gpu` rows, measured between the markers
 /// that bracket its launches. Both are that one step's real durations, so the two
@@ -991,25 +995,44 @@ pub fn run_with(
     // ensured the shape's state exists.
     let sample = sample_due(key);
 
-    // The ordering *is* the mechanism: prepare (blocking D2H) before the GPU arm,
-    // GPU arm async, CPU multiply, then the H2D of the CPU's rows — completed as
-    // the join on a sampled step, merely enqueued on an unsampled one, where the
-    // stream orders it before every later consumer.
+    // The ordering *is* the mechanism: enqueue the CPU arm's read, enqueue the
+    // GPU arm on the same stream, cross the read's own input-ready boundary (the
+    // arm, queued after it, does not hold it up), multiply and transform on the
+    // host while the arm runs, then the H2D of the CPU's rows — the join on a
+    // sampled step, merely enqueued on an unsampled one, where the stream orders
+    // it before every later consumer.
     let step_start = Instant::now();
-    let arm = cpu_exec::cpu_arm_prepare(gpu, &plan, g..w.m)?;
+    let mut arm = cpu_exec::cpu_arm_prepare(gpu, &plan, g..w.m)?;
     // The GPU arm's own duration, bracketed by this device's reusable marker pair
     // on the stream the arm and its H2D both run on. Only a sampled step records
     // them, and every failure here fails the step: the pair is a measurement, not
     // an optional extra, so a marker that cannot be created or recorded is
     // reported rather than silently leaving the controller (and the trace) with a
     // step that looks sampled but fed nothing.
-    if sample {
-        gpu.span_begin().map_err(hip_err)?;
+    //
+    // Nothing in here may wait on the stream: the arm's reads are already recorded
+    // behind their own input-ready marker, and that marker is what the host waits
+    // below, *after* this launch, so the read boundary and the arm overlap.
+    let launched = (|| -> Result<(), DispatchError> {
+        if sample {
+            gpu.span_begin().map_err(hip_err)?;
+        }
+        launch_op_rows(gpu, ctx, step, Some(0..g))?;
+        if sample {
+            gpu.span_end().map_err(hip_err)?;
+        }
+        Ok(())
+    })();
+    if let Err(err) = launched {
+        // The arm's copies may still be queued and nothing has read the staging
+        // bytes, so retire that read rather than leave an unresolved marker for the
+        // next step's enqueue to refuse. Error path only.
+        cpu_exec::cpu_arm_abort(gpu, &mut arm);
+        return Err(err);
     }
-    launch_op_rows(gpu, ctx, step, Some(0..g))?;
-    if sample {
-        gpu.span_end().map_err(hip_err)?;
-    }
+    // Wait the arm's input-ready marker — not the GPU arm enqueued after it — and
+    // stage/transform the bytes while that arm runs, before the multiply.
+    cpu_exec::cpu_arm_stage(gpu, &mut arm)?;
     let (gemv_ns, h2d_ns) = cpu_exec::cpu_arm_finish(gpu, &arm, sample)?;
     if sample {
         // Read only now: the completed H2D above is stream-ordered behind both
