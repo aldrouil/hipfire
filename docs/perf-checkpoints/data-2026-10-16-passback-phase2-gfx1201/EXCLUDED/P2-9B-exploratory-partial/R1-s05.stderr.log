@@ -1,0 +1,14 @@
+[gpu-lock] directory=/tmp/hipfire-locks
+[hip-bridge] GPU_PINNED_MIN_XFER_SIZE=100000: pageable weight copies staged out of reclaim
+[gpu-lock] reserved /tmp/hipfire-locks/gpu-GPU-0c088c33052923ba.lock
+[gpu-lock] reserved /tmp/hipfire-locks/gpu-pci-0000:14:00.0.lock
+[devices] logical 0: HIP gfx1201 0000:03:00.0 = index 0 GPU-0c088c33052923ba
+[devices] logical 1: HIP gfx1036 0000:14:00.0 = index 1 pci-0000:14:00.0
+GPU dev 0: gfx1201 (17.1 GB VRAM, HIP 7.2)
+  pre-compiled kernels: /home/avery/.hipfire_kernels/gfx1201
+  kernels: compiling kernels on first use (one-time, cached afterwards)… [no closed route plan: UnsupportedRoute("model arch 5 on gfx1201 has no closed route")]
+  KV cache: requested mode=auto, effective K=q8, effective V=q8
+  partial offload: 16 of 32 layers host-placed, device weights 3299 MiB of 14697 MiB available
+  kv reserved: 4096 tokens x 17408 B = 68 MiB; pbs floor 1286 MiB; draft 0 MiB; slack 128 MiB; weight budget 14697 MiB of 16180 MiB free
+  partial offload: 16 of 32 layers host-placed; pinned host 1753 MiB; device weights 3299 MiB
+hipfire: daemon error: [gpu retryable=false rolled_back=false attempt=0] load failed: host-placed weights need 1.7 GiB of pinned host RAM plus 4 GiB headroom, but MemAvailable - CMA is 5.3 GiB (plus 0.0 GiB estimated in TTM's page pool); free host memory or keep more weights in VRAM (memory.moe_expert_budget / memory.gpu_layer_budget). GPU: gfx1201 (16152 MB free / 16304 MB total); no model loaded (the prior model was unloaded before this load)

@@ -1,0 +1,21 @@
+# Phase2 commands (exact invocations; scripts archived under SCRIPTS/)
+## Sweep sample (per fresh process; N=3/arm via driver loop, rotated interleave)
+P2-one.sh <cli> <daemon> passback <share:auto|0.25|0.375|0.45|0.5> <budget:16|56> <model> <out> <home>
+# bench line inside: <cli> bench <model> --runs 3 --warmups 3 --spec off --backend noslots --workload stateless --max-tokens 128 --max-seq 4096 --kv-mode auto --kv-backend vmm --prompt-file benchmarks/prompts/gpu_offload_probe.txt --json
+# env: HIPFIRE_HOME/HIPFIRE_MODELS_DIR isolated per process, HIPFIRE_DAEMON_BIN=<wrap>, HIPFIRE_LOCAL=1, HIPFIRE_NO_REGISTRY_FETCH=1, HIPFIRE_DPM_WARMUP_SECS=10, HIPFIRE_OFFLOAD_EXEC=passback, HIPFIRE_GPU_LAYER_BUDGET=<budget>, HIPFIRE_OFFLOAD_PASSBACK_SHARE=<share|unset>; RAYON_NUM_THREADS/HIPFIRE_CPU_EXEC_TRACE/HIPFIRE_PROFILE*/HIPFIRE_MEMSET_DUMP unset
+# reverse-block runner P2-rev-one.py: same contract, plus HIPFIRE_SPLIT_DIAG explicitly unset and SPLIT_DIAG_ambient recorded in meta
+## Drivers
+bash P2-9B.sh  (5 shares x N3, budget 16) ; bash P2-27B.sh  (5 shares x N3, budget 56)
+bash P2C-ABBA-9B.sh / P2C-ABBA-27B.sh (base-vs-cand ABBA N4/arm) ; bash P2C-REV-9B.sh / P2C-REV-27B.sh (reverse BAABBAAB N4/arm)
+## Diagnostics (warmed, trace on)
+HIPFIRE_SPLIT_DIAG=1 HIPFIRE_CPU_EXEC_TRACE=1 <cli> bench ... (same bench line, --runs 1 --warmups 3)
+## Oracle tests (candidate build, release)
+cargo test -p hipfire-dispatch --lib -- --test-threads=1  (410 pass / 1 ignored)
+HIPFIRE_OFFLOAD_EXEC=passback cargo test -p hipfire-arch-qwen35 --release --test gpu_gemv_parity -- --ignored --nocapture passback_row_offset  (18 cases x3 streams bit-exact)
+HIPFIRE_OFFLOAD_EXEC=cpu cargo test -p hipfire-arch-qwen35 --release --test gpu_gemv_parity -- --ignored --nocapture cpu_offload_return_stream  (PASS)
+cargo build --release --features deltanet --example test_kernels -p hipfire-runtime && ./target/release/examples/test_kernels (17 pass / 1 gfx1151-only skip) — channel suite; named oracles live in gpu_gemv_parity, not this binary
+## Serve correctness (candidate binaries, HIPFIRE_DAEMON_BIN/HIPFIRE_CLI_BIN set, DPM 10)
+python3 scripts/serve_harness.py --model <model> --tag <qwen3.5:9b|qwen3.8:27b> --sampling greedy --thinking off --mode <battery|chain> --max-tokens 128 --max-seq 4096 --kv auto --home <home> --serve-log <log> --port <11661-11666> --out <json>
+# identity smoke: same line with --prompt-file benchmarks/prompts/gpu_offload_probe.txt, HIPFIRE_OFFLOAD_EXEC=passback + SHARE=0 vs HIPFIRE_OFFLOAD_EXEC=cpu, budget 16
+## Builds (workspace, no -p)
+cargo build --release  (baseline a5a87e6c; diag build with temp patch; candidate build with rotovl patch)

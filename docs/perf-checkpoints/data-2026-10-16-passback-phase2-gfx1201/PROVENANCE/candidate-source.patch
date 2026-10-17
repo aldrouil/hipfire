@@ -1,0 +1,217 @@
+diff --git a/crates/hipfire-dispatch/src/cpu_exec.rs b/crates/hipfire-dispatch/src/cpu_exec.rs
+index fe2fea0e9..32b53e87a 100644
+--- a/crates/hipfire-dispatch/src/cpu_exec.rs
++++ b/crates/hipfire-dispatch/src/cpu_exec.rs
+@@ -526,8 +526,8 @@ pub fn run_host_mapped_gemv(
+         residual: None,
+     };
+     let step_start = Instant::now();
+-    let arm = cpu_arm_prepare(gpu, &plan, 0..w.m)?;
+-    let (gemv_ns, h2d_ns) = cpu_arm_finish(gpu, &arm, true)?;
++    let mut arm = cpu_arm_prepare(gpu, &plan, 0..w.m)?;
++    let (gemv_ns, h2d_ns) = cpu_arm_finish(gpu, &mut arm, true)?;
+     finish_step(
+         arm.q,
+         w,
+@@ -579,7 +579,7 @@ pub(crate) fn prepare_activation(
+ 
+ /// The CPU arm of a host-executed step: every blocking device read already done
+ /// ([`cpu_arm_prepare`]), the multiply and the write-back still pending
+-/// ([`cpu_arm_finish`]).
++/// ([`cpu_arm_finish`]) — and, for a split arm that rotates, the FWHT too.
+ ///
+ /// The two phases exist so a pass-back split can interleave a GPU launch
+ /// *between* them: a blocking D2H issued after that launch would drain it, so the
+@@ -591,14 +591,19 @@ pub(crate) fn prepare_activation(
+ pub(crate) struct CpuArm<'a> {
+     /// The weight's CPU decoder.
+     pub(crate) q: CpuQuant,
+-    /// Whether the activation was rotated (and AWQ-divided) — i.e. whether the
+-    /// launcher would have self-rotated this input. Mirrored here so the
+-    /// pass-back can hand it to [`finish_step`] without keeping the plan alive.
++    /// Whether the launcher would have self-rotated this input — i.e. whether
++    /// the activation is FWHT-rotated (and AWQ-divided) before the multiply.
++    /// Mirrored here so the pass-back can hand it to [`finish_step`] without
++    /// keeping the plan alive. It is also what tells [`cpu_arm_finish`] to run
++    /// the deferred FWHT on a split arm.
+     pub(crate) rotate_input: bool,
+     /// Elapsed time of the blocking reads: the activation, plus the accumulator
+     /// when the step is a residual form. The trace's `d2h`; the controller does
+     /// not see it (it runs before the GPU arm is launched, so it is not part of
+-    /// the interval the two arms share).
++    /// the interval the two arms share). On a *split* step that rotates it no
++    /// longer includes the FWHT (which [`cpu_arm_finish`] now runs late, to
++    /// overlap the prefix); the whole-CPU route's still does, as
++    /// [`prepare_activation`] documents.
+     pub(crate) d2h_ns: u64,
+     w: &'a WeightRef<'a>,
+     /// The row range this arm multiplies.
+@@ -607,8 +612,11 @@ pub(crate) struct CpuArm<'a> {
+     /// residual form (a residual step never writes `out` — see the GemvResidual
+     /// arms in `steps.rs`).
+     target: &'a GpuTensor,
+-    /// The activation for `rows`, already rotated and AWQ-divided exactly as the
+-    /// launcher's rotate step would have done.
++    /// The activation for `rows`, AWQ-divided exactly as the launcher's rotate
++    /// step would have done. Rotated here too on the whole-CPU route (it comes
++    /// from [`prepare_activation`]); a *split* arm's stays unrotated until
++    /// [`cpu_arm_finish`], which runs the FWHT after the pass-back's GPU prefix
++    /// is enqueued.
+     x_host: Vec<f32>,
+     /// The accumulator read back for the residual form, *before* the multiply, so
+     /// a concurrently executing GPU arm cannot race this read.
+@@ -634,6 +642,13 @@ fn split_arm(rows: &Range<usize>, m: usize) -> bool {
+ /// allocation instead of the whole-CPU route's blocking pageable copies, so the
+ /// split's copy mechanics can be measured and reworked on their own; both paths
+ /// block before returning, so the two-phase contract is unchanged.
++///
++/// The two routes differ in *when* the FWHT runs. The whole-CPU route rotates
++/// inside [`prepare_activation`] (so its arm's `x_host` is ready to multiply).
++/// A split arm defers the rotation to [`cpu_arm_finish`]: the pass-back enqueues
++/// its GPU prefix between this call and that one, and the rotation then overlaps
++/// that prefix. Both routes read the D2H, AWQ-divide, FWHT and multiply in the
++/// same order on the same bytes; only the wall-clock position of the FWHT moves.
+ pub(crate) fn cpu_arm_prepare<'a>(
+     gpu: &Gpu,
+     cpu: &CpuStep<'a>,
+@@ -681,6 +696,13 @@ pub(crate) fn cpu_arm_prepare<'a>(
+ /// The pinned lease lives for the duration of this call only: the pass-back
+ /// launches its GPU arm with `&mut Gpu` between the two phases, so a
+ /// thread-local borrow cannot be held across it.
++///
++/// The FWHT (`rotate_x`) is *not* applied here even when the step rotates: it is
++/// deferred to [`cpu_arm_finish`], which the pass-back calls only after it has
++/// enqueued the GPU prefix, so the rotation overlaps that prefix instead of
++/// running before it. The AWQ divide stays here (divide-then-FWHT order is
++/// unchanged) and the returned activation is therefore AWQ-divided but
++/// unrotated.
+ fn prepare_split_read(
+     gpu: &Gpu,
+     cpu: &CpuStep<'_>,
+@@ -717,15 +739,15 @@ fn prepare_split_read(
+         let staged = transfer_values(transfer, acc_off + acc_len);
+         let (x, rest) = staged.split_at_mut(k);
+         let (scale_host, acc_host) = rest.split_at_mut(scale_len);
+-        // The same two transforms `prepare_activation` applies, in the same
+-        // order, on the same bytes.
++        // Only the *first* of the two transforms `prepare_activation` applies,
++        // on the same bytes: the AWQ divide. The FWHT is deferred to
++        // `cpu_arm_finish`, which runs it after the pass-back's GPU prefix is
++        // enqueued (see there); the order — divide then FWHT — is preserved, and
++        // the activation is still unrotated when this call returns.
+         let mut x_host = x.to_vec();
+         if scale.is_some() {
+             divide_by_awq_scale(&mut x_host, scale_host);
+         }
+-        if cpu.rotate_input {
+-            rotate_x(&mut x_host);
+-        }
+         Ok((x_host, cpu.residual.map(|_| acc_host.to_vec())))
+     })
+ }
+@@ -779,6 +801,16 @@ fn upload_arm_result(
+ /// Phase two of the CPU arm: the multiply over `rows`, the residual add when
+ /// there is one, and the write-back. Returns `(gemv_ns, h2d_ns)`.
+ ///
++/// For a *split* arm this also applies the deferred FWHT (`rotate_x`) that
++/// [`prepare_split_read`] left out, in place over the owned `x_host`, before the
++/// multiply — so on the pass-back it runs after the GPU prefix is enqueued and
++/// overlaps it. `gemv_ns` covers the multiply alone: the rotation is *not* in
++/// the controller's CPU observation (nor was it before — it used to sit in the
++/// `d2h_ns` read phase, which the controller also never sees). The tradeoff is
++/// deliberate: the controller's CPU-per-step estimate stays the multiply it has
++/// always been, at the cost of not attributing the rotation's wall to the CPU
++/// arm, which is what lets the rotation hide under the prefix.
++///
+ /// The write-back is the join of a *sampled* pass-back split: same stream as the
+ /// GPU arm, so it waits for it, and the two arms' rows are disjoint, so nothing
+ /// else is needed. For such a step `h2d_ns` therefore also carries the GPU arm's
+@@ -793,7 +825,7 @@ fn upload_arm_result(
+ /// join — see [`StepTiming`].
+ pub(crate) fn cpu_arm_finish(
+     gpu: &Gpu,
+-    arm: &CpuArm<'_>,
++    arm: &mut CpuArm<'_>,
+     wait_for_return: bool,
+ ) -> Result<(u64, u64), DispatchError> {
+     let rows = arm.rows.clone();
+@@ -803,13 +835,23 @@ pub(crate) fn cpu_arm_finish(
+     let row_bytes = crate::families::gemv::weight_row_bytes(arm.w)
+         .ok_or_else(|| cpu_err("weight byte length is not a whole number of rows"))?;
+     let w_rows = &bytes[rows.start * row_bytes..];
++    let split = split_arm(&rows, arm.w.m);
++    // A split arm stages its activation AWQ-divided but *unrotated*
++    // ([`prepare_split_read`]); its FWHT runs here — after the pass-back
++    // enqueued the GPU prefix and immediately before the multiply — so it
++    // overlaps that prefix. The whole-CPU route already rotated inside
++    // [`prepare_activation`], so it must NOT run there: a second FWHT is a
++    // silent $\mathcal{R}^2$ error. In place over the arm's owned `x_host`: no
++    // allocation, no copy.
++    if split && arm.rotate_input {
++        rotate_x(&mut arm.x_host);
++    }
+     let mut y = vec![0.0f32; rows.len()];
+     let t1 = Instant::now();
+     gemv(arm.q, w_rows, rows.len(), arm.w.k, &arm.x_host, &mut y);
+     let gemv_ns = t1.elapsed().as_nanos() as u64;
+     let t2 = Instant::now();
+     let target = arm.target.sub_offset(rows.start, rows.len());
+-    let split = split_arm(&rows, arm.w.m);
+     match arm.acc_host.as_ref() {
+         Some(acc_host) => {
+             let mut acc = acc_host.clone();
+@@ -847,8 +889,8 @@ pub fn run_host_mapped_gemv_residual(
+         residual: Some(acc),
+     };
+     let step_start = Instant::now();
+-    let arm = cpu_arm_prepare(gpu, &plan, 0..w.m)?;
+-    let (gemv_ns, h2d_ns) = cpu_arm_finish(gpu, &arm, true)?;
++    let mut arm = cpu_arm_prepare(gpu, &plan, 0..w.m)?;
++    let (gemv_ns, h2d_ns) = cpu_arm_finish(gpu, &mut arm, true)?;
+     finish_step(
+         arm.q,
+         w,
+@@ -1893,8 +1935,8 @@ pub(crate) fn reads_host_mapped_weight(gpu: &Gpu, step: &Step) -> bool {
+ /// The order is the observable contract: D2H x, [D2H acc], gemv, [add], H2D.
+ pub(crate) fn run_step(gpu: &Gpu, plan: &CpuStep) -> Result<(), DispatchError> {
+     let step_start = Instant::now();
+-    let arm = cpu_arm_prepare(gpu, plan, 0..plan.w.m)?;
+-    let (gemv_ns, h2d_ns) = cpu_arm_finish(gpu, &arm, true)?;
++    let mut arm = cpu_arm_prepare(gpu, plan, 0..plan.w.m)?;
++    let (gemv_ns, h2d_ns) = cpu_arm_finish(gpu, &mut arm, true)?;
+     finish_step(
+         arm.q,
+         plan.w,
+diff --git a/crates/hipfire-dispatch/src/offload_split.rs b/crates/hipfire-dispatch/src/offload_split.rs
+index 1dc9857d9..078fc5562 100644
+--- a/crates/hipfire-dispatch/src/offload_split.rs
++++ b/crates/hipfire-dispatch/src/offload_split.rs
+@@ -991,12 +991,14 @@ pub fn run_with(
+     // ensured the shape's state exists.
+     let sample = sample_due(key);
+ 
+-    // The ordering *is* the mechanism: prepare (blocking D2H) before the GPU arm,
+-    // GPU arm async, CPU multiply, then the H2D of the CPU's rows — completed as
+-    // the join on a sampled step, merely enqueued on an unsampled one, where the
+-    // stream orders it before every later consumer.
++    // The ordering *is* the mechanism: prepare (blocking D2H, AWQ divide) before
++    // the GPU arm, GPU arm async, then the CPU multiply — whose deferred FWHT
++    // runs in `cpu_arm_finish`, i.e. after the GPU arm is enqueued and before the
++    // multiply, so it overlaps the arm — and the H2D of the CPU's rows, completed
++    // as the join on a sampled step, merely enqueued on an unsampled one, where
++    // the stream orders it before every later consumer.
+     let step_start = Instant::now();
+-    let arm = cpu_exec::cpu_arm_prepare(gpu, &plan, g..w.m)?;
++    let mut arm = cpu_exec::cpu_arm_prepare(gpu, &plan, g..w.m)?;
+     // The GPU arm's own duration, bracketed by this device's reusable marker pair
+     // on the stream the arm and its H2D both run on. Only a sampled step records
+     // them, and every failure here fails the step: the pair is a measurement, not
+@@ -1010,7 +1012,7 @@ pub fn run_with(
+     if sample {
+         gpu.span_end().map_err(hip_err)?;
+     }
+-    let (gemv_ns, h2d_ns) = cpu_exec::cpu_arm_finish(gpu, &arm, sample)?;
++    let (gemv_ns, h2d_ns) = cpu_exec::cpu_arm_finish(gpu, &mut arm, sample)?;
+     if sample {
+         // Read only now: the completed H2D above is stream-ordered behind both
+         // markers, so both have completed and the elapsed time is this step's own

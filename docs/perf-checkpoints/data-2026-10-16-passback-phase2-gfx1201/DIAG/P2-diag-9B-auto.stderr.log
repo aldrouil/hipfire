@@ -1,0 +1,174 @@
+[gpu-lock] directory=/tmp/hipfire-locks
+[hip-bridge] GPU_PINNED_MIN_XFER_SIZE=100000: pageable weight copies staged out of reclaim
+[gpu-lock] reserved /tmp/hipfire-locks/gpu-GPU-0c088c33052923ba.lock
+[gpu-lock] reserved /tmp/hipfire-locks/gpu-pci-0000:14:00.0.lock
+[devices] logical 0: HIP gfx1201 0000:03:00.0 = index 0 GPU-0c088c33052923ba
+[devices] logical 1: HIP gfx1036 0000:14:00.0 = index 1 pci-0000:14:00.0
+GPU dev 0: gfx1201 (17.1 GB VRAM, HIP 7.2)
+  pre-compiled kernels: /home/avery/.hipfire_kernels/gfx1201
+  kernels: compiling kernels on first use (one-time, cached afterwards)… [no closed route plan: UnsupportedRoute("model arch 5 on gfx1201 has no closed route")]
+  KV cache: requested mode=auto, effective K=q8, effective V=q8
+  partial offload: 16 of 32 layers host-placed, device weights 3299 MiB of 14697 MiB available
+  kv reserved: 4096 tokens x 17408 B = 68 MiB; pbs floor 1286 MiB; draft 0 MiB; slack 128 MiB; weight budget 14697 MiB of 16180 MiB free
+  partial offload: 16 of 32 layers host-placed; pinned host 1753 MiB; device weights 3299 MiB
+  DeltaNet state: Q8
+passback: memory.offload_exec=passback is non-deterministic by design — its CPU/GPU row split is scheduled per process, so generated tokens may change across runs; choose cpu or pcie for reproducible output
+cpu exec: 16/16 spilled layers fully covered by the CPU seam; uncovered quants: none
+passback: 16/16 spilled layers splittable; share auto; min step 2 MiB
+  loading token_embd...
+  qwen3.5-vl text wrapper: mrope_interleaved=true mrope_section=[11, 11, 10]
+  loading output_norm...
+  loading output (separate lm_head)...
+  lm_head AWQ sidecar: absent (no-op)
+  loading layer 0/32 (LinearAttention)...
+  loading layer 1/32 (LinearAttention)...
+  loading layer 2/32 (LinearAttention)...
+  loading layer 3/32 (FullAttention)...
+  loading layer 4/32 (LinearAttention)...
+  loading layer 5/32 (LinearAttention)...
+  loading layer 6/32 (LinearAttention)...
+  loading layer 7/32 (FullAttention)...
+  loading layer 8/32 (LinearAttention)...
+  loading layer 9/32 (LinearAttention)...
+  loading layer 10/32 (LinearAttention)...
+  loading layer 11/32 (FullAttention)...
+  loading layer 12/32 (LinearAttention)...
+  loading layer 13/32 (LinearAttention)...
+  loading layer 14/32 (LinearAttention)...
+  loading layer 15/32 (FullAttention)...
+  loading layer 16/32 (LinearAttention)...
+  loading layer 17/32 (LinearAttention)...
+  loading layer 18/32 (LinearAttention)...
+  loading layer 19/32 (FullAttention)...
+  loading layer 20/32 (LinearAttention)...
+  loading layer 21/32 (LinearAttention)...
+  loading layer 22/32 (LinearAttention)...
+  loading layer 23/32 (FullAttention)...
+  loading layer 24/32 (LinearAttention)...
+  loading layer 25/32 (LinearAttention)...
+  loading layer 26/32 (LinearAttention)...
+  loading layer 27/32 (FullAttention)...
+  loading layer 28/32 (LinearAttention)...
+  loading layer 29/32 (LinearAttention)...
+  loading layer 30/32 (LinearAttention)...
+  loading layer 31/32 (FullAttention)...
+  weight sweep: 12166 ms (packed-expert host-read 0 ms, H2D 0 ms)
+max_seq budget: free_after_weights=13243514880 min_prefill=1348804864 page_rounding=134217728 kv_bytes_per_token=17408
+  KV cache: requested mode=auto, effective K=q8, effective V=q8
+KV cache: mapped_prefix=0->1927 / physical_cap=4096 / max_seq=4096
+KV cache: Q8 vmm (8/32 layers carry KV; K 272B/head + V Q8 272B/head; mapped_prefix=1927 / physical_cap=4096 / max_seq=4096)
+QWEN35_LOAD_PHASES route=private weights_ms=12167.194 kv_ms=1.070 dn_ms=0.608 scratch_ms=0.093
+max_seq: 4096 (bound=user; model_ctx=262144, card_cap=675579, kv=q8)
+warming caches... took 10.00s
+hipfire bench
+  model:  /home/avery/.hipfire/models/qwen3.5-9b.mq4
+  arch:   qwen3_5
+  gpu:    gfx1201
+  runs:   1
+  max_tokens: 128
+  prompt_md5: 5835c71e471849b4a72e1dc8e39695e7
+  prompt_chars: 215
+  max_seq: 4096 (flag)
+  power:  card1 PCI 0000:03:00.0 gfx1201 (unfiltered: first ROCr agent of the daemon's arch)
+prefill_chunk: requested=512 admitted=512 commit_stride=none
+passback: hipGraph capture disabled (host-executed steps present)
+split: step gemv m=8192 k=4096 quant=Mq4G256 gpu_rows=3624/8192 share=0.442 (gpu=16.1GB/s, 1 sampled, target=—, 0 applied, 0 reopens) rotated=false residual=false awq=false | 1 calls | 1 steps (1 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.09ms gemv=0.46ms return=0.20ms | cpu=21.8GB/s
+cpu exec: idle 0.0% — window ending at step 2 covers 1 steps: 0ms wall, 0ms on CPU (0us CPU/step) — GPU-idle lower bound, see report_idle; 1 split steps (1808 rows on GPU, 0ms split wall) not counted as CPU-idle
+split: step gemv m=4096 k=4096 quant=Mq4G256 gpu_rows=1808/4096 share=0.442 (gpu=16.1GB/s, 1 sampled, target=—, 0 applied, 0 reopens) rotated=false residual=false awq=false | 1 calls | 2 steps (2 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.03ms gemv=0.23ms return=0.01ms | cpu=21.2GB/s
+cpu exec: step gemv m=32 k=4096 quant=Mq4G256 rotated=false residual=false awq=false | 1 calls | 1 steps on CPU, 0 host-mapped steps still on GPU | mean per step: d2h=0.03ms gemv=0.05ms h2d=0.03ms
+cpu exec: idle 53.3% — window ending at step 4 covers 2 steps: 0ms wall, 0ms on CPU (104us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: step gemv m=32 k=4096 quant=Mq4G256 rotated=false residual=false awq=false | 2 calls | 2 steps on CPU, 0 host-mapped steps still on GPU | mean per step: d2h=0.03ms gemv=0.05ms h2d=0.03ms
+split: step gemv m=4096 k=4096 quant=Mq4G256 gpu_rows=1808/4096 share=0.442 (gpu=16.1GB/s, 1 sampled, target=—, 0 applied, 0 reopens) rotated=true residual=true awq=false | 1 calls | 5 steps (3 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.18ms gemv=0.28ms return=0.01ms | cpu=18.1GB/s
+split: step gemv m=12288 k=4096 quant=Mq4G256 gpu_rows=5432/12288 share=0.442 (gpu=16.1GB/s, 1 sampled, target=—, 0 applied, 0 reopens) rotated=false residual=false awq=false | 1 calls | 6 steps (4 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.03ms gemv=0.57ms return=0.17ms | cpu=26.4GB/s
+split: step gemv m=12288 k=4096 quant=Mq4G256 gpu_rows=5432/12288 share=0.442 (gpu=16.1GB/s, 1 sampled, target=—, 0 applied, 0 reopens) rotated=false residual=false awq=false | 2 calls | 7 steps (5 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.03ms gemv=0.52ms return=0.09ms | cpu=28.8GB/s
+cpu exec: idle 0.0% — window ending at step 8 covers 4 steps: 12ms wall, 0ms on CPU (0us CPU/step) — GPU-idle lower bound, see report_idle; 4 split steps (14496 rows on GPU, 4ms split wall) not counted as CPU-idle
+split: step gemv m=4096 k=12288 quant=Mq4G256 gpu_rows=1824/4096 share=0.447 (gpu=26.1GB/s, 1 sampled, target=—, 0 applied, 0 reopens) rotated=true residual=true awq=false | 1 calls | 8 steps (6 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.27ms gemv=0.44ms return=0.04ms | cpu=33.5GB/s
+split: step gemv m=8192 k=4096 quant=Mq4G256 gpu_rows=3624/8192 share=0.442 (gpu=16.1GB/s, 1 sampled, target=—, 0 applied, 0 reopens) rotated=false residual=false awq=false | 2 calls | 9 steps (7 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.06ms gemv=0.47ms return=0.11ms | cpu=21.0GB/s
+split: step gemv m=4096 k=4096 quant=Mq4G256 gpu_rows=1808/4096 share=0.442 (gpu=16.1GB/s, 1 sampled, target=—, 0 applied, 0 reopens) rotated=false residual=false awq=false | 2 calls | 10 steps (8 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.03ms gemv=0.31ms return=0.01ms | cpu=16.3GB/s
+cpu exec: step gemv m=32 k=4096 quant=Mq4G256 rotated=false residual=false awq=false | 4 calls | 4 steps on CPU, 0 host-mapped steps still on GPU | mean per step: d2h=0.03ms gemv=0.05ms h2d=0.03ms
+split: step gemv m=4096 k=4096 quant=Mq4G256 gpu_rows=1808/4096 share=0.442 (gpu=16.1GB/s, 1 sampled, target=—, 0 applied, 0 reopens) rotated=true residual=true awq=false | 2 calls | 13 steps (9 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.13ms gemv=0.29ms return=0.01ms | cpu=17.0GB/s
+split: step gemv m=12288 k=4096 quant=Mq4G256 gpu_rows=5432/12288 share=0.442 (gpu=16.1GB/s, 1 sampled, target=—, 0 applied, 0 reopens) rotated=false residual=false awq=false | 4 calls | 15 steps (11 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.03ms gemv=0.58ms return=0.05ms | cpu=25.7GB/s
+cpu exec: idle 5.3% — window ending at step 16 covers 8 steps: 4ms wall, 0ms on CPU (28us CPU/step) — GPU-idle lower bound, see report_idle; 6 split steps (19928 rows on GPU, 3ms split wall) not counted as CPU-idle
+split: step gemv m=4096 k=12288 quant=Mq4G256 gpu_rows=1824/4096 share=0.447 (gpu=26.1GB/s, 1 sampled, target=—, 0 applied, 0 reopens) rotated=true residual=true awq=false | 2 calls | 16 steps (12 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.17ms gemv=0.49ms return=0.02ms | cpu=30.6GB/s
+split: step gemv m=8192 k=4096 quant=Mq4G256 gpu_rows=3624/8192 share=0.442 (gpu=18.6GB/s, 2 sampled, target=—, 0 applied, 0 reopens) rotated=false residual=false awq=false | 4 calls | 25 steps (19 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.06ms gemv=0.43ms return=0.06ms | cpu=23.0GB/s
+split: step gemv m=1024 k=4096 quant=Mq4G256 gpu_rows=448/1024 share=0.442 (gpu=18.6GB/s, 2 sampled, target=—, 0 applied, 0 reopens) rotated=false residual=false awq=false | 1 calls | 26 steps (20 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.03ms gemv=0.14ms return=0.01ms | cpu=8.8GB/s
+split: step gemv m=1024 k=4096 quant=Mq4G256 gpu_rows=448/1024 share=0.442 (gpu=18.6GB/s, 2 sampled, target=—, 0 applied, 0 reopens) rotated=false residual=false awq=false | 2 calls | 27 steps (21 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.03ms gemv=0.14ms return=0.01ms | cpu=8.8GB/s
+split: step gemv m=4096 k=4096 quant=Mq4G256 gpu_rows=1808/4096 share=0.442 (gpu=18.6GB/s, 2 sampled, target=—, 0 applied, 0 reopens) rotated=true residual=true awq=false | 4 calls | 28 steps (22 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.09ms gemv=0.27ms return=0.01ms | cpu=18.2GB/s
+split: step gemv m=12288 k=4096 quant=Mq4G256 gpu_rows=5432/12288 share=0.442 (gpu=18.6GB/s, 2 sampled, target=—, 0 applied, 0 reopens) rotated=false residual=false awq=false | 8 calls | 30 steps (24 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.04ms gemv=0.54ms return=0.03ms | cpu=27.8GB/s
+split: step gemv m=4096 k=12288 quant=Mq4G256 gpu_rows=1824/4096 share=0.447 (gpu=26.1GB/s, 1 sampled, target=—, 0 applied, 0 reopens) rotated=true residual=true awq=false | 4 calls | 31 steps (25 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.12ms gemv=0.52ms return=0.02ms | cpu=28.6GB/s
+cpu exec: idle 1.3% — window ending at step 32 covers 16 steps: 12ms wall, 0ms on CPU (10us CPU/step) — GPU-idle lower bound, see report_idle; 14 split steps (42568 rows on GPU, 6ms split wall) not counted as CPU-idle
+split: step gemv m=4096 k=4096 quant=Mq4G256 gpu_rows=1808/4096 share=0.442 (gpu=18.6GB/s, 2 sampled, target=—, 0 applied, 0 reopens) rotated=false residual=false awq=false | 4 calls | 33 steps (27 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.03ms gemv=0.24ms return=0.01ms | cpu=20.7GB/s
+cpu exec: step gemv m=32 k=4096 quant=Mq4G256 rotated=false residual=false awq=false | 8 calls | 8 steps on CPU, 0 host-mapped steps still on GPU | mean per step: d2h=0.03ms gemv=0.04ms h2d=0.03ms
+split: step gemv m=8192 k=4096 quant=Mq4G256 gpu_rows=3606/8192 share=0.437 (gpu=18.5GB/s, 6 sampled, target=0.437, 1 applied, 0 reopens) rotated=false residual=false awq=false | 8 calls | 56 steps (44 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.06ms gemv=0.42ms return=0.07ms | cpu=23.9GB/s
+split: step gemv m=1024 k=4096 quant=Mq4G256 gpu_rows=444/1024 share=0.437 (gpu=18.7GB/s, 7 sampled, target=0.437, 1 applied, 0 reopens) rotated=false residual=false awq=false | 4 calls | 58 steps (46 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.03ms gemv=0.15ms return=0.02ms | cpu=8.2GB/s
+split: step gemv m=4096 k=4096 quant=Mq4G256 gpu_rows=1799/4096 share=0.437 (gpu=18.7GB/s, 7 sampled, target=0.437, 1 applied, 0 reopens) rotated=true residual=true awq=false | 8 calls | 59 steps (47 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.08ms gemv=0.26ms return=0.01ms | cpu=19.0GB/s
+split: step gemv m=12288 k=4096 quant=Mq4G256 gpu_rows=5415/12288 share=0.452 (gpu=21.9GB/s, 9 sampled, target=0.452, 2 applied, 0 reopens) rotated=false residual=false awq=false | 16 calls | 61 steps (49 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.04ms gemv=0.56ms return=0.04ms | cpu=26.7GB/s
+split: step gemv m=4096 k=12288 quant=Mq4G256 gpu_rows=1824/4096 share=0.447 (gpu=26.1GB/s, 1 sampled, target=—, 0 applied, 0 reopens) rotated=true residual=true awq=false | 8 calls | 62 steps (50 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.11ms gemv=0.49ms return=0.01ms | cpu=30.0GB/s
+cpu exec: idle 3.8% — window ending at step 64 covers 32 steps: 14ms wall, 1ms on CPU (17us CPU/step) — GPU-idle lower bound, see report_idle; 26 split steps (80168 rows on GPU, 13ms split wall) not counted as CPU-idle
+split: step gemv m=4096 k=4096 quant=Mq4G256 gpu_rows=1813/4096 share=0.455 (gpu=21.8GB/s, 12 sampled, target=0.455, 3 applied, 0 reopens) rotated=false residual=false awq=false | 8 calls | 72 steps (58 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.03ms gemv=0.23ms return=0.01ms | cpu=21.5GB/s
+cpu exec: step gemv m=32 k=4096 quant=Mq4G256 rotated=false residual=false awq=false | 16 calls | 16 steps on CPU, 0 host-mapped steps still on GPU | mean per step: d2h=0.03ms gemv=0.04ms h2d=0.03ms
+split: step gemv m=8192 k=4096 quant=Mq4G256 gpu_rows=3700/8192 share=0.478 (gpu=24.7GB/s, 20 sampled, target=0.478, 5 applied, 0 reopens) rotated=false residual=false awq=false | 16 calls | 118 steps (94 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.06ms gemv=0.40ms return=0.04ms | cpu=24.5GB/s
+split: step gemv m=1024 k=4096 quant=Mq4G256 gpu_rows=461/1024 share=0.478 (gpu=24.7GB/s, 20 sampled, target=0.478, 5 applied, 0 reopens) rotated=false residual=false awq=false | 8 calls | 120 steps (96 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.03ms gemv=0.13ms return=0.02ms | cpu=9.4GB/s
+split: step gemv m=4096 k=4096 quant=Mq4G256 gpu_rows=1852/4096 share=0.478 (gpu=24.7GB/s, 20 sampled, target=0.478, 5 applied, 0 reopens) rotated=true residual=true awq=false | 16 calls | 121 steps (97 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.08ms gemv=0.26ms return=0.02ms | cpu=18.5GB/s
+split: step gemv m=12288 k=4096 quant=Mq4G256 gpu_rows=5572/12288 share=0.478 (gpu=24.7GB/s, 20 sampled, target=0.478, 5 applied, 0 reopens) rotated=false residual=false awq=false | 32 calls | 123 steps (99 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.04ms gemv=0.57ms return=0.04ms | cpu=25.8GB/s
+split: step gemv m=4096 k=12288 quant=Mq4G256 gpu_rows=1824/4096 share=0.447 (gpu=26.1GB/s, 2 sampled, target=—, 0 applied, 0 reopens) rotated=true residual=true awq=false | 16 calls | 124 steps (100 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.09ms gemv=0.54ms return=0.01ms | cpu=27.6GB/s
+cpu exec: idle 3.8% — window ending at step 128 covers 64 steps: 35ms wall, 1ms on CPU (21us CPU/step) — GPU-idle lower bound, see report_idle; 50 split steps (165408 rows on GPU, 25ms split wall) not counted as CPU-idle
+split: step gemv m=4096 k=4096 quant=Mq4G256 gpu_rows=1871/4096 share=0.476 (gpu=23.9GB/s, 26 sampled, target=0.476, 6 applied, 0 reopens) rotated=false residual=false awq=false | 16 calls | 157 steps (127 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.07ms gemv=0.24ms return=0.01ms | cpu=20.3GB/s
+cpu exec: step gemv m=32 k=4096 quant=Mq4G256 rotated=false residual=false awq=false | 32 calls | 32 steps on CPU, 0 host-mapped steps still on GPU | mean per step: d2h=0.03ms gemv=0.04ms h2d=0.03ms
+split: step gemv m=8192 k=4096 quant=Mq4G256 gpu_rows=3767/8192 share=0.466 (gpu=22.2GB/s, 38 sampled, target=0.466, 9 applied, 0 reopens) rotated=false residual=false awq=false | 32 calls | 242 steps (194 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.08ms gemv=0.41ms return=0.03ms | cpu=23.6GB/s
+split: step gemv m=1024 k=4096 quant=Mq4G256 gpu_rows=468/1024 share=0.466 (gpu=22.2GB/s, 38 sampled, target=0.466, 9 applied, 0 reopens) rotated=false residual=false awq=false | 16 calls | 244 steps (196 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.04ms gemv=0.13ms return=0.01ms | cpu=9.3GB/s
+split: step gemv m=4096 k=4096 quant=Mq4G256 gpu_rows=1884/4096 share=0.466 (gpu=22.9GB/s, 39 sampled, target=0.466, 9 applied, 0 reopens) rotated=true residual=true awq=false | 32 calls | 245 steps (197 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.07ms gemv=0.24ms return=0.01ms | cpu=20.3GB/s
+split: step gemv m=12288 k=4096 quant=Mq4G256 gpu_rows=5663/12288 share=0.464 (gpu=23.8GB/s, 40 sampled, target=0.464, 10 applied, 0 reopens) rotated=false residual=false awq=false | 64 calls | 247 steps (199 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.05ms gemv=0.49ms return=0.04ms | cpu=29.1GB/s
+split: step gemv m=4096 k=12288 quant=Mq4G256 gpu_rows=1824/4096 share=0.446 (gpu=23.0GB/s, 6 sampled, target=0.446, 1 applied, 0 reopens) rotated=true residual=true awq=false | 32 calls | 248 steps (200 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.11ms gemv=0.51ms return=0.02ms | cpu=29.2GB/s
+cpu exec: idle 4.5% — window ending at step 256 covers 128 steps: 57ms wall, 3ms on CPU (20us CPU/step) — GPU-idle lower bound, see report_idle; 104 split steps (347096 rows on GPU, 48ms split wall) not counted as CPU-idle
+split: step gemv m=4096 k=4096 quant=Mq4G256 gpu_rows=1884/4096 share=0.464 (gpu=24.6GB/s, 48 sampled, target=0.464, 12 applied, 0 reopens) rotated=false residual=false awq=false | 32 calls | 320 steps (258 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.06ms gemv=0.22ms return=0.01ms | cpu=22.1GB/s
+cpu exec: step gemv m=32 k=4096 quant=Mq4G256 rotated=false residual=false awq=false | 64 calls | 64 steps on CPU, 0 host-mapped steps still on GPU | mean per step: d2h=0.03ms gemv=0.04ms h2d=0.03ms
+split: step gemv m=8192 k=4096 quant=Mq4G256 gpu_rows=3798/8192 share=0.481 (gpu=23.2GB/s, 76 sampled, target=0.481, 19 applied, 0 reopens) rotated=false residual=false awq=false | 64 calls | 490 steps (394 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.07ms gemv=0.37ms return=0.02ms | cpu=26.1GB/s
+split: step gemv m=1024 k=4096 quant=Mq4G256 gpu_rows=472/1024 share=0.481 (gpu=23.2GB/s, 76 sampled, target=0.481, 19 applied, 0 reopens) rotated=false residual=false awq=false | 32 calls | 492 steps (396 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.04ms gemv=0.11ms return=0.01ms | cpu=10.6GB/s
+split: step gemv m=4096 k=4096 quant=Mq4G256 gpu_rows=1898/4096 share=0.481 (gpu=23.2GB/s, 76 sampled, target=0.481, 19 applied, 0 reopens) rotated=true residual=true awq=false | 64 calls | 493 steps (397 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.07ms gemv=0.23ms return=0.01ms | cpu=21.2GB/s
+split: step gemv m=12288 k=4096 quant=Mq4G256 gpu_rows=5707/12288 share=0.481 (gpu=23.2GB/s, 76 sampled, target=0.481, 19 applied, 0 reopens) rotated=false residual=false awq=false | 128 calls | 495 steps (399 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.07ms gemv=0.46ms return=0.03ms | cpu=31.3GB/s
+split: step gemv m=4096 k=12288 quant=Mq4G256 gpu_rows=1810/4096 share=0.428 (gpu=24.6GB/s, 18 sampled, target=0.428, 4 applied, 0 reopens) rotated=true residual=true awq=false | 64 calls | 496 steps (400 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.14ms gemv=0.47ms return=0.03ms | cpu=31.8GB/s
+cpu exec: idle 4.1% — window ending at step 512 covers 256 steps: 107ms wall, 4ms on CPU (17us CPU/step) — GPU-idle lower bound, see report_idle; 206 split steps (684832 rows on GPU, 90ms split wall) not counted as CPU-idle
+split: step gemv m=4096 k=4096 quant=Mq4G256 gpu_rows=1902/4096 share=0.449 (gpu=25.2GB/s, 97 sampled, target=0.449, 24 applied, 0 reopens) rotated=false residual=false awq=false | 64 calls | 653 steps (527 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.07ms gemv=0.20ms return=0.01ms | cpu=23.8GB/s
+cpu exec: step gemv m=32 k=4096 quant=Mq4G256 rotated=false residual=false awq=false | 128 calls | 128 steps on CPU, 0 host-mapped steps still on GPU | mean per step: d2h=0.03ms gemv=0.03ms h2d=0.03ms
+split: step gemv m=8192 k=4096 quant=Mq4G256 gpu_rows=3750/8192 share=0.447 (gpu=23.9GB/s, 158 sampled, target=0.447, 39 applied, 0 reopens) rotated=false residual=false awq=false | 128 calls | 986 steps (794 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.06ms gemv=0.33ms return=0.02ms | cpu=28.9GB/s
+split: step gemv m=1024 k=4096 quant=Mq4G256 gpu_rows=465/1024 share=0.447 (gpu=23.9GB/s, 158 sampled, target=0.447, 39 applied, 0 reopens) rotated=false residual=false awq=false | 64 calls | 988 steps (796 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.04ms gemv=0.10ms return=0.01ms | cpu=12.3GB/s
+split: step gemv m=4096 k=4096 quant=Mq4G256 gpu_rows=1874/4096 share=0.447 (gpu=23.9GB/s, 158 sampled, target=0.447, 39 applied, 0 reopens) rotated=true residual=true awq=false | 128 calls | 989 steps (797 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.07ms gemv=0.23ms return=0.01ms | cpu=21.3GB/s
+split: step gemv m=12288 k=4096 quant=Mq4G256 gpu_rows=5630/12288 share=0.447 (gpu=23.9GB/s, 158 sampled, target=0.447, 39 applied, 0 reopens) rotated=false residual=false awq=false | 256 calls | 991 steps (799 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.07ms gemv=0.43ms return=0.03ms | cpu=33.5GB/s
+split: step gemv m=4096 k=12288 quant=Mq4G256 gpu_rows=1766/4096 share=0.414 (gpu=25.0GB/s, 31 sampled, target=0.414, 7 applied, 0 reopens) rotated=true residual=true awq=false | 128 calls | 992 steps (800 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.13ms gemv=0.45ms return=0.02ms | cpu=34.0GB/s
+cpu exec: idle 4.2% — window ending at step 1024 covers 512 steps: 205ms wall, 9ms on CPU (17us CPU/step) — GPU-idle lower bound, see report_idle; 414 split steps (1319136 rows on GPU, 171ms split wall) not counted as CPU-idle
+split: step gemv m=4096 k=4096 quant=Mq4G256 gpu_rows=1865/4096 share=0.441 (gpu=22.6GB/s, 206 sampled, target=0.441, 51 applied, 0 reopens) rotated=false residual=false awq=false | 128 calls | 1312 steps (1058 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.06ms gemv=0.19ms return=0.01ms | cpu=25.0GB/s
+cpu exec: step gemv m=32 k=4096 quant=Mq4G256 rotated=false residual=false awq=false | 256 calls | 256 steps on CPU, 0 host-mapped steps still on GPU | mean per step: d2h=0.03ms gemv=0.03ms h2d=0.03ms
+split: step gemv m=8192 k=4096 quant=Mq4G256 gpu_rows=3723/8192 share=0.424 (gpu=22.5GB/s, 320 sampled, target=0.424, 80 applied, 0 reopens) rotated=false residual=false awq=false | 256 calls | 1978 steps (1594 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.06ms gemv=0.33ms return=0.03ms | cpu=29.5GB/s
+split: step gemv m=1024 k=4096 quant=Mq4G256 gpu_rows=461/1024 share=0.424 (gpu=22.5GB/s, 320 sampled, target=0.424, 80 applied, 0 reopens) rotated=false residual=false awq=false | 128 calls | 1980 steps (1596 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.04ms gemv=0.10ms return=0.01ms | cpu=12.1GB/s
+split: step gemv m=4096 k=4096 quant=Mq4G256 gpu_rows=1860/4096 share=0.424 (gpu=22.5GB/s, 320 sampled, target=0.424, 80 applied, 0 reopens) rotated=true residual=true awq=false | 256 calls | 1981 steps (1597 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.07ms gemv=0.22ms return=0.01ms | cpu=21.8GB/s
+split: step gemv m=12288 k=4096 quant=Mq4G256 gpu_rows=5588/12288 share=0.424 (gpu=22.3GB/s, 321 sampled, target=0.424, 80 applied, 0 reopens) rotated=false residual=false awq=false | 512 calls | 1983 steps (1599 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.08ms gemv=0.44ms return=0.04ms | cpu=33.4GB/s
+split: step gemv m=4096 k=12288 quant=Mq4G256 gpu_rows=1720/4096 share=0.401 (gpu=22.7GB/s, 60 sampled, target=0.401, 15 applied, 0 reopens) rotated=true residual=true awq=false | 256 calls | 1984 steps (1600 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.13ms gemv=0.46ms return=0.05ms | cpu=33.9GB/s
+cpu exec: idle 1.7% — window ending at step 2048 covers 1024 steps: 1051ms wall, 18ms on CPU (18us CPU/step) — GPU-idle lower bound, see report_idle; 826 split steps (2618496 rows on GPU, 376ms split wall) not counted as CPU-idle
+split: step gemv m=4096 k=4096 quant=Mq4G256 gpu_rows=1839/4096 share=0.440 (gpu=22.6GB/s, 432 sampled, target=0.440, 92 applied, 0 reopens, frozen) rotated=false residual=false awq=false | 256 calls | 2637 steps (2127 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.06ms gemv=0.20ms return=0.01ms | cpu=24.9GB/s
+cpu exec: step gemv m=32 k=4096 quant=Mq4G256 rotated=false residual=false awq=false | 512 calls | 512 steps on CPU, 0 host-mapped steps still on GPU | mean per step: d2h=0.03ms gemv=0.03ms h2d=0.03ms
+split: step gemv m=8192 k=4096 quant=Mq4G256 gpu_rows=3655/8192 share=0.440 (gpu=24.8GB/s, 653 sampled, target=0.440, 92 applied, 0 reopens, frozen) rotated=false residual=false awq=false | 512 calls | 3962 steps (3194 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.06ms gemv=0.32ms return=0.03ms | cpu=30.5GB/s
+split: step gemv m=1024 k=4096 quant=Mq4G256 gpu_rows=454/1024 share=0.440 (gpu=23.9GB/s, 654 sampled, target=0.440, 92 applied, 0 reopens, frozen) rotated=false residual=false awq=false | 256 calls | 3964 steps (3196 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.04ms gemv=0.10ms return=0.01ms | cpu=13.1GB/s
+split: step gemv m=4096 k=4096 quant=Mq4G256 gpu_rows=1826/4096 share=0.440 (gpu=23.9GB/s, 654 sampled, target=0.440, 92 applied, 0 reopens, frozen) rotated=true residual=true awq=false | 512 calls | 3965 steps (3197 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.07ms gemv=0.22ms return=0.01ms | cpu=22.7GB/s
+split: step gemv m=12288 k=4096 quant=Mq4G256 gpu_rows=5488/12288 share=0.440 (gpu=24.5GB/s, 655 sampled, target=0.440, 92 applied, 0 reopens, frozen) rotated=false residual=false awq=false | 1024 calls | 3967 steps (3199 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.07ms gemv=0.43ms return=0.04ms | cpu=34.3GB/s
+split: step gemv m=4096 k=12288 quant=Mq4G256 gpu_rows=1661/4096 share=0.392 (gpu=25.0GB/s, 119 sampled, target=0.392, 29 applied, 0 reopens) rotated=true residual=true awq=false | 512 calls | 3968 steps (3200 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.12ms gemv=0.46ms return=0.03ms | cpu=34.8GB/s
+cpu exec: idle 4.4% — window ending at step 4096 covers 2048 steps: 844ms wall, 37ms on CPU (18us CPU/step) — GPU-idle lower bound, see report_idle; 1650 split steps (5112168 rows on GPU, 702ms split wall) not counted as CPU-idle
+split: step gemv m=4096 k=4096 quant=Mq4G256 gpu_rows=1819/4096 share=0.454 (gpu=24.9GB/s, 861 sampled, target=0.454, 106 applied, 2 reopens) rotated=false residual=false awq=false | 512 calls | 5280 steps (4258 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.06ms gemv=0.20ms return=0.01ms | cpu=25.3GB/s
+cpu exec: step gemv m=32 k=4096 quant=Mq4G256 rotated=false residual=false awq=false | 1024 calls | 1024 steps on CPU, 0 host-mapped steps still on GPU | mean per step: d2h=0.03ms gemv=0.03ms h2d=0.03ms
+split: step gemv m=8192 k=4096 quant=Mq4G256 gpu_rows=3663/8192 share=0.451 (gpu=25.5GB/s, 1326 sampled, target=0.451, 119 applied, 3 reopens, frozen) rotated=false residual=false awq=false | 1024 calls | 7930 steps (6394 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.05ms gemv=0.31ms return=0.02ms | cpu=31.8GB/s
+split: step gemv m=1024 k=4096 quant=Mq4G256 gpu_rows=454/1024 share=0.451 (gpu=23.9GB/s, 1327 sampled, target=0.451, 119 applied, 3 reopens, frozen) rotated=false residual=false awq=false | 512 calls | 7932 steps (6396 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.05ms gemv=0.09ms return=0.01ms | cpu=13.8GB/s
+split: step gemv m=4096 k=4096 quant=Mq4G256 gpu_rows=1830/4096 share=0.451 (gpu=23.9GB/s, 1327 sampled, target=0.451, 119 applied, 3 reopens, frozen) rotated=true residual=true awq=false | 1024 calls | 7933 steps (6397 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.07ms gemv=0.22ms return=0.01ms | cpu=22.7GB/s
+split: step gemv m=12288 k=4096 quant=Mq4G256 gpu_rows=5499/12288 share=0.451 (gpu=23.4GB/s, 1328 sampled, target=0.451, 119 applied, 3 reopens, frozen) rotated=false residual=false awq=false | 2048 calls | 7935 steps (6399 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.07ms gemv=0.42ms return=0.03ms | cpu=34.9GB/s
+split: step gemv m=4096 k=12288 quant=Mq4G256 gpu_rows=1657/4096 share=0.407 (gpu=25.7GB/s, 244 sampled, target=0.407, 61 applied, 0 reopens) rotated=true residual=true awq=false | 1024 calls | 7936 steps (6400 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.12ms gemv=0.45ms return=0.03ms | cpu=35.6GB/s
+cpu exec: idle 4.3% — window ending at step 8192 covers 4096 steps: 1652ms wall, 71ms on CPU (17us CPU/step) — GPU-idle lower bound, see report_idle; 3304 split steps (10468384 rows on GPU, 1359ms split wall) not counted as CPU-idle
+split: step gemv m=4096 k=4096 quant=Mq4G256 gpu_rows=1834/4096 share=0.451 (gpu=25.0GB/s, 1785 sampled, target=0.451, 119 applied, 3 reopens, frozen) rotated=false residual=false awq=false | 1024 calls | 10573 steps (8527 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.06ms gemv=0.19ms return=0.01ms | cpu=25.3GB/s
+cpu exec: step gemv m=32 k=4096 quant=Mq4G256 rotated=false residual=false awq=false | 2048 calls | 2048 steps on CPU, 0 host-mapped steps still on GPU | mean per step: d2h=0.03ms gemv=0.03ms h2d=0.03ms
+split: step gemv m=8192 k=4096 quant=Mq4G256 gpu_rows=3675/8192 share=0.430 (gpu=25.0GB/s, 2735 sampled, target=0.430, 124 applied, 4 reopens, frozen) rotated=false residual=false awq=false | 2048 calls | 15866 steps (12794 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.05ms gemv=0.31ms return=0.02ms | cpu=32.2GB/s
+split: step gemv m=1024 k=4096 quant=Mq4G256 gpu_rows=454/1024 share=0.430 (gpu=25.0GB/s, 2735 sampled, target=0.430, 124 applied, 4 reopens, frozen) rotated=false residual=false awq=false | 1024 calls | 15868 steps (12796 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.04ms gemv=0.09ms return=0.01ms | cpu=14.2GB/s
+split: step gemv m=4096 k=4096 quant=Mq4G256 gpu_rows=1836/4096 share=0.430 (gpu=25.0GB/s, 2735 sampled, target=0.430, 124 applied, 4 reopens, frozen) rotated=true residual=true awq=false | 2048 calls | 15869 steps (12797 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.07ms gemv=0.21ms return=0.01ms | cpu=22.9GB/s
+split: step gemv m=12288 k=4096 quant=Mq4G256 gpu_rows=5514/12288 share=0.430 (gpu=25.0GB/s, 2735 sampled, target=0.430, 124 applied, 4 reopens, frozen) rotated=false residual=false awq=false | 4096 calls | 15871 steps (12799 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.07ms gemv=0.42ms return=0.03ms | cpu=35.2GB/s
+split: step gemv m=4096 k=12288 quant=Mq4G256 gpu_rows=1665/4096 share=0.409 (gpu=24.8GB/s, 503 sampled, target=0.409, 66 applied, 0 reopens, frozen) rotated=true residual=true awq=false | 2048 calls | 15872 steps (12800 split), 0 host-mapped steps still on GPU | mean per split step: d2h=0.11ms gemv=0.45ms return=0.02ms | cpu=35.5GB/s
+cpu exec: idle 4.6% — window ending at step 16384 covers 8192 steps: 3279ms wall, 150ms on CPU (18us CPU/step) — GPU-idle lower bound, see report_idle; 6606 split steps (20950040 rows on GPU, 2724ms split wall) not counted as CPU-idle
+.
+  prompt_tokens: 59
+  warning: prompt is 59 tokens; prefill_tok_s at this length measures launch overhead, not prefill throughput — use --prompt-file with ≥256 tokens for a prefill number

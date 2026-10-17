@@ -1,0 +1,52 @@
+=== P2 sample: OUT=.codeinsight+research/passback-phase2/raw/P2-9B/R3-auto HN=r3-auto HOME=/tmp/P2-home-r3-auto ===
+date_utc=2026-10-17T00:24:09Z
+cli_md5=3413c7bdfe10a1b79abbe63d4f3db452 daemon_md5=f6cb5fec835e6fede7bbddf28ff5b828
+model_md5=296092bf1e6a45d78c1acf815eb93366 model_bytes=5313750016
+prompt_md5=5835c71e471849b4a72e1dc8e39695e7 prompt_bytes=215
+commit=a5a87e6cdd67af97e03482423a997552de50f98f dirty=[ M crates/hipfire-dispatch/src/cpu_exec.rs; M crates/hipfire-dispatch/src/offload_split.rs;?? WATCHDOG.yml;]
+RAYON=[unset]
+HIPFIRE_OFFLOAD_EXEC=passback HIPFIRE_GPU_LAYER_BUDGET=16 HIPFIRE_OFFLOAD_PASSBACK_SHARE=[auto]
+unset-check: []
+=== power pre ===
+power1_average_uW=50000000
+power1_cap_uW=374000000
+temp_edge_mC=48000
+temp_junction_mC=49000
+temp_mem_mC=70000
+sclk_Hz=1571000000
+mclk_Hz=1258000000
+perf_level=auto
+pp_sclk_star=S: 67Mhz *
+throttle_log=0000:03:00.0: thermal throttling logging enabled, with interval 60 seconds
+vram_used_B=1876348928
+vram_total_B=17095983104
+gtt_used_B=259596288
+gpu_busy_pct=7
+mem_busy_pct=0
+host_MemAvailable_kB=5751276
+host_MemAvailable_pre_kB=5751276
+swap_used_kB_pre=18098436
+rc=1 date_utc=2026-10-17T00:24:16Z
+=== power post ===
+power1_average_uW=48000000
+power1_cap_uW=374000000
+temp_edge_mC=48000
+temp_junction_mC=49000
+temp_mem_mC=72000
+sclk_Hz=58000000
+mclk_Hz=1258000000
+perf_level=auto
+pp_sclk_star=S: 173Mhz *
+throttle_log=0000:03:00.0: thermal throttling logging enabled, with interval 60 seconds
+vram_used_B=1876365312
+vram_total_B=17095983104
+gtt_used_B=268877824
+gpu_busy_pct=6
+mem_busy_pct=0
+host_MemAvailable_kB=5681196
+host_MemAvailable_post_kB=5680832
+swap_used_kB_post=18098436
+=== daemon proof ===
+WRAP-INVOCATION daemon_md5=f6cb5fec835e6fede7bbddf28ff5b828 cli_md5=3413c7bdfe10a1b79abbe63d4f3db452
+=== loaded/kv/samples from JSON ===
+JSON-UNREADABLE: Expecting value: line 1 column 1 (char 0)

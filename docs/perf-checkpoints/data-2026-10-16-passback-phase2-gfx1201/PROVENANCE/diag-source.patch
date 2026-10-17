@@ -1,0 +1,668 @@
+diff --git a/crates/hipfire-dispatch/src/cpu_exec.rs b/crates/hipfire-dispatch/src/cpu_exec.rs
+index fe2fea0e9..a7793ac23 100644
+--- a/crates/hipfire-dispatch/src/cpu_exec.rs
++++ b/crates/hipfire-dispatch/src/cpu_exec.rs
+@@ -577,6 +577,375 @@ pub(crate) fn prepare_activation(
+     Ok((host, t0.elapsed().as_nanos() as u64))
+ }
+ 
++// ── Temporary split-phase diagnostic (`HIPFIRE_SPLIT_DIAG`) ──────────────
++//
++// Opt-in, temporary instrumentation for the pass-back split path only. It
++// partitions one split step into named intervals so the D2H read boundary, the
++// host staging/AWQ/FWHT prep, the CPU GEMV, the return host prep and the H2D
++// side can be read separately. It is not an optimization and nothing in the
++// controller or the C5 trace reads its numbers.
++//
++// Two modes, resolved once per process:
++//  * `HIPFIRE_SPLIT_DIAG=1` (default) — **host-only**. Gated host-wall timings
++//    around work the split already does; no event, no extra sync. The D2H
++//    `complete` is reported as the combined producer-wait + copy boundary, and
++//    the existing C5 GPU-arm elapsed is retained.
++//  * `HIPFIRE_SPLIT_DIAG=events` — host-only timings **plus** an extra producer
++//    `stream_synchronize` (`produce_wait`, labelled) and event stream transfer
++//    spans (`*_ev`); event create/destroy is charged to an explicit `overhead`
++//    bucket. `produce_wait` does NOT measure the baseline producer latency (the
++//    sync is taken before the enqueues, so an overlapped producer hides inside
++//    it), and the `*_ev` spans are stream transfer spans (host submit +
++//    starvation included), not physical copy time.
++//
++// Verified when off: the added cost is the cached [`split_diag_mode`] reads
++// only (no event, no extra sync, no allocation, no `Instant::now`); the
++// whole-CPU path pays none of them.
++
++/// Whether the temporary split-path phase diagnostic is armed
++/// (`HIPFIRE_SPLIT_DIAG`). Cached once per process.
++pub(crate) fn split_diag_enabled() -> bool {
++    split_diag_mode().enabled()
++}
++
++/// How the temporary split-path phase diagnostic is armed.
++#[derive(Clone, Copy, PartialEq, Eq)]
++pub(crate) enum SplitDiagMode {
++    /// Unset: no instrumentation at all.
++    Off,
++    /// `HIPFIRE_SPLIT_DIAG=1` (any value except `events`): **host-only**.
++    /// Gated host-wall timings around work the split already does — the D2H
++    /// `complete`, the staging copies, the AWQ/FWHT transforms, the return
++    /// prep and the H2D join — plus the existing C5 GPU-arm elapsed. No event,
++    /// no extra producer sync.
++    Host,
++    /// `HIPFIRE_SPLIT_DIAG=events`: host-only timings **plus** an event pair
++    /// (the D2H/H2D stream transfer spans) and one extra producer
++    /// `stream_synchronize` before the D2H enqueues. The extra sync's wall is
++    /// the `produce_wait` interval, labelled and reported separately.
++    Events,
++}
++
++impl SplitDiagMode {
++    fn enabled(self) -> bool {
++        !matches!(self, SplitDiagMode::Off)
++    }
++    fn events(self) -> bool {
++        matches!(self, SplitDiagMode::Events)
++    }
++}
++
++/// Resolve `HIPFIRE_SPLIT_DIAG` once per process: unset → [`Off`]; exactly
++/// `events` → [`Events`]; any other set value (the documented default `1`) →
++/// [`Host`]. Cached, so arming costs only the cached reads on the split path
++/// and nothing at all on the whole-CPU path.
++///
++/// [`Off`]: SplitDiagMode::Off
++/// [`Events`]: SplitDiagMode::Events
++/// [`Host`]: SplitDiagMode::Host
++pub(crate) fn split_diag_mode() -> SplitDiagMode {
++    static MODE: LazyLock<SplitDiagMode> = LazyLock::new(|| {
++        match hipfire_config::developer_var("HIPFIRE_SPLIT_DIAG") {
++            Ok(value) if value == "events" => SplitDiagMode::Events,
++            Ok(_) => SplitDiagMode::Host,
++            Err(_) => SplitDiagMode::Off,
++        }
++    });
++    *MODE
++}
++
++/// One split step's phase breakdown. Every `*_ns` host-wall field is an
++/// `Instant` interval; the `*_span_ns` fields are GPU-event *stream transfer
++/// spans* (`hipEventElapsedTime`) present only in [`SplitDiagMode::Events`],
++/// labelled `*_ev` in the print. Field-by-field definitions are the contract the
++/// diagnostic is read against:
++#[derive(Clone, Copy, Default)]
++pub(crate) struct SplitDiag {
++    /// **Events mode only.** Host wall of the *extra* `stream_synchronize`
++    /// inserted before the D2H enqueues. This interval does not exist in the
++    /// un-instrumented split, and it does NOT measure the baseline producer
++    /// latency: the sync is taken *before* the D2H enqueues, so a producer that
++    /// would otherwise have overlapped the host enqueue path finishes invisibly
++    /// inside it. Reported separately, never as the baseline critical path.
++    pub produce_wait_ns: u64,
++    /// Host wall of the existing `transfer.complete()` on the D2H — the split's
++    /// only D2H read boundary, so it combines the producer wait and the physical
++    /// copy. Available in both modes; in events mode the producer wait is pulled
++    /// out into `produce_wait_ns` and `complete` shrinks to the drained copy.
++    pub d2h_complete_ns: u64,
++    /// **Events mode only.** Stream-ordered event span between markers recorded
++    /// on the arm's stream around the D2H enqueue batch. This is the *transfer
++    /// span on the stream*, not copy-only: it includes host submit time between
++    /// the two markers and any GPU starvation before the copies run, so it is an
++    /// upper bound on the physical copy. Read only after the existing `complete`.
++    pub d2h_span_ns: u64,
++    /// Host wall of staging the pinned bytes into the vectors the CPU multiply
++    /// reads (`x.to_vec()`, plus the accumulator's `to_vec()`): host copies only,
++    /// no AWQ/FWHT.
++    pub staging_copy_ns: u64,
++    /// Host wall of the activation transforms (`divide_by_awq_scale` when the
++    /// step rotates, then `rotate_x`): the AWQ divide + FWHT.
++    pub awq_fwht_ns: u64,
++    /// Host wall of the return-side preparation before the upload: the residual
++    /// clone + `residual_add` when the step accumulates, plus the staging
++    /// `copy_from_slice` into the pinned buffer.
++    pub return_prep_ns: u64,
++    /// **Events mode only.** Stream-ordered event span between markers recorded
++    /// on the arm's stream around the H2D enqueue (a transfer span on the stream,
++    /// an upper bound on the physical copy — see `d2h_span_ns`). Recorded **only
++    /// on a sampled step**, whose completed join lets it be read without a new
++    /// sync; zero otherwise.
++    pub h2d_span_ns: u64,
++    /// Host wall of a sampled step's H2D join (`transfer.complete()`), which also
++    /// carries the GPU arm's wait. For an unsampled step the write-back is a bare
++    /// enqueue; the existing C5 `return` figure carries that wall instead.
++    pub h2d_join_ns: u64,
++    /// **Events mode only.** Host wall of creating and destroying the event pair
++    /// for this measurement — the diagnostic's own overhead, excluded from the
++    /// baseline intervals.
++    pub overhead_ns: u64,
++    /// Whether this step is a sampled step (its H2D was completed here).
++    pub sampled: bool,
++    /// Whether the extra producer sync above was taken.
++    pub extra_sync: bool,
++    /// Whether this record came from [`SplitDiagMode::Events`].
++    pub events: bool,
++}
++
++/// A two-event pair owned for exactly one measurement, created from the calling
++/// `Gpu`'s loaded runtime and destroyed on every exit path, so it can never
++/// outlive the `Gpu`/HIP context that owns its handles and never crosses a
++/// device replacement. `Drop` destroys both handles; if a marker may still be in
++/// flight (a record was made but not read) it first drains the device, and
++/// *retains* (leaks) the handles rather than destroying a live marker when even
++/// that drain fails — the same trade `rdna_compute`'s `SpanTimer` and
++/// `PinnedTransferBuffer` make. This is why the pair is not cached: a cached
++/// thread-local pair would outlive a `Gpu` (and its context) and could be reused
++/// on a different device.
++struct DiagEvents<'h> {
++    hip: &'h hip_bridge::HipRuntime,
++    start: Option<hip_bridge::Event>,
++    stop: Option<hip_bridge::Event>,
++    /// A record was made and the span was not read back: a marker may still be
++    /// in flight, so `Drop` must drain before destroying.
++    unresolved: bool,
++}
++
++impl<'h> DiagEvents<'h> {
++    fn create(hip: &'h hip_bridge::HipRuntime) -> Result<Self, DispatchError> {
++        let start = hip
++            .event_create()
++            .map_err(|e| cpu_err(&format!("diag event create: {e}")))?;
++        let stop = match hip.event_create() {
++            Ok(stop) => stop,
++            Err(error) => {
++                let _ = hip.event_destroy(start);
++                return Err(cpu_err(&format!("diag event create: {error}")));
++            }
++        };
++        Ok(DiagEvents {
++            hip,
++            start: Some(start),
++            stop: Some(stop),
++            unresolved: false,
++        })
++    }
++
++    fn record_start(&mut self, stream: Option<&hip_bridge::Stream>) -> Result<(), DispatchError> {
++        self.unresolved = true;
++        self.hip
++            .event_record(self.start.as_ref().expect("live event"), stream)
++            .map_err(|e| cpu_err(&format!("diag span start: {e}")))
++    }
++
++    fn record_stop(&mut self, stream: Option<&hip_bridge::Stream>) -> Result<(), DispatchError> {
++        self.unresolved = true;
++        self.hip
++            .event_record(self.stop.as_ref().expect("live event"), stream)
++            .map_err(|e| cpu_err(&format!("diag span stop: {e}")))
++    }
++
++    /// Nanoseconds between the markers. Never synchronizes: the caller reads it
++    /// only after the span's own stream-ordered completion was observed (the
++    /// existing D2H/H2D `complete`). A sub-resolution span reads 0.
++    fn elapsed_ns(&mut self) -> Result<u64, DispatchError> {
++        let ms = self
++            .hip
++            .event_elapsed_ms(self.start.as_ref().expect("live event"), self.stop.as_ref().expect("live event"))
++            .map_err(|e| cpu_err(&format!("diag span elapsed: {e}")))?;
++        self.unresolved = false;
++        Ok((ms as f64 * 1e6) as u64)
++    }
++
++    /// Destroy the pair now, so a caller can time the diagnostic's own overhead.
++    /// A no-op if already closed. A marker that was recorded but not read leaves
++    /// `unresolved` set; the device is drained first, and the handles are
++    /// retained (the fields are `None`) if even that drain fails.
++    fn close(&mut self) {
++        let (Some(start), Some(stop)) = (self.start.take(), self.stop.take()) else {
++            return;
++        };
++        if self.unresolved && self.hip.device_synchronize().is_err() {
++            return;
++        }
++        let _ = self.hip.event_destroy(start);
++        let _ = self.hip.event_destroy(stop);
++        self.unresolved = false;
++    }
++}
++
++impl Drop for DiagEvents<'_> {
++    fn drop(&mut self) {
++        // Fail-closed fallback for the error paths: any pair not closed by the
++        // caller is destroyed here (drain-first if unresolved).
++        self.close();
++    }
++}
++
++/// The current split step's diagnostic, handed from `cpu_arm_prepare` (which
++/// fills the read-side intervals) through `cpu_arm_finish` (which adds the
++/// return-side ones) to the pass-back's `run_with` (which reads it out). A
++/// thread-local side channel keeps every public/`pub(crate)` signature unchanged;
++/// it is single-threaded and overwritten per split step, so a step that errors
++/// before `finish` only leaves a stale value the next step's `prepare`
++/// overwrites. Only ever set when `HIPFIRE_SPLIT_DIAG` is on.
++thread_local! {
++    static SPLIT_STEP_DIAG: std::cell::RefCell<Option<SplitDiag>> =
++        const { std::cell::RefCell::new(None) };
++}
++
++fn store_split_step_diag(diag: SplitDiag) {
++    SPLIT_STEP_DIAG.with(|cell| *cell.borrow_mut() = Some(diag));
++}
++
++/// Take the split step diagnostic `cpu_arm_finish` stored for the step just
++/// executed, or the zeroed default if the diagnostic was off.
++pub(crate) fn take_split_step_diag() -> SplitDiag {
++    SPLIT_STEP_DIAG.with(|cell| cell.borrow_mut().take().unwrap_or_default())
++}
++
++/// Per-shape totals for the split phase diagnostic: sums of one split step's
++/// [`SplitDiag`] intervals plus the step's whole wall, one line per
++/// `(quant, m, k, rotated, residual, awq, sampled, events)` at its first call and
++/// every doubling. `sampled` and `events` are part of the key because the return
++/// phase and the transferred intervals differ between them.
++#[derive(Clone, Copy, Default)]
++struct SplitDiagStats {
++    calls: u64,
++    extra_sync_calls: u64,
++    produce_wait_ns: u64,
++    d2h_span_ns: u64,
++    d2h_complete_ns: u64,
++    staging_copy_ns: u64,
++    awq_fwht_ns: u64,
++    gemv_ns: u64,
++    return_prep_ns: u64,
++    h2d_span_ns: u64,
++    h2d_join_ns: u64,
++    overhead_ns: u64,
++    gpu_arm_ns: u64,
++    total_ns: u64,
++}
++
++/// `(quant, m, k, rotated, residual, awq, sampled, events)` → running totals.
++static SPLIT_DIAG: LazyLock<
++    Mutex<BTreeMap<(u8, usize, usize, bool, bool, bool, bool, bool), SplitDiagStats>>,
++> = LazyLock::new(|| Mutex::new(BTreeMap::new()));
++
++/// Print one split step's phase breakdown, aggregated per shape under
++/// `HIPFIRE_SPLIT_DIAG`. Host fields are present in both modes; the `*_ev`
++/// transfer spans, `produce_wait` and `overhead` are `events`-mode only (0 in
++/// host mode). `gemv_ns` is the already-measured CPU multiply and `total_ns` the
++/// step's whole wall; `arm_ns` is the C5 GPU-arm elapsed (sampled steps only).
++/// The `other` bucket is `total - accounted`, where the accounted intervals are
++/// the host walls plus the CPU multiply plus `overhead`; the event transfer spans
++/// and the GPU arm are excluded from it (they overlap the host walls or the CPU
++/// multiply — the D2H span is the copy the D2H `complete` already covers, and the
++/// H2D span the copy the H2D join already covers).
++#[allow(clippy::too_many_arguments)]
++pub(crate) fn split_diag_trace(
++    q: CpuQuant,
++    w: &WeightRef,
++    rotated: bool,
++    residual: bool,
++    gemv_ns: u64,
++    total_ns: u64,
++    arm_ns: u64,
++    diag: &SplitDiag,
++) {
++    let key = (
++        q as u8,
++        w.m,
++        w.k,
++        rotated,
++        residual,
++        w.awq_scale.is_some(),
++        diag.sampled,
++        diag.events,
++    );
++    let Ok(mut shapes) = SPLIT_DIAG.lock() else {
++        return;
++    };
++    let stats = shapes.entry(key).or_default();
++    stats.calls += 1;
++    if diag.extra_sync {
++        stats.extra_sync_calls += 1;
++    }
++    stats.produce_wait_ns += diag.produce_wait_ns;
++    stats.d2h_span_ns += diag.d2h_span_ns;
++    stats.d2h_complete_ns += diag.d2h_complete_ns;
++    stats.staging_copy_ns += diag.staging_copy_ns;
++    stats.awq_fwht_ns += diag.awq_fwht_ns;
++    stats.gemv_ns += gemv_ns;
++    stats.return_prep_ns += diag.return_prep_ns;
++    stats.h2d_span_ns += diag.h2d_span_ns;
++    stats.h2d_join_ns += diag.h2d_join_ns;
++    stats.overhead_ns += diag.overhead_ns;
++    stats.gpu_arm_ns += arm_ns;
++    stats.total_ns += total_ns;
++    let stats = *stats;
++    if !stats.calls.is_power_of_two() {
++        return;
++    }
++    let accounted = stats.produce_wait_ns
++        + stats.d2h_complete_ns
++        + stats.staging_copy_ns
++        + stats.awq_fwht_ns
++        + stats.gemv_ns
++        + stats.return_prep_ns
++        + stats.h2d_join_ns
++        + stats.overhead_ns;
++    let other = stats.total_ns.saturating_sub(accounted);
++    let mean_us = |ns: u64| ns as f64 / 1e3 / stats.calls as f64;
++    eprintln!(
++        "split diag: mode={} m={} k={} quant={q:?} rotated={rotated} residual={residual} \
++         awq={} sampled={} | {} calls ({} extra-sync) | mean per step us: \
++         d2h_complete(prod+copy)={:.2} staging_copy={:.2} awq_fwht={:.2} gemv={:.2} \
++         return_prep={:.2} h2d_join={:.2} gpu_arm={:.2} produce_wait_ev={:.2}[extra-sync] \
++         d2h_span_ev={:.2} h2d_span_ev={:.2} overhead_ev={:.2} other={:.2} total={:.2}",
++        if diag.events { "events" } else { "host" },
++        w.m,
++        w.k,
++        w.awq_scale.is_some(),
++        diag.sampled,
++        stats.calls,
++        stats.extra_sync_calls,
++        mean_us(stats.d2h_complete_ns),
++        mean_us(stats.staging_copy_ns),
++        mean_us(stats.awq_fwht_ns),
++        mean_us(stats.gemv_ns),
++        mean_us(stats.return_prep_ns),
++        mean_us(stats.h2d_join_ns),
++        mean_us(stats.gpu_arm_ns),
++        mean_us(stats.produce_wait_ns),
++        mean_us(stats.d2h_span_ns),
++        mean_us(stats.h2d_span_ns),
++        mean_us(stats.overhead_ns),
++        mean_us(other),
++        mean_us(stats.total_ns),
++    );
++}
++
+ /// The CPU arm of a host-executed step: every blocking device read already done
+ /// ([`cpu_arm_prepare`]), the multiply and the write-back still pending
+ /// ([`cpu_arm_finish`]).
+@@ -700,34 +1069,103 @@ fn prepare_split_read(
+     } else {
+         0
+     };
++    // When the diagnostic is off this is the only added cost: one cached check.
++    let mode = split_diag_mode();
++    let diag_on = mode.enabled();
++    let mut diag = SplitDiag::default();
++    diag.events = mode.events();
+     // Staging layout, in f32 elements: activation | AWQ scale | accumulator rows.
+     let acc_off = k + scale_len;
+-    with_cpu_transfer(gpu, acc_off + acc_len, |transfer| {
+-        download_transfer(gpu, transfer, cpu.x, 0, k)?;
+-        if let Some(scale) = scale {
+-            download_transfer(gpu, transfer, scale, k, k)?;
+-        }
+-        if let Some(acc) = cpu.residual {
+-            let acc_rows = acc.sub_offset(rows.start, rows.len());
+-            download_transfer(gpu, transfer, &acc_rows, acc_off, rows.len())?;
+-        }
+-        transfer
+-            .complete(&gpu.hip)
+-            .map_err(|e| cpu_err(&format!("D2H complete: {e}")))?;
+-        let staged = transfer_values(transfer, acc_off + acc_len);
+-        let (x, rest) = staged.split_at_mut(k);
+-        let (scale_host, acc_host) = rest.split_at_mut(scale_len);
+-        // The same two transforms `prepare_activation` applies, in the same
+-        // order, on the same bytes.
+-        let mut x_host = x.to_vec();
+-        if scale.is_some() {
+-            divide_by_awq_scale(&mut x_host, scale_host);
+-        }
+-        if cpu.rotate_input {
+-            rotate_x(&mut x_host);
+-        }
+-        Ok((x_host, cpu.residual.map(|_| acc_host.to_vec())))
+-    })
++    let staged_vectors = with_cpu_transfer(
++        gpu,
++        acc_off + acc_len,
++        |transfer| -> Result<(Vec<f32>, Option<Vec<f32>>), DispatchError> {
++            // Events mode only: an event pair for this one measurement, created
++            // from this `Gpu`'s runtime after the thread is bound to its device
++            // (so it cannot outlive the context) and destroyed on every exit
++            // path. Its create/destroy wall is charged to `overhead_ns`.
++            let mut events = if mode.events() {
++                let t_create = Instant::now();
++                let ev = DiagEvents::create(&gpu.hip)?;
++                diag.overhead_ns += t_create.elapsed().as_nanos() as u64;
++                Some(ev)
++            } else {
++                None
++            };
++            if let Some(ev) = events.as_mut() {
++                // The *extra*, labelled drain of this step's producers. It does
++                // not exist in the un-instrumented split, and it does NOT measure
++                // the baseline producer latency: a producer that would have
++                // overlapped the host enqueue path finishes invisibly inside it.
++                let t_wait = Instant::now();
++                match gpu.active_stream.as_ref() {
++                    Some(stream) => gpu.hip.stream_synchronize(stream),
++                    None => gpu.hip.stream_synchronize_default(),
++                }
++                .map_err(|e| cpu_err(&format!("diag producer drain: {e}")))?;
++                diag.produce_wait_ns = t_wait.elapsed().as_nanos() as u64;
++                diag.extra_sync = true;
++                ev.record_start(gpu.active_stream.as_ref())?;
++            }
++            download_transfer(gpu, transfer, cpu.x, 0, k)?;
++            if let Some(scale) = scale {
++                download_transfer(gpu, transfer, scale, k, k)?;
++            }
++            if let Some(acc) = cpu.residual {
++                let acc_rows = acc.sub_offset(rows.start, rows.len());
++                download_transfer(gpu, transfer, &acc_rows, acc_off, rows.len())?;
++            }
++            if let Some(ev) = events.as_mut() {
++                ev.record_stop(gpu.active_stream.as_ref())?;
++            }
++            let t_complete = if diag_on { Some(Instant::now()) } else { None };
++            transfer
++                .complete(&gpu.hip)
++                .map_err(|e| cpu_err(&format!("D2H complete: {e}")))?;
++            if let Some(t) = t_complete {
++                // The existing D2H read boundary: producer wait + copy combined
++                // (host mode), or the drained copy alone (events mode).
++                diag.d2h_complete_ns = t.elapsed().as_nanos() as u64;
++            }
++            if let Some(ev) = events.as_mut() {
++                diag.d2h_span_ns = ev.elapsed_ns()?;
++            }
++            let staged = transfer_values(transfer, acc_off + acc_len);
++            let (x, rest) = staged.split_at_mut(k);
++            let (scale_host, acc_host) = rest.split_at_mut(scale_len);
++            // The same two transforms `prepare_activation` applies, in the same
++            // order, on the same bytes — measured as host copies vs transforms.
++            let t_stage = if diag_on { Some(Instant::now()) } else { None };
++            let mut x_host = x.to_vec();
++            let acc_out = cpu.residual.map(|_| acc_host.to_vec());
++            if let Some(t) = t_stage {
++                diag.staging_copy_ns = t.elapsed().as_nanos() as u64;
++            }
++            let t_prep = if diag_on { Some(Instant::now()) } else { None };
++            if scale.is_some() {
++                divide_by_awq_scale(&mut x_host, scale_host);
++            }
++            if cpu.rotate_input {
++                rotate_x(&mut x_host);
++            }
++            if let Some(t) = t_prep {
++                diag.awq_fwht_ns = t.elapsed().as_nanos() as u64;
++            }
++            // Time the destroy on the success path; `Drop` still covers errors.
++            if let Some(mut ev) = events.take() {
++                let t_close = Instant::now();
++                ev.close();
++                diag.overhead_ns += t_close.elapsed().as_nanos() as u64;
++            }
++            Ok((x_host, acc_out))
++        },
++    )?;
++    // Hand the read-side intervals to `cpu_arm_finish`, which adds the
++    // return-side ones and stores the merged record for `run_with` to print.
++    if diag_on {
++        store_split_step_diag(diag);
++    }
++    Ok(staged_vectors)
+ }
+ 
+ /// The CPU arm's write-back: the whole-CPU route's blocking pageable upload, or
+@@ -751,13 +1189,40 @@ fn upload_arm_result(
+     values: &[f32],
+     split: bool,
+     wait: bool,
++    diag: &mut SplitDiag,
+ ) -> Result<(), DispatchError> {
+     if !split {
+         return upload_f32(gpu, target, values);
+     }
++    let mode = split_diag_mode();
++    let diag_on = mode.enabled();
+     with_cpu_transfer(gpu, values.len(), |transfer| {
++        let t_stage = if diag_on { Some(Instant::now()) } else { None };
+         transfer_values(transfer, values.len()).copy_from_slice(values);
++        if let Some(t) = t_stage {
++            diag.return_prep_ns = diag
++                .return_prep_ns
++                .saturating_add(t.elapsed().as_nanos() as u64);
++        }
++        // Events mode only, and only on a sampled step: an unsampled step returns
++        // with the H2D still queued, so a span could not be read without adding a
++        // sync, which this path must not do. Create/destroy is charged to
++        // `overhead_ns`.
++        let mut events = if mode.events() && wait {
++            let t_create = Instant::now();
++            let ev = DiagEvents::create(&gpu.hip)?;
++            diag.overhead_ns += t_create.elapsed().as_nanos() as u64;
++            Some(ev)
++        } else {
++            None
++        };
++        if let Some(ev) = events.as_mut() {
++            ev.record_start(gpu.active_stream.as_ref())?;
++        }
+         upload_transfer(gpu, transfer, target, 0, values.len())?;
++        if let Some(ev) = events.as_mut() {
++            ev.record_stop(gpu.active_stream.as_ref())?;
++        }
+         if !wait {
+             // Asynchronous return: the H2D stays queued on this stream, ordered
+             // after the GPU arm just launched and before the consumer of these
+@@ -765,14 +1230,29 @@ fn upload_arm_result(
+             // `pending` flag keeps the storage off-limits to the host until the
+             // next enqueue's `complete` drains it (same stream) or its
+             // destructor / the stream-change drain in `begin` retires it.
++            // `events` is always None here: it is created only when `wait`.
+             return Ok(());
+         }
+         // The join: the GPU arm of this step was launched on the same stream,
+         // so this waits for it exactly as the blocking pageable upload did. The
+         // arms' rows are disjoint, so nothing further is needed.
++        let t_join = if diag_on { Some(Instant::now()) } else { None };
+         transfer
+             .complete(&gpu.hip)
+-            .map_err(|e| cpu_err(&format!("H2D complete: {e}")))
++            .map_err(|e| cpu_err(&format!("H2D complete: {e}")))?;
++        if let Some(t) = t_join {
++            diag.h2d_join_ns = t.elapsed().as_nanos() as u64;
++        }
++        if let Some(ev) = events.as_mut() {
++            diag.h2d_span_ns = ev.elapsed_ns()?;
++        }
++        // Time the destroy on the success path; `Drop` still covers errors.
++        if let Some(mut ev) = events.take() {
++            let t_close = Instant::now();
++            ev.close();
++            diag.overhead_ns += t_close.elapsed().as_nanos() as u64;
++        }
++        Ok(())
+     })
+ }
+ 
+@@ -810,13 +1290,45 @@ pub(crate) fn cpu_arm_finish(
+     let t2 = Instant::now();
+     let target = arm.target.sub_offset(rows.start, rows.len());
+     let split = split_arm(&rows, arm.w.m);
++    // Only a split step the diagnostic armed at `prepare` time has a record to
++    // amend; the whole-CPU route never stores or measures one.
++    let mode = if split {
++        split_diag_mode()
++    } else {
++        SplitDiagMode::Off
++    };
++    let diag_on = mode.enabled();
++    let mut diag = if diag_on {
++        let mut d = take_split_step_diag();
++        d.sampled = wait_for_return;
++        d.events = mode.events();
++        d
++    } else {
++        SplitDiag::default()
++    };
++    let t_ret = if diag_on { Some(Instant::now()) } else { None };
+     match arm.acc_host.as_ref() {
+         Some(acc_host) => {
+             let mut acc = acc_host.clone();
+             residual_add(&mut acc, &y);
+-            upload_arm_result(gpu, &target, &acc, split, wait_for_return)?;
++            if let Some(t) = t_ret {
++                diag.return_prep_ns = diag
++                    .return_prep_ns
++                    .saturating_add(t.elapsed().as_nanos() as u64);
++            }
++            upload_arm_result(gpu, &target, &acc, split, wait_for_return, &mut diag)?;
+         }
+-        None => upload_arm_result(gpu, &target, &y, split, wait_for_return)?,
++        None => {
++            if let Some(t) = t_ret {
++                diag.return_prep_ns = diag
++                    .return_prep_ns
++                    .saturating_add(t.elapsed().as_nanos() as u64);
++            }
++            upload_arm_result(gpu, &target, &y, split, wait_for_return, &mut diag)?;
++        }
++    }
++    if diag_on {
++        store_split_step_diag(diag);
+     }
+     let h2d_ns = t2.elapsed().as_nanos() as u64;
+     Ok((gemv_ns, h2d_ns))
+diff --git a/crates/hipfire-dispatch/src/offload_split.rs b/crates/hipfire-dispatch/src/offload_split.rs
+index 1dc9857d9..f306fc0ff 100644
+--- a/crates/hipfire-dispatch/src/offload_split.rs
++++ b/crates/hipfire-dispatch/src/offload_split.rs
+@@ -1011,6 +1011,7 @@ pub fn run_with(
+         gpu.span_end().map_err(hip_err)?;
+     }
+     let (gemv_ns, h2d_ns) = cpu_exec::cpu_arm_finish(gpu, &arm, sample)?;
++    let mut arm_ns = 0u64;
+     if sample {
+         // Read only now: the completed H2D above is stream-ordered behind both
+         // markers, so both have completed and the elapsed time is this step's own
+@@ -1018,9 +1019,24 @@ pub fn run_with(
+         // path must not add (and would time a kernel still in flight), while the
+         // CPU interval the controller is handed is the multiply alone — the part
+         // that actually ran alongside the arm.
+-        let arm_ns = gpu.span_elapsed_ns().map_err(hip_err)?;
++        arm_ns = gpu.span_elapsed_ns().map_err(hip_err)?;
+         observe(key, w.m - g, g, row_bytes, gemv_ns, arm_ns);
+     }
++    // Temporary split-phase diagnostic (`HIPFIRE_SPLIT_DIAG`): one cached check
++    // when off; aggregates a line per shape on a power-of-two schedule when on.
++    if cpu_exec::split_diag_enabled() {
++        let diag = cpu_exec::take_split_step_diag();
++        cpu_exec::split_diag_trace(
++            arm.q,
++            w,
++            arm.rotate_input,
++            residual,
++            gemv_ns,
++            step_start.elapsed().as_nanos() as u64,
++            arm_ns,
++            &diag,
++        );
++    }
+     cpu_exec::finish_step(
+         arm.q,
+         w,

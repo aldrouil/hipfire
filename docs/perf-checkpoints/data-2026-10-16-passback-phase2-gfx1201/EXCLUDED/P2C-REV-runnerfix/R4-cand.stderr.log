@@ -1,0 +1,3 @@
+/tmp/P2-rev-wrap-rev9-r4c/daemon-wrap.sh: line 2: syntax error near unexpected token `daemon' while looking for matching `)'
+/tmp/P2-rev-wrap-rev9-r4c/daemon-wrap.sh: line 2: `echo "WRAP-INVOCATION daemon_md5=$(md5(daemon)) cli_md5=$(md5(cli))" >> ".codeinsight+research/passback-phase2/raw/P2C-REV-9B/R4-cand.daemonproof.log"'
+hipfire: daemon closed its output (status exit status: 2)

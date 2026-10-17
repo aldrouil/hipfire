@@ -1,0 +1,306 @@
+{
+  "protocol": "native-generate-v1",
+  "model": "/home/avery/.hipfire/models/qwen3.5-9b.mq4",
+  "loaded": {
+    "type": "loaded",
+    "arch": "qwen3_5",
+    "dim": 4096,
+    "layers": 32,
+    "vocab": 248320,
+    "vl": false,
+    "reasoning_contract": "qwen_jinja",
+    "reasoning_effort_native": false,
+    "reasoning_efforts": [
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max"
+    ],
+    "cache_capable": true,
+    "retry_reset_eligible": true,
+    "continuous_batch_capable": false,
+    "kv_backend_request": "explicit",
+    "kv_backend": "vmm",
+    "kv_backend_reason": null,
+    "kv_backend_legacy": false,
+    "kv_backend_warning": null,
+    "max_seq": 4096,
+    "max_seq_bound": "user",
+    "max_seq_reason": null,
+    "model_ctx": 262144,
+    "card_cap": 675579,
+    "kv_mode": "q8"
+  },
+  "gpu": {
+    "type": "diag",
+    "arch": "gfx1201",
+    "hip_version": "7.2",
+    "vram_free_mb": 12548,
+    "vram_total_mb": 16304,
+    "model_loaded": true,
+    "model_arch": "qwen3_5",
+    "kernels": 0,
+    "kernel_hashes": 0,
+    "kv_backend": "vmm",
+    "kv_backend_request": "explicit",
+    "kv_backend_reason": null,
+    "kv_backend_legacy": false,
+    "kv_backend_warning": null,
+    "kv_mode": "q8"
+  },
+  "vram_free_before_mb": 16180,
+  "max_seq": {
+    "effective": 4096,
+    "requested": 4096,
+    "source": "flag",
+    "run_need": null,
+    "model_limit": null
+  },
+  "max_tokens": 128,
+  "runs": 3,
+  "batch": 1,
+  "prompt_tokens": 59,
+  "prompt_md5": "5835c71e471849b4a72e1dc8e39695e7",
+  "prompt_chars": 215,
+  "warnings": [
+    "prompt is 59 tokens; prefill_tok_s at this length measures launch overhead, not prefill throughput — use --prompt-file with ≥256 tokens for a prefill number"
+  ],
+  "power_device": {
+    "card": "card1",
+    "pci": "0000:03:00.0",
+    "arch": "gfx1201",
+    "selected_by": "unfiltered: first ROCr agent of the daemon's arch",
+    "sample_period_ms": 500
+  },
+  "power": [
+    {
+      "samples": 16,
+      "duration_s": 7.27,
+      "gpu_metrics_format": "1.3",
+      "gfxclk_mhz": "unavailable",
+      "gfx_maxfreq_mhz_min": "unavailable",
+      "socket_power_w": "unavailable",
+      "gfx_power_w": "unavailable",
+      "gfx_temp_c_max": "unavailable",
+      "fclk_mhz_avg": "unavailable",
+      "throttle_pct": "unavailable",
+      "tctl_c_max": 69.6,
+      "perf_level": "auto",
+      "od_sclk": "unavailable",
+      "hwmon": {
+        "temp_c": {
+          "edge": {
+            "max": 53.0
+          },
+          "junction": {
+            "max": 63.0
+          },
+          "mem": {
+            "max": 82.0
+          }
+        },
+        "freq_mhz": {
+          "sclk": {
+            "avg": 3431.3,
+            "min": 3429.0,
+            "max": 3435.0
+          },
+          "mclk": {
+            "avg": 1258.0,
+            "min": 1258.0,
+            "max": 1258.0
+          }
+        }
+      },
+      "memory": {
+        "vram_total_mib": 16304.0,
+        "vram_used_mib": 5505.3,
+        "vram_free_mib": 10798.7,
+        "gtt_total_mib": 14831.0,
+        "gtt_used_mib": 245.6,
+        "gtt_free_mib": 14585.3,
+        "mem_total_mib": 29661.9,
+        "mem_available_mib": 17933.3
+      }
+    },
+    {
+      "samples": 16,
+      "duration_s": 7.32,
+      "gpu_metrics_format": "1.3",
+      "gfxclk_mhz": "unavailable",
+      "gfx_maxfreq_mhz_min": "unavailable",
+      "socket_power_w": "unavailable",
+      "gfx_power_w": "unavailable",
+      "gfx_temp_c_max": "unavailable",
+      "fclk_mhz_avg": "unavailable",
+      "throttle_pct": "unavailable",
+      "tctl_c_max": 71.6,
+      "perf_level": "auto",
+      "od_sclk": "unavailable",
+      "hwmon": {
+        "temp_c": {
+          "edge": {
+            "max": 53.0
+          },
+          "junction": {
+            "max": 63.0
+          },
+          "mem": {
+            "max": 76.0
+          }
+        },
+        "freq_mhz": {
+          "sclk": {
+            "avg": 3428.1,
+            "min": 3400.0,
+            "max": 3444.0
+          },
+          "mclk": {
+            "avg": 1258.0,
+            "min": 1258.0,
+            "max": 1258.0
+          }
+        }
+      },
+      "memory": {
+        "vram_total_mib": 16304.0,
+        "vram_used_mib": 5535.3,
+        "vram_free_mib": 10768.7,
+        "gtt_total_mib": 14831.0,
+        "gtt_used_mib": 245.6,
+        "gtt_free_mib": 14585.3,
+        "mem_total_mib": 29661.9,
+        "mem_available_mib": 17946.4
+      }
+    },
+    {
+      "samples": 17,
+      "duration_s": 7.63,
+      "gpu_metrics_format": "1.3",
+      "gfxclk_mhz": "unavailable",
+      "gfx_maxfreq_mhz_min": "unavailable",
+      "socket_power_w": "unavailable",
+      "gfx_power_w": "unavailable",
+      "gfx_temp_c_max": "unavailable",
+      "fclk_mhz_avg": "unavailable",
+      "throttle_pct": "unavailable",
+      "tctl_c_max": 71.5,
+      "perf_level": "auto",
+      "od_sclk": "unavailable",
+      "hwmon": {
+        "temp_c": {
+          "edge": {
+            "max": 53.0
+          },
+          "junction": {
+            "max": 63.0
+          },
+          "mem": {
+            "max": 76.0
+          }
+        },
+        "freq_mhz": {
+          "sclk": {
+            "avg": 3429.3,
+            "min": 3416.0,
+            "max": 3436.0
+          },
+          "mclk": {
+            "avg": 1258.0,
+            "min": 1258.0,
+            "max": 1258.0
+          }
+        }
+      },
+      "memory": {
+        "vram_total_mib": 16304.0,
+        "vram_used_mib": 5537.5,
+        "vram_free_mib": 10766.5,
+        "gtt_total_mib": 14831.0,
+        "gtt_used_mib": 256.5,
+        "gtt_free_mib": 14574.5,
+        "mem_total_mib": 29661.9,
+        "mem_available_mib": 17954.3
+      }
+    }
+  ],
+  "decode_tok_s": {
+    "median": 19.0,
+    "mean": 18.76666666666667,
+    "min": 18.2,
+    "max": 19.1,
+    "stdev": 0.40276819911981976
+  },
+  "prefill_tok_s": {
+    "median": 100.8,
+    "mean": 99.66666666666667,
+    "min": 97.1,
+    "max": 101.1,
+    "stdev": 1.8190351532856344
+  },
+  "wall_tok_s": {
+    "median": 17.5,
+    "mean": 17.3,
+    "min": 16.8,
+    "max": 17.6,
+    "stdev": 0.35590260840104376
+  },
+  "ttft_ms": {
+    "median": 585.6,
+    "mean": 592.2666666666667,
+    "min": 583.4,
+    "max": 607.8,
+    "stdev": 11.020385151567455
+  },
+  "spec_requested": "off",
+  "load_speculation": {
+    "mtp_mode": "off",
+    "dflash_mode": "off",
+    "dspark_mode": "off",
+    "ngram_draft": false
+  },
+  "spec_route": [
+    null,
+    null,
+    null
+  ],
+  "spec_tau": [
+    null,
+    null,
+    null
+  ],
+  "spec_mtp": [
+    null,
+    null,
+    null
+  ],
+  "samples": {
+    "decode": [
+      19.1,
+      19.0,
+      18.2
+    ],
+    "prefill": [
+      101.1,
+      100.8,
+      97.1
+    ],
+    "wall": [
+      17.6,
+      17.5,
+      16.8
+    ],
+    "ttft_ms": [
+      583.4,
+      585.6,
+      607.8
+    ]
+  },
+  "kv_backend": "vmm",
+  "kv_backend_request": "explicit",
+  "kv_backend_reason": null,
+  "kv_backend_legacy": false,
+  "kv_backend_warning": null,
+  "kv_mode": "q8"
+}

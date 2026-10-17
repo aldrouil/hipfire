@@ -1,0 +1,39 @@
+==================== serve_harness pre-flight (CONFIRM before run) ====================
+  model         : /home/avery/.hipfire/models/qwen3.5-9b.mq4
+  registry tag  : qwen3.5:9b
+  kv_mode       : auto [explicit(--kv)]   kv_backend: automatic [automatic]   mtp_mode: off   mode: chain
+  max_seq       : 4096 [explicit(--max-seq)]
+  dflash        : off   draft: (none / filename auto-match)
+  ngram         : off   ngram_k: (loader default 12)
+  mtp_ngram     : off   (off / default gate 24/48/64 when enabled)
+  speculation   : (derived from --dflash/--mtp above)
+  ds4 experts/tok: (checkpoint default)
+  ds4 placement : single
+  devices       : (runtime default)
+  expert parallel: tp=1
+  seed          : None   prompt_source: (built-in battery)
+  thinking_cap  : thinking DISABLED (sentinel cap 1) [named-budget(off)]
+  reasoning_effort: auto  (parent prompt semantics; independent of cap)
+  max_tokens     : 128 [explicit(--max-tokens)]  (no think block emitted)
+  stop          : (none)
+  sampling (what IS set):
+      temperature       = 0.0      [explicit(greedy)]
+  sampling (NOT set, serve/daemon default applies): top_p, top_k, min_p, presence_penalty, repeat_penalty, reasoning_effort
+=======================================================================================
+  [serve warm; MTP head loaded lines=0]
+  [kv_backend effective: vmm (log-marker)]
+  kv_mode_resolved=UNOBSERVED (requested auto [explicit(--kv)]; no loaded ACK or KV-cache log line seen, e.g. --no-spawn)
+### RUN qwen3.5-9b.mq4|off|chain  kv=auto sampling={'temperature': 0.0} seed=None ###
+  [code]t1  finish=length ctx=44     cached=0      gen=128  (think 0/ans 72w) prefill=13692.8ms/3.2tok/s decode=8.8tok/s tau=None !RUNAWAY | '```python\ndef merge_sorted(a, b):\n    """\n    Merge two already-sorted lists into one sort'
+  [reason]t2  finish=length ctx=229    cached=172    gen=128  (think 0/ans 76w) prefill=587.7ms/97.0tok/s decode=20.1tok/s tau=None !RUNAWAY | 'To find the total distance traveled, we calculate the distance for each segment of the tri'
+  [factual]t3  finish=stop   ctx=383    cached=44     gen=80   (think 0/ans 70w) prefill=3355.2ms/101.0tok/s decode=20.0tok/s tau=None | "The seasons on Earth are caused by the tilt of the Earth's rotational axis relative to its"
+  [prose]t4  finish=stop   ctx=497    cached=464    gen=112  (think 0/ans 89w) prefill=418.9ms/78.8tok/s decode=20.3tok/s tau=None | 'Elias tended the flickering flame as the storm battered the jagged cliffs, his eyes scanni'
+  [instruct]t5  finish=stop   ctx=641    cached=610    gen=88   (think 0/ans 63w) prefill=243.6ms/127.3tok/s decode=20.2tok/s tau=None | '1. Use meaningful variable and function names that clearly describe their purpose.\n2. Brea'
+[qwen3.5-9b.mq4|off|chain DONE] turns=5 runaway=2 empty=0 attractor=0 retrieval_miss=0 avg_prefill=81.5tok/s avg_decode=17.9tok/s
+  prompt_md5=43ca0d15712d3dfb777b51ae76d8fd5f request_md5=a8393dc2131fe54c5e2716e5f353670b step=
+  prompt_md5=640e0fd4f55996cb175a422f0a12cef5 request_md5=47a8b47b5dbae747edce231f33450711 step=
+  prompt_md5=8f66b4c97988825bd8e7840aaf44357e request_md5=9c749f5f528fe0b377ce567ae6556a57 step=
+  prompt_md5=8fe0ad36f61bcf4992cc9df81cdf3817 request_md5=4dddea9878785de64293f9d89da48bd0 step=
+  prompt_md5=8bed8e2d056dc1d47dccae9d32dbecf4 request_md5=1bba98ce6f7b6a84f322fa7abc88877e step=
+  daemon_binary_md5=f82f4fbac5155cafab41d70210ce8818 path=/home/avery/Documents/vibecoding/hipfire-special/hipfire-passback-opt/.codeinsight+research/passback-phase2/candidate-bin/daemon-rotovl
+  kv_mode_resolved=UNOBSERVED (requested auto [explicit(--kv)]; no loaded ACK or KV-cache log line seen, e.g. --no-spawn)
