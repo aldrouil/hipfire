@@ -477,14 +477,15 @@ fn dory_disposition_mq4_and_q8() {
     }
 }
 
-const MQ2G256V2: u8 = 50;
 const MQ3G256V2: u8 = 49;
 const MQ5G256V2: u8 = 48;
 const MQ6G256V2: u8 = 47;
 const MQ8G256: u8 = 14;
 
 /// Requested Dory body formats reach their wire qt while the exact-F32
-/// vectors and the Q8 embed/head holds stay put.
+/// vectors and the Q8 embed/head holds stay put. MQ2V2 is refused on Dory
+/// (catastrophic quality; covered by `dory_mq2v2_is_refused` below) so it
+/// has no row here.
 #[test]
 fn dory_requested_body_formats_reach_wire_qt() {
     let tmp = tempfile::tempdir().unwrap();
@@ -492,7 +493,6 @@ fn dory_requested_body_formats_reach_wire_qt() {
     // Explicit V2 spellings plus the already-supported mq8 body; the legacy
     // mq4 alias still means qt44 (covered by dory_disposition_mq4_and_q8).
     for (format, proj_qt) in [
-        ("mq2v2", MQ2G256V2),
         ("mq3v2", MQ3G256V2),
         ("mq4v2", MQ4G256V2),
         ("mq5v2", MQ5G256V2),
@@ -547,6 +547,37 @@ fn dory_requested_body_formats_reach_wire_qt() {
     }
 }
 
+/// Dory refuses MQ2V2 at export time (catastrophic quality on arch 19):
+/// no partial artifact is written, and the error names a supported tier.
+/// The global `--format mq2v2` allowlist is unchanged for other models.
+#[test]
+fn dory_mq2v2_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = dory(&tmp.path().join("dory-mq2v2-refused"));
+    for format in ["mq2v2", "mq2g256v2"] {
+        let out_path = tmp.path().join(format!("dory-{format}.hfq"));
+        let out = quantize(
+            &[
+                "--input",
+                input.to_str().unwrap(),
+                "--output",
+                out_path.to_str().unwrap(),
+                "--format",
+                format,
+            ],
+            &[],
+        );
+        assert_eq!(out.status.code(), Some(2), "{format}: {}", stderr(&out));
+        assert!(
+            stderr(&out).contains("mq2v2 is not supported for Dory"),
+            "{format}: {}",
+            stderr(&out)
+        );
+        assert!(stderr(&out).contains("mq3v2"), "{format}: {}", stderr(&out));
+        assert!(!out_path.exists(), "{format}: partial artifact written");
+    }
+}
+
 /// Dory XT tier keeps embed Q8 and exact-F32 vectors, but the untied head
 /// follows the body format so XT stays distinguishable from Base.
 #[test]
@@ -556,7 +587,6 @@ fn dory_xt_head_follows_body_format() {
     for (format, proj_qt) in [
         ("mq4v2", MQ4G256V2),
         ("mq3v2", MQ3G256V2),
-        ("mq2v2", MQ2G256V2),
         ("mq5v2", MQ5G256V2),
         ("mq6v2", MQ6G256V2),
         ("mq8", MQ8G256),

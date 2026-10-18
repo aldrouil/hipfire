@@ -24,7 +24,8 @@
 //! Bring-up policy: exactly ONE recurrent pass over
 //! `[n_input, n_input+n_recurrent)` (declared `n_recurrent_loops` admits 1
 //! or 2). Native BF16 weights stay BF16 on device (`gemv_bf16_xf32`);
-//! activations and KV are F32.
+//! HFQM quants ride the shared quant codecs; embeddings stay resident
+//! (BF16 verbatim / Q8 lookup). Activations and KV are F32.
 //!
 //! arch_id = 19, arch_key = "dory". See `docs/architecture-ids.md`.
 

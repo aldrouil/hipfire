@@ -29,30 +29,36 @@ impl Architecture for Dory {
         "dory"
     }
 
-    fn config_from_hfq(_hfq: &HfqFile) -> Result<Self::Config, String> {
-        Err("dory: HFQ unsupported (native BF16 safetensors dir only)".into())
+    fn config_from_hfq(hfq: &HfqFile) -> Result<Self::Config, String> {
+        if hfq.arch_id != 19 {
+            return Err(format!("dory: HFQ arch_id={} (expected 19)", hfq.arch_id));
+        }
+        // Config rides the already-open metadata JSON — parse it in place
+        // (same `config` wrapper `config_from_source` reads). No reopen,
+        // no mmap, no index materialization just to read config.
+        let meta: serde_json::Value = serde_json::from_str(&hfq.metadata_json)
+            .map_err(|e| format!("dory: HFQ metadata_json not valid JSON: {e}"))?;
+        let inner = meta
+            .get("config")
+            .ok_or_else(|| "dory: HFQ metadata_json missing `config` wrapper".to_string())?;
+        crate::dory::config_from_value(inner)
+            .map_err(|e| format!("dory: failed to parse Dory config from HFQ metadata: {e}"))
     }
 
     fn load_weights(
-        _hfq: &mut HfqFile,
-        _cfg: &Self::Config,
-        _gpu: &mut Gpu,
+        hfq: &mut HfqFile,
+        cfg: &Self::Config,
+        gpu: &mut Gpu,
     ) -> Result<Self::Weights, String> {
-        Err("dory: HFQ unsupported (native BF16 safetensors dir only)".into())
+        // The owned bridge needs the file by value (`HfqFile` is not
+        // `Clone`), so reopen the pack at its path and hand that to the
+        // shared source loader. Same bytes, same index.
+        let owned = HfqFile::open(hfq.path()).map_err(|e| format!("dory: reopen HFQ: {e:?}"))?;
+        let bridge = hipfire_runtime::hfq::HfqModelSource::from_hfq(owned);
+        crate::dory::load_weights_from_source(&bridge, cfg, gpu)
     }
 
     fn new_state(gpu: &mut Gpu, cfg: &Self::Config) -> Result<Self::State, String> {
         DoryState::new(gpu, cfg)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn dory_arch_id_and_name() {
-        assert_eq!(Dory::arch_id(), 19);
-        assert_eq!(Dory::name(), "dory");
     }
 }

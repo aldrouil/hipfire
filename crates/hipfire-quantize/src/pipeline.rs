@@ -2283,9 +2283,16 @@ pub(crate) fn run() {
     // tied + scaled by √3840 making AWQ scale saliency meaningless there.
     let is_gemma4_family = arch_id == 13 || arch_id == 22;
     // Dory (arch_id 19): dense Nemotron-Dory checkpoint. Not MoE-gated, so the
-    // dense V2 formats stay admissible; disposition is handled by the Dory
+    // dense V2 formats except MQ2V2 stay admissible (MQ2V2 refused below:
+    // catastrophic on Dory); disposition is handled by the Dory
     // branch in the main loop and `handle_main_quant`.
     let is_dory = arch_id == 19;
+    if is_dory && use_mq2g256v2 {
+        eprintln!(
+            "error: --format mq2v2 is not supported for Dory (arch_id=19): catastrophic quality; use mq3v2 or higher (mq3v2/mq4v2/mq5v2/mq6v2/mq8) or q8"
+        );
+        std::process::exit(2);
+    }
     let is_moe_like =
         is_moe || is_deepseek4 || is_lfm2moe || is_minimax || is_cohere2moe || is_gemma4;
     if (use_mq6g256v2 || use_mq5g256v2 || use_mq3g256v2 || use_mq2g256v2) && is_moe_like {

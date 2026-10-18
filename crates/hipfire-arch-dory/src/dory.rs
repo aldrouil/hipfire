@@ -16,20 +16,23 @@
 //! forward always runs exactly ONE recurrent pass over layers
 //! `[n_input, n_input + n_recurrent)`. The carrier logs this at load time.
 //!
-//! Weight residency: native BF16 bytes are uploaded verbatim and executed
-//! through `gemv_bf16_xf32` (F32 activations). No 16 GB F32 weight expansion:
-//! the full checkpoint is ~7.95 GB on disk and stays ~7.95 GB on device.
+//! Weight residency: native BF16 bytes upload verbatim and execute through
+//! `gemv_bf16_xf32` (F32 activations); HFQ packs ride their common quant
+//! codecs (`dequant_weight_raw`, Q8 embedding via `load_embedding`) with
+//! the same F32 activations. No 16 GB F32 weight expansion: the full
+//! checkpoint stays compressed on device (BF16 ~7.95 GB; quants smaller).
 //! Per-vector scales (`attn_alpha`, `mlp_alpha`, `sqk`, `s_gate`, `suv_*`,
-//! `logit_scale`) are widened BF16 → F32 once at load. Activations and the KV
-//! cache are F32 (KV F32 bring-up at modest `max_seq`).
-//!
+//! `logit_scale`) are widened BF16 → F32 once at load (native) or consumed
+//! as exact-F32 HFQ scales. Activations and the KV cache are F32 (KV F32
+//! bring-up at modest `max_seq`).
 //! Naming: local safetensors tensors are `backbone.*`; the vLLM reference
 //! packs QKV (`qkv_proj`) and gate/up (`gate_up_proj`) where the checkpoint
 //! stores split `q/k/v_proj` and `gate/up_proj`. The loader maps exact local
 //! names (never the packed names) and fails closed on any shape/dtype miss.
 
-use hipfire_runtime::llama::WeightTensor;
+use hipfire_runtime::llama::{EmbeddingFormat, WeightTensor};
 use hipfire_runtime::model_source::ModelSource;
+use hipfire_runtime::weight_backend::{dequant_weight_raw, load_embedding, MemoryTarget};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Exact BF16 bytes for one row-major `[m, k]` matrix on GPU.
@@ -70,9 +73,11 @@ fn upload_bf16_matrix(
     Ok(buf)
 }
 
-/// Widen one BF16 per-vector scale to F32, applying a host-exact transform.
-/// Admission (dtype/shape/bytes) is checked once here; `f` maps each widened
+/// Widen one per-vector scale to F32, applying a host-exact transform.
+/// Admission (dtype/shape/bytes) is checked once here; `f` maps each decoded
 /// value to what the forward consumes, so per-token work stays one `mul_f32`.
+/// Sources: native BF16 safetensors bytes, or HFQ exact-F32 scales (the
+/// quantizer widens every nGPT vector BF16 → F32 losslessly, qt=2).
 /// Plain widen (`load_vec_f32`) is for `logit_scale` (consumed raw); the
 /// scaled variants fold the reference's per-element factors at load.
 fn load_vec_f32_mapped(
@@ -85,34 +90,44 @@ fn load_vec_f32_mapped(
     let (info, data) = source
         .tensor_data(name)
         .ok_or_else(|| format!("dory: tensor not found: {name}"))?;
-    if info.dtype != "BF16" {
-        return Err(format!(
-            "dory: tensor {name} has dtype {} (expected BF16)",
-            info.dtype
-        ));
-    }
     if info.shape != vec![n] {
         return Err(format!(
             "dory: tensor {name} has shape {:?} (expected [{n}])",
             info.shape
         ));
     }
-    if data.len() != n * 2 {
+    // Native BF16 dir bytes widen exactly (BF16 = upper F32 bits); HFQ
+    // nGPT scales ride exact F32 (qt=2) and are consumed verbatim.
+    let raw: Vec<f32> = if info.dtype == "BF16" {
+        if data.len() != n * 2 {
+            return Err(format!(
+                "dory: tensor {name} has {} bytes (expected {})",
+                data.len(),
+                n * 2
+            ));
+        }
+        data.chunks_exact(2)
+            .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+            .collect()
+    } else if info.dtype == "F32" {
+        if data.len() != n * 4 {
+            return Err(format!(
+                "dory: tensor {name} has {} bytes (expected {})",
+                data.len(),
+                n * 4
+            ));
+        }
+        data.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    } else {
         return Err(format!(
-            "dory: tensor {name} has {} bytes (expected {})",
-            data.len(),
-            n * 2
+            "dory: tensor {name} has dtype {} (expected BF16 or F32)",
+            info.dtype
         ));
-    }
-    let vals: Vec<f32> = data
-        .chunks_exact(2)
-        .map(|c| {
-            f(f32::from_bits(
-                (u16::from_le_bytes([c[0], c[1]]) as u32) << 16,
-            ))
-        })
-        .collect();
-    debug_assert_eq!(vals.len(), n);
+    };
+    debug_assert_eq!(raw.len(), n);
+    let vals: Vec<f32> = raw.into_iter().map(f).collect();
     gpu.upload_f32(&vals, &[n])
         .map_err(|e| format!("dory: upload {name}: {e}"))
 }
@@ -188,6 +203,70 @@ fn load_linear_bf16(
         lloyd_lut_f16: None,
         lloyd_lut_c16: None,
     })
+}
+/// Load one `[m, k]` matrix through the shared [`dequant_weight_raw`] codec:
+/// BF16 bytes (native dir or HFQ qt16) upload verbatim (`DType::BF16`); every
+/// other HFQ quant in the Dory set rides its common passthrough (`MQ3V2`
+/// qt49, `MQ4V2` qt44, `MQ5V2` qt48, `MQ6V2` qt47, `MQ8` qt14,
+/// `Q8_0` qt3). MQ2V2 (qt50) never reaches here: the
+/// `load_weights_from_source` preflight refuses it first (catastrophic on
+/// Dory). Anything else reaches the common decoder, whose `K % 256`
+/// and payload-length guards fail closed on unlisted layouts.
+fn load_linear_common(
+    source: &dyn ModelSource,
+    gpu: &mut Gpu,
+    name: &str,
+    m: usize,
+    k: usize,
+) -> Result<WeightTensor, String> {
+    let (info, data) = source
+        .tensor_data(name)
+        .ok_or_else(|| format!("dory: tensor not found: {name}"))?;
+    if info.shape != vec![m, k] {
+        return Err(format!(
+            "dory: tensor {name} has shape {:?} (expected [{m}, {k}])",
+            info.shape
+        ));
+    }
+    // BF16 bytes upload verbatim regardless of container: native dirs and
+    // HFQ qt16 alike (qt16 payloads are BF16 bytes; only the common
+    // decoder's host path widens them — never taken here).
+    if info.dtype == "BF16" {
+        return load_linear_bf16(source, gpu, name, m, k);
+    }
+    dequant_weight_raw(gpu, info.quant_type, data, m, k, MemoryTarget::Device)
+        .map_err(|e| format!("dory: tensor {name}: {e:?}"))
+}
+
+/// Load the embedding table for an HFQ source. Tables arrive Q8 (qt=3, every
+/// shipped tier) via the shared [`load_embedding`] helper: raw upload + Q8
+/// GPU lookup, no giant dequantized float matrix. Any other codec (fixed-tier
+/// overrides, BF16 widenings) fails closed — never silently
+/// misread. Native BF16 dirs never reach here (verbatim path inline).
+fn load_embed_table(
+    source: &dyn ModelSource,
+    gpu: &mut Gpu,
+    name: &str,
+    v: usize,
+    h: usize,
+) -> Result<(GpuTensor, EmbeddingFormat), String> {
+    let (info, data) = source
+        .tensor_data(name)
+        .ok_or_else(|| format!("dory: tensor not found: {name}"))?;
+    if info.shape != vec![v, h] {
+        return Err(format!(
+            "dory: tensor {name} has shape {:?} (expected [{v}, {h}])",
+            info.shape
+        ));
+    }
+    if info.quant_type != 3 {
+        return Err(format!(
+            "dory: tensor {name} has quant_type {} (expected 3=Q8_0); non-Q8 embedding tables unsupported",
+            info.quant_type
+        ));
+    }
+    load_embedding(gpu, info.quant_type, data, v, h)
+        .map_err(|e| format!("dory: upload {name}: {e:?}"))
 }
 
 /// Dory shape constants parsed from the safetensors `config.json`.
@@ -498,28 +577,32 @@ pub fn config_from_source(source: &dyn ModelSource) -> Result<DoryConfig, String
 /// half, MLP layers the `mlp` half; the other half is `None`. Exactly one
 /// half is `Some` per layer, matching `config.is_attention[i]`.
 pub struct DoryAttnWeights {
-    pub wq: WeightTensor, // backbone.layers.{i}.mixer.q_proj.weight [4096, 2560] BF16
-    pub wk: WeightTensor, // ...k_proj.weight [1024, 2560] BF16
-    pub wv: WeightTensor, // ...v_proj.weight [1024, 2560] BF16
-    pub wo: WeightTensor, // ...o_proj.weight [2560, 4096] BF16
-    pub wg: WeightTensor, // ...g_proj.weight [4096, 2560] BF16
-    pub sqk: GpuTensor,   // ...sqk [4096] F32 (host-widened)
+    pub wq: WeightTensor,  // backbone.layers.{i}.mixer.q_proj.weight [4096, 2560]
+    pub wk: WeightTensor,  // ...k_proj.weight [1024, 2560]
+    pub wv: WeightTensor,  // ...v_proj.weight [1024, 2560]
+    pub wo: WeightTensor,  // ...o_proj.weight [2560, 4096]
+    pub wg: WeightTensor,  // ...g_proj.weight [4096, 2560]
+    pub sqk: GpuTensor,    // ...sqk [4096] F32 (host-widened)
     pub s_gate: GpuTensor, // ...s_gate [4096] F32 (host-widened)
-    pub alpha: GpuTensor, // ...attn_alpha [2560] F32 (host-widened)
+    pub alpha: GpuTensor,  // ...attn_alpha [2560] F32 (host-widened)
 }
 
 pub struct DoryMlpWeights {
-    pub w_gate: WeightTensor, // ...mixer.gate_proj.weight [7168, 2560] BF16
-    pub w_up: WeightTensor,   // ...mixer.up_proj.weight   [7168, 2560] BF16
-    pub w_down: WeightTensor, // ...mixer.down_proj.weight [2560, 7168] BF16
+    pub w_gate: WeightTensor, // ...mixer.gate_proj.weight [7168, 2560]
+    pub w_up: WeightTensor,   // ...mixer.up_proj.weight   [7168, 2560]
+    pub w_down: WeightTensor, // ...mixer.down_proj.weight [2560, 7168]
     pub suv_gate: GpuTensor,  // ...suv_gate [7168] F32
     pub suv_up: GpuTensor,    // ...suv_up   [7168] F32
     pub alpha: GpuTensor,     // ...mlp_alpha [2560] F32
 }
 
 pub struct DoryWeights {
-    pub token_embd: GpuTensor, // backbone.embeddings.weight [131072, 2560] BF16
-    pub lm_head: WeightTensor, // lm_head.weight [131072, 2560] BF16
+    pub token_embd: GpuTensor, // backbone.embeddings.weight [131072, 2560] BF16 or Q8
+    /// On-GPU embedding layout: `None` = native verbatim BF16 (forward
+    /// widens the row at use); `Some(Q8_0)` = HFQ Q8 table via
+    /// `embedding_lookup_dispatch`. No other variant is admitted.
+    pub embd_format: Option<EmbeddingFormat>,
+    pub lm_head: WeightTensor, // lm_head.weight [131072, 2560] BF16 or quant
     pub logit_scale: GpuTensor, // lm_head.logit_scale [131072] F32
     pub attn: Vec<Option<DoryAttnWeights>>,
     pub mlp: Vec<Option<DoryMlpWeights>>,
@@ -528,11 +611,13 @@ pub struct DoryWeights {
 impl DoryWeights {
     /// Release every GPU buffer. Exhaustive field-by-field frees: a future
     /// added GPU-bearing field is a compile error here, not a silent leak.
-    /// Every `WeightTensor` here owns a plain BF16 buffer (no Paro/AWQ/Lloyd
-    /// sidecars), so `free_all` frees exactly the buffer.
+    /// `WeightTensor`s own plain buffers here (BF16 verbatim or quant
+    /// passthrough — no Paro/AWQ/Lloyd sidecars), so `free_all` frees
+    /// exactly the buffer. `embd_format` is a layout tag, not an allocation.
     pub fn free_gpu(self, gpu: &mut Gpu) {
         let DoryWeights {
             token_embd,
+            embd_format: _,
             lm_head,
             logit_scale,
             attn,
@@ -660,6 +745,23 @@ pub fn load_weights_from_source(
     cfg: &DoryConfig,
     gpu: &mut Gpu,
 ) -> Result<DoryWeights, String> {
+    // MQ2V2 (qt50) preflight: refused before any GPU allocation. The
+    // quantizer no longer emits MQ2V2 Dory artifacts, but an existing
+    // arch-19 qt50 pack must fail closed with an explicit message — never
+    // fall through to the common decoder. `tensor_info` exposes the
+    // per-tensor `quant_type` on the shared trait, so the check stays in
+    // the generic `ModelSource` contract (no HFQ downcast). Only qt50 is
+    // refused; native safetensors dirs carry sentinel 0xFF (never 50) and
+    // all other quants flow unchanged to their codec arms below.
+    for name in source.tensor_names() {
+        if let Some(info) = source.tensor_info(name) {
+            if info.quant_type == 50 {
+                return Err(format!(
+                    "dory: tensor {name} has quant_type 50=MQ2V2 (unsupported on Dory: catastrophic quality); re-export with --format mq3v2 or higher"
+                ));
+            }
+        }
+    }
     let h = cfg.hidden_size;
     let v = cfg.vocab_size;
     let mut parts = LoadParts {
@@ -694,12 +796,35 @@ pub fn load_weights_from_source(
             }
         }};
     }
+    // Embeddings: native BF16 uploads verbatim (`embd_format=None`, the
+    // forward widens the row at use); HFQ tables arrive Q8 (qt=3, every
+    // shipped tier) and stay resident Q8 (`Some(Q8_0)` consumed via
+    // `embedding_lookup_dispatch`) — no giant dequantized float matrix.
+    let mut embd_format: Option<EmbeddingFormat> = None;
+    {
+        let is_bf16 = source
+            .tensor_info("backbone.embeddings.weight")
+            .map(|i| i.dtype == "BF16")
+            .unwrap_or(false);
+        if is_bf16 {
+            step!(
+                upload_bf16_matrix(source, gpu, "backbone.embeddings.weight", v, h),
+                parts.token_embd
+            );
+        } else {
+            // First load: nothing in `parts` yet, so a failure returns
+            // directly (no VRAM to reclaim).
+            match load_embed_table(source, gpu, "backbone.embeddings.weight", v, h) {
+                Ok((t, f)) => {
+                    parts.token_embd = Some(t);
+                    embd_format = Some(f);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
     step!(
-        upload_bf16_matrix(source, gpu, "backbone.embeddings.weight", v, h),
-        parts.token_embd
-    );
-    step!(
-        load_linear_bf16(source, gpu, "lm_head.weight", v, h),
+        load_linear_common(source, gpu, "lm_head.weight", v, h),
         parts.lm_head
     );
     step!(
@@ -711,7 +836,7 @@ pub fn load_weights_from_source(
             let p = format!("backbone.layers.{i}.mixer");
             let q = cfg.num_attention_heads * cfg.head_dim;
             let kv = cfg.num_key_value_heads * cfg.head_dim;
-            let wq = match load_linear_bf16(source, gpu, &format!("{p}.q_proj.weight"), q, h) {
+            let wq = match load_linear_common(source, gpu, &format!("{p}.q_proj.weight"), q, h) {
                 Ok(w) => w,
                 Err(e) => {
                     parts.abort(gpu);
@@ -725,19 +850,19 @@ pub fn load_weights_from_source(
                     return Err($e);
                 }};
             }
-            let wk = match load_linear_bf16(source, gpu, &format!("{p}.k_proj.weight"), kv, h) {
+            let wk = match load_linear_common(source, gpu, &format!("{p}.k_proj.weight"), kv, h) {
                 Ok(w) => w,
                 Err(e) => attn_fail!(e, wq.free_all(gpu);),
             };
-            let wv = match load_linear_bf16(source, gpu, &format!("{p}.v_proj.weight"), kv, h) {
+            let wv = match load_linear_common(source, gpu, &format!("{p}.v_proj.weight"), kv, h) {
                 Ok(w) => w,
                 Err(e) => attn_fail!(e, wq.free_all(gpu); wk.free_all(gpu);),
             };
-            let wo = match load_linear_bf16(source, gpu, &format!("{p}.o_proj.weight"), h, q) {
+            let wo = match load_linear_common(source, gpu, &format!("{p}.o_proj.weight"), h, q) {
                 Ok(w) => w,
                 Err(e) => attn_fail!(e, wq.free_all(gpu); wk.free_all(gpu); wv.free_all(gpu);),
             };
-            let wg = match load_linear_bf16(source, gpu, &format!("{p}.g_proj.weight"), q, h) {
+            let wg = match load_linear_common(source, gpu, &format!("{p}.g_proj.weight"), q, h) {
                 Ok(w) => w,
                 Err(e) => {
                     attn_fail!(e, wq.free_all(gpu); wk.free_all(gpu); wv.free_all(gpu); wo.free_all(gpu);)
@@ -800,20 +925,20 @@ pub fn load_weights_from_source(
                     return Err($e);
                 }};
             }
-            let w_gate = match load_linear_bf16(source, gpu, &format!("{p}.gate_proj.weight"), f, h)
-            {
-                Ok(w) => w,
-                Err(e) => mlp_fail!(e,),
-            };
-            let w_up = match load_linear_bf16(source, gpu, &format!("{p}.up_proj.weight"), f, h) {
+            let w_gate =
+                match load_linear_common(source, gpu, &format!("{p}.gate_proj.weight"), f, h) {
+                    Ok(w) => w,
+                    Err(e) => mlp_fail!(e,),
+                };
+            let w_up = match load_linear_common(source, gpu, &format!("{p}.up_proj.weight"), f, h) {
                 Ok(w) => w,
                 Err(e) => mlp_fail!(e, w_gate.free_all(gpu);),
             };
-            let w_down = match load_linear_bf16(source, gpu, &format!("{p}.down_proj.weight"), h, f)
-            {
-                Ok(w) => w,
-                Err(e) => mlp_fail!(e, w_gate.free_all(gpu); w_up.free_all(gpu);),
-            };
+            let w_down =
+                match load_linear_common(source, gpu, &format!("{p}.down_proj.weight"), h, f) {
+                    Ok(w) => w,
+                    Err(e) => mlp_fail!(e, w_gate.free_all(gpu); w_up.free_all(gpu);),
+                };
             let suv_gate = match load_vec_f32_scaled(
                 source,
                 gpu,
@@ -870,6 +995,7 @@ pub fn load_weights_from_source(
     } = parts;
     Ok(DoryWeights {
         token_embd: token_embd.expect("dory: embeddings loaded"),
+        embd_format,
         lm_head: lm_head.expect("dory: lm_head loaded"),
         logit_scale: logit_scale.expect("dory: logit_scale loaded"),
         attn,

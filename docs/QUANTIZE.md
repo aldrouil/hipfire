@@ -123,9 +123,11 @@ names. Projection matrices follow `--format`: `mq4` selects MQ4V2
 All nGPT scale vectors, including `lm_head.logit_scale`, are stored as F32
 by exact BF16 widening, not quantized or narrowed to F16.
 
-Use `mq2v2`, `mq3v2`, `mq5v2` or `mq6v2` for the other V2 body widths;
-`mq8` selects the existing qt14 format. MQ2 support is not a quality
-recommendation. `--tier xt` keeps the embedding at Q8 and lets the language
+Use `mq3v2`, `mq5v2` or `mq6v2` for the other supported V2 body widths;
+`mq8` selects the existing qt14 format. **Dory MQ2V2 export and loading
+are deliberately refused:** both default and Pro exports produced garbled
+text. Shared MQ2V2 support for other architectures is unchanged.
+`--tier xt` keeps the embedding at Q8 and lets the language
 head follow the body; `--tier base` keeps both at Q8. Dory's `--tier pro`
 also keeps every attention output (`mixer.o_proj.weight`) and MLP down
 (`mixer.down_proj.weight`) projection at Q8. Other projection matrices
@@ -140,9 +142,11 @@ hipfire quantize ./dory-bf16 --format mq6v2 --tier pro -o dory-4b.mq6v2-pro.hfq
 
 The artifact embeds config, tokenizer, chat template and generation config,
 including EOS IDs. It is self-contained rather than dependent on the source
-directory. Exporter support alone does not establish runtime or quality:
-the Dory loader must support the emitted formats before the artifact can
-generate text. The initial runtime remains single-loop.
+directory. The native Dory loader consumes the formats and tier recipes
+above directly, with resident quantized weights and F32 activations/KV.
+Execution remains one recurrent loop. Non-Q8 fixed-tier embedding tables
+are explicitly refused by the loader; the standard XT/Base/Pro recipes
+all retain Q8 embeddings.
 
 ## From GGUF (deprecated, removal in 0.5.0)
 

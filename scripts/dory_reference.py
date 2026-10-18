@@ -19,6 +19,15 @@ larger rounding envelope.
 Weight streaming: the 7.95 GB BF16 safetensors file is mmapped and each tensor
 is converted BF16->F32 on demand (exact conversion); full-model F32 residency
 (~16 GB) is never required. Peak RSS is ~2.5 GB (lm_head F32 + one layer).
+The self-contained Q8 .hfq path streams the same way: each Q8F16 tensor (34 B
+per 32 weights: f16 LE scale + 32 x int8) or each F32 tensor (qt=2)
+decodes to F32 per tensor / per embedding row, never holding a full F32
+model copy.
+
+--model accepts a BF16 safetensors dir (default) or a self-contained Dory
+.hfq file (config + tokenizer + weights; qt=3 Q8F16 group-32 matrices and
+qt=2 F32 vectors; other quant_types are rejected). Forward math is the
+same NumPy F32 path for both sources; only the weight decode differs.
 
 Layout facts (the reference Dory config.json and safetensors header):
   vocab=131072 hidden=2560 layers=72 inter=7168 heads=16 kv_heads=4 head_dim=256
@@ -33,15 +42,14 @@ Deps: numpy, safetensors (header parse only), tokenizers (prompt only).
 Usage:
   python3 scripts/dory_reference.py --selftest
       # tiny deterministic fixture: F32 fast path vs float64 reference,
-      # one attention + one MLP layer incl. rope/qk-norm/gate/slerp.
-  python3 scripts/dory_reference.py --run --prompt "..." --prefill 10 --out DIR
+      # one attention + one MLP layer incl. rope/qk-norm/gate/slerp,
+      # plus Q8F16 signed-scale and F32 bit-exactness decoder checks.
+  python3 scripts/dory_reference.py --run --model ./dory-bf16 --out DIR
       # full model: prefill S[:prefill], KV-cached decode of S[prefill:],
       # prefill-vs-decode self-consistency check, emits artifact DIR/.
-  python3 scripts/dory_reference.py --bf16twin --artifact DIR
-      # full-sequence prefill in twin mode vs the F32 artifact,
-      # records measured envelope into DIR/bf16_envelope.json
-  python3 scripts/dory_reference.py --compare NATIVE_JSON --artifact DIR
-      # compare a native dump (schema below) against the reference artifact.
+  python3 scripts/dory_reference.py --run --model dory-4b.q8.hfq --out DIR
+      # same 16-token teacher-forced run from the self-contained Q8 file
+      # (config/tokenizer from embedded HFQ metadata, no sidecar dir).
 
 Native JSON schema for --compare:
   {"tokens": [...], "logits": [[...131072 floats...], ...],
@@ -56,6 +64,7 @@ import json
 import os
 import struct
 import sys
+import tempfile
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -77,6 +86,25 @@ def bf16_to_f32(bits: np.ndarray) -> np.ndarray:
     return ((u.astype(np.uint32) << np.uint32(16)).view(np.float32)).astype(np.float32)
 
 
+def f16_to_f32(bits: np.ndarray) -> np.ndarray:
+    """Exact F16 -> F32 widening. Input uint16 array."""
+    u = np.ascontiguousarray(bits, dtype=np.uint16).astype(np.int32)
+    sign = (u >> 15) & 1
+    exp = (u >> 10) & 0x1F
+    mant = u & 0x3FF
+    fsign = np.where(sign == 1, np.float32(-1.0), np.float32(1.0))
+    out = np.empty(u.shape, dtype=np.float32)
+    norm = (exp != 0) & (exp != 31)
+    out[norm] = (fsign[norm] * (2.0 ** (exp[norm] - 15))
+                 * (1.0 + mant[norm] / np.float32(1024.0)))
+    sub = exp == 0
+    out[sub] = fsign[sub] * np.float32(2.0 ** -14) * (mant[sub] / np.float32(1024.0))
+    infnan = exp == 31
+    inf = fsign * np.float32(np.inf)
+    out[infnan] = np.where(mant[infnan] == 0, inf[infnan], np.float32(np.nan))
+    return out.astype(np.float32, copy=False)
+
+
 def f32_to_bf16_bits(x: np.ndarray) -> np.ndarray:
     """F32 -> BF16 bits, round-to-nearest-even."""
     a = np.ascontiguousarray(x, dtype=np.float32)
@@ -89,6 +117,7 @@ def f32_to_bf16_bits(x: np.ndarray) -> np.ndarray:
 def bf16_round(x: np.ndarray) -> np.ndarray:
     """Round an F32 array to BF16-representable values (twin mode)."""
     return bf16_to_f32(f32_to_bf16_bits(x))
+
 
 # ----------------------------------------------------------------------------
 # Streaming BF16 safetensors reader
@@ -150,6 +179,224 @@ class STReader:
         with open(self.path, "rb") as f:
             h.update(f.read(1 << 16))
         return h.hexdigest()[:32]
+
+# ----------------------------------------------------------------------------
+# Streaming HFQM (.hfq) reader — Q8 (qt=3) + F32 (qt=2)
+# ----------------------------------------------------------------------------
+#
+# Container layout (mirrors hipfire-runtime/src/hfq.rs `open_at_offset`):
+#   header (32 B): "HFQM" | u32 version | u32 arch_id | u32 n_tensors
+#                  | u64 metadata_offset | u64 data_offset
+#   metadata JSON at metadata_offset (brace-terminated), then tensor index:
+#   u32 count, per tensor: u16 name_len | name | u8 quant_type | u8 n_dims
+#                  | n_dims x u32 shape | u32 group_size | u64 data_size.
+#   Tensor payloads pack contiguously from data_offset in index order.
+#   When the version word carries the overlay bit (0x8000_0000), the legacy
+#   metadata is superseded by the overlay at EOF: metadata bytes +
+#   u64 len | u32 schema | 32 B sha256 | "HFQMDOV1" (52-B footer).
+# Decoders (mirrors hipfire-quantize/src/quant_q4.rs `quantize_q8f16` and
+# crates/hipfire-runtime/src/weight_backend.rs `dequantize_to_f32`):
+#   qt=3 Q8F16: 34 B per 32 weights = f16 LE scale + 32 x int8,
+#               w = f32(scale) * q. qt=2 F32: 4 B LE per weight.
+#   Any other quant_type is rejected explicitly.
+
+HFQ_OVERLAY_FLAG = 0x80000000
+HFQ_OVERLAY_MAGIC = b"HFQMDOV1"
+HFQ_OVERLAY_FOOTER_LEN = 8 + 4 + 32 + 8
+
+
+class HfqReader:
+    """Streamed Q8/F32 tensors from a self-contained Dory .hfq file."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self.file_size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            hdr = f.read(32)
+        if len(hdr) < 32 or hdr[:4] != b"HFQM":
+            raise SystemExit(f"not an HFQM container: {path}")
+        raw_ver = struct.unpack("<I", hdr[4:8])[0]
+        if raw_ver & ~HFQ_OVERLAY_FLAG != 1:
+            raise SystemExit(f"{path}: unsupported HFQM version {raw_ver & ~HFQ_OVERLAY_FLAG}")
+        self.has_overlay = bool(raw_ver & HFQ_OVERLAY_FLAG)
+        self.arch_id = struct.unpack("<I", hdr[8:12])[0]
+        n_tensors = struct.unpack("<I", hdr[12:16])[0]
+        metadata_off = struct.unpack("<Q", hdr[16:24])[0]
+        data_off = struct.unpack("<Q", hdr[24:32])[0]
+        if not (metadata_off == 32 and metadata_off <= data_off <= self.file_size):
+            raise SystemExit(f"{path}: invalid HFQ metadata/data offsets "
+                             f"{metadata_off}/{data_off} for {self.file_size}-byte file")
+        mm = np.memmap(path, dtype=np.uint8, mode="r", shape=(self.file_size,))
+        try:
+            meta_bytes = bytes(mm[metadata_off:data_off])
+            # brace-match the JSON end (metadata is followed by the index)
+            depth = 0
+            in_str = False
+            esc = False
+            json_end = 0
+            for i, b in enumerate(meta_bytes):
+                b = int(b)
+                if esc:
+                    esc = False
+                    continue
+                if b == 0x5C and in_str:  # backslash
+                    esc = True
+                    continue
+                if b == 0x22:  # quote
+                    in_str = not in_str
+                    continue
+                if not in_str:
+                    if b == 0x7B:
+                        depth += 1
+                    elif b == 0x7D:
+                        depth -= 1
+                        if depth == 0:
+                            json_end = i + 1
+                            break
+            if json_end == 0:
+                raise SystemExit(f"{path}: HFQ metadata JSON is not brace-terminated")
+            legacy_meta = meta_bytes[:json_end].decode("utf-8")
+            pos = metadata_off + json_end
+            (idx_n,) = struct.unpack("<I", bytes(mm[pos:pos + 4]))
+            if idx_n != n_tensors:
+                raise SystemExit(f"{path}: index count {idx_n} != header {n_tensors}")
+            pos += 4
+            self.tensors: Dict[str, dict] = {}
+            cum = data_off
+            for _ in range(n_tensors):
+                (nl,) = struct.unpack("<H", bytes(mm[pos:pos + 2]))
+                pos += 2
+                name = bytes(mm[pos:pos + nl]).decode("utf-8")
+                pos += nl
+                qt = int(mm[pos])
+                nd = int(mm[pos + 1])
+                pos += 2
+                shape = tuple(struct.unpack("<%dI" % nd, bytes(mm[pos:pos + 4 * nd]))) if nd else ()
+                pos += 4 * nd
+                (gs,) = struct.unpack("<I", bytes(mm[pos:pos + 4]))
+                (ds,) = struct.unpack("<Q", bytes(mm[pos + 4:pos + 12]))
+                pos += 12
+                end = cum + ds
+                if end > self.file_size:
+                    raise SystemExit(f"{path}: tensor '{name}' payload "
+                                     f"[{cum}, {end}) past {self.file_size}-byte EOF")
+                self.tensors[name] = {"quant_type": qt, "shape": shape,
+                                      "group_size": gs, "offset": cum, "size": ds}
+                cum = end
+            payload_end = cum
+            if self.has_overlay:
+                fl = self.file_size
+                if fl < HFQ_OVERLAY_FOOTER_LEN:
+                    raise SystemExit(f"{path}: metadata overlay footer truncated")
+                fs = fl - HFQ_OVERLAY_FOOTER_LEN
+                foot = bytes(mm[fs:fl])
+                (mlen,) = struct.unpack("<Q", foot[:8])
+                (schema,) = struct.unpack("<I", foot[8:12])
+                digest = foot[12:44]
+                magic = foot[44:52]
+                if schema != 1 or magic != HFQ_OVERLAY_MAGIC:
+                    raise SystemExit(f"{path}: bad metadata overlay footer "
+                                     f"(schema={schema})")
+                mstart = fs - mlen
+                if mstart < payload_end:
+                    raise SystemExit(f"{path}: overlay starts before payload end")
+                raw = bytes(mm[mstart:fs])
+                if hashlib.sha256(raw).digest() != digest:
+                    raise SystemExit(f"{path}: metadata overlay checksum mismatch")
+                self.metadata_json = raw.decode("utf-8")
+            else:
+                self.metadata_json = legacy_meta
+        finally:
+            del mm
+        self.meta = json.loads(self.metadata_json)
+        self.header_len = len(self.metadata_json.encode("utf-8"))
+        self.raw_header = self.metadata_json.encode("utf-8")
+        self._f32cache: Dict[str, np.ndarray] = {}
+
+    def _check_supported(self, name: str) -> dict:
+        e = self.tensors.get(name)
+        if e is None:
+            raise SystemExit(f"tensor not found in HFQ: {name}")
+        if e["quant_type"] not in (2, 3):
+            raise SystemExit(f"tensor '{name}': quant_type={e['quant_type']} unsupported "
+                             f"in the CPU oracle (only qt=2 F32, qt=3 Q8F16)")
+        if e["quant_type"] == 3 and e["group_size"] not in (0, 32):
+            raise SystemExit(f"tensor '{name}': Q8F16 group_size={e['group_size']} "
+                             f"(expected 32)")
+        return e
+
+
+    def _read_bytes(self, e: dict, start: int, n: int) -> np.ndarray:
+        mm = np.memmap(self.path, dtype=np.uint8, mode="r",
+                       offset=e["offset"] + start, shape=(n,))
+        out = np.asarray(mm).copy()
+        del mm
+        return out
+
+    @staticmethod
+    def _decode_q8f16(raw: np.ndarray, ne: int) -> np.ndarray:
+        """Decode whole-buffer Q8F16 (34 B blocks) to F32, row-major flat."""
+        nb = (ne + 31) // 32
+        if len(raw) < nb * 34:
+            raise SystemExit(f"Q8F16 payload short: {len(raw)} < {nb * 34}")
+        blk = np.ascontiguousarray(raw[:nb * 34]).reshape(nb, 34)
+        sbits = (blk[:, 0].astype(np.uint16)
+                 | (blk[:, 1].astype(np.uint16) << np.uint16(8)))
+        scales = f16_to_f32(sbits).astype(np.float32)
+        qs = blk[:, 2:].astype(np.int8).astype(np.float32)
+        flat = (qs * scales[:, None]).reshape(-1)[:ne]
+        return flat.astype(np.float32, copy=False)
+
+
+    def bf16_f32(self, name: str) -> np.ndarray:
+        """Load tensor dequantized to F32 (Q8F16 or F32 source)."""
+        e = self._check_supported(name)
+        shape = tuple(e["shape"])
+        ne = int(np.prod(shape)) if shape else 1
+        if name in self._f32cache:
+            return self._f32cache[name]
+        if e["quant_type"] == 2:
+            if e["size"] < ne * 4:
+                raise SystemExit(f"tensor '{name}': F32 payload short")
+            mm = np.memmap(self.path, dtype="<f4", mode="r",
+                           offset=e["offset"], shape=(ne,))
+            out = np.asarray(mm).astype(np.float32).reshape(shape)
+            del mm
+        else:
+            nb = (ne + 31) // 32
+            raw = self._read_bytes(e, 0, nb * 34)
+            out = self._decode_q8f16(raw, ne).reshape(shape)
+        if out.ndim <= 1:
+            self._f32cache[name] = out
+        return out
+
+    def row_gather_f32(self, name: str, ids: np.ndarray) -> np.ndarray:
+        """Gather rows without materializing the full matrix."""
+        e = self._check_supported(name)
+        assert len(e["shape"]) == 2
+        nrow, ncol = (int(e["shape"][0]), int(e["shape"][1]))
+        ids = np.asarray(ids, dtype=np.int64)
+        out = np.empty((len(ids), ncol), dtype=np.float32)
+        if e["quant_type"] == 2:
+            for j, r in enumerate(ids):
+                mm = np.memmap(self.path, dtype="<f4", mode="r",
+                               offset=e["offset"] + int(r) * ncol * 4, shape=(ncol,))
+                out[j] = np.asarray(mm)
+                del mm
+        else:
+            nb = (ncol + 31) // 32
+            row_bytes = nb * 34
+            for j, r in enumerate(ids):
+                raw = self._read_bytes(e, int(r) * row_bytes, row_bytes)
+                out[j] = self._decode_q8f16(raw, ncol)
+        return out
+
+    def header_fingerprint(self) -> str:
+        h = hashlib.sha256()
+        with open(self.path, "rb") as f:
+            h.update(f.read(1 << 16))
+        return h.hexdigest()[:32]
+
 
 # ----------------------------------------------------------------------------
 # Core math (mirrors upstream; all F32 unless twin mode passes bf16=True)
@@ -491,7 +738,24 @@ def run_selftest_main() -> int:
     print(f"selftest slerp  F32-vs-F64 maxabs = {ds:.3e} (tol 5e-5)")
     print(f"selftest decode-vs-prefill maxabs = {dd:.3e} (tol 1e-5)")
     ok = da < 5e-5 and dm < 5e-5 and ds < 5e-5 and dd < 1e-5
-    print("SELFTEST " + ("PASS" if ok else "FAIL"))
+    # --- Q8F16 block decoder fixture (signed int8 + f16 scale) ---
+    # one 32-group: scale = 0.5 exactly, q = [-128..-101] + zeros
+    import struct as _st
+    qvals = np.array([-128 + i if i < 28 else 0 for i in range(32)], dtype=np.int8)
+    qraw = np.empty(34, dtype=np.uint8)
+    qraw[0:2] = np.frombuffer(_st.pack("<e", np.float16(0.5)), dtype=np.uint8)
+    qraw[2:] = qvals.view(np.uint8)
+    got = HfqReader._decode_q8f16(qraw, 32)
+    want = qvals.astype(np.float32) * np.float32(0.5)
+    dq = float(np.abs(got.astype(np.float64) - want.astype(np.float64)).max())
+    print(f"selftest q8f16   signed-scale maxabs = {dq:.3e} (tol 0)")
+    ok = ok and dq == 0.0
+    # --- F32 bit-exactness fixture ---
+    fvals = np.array([1.0, -2.5, 0.0, 3.140625], dtype=np.float32)
+    back = np.frombuffer(fvals.tobytes(), dtype="<f4").astype(np.float32)
+    df = float(np.abs(back.astype(np.float64) - fvals.astype(np.float64)).max())
+    print(f"selftest f32     bits maxabs = {df:.3e} (tol 0)")
+    ok = ok and df == 0.0
     return 0 if ok else 1
 
 # ----------------------------------------------------------------------------
@@ -504,17 +768,58 @@ def encode_prompt(tokenizer_json: str, prompt: str) -> List[int]:
     return tok.encode(prompt).ids
 
 
+def encode_prompt_hfq(metadata: dict, prompt: str) -> List[int]:
+    """Encode with the tokenizer embedded in HFQ metadata (no sidecar files)."""
+    from tokenizers import Tokenizer
+    blob = metadata.get("tokenizer")
+    if not isinstance(blob, str) or not blob:
+        raise SystemExit("HFQ metadata has no embedded `tokenizer` string")
+    fd, tmppath = tempfile.mkstemp(suffix=".json")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(blob)
+        tok = Tokenizer.from_file(tmppath)
+        return tok.encode(prompt).ids
+    finally:
+        try:
+            os.unlink(tmppath)
+        except OSError:
+            pass
+
+
+def _open_source(model: str):
+    """Open a model path: .hfq file (self-contained) or BF16 safetensors dir.
+
+    Returns (cfg, reader, model_label, tokenizer_ids_fn, source_kind).
+    """
+    if os.path.isfile(model) and model.endswith(".hfq"):
+        reader = HfqReader(model)
+        meta = reader.meta
+        cfg = meta.get("config")
+        if not isinstance(cfg, dict):
+            raise SystemExit(f"{model}: HFQ metadata has no `config` object")
+        return cfg, reader, model, lambda prompt: encode_prompt_hfq(meta, prompt), "hfq"
+    cfg = json.load(open(os.path.join(model, "config.json")))
+    reader = STReader(os.path.join(model, "model.safetensors"))
+    tok_json = os.path.join(model, "tokenizer.json")
+    return cfg, reader, model, lambda prompt: encode_prompt(tok_json, prompt), "dir"
+
+
 def run_full(args) -> int:
-    model_dir = args.model
-    cfg = json.load(open(os.path.join(model_dir, "config.json")))
+    model_arg = args.model
+    cfg, reader, model_label, encode_fn, kind = _open_source(model_arg)
     assert cfg["n_recurrent_loops"] == 2, "config changed; oracle pins 1 loop explicitly"
-    reader = STReader(os.path.join(model_dir, "model.safetensors"))
-    nparams = sum(int(np.prod(v["shape"])) for k, v in reader.header.items()
-                  if k != "__metadata__")
-    print(f"tensors={len(reader.header) - ('__metadata__' in reader.header)} "
+    if kind == "dir":
+        nparams = sum(int(np.prod(v["shape"])) for k, v in reader.header.items()
+                      if k != "__metadata__")
+        ntensors = len(reader.header) - ("__metadata__" in reader.header)
+    else:
+        nparams = sum(int(np.prod(v["shape"])) for v in reader.tensors.values())
+        ntensors = len(reader.tensors)
+    print(f"tensors={ntensors} "
           f"params={nparams / 1e9:.3f}B fp={reader.header_fingerprint()} "
           f"size={reader.file_size}", flush=True)
-    toks = encode_prompt(os.path.join(model_dir, "tokenizer.json"), args.prompt)
+    toks = encode_fn(args.prompt)
     S = toks[:args.seq]
     if len(S) < args.seq:
         raise SystemExit(f"prompt encodes to {len(toks)} ids < --seq {args.seq}")
@@ -567,7 +872,8 @@ def run_full(args) -> int:
     np.save(os.path.join(out, "hidden_f32.npy"), h_full.astype(np.float32))
     manifest = {
         "source_math": SRC_ATTRIBUTION,
-        "model_dir": model_dir,
+        "model_dir": model_label,
+        "model_kind": kind,
         "config_snapshot": {k: cfg[k] for k in (
             "vocab_size", "hidden_size", "num_hidden_layers", "intermediate_size",
             "num_attention_heads", "num_key_value_heads", "head_dim",
@@ -576,8 +882,10 @@ def run_full(args) -> int:
             "initializer_range", "attention_output_gate_logit_scale_init",
             "tie_word_embeddings", "layer_types")},
         "loops_executed": 1,
-        "precision": "F32 accumulate, exact BF16->F32 weights, no activation rounding",
-        "weight_file_bytes": reader.file_size,
+        "precision": ("F32 accumulate, Q8F16/F32 dequant weights, "
+                      "no activation rounding"
+                      if kind == "hfq" else
+                      "F32 accumulate, exact BF16->F32 weights, no activation rounding"),
         "weight_file_prefix_sha256_16": reader.header_fingerprint(),
         "weight_header_sha256": hashlib.sha256(reader.raw_header).hexdigest(),
         "weight_header_bytes": reader.header_len,
@@ -618,9 +926,8 @@ def run_bf16twin(args) -> int:
     """
     art = args.artifact
     man = json.load(open(os.path.join(art, "dory_one_loop_f32.json")))
-    model_dir = man["model_dir"]
-    cfg = json.load(open(os.path.join(model_dir, "config.json")))
-    reader = STReader(os.path.join(model_dir, "model.safetensors"))
+    model_src = man["model_dir"]
+    cfg, reader, _, _, _ = _open_source(model_src)
     S = man["tokens"]
     ref = DoryRef(cfg, reader, n_loops=1, bf16=True)
     import time
@@ -729,7 +1036,9 @@ def _pkg_ver(name: str):
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Dory one-loop CPU reference oracle")
-    ap.add_argument("--model", default="./dory-bf16")
+    ap.add_argument("--model", default="./dory-bf16",
+                    help="BF16 safetensors dir or self-contained Dory .hfq "
+                         "(qt=3 Q8F16 + qt=2 F32)")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--run", action="store_true")
     ap.add_argument("--bf16twin", action="store_true")

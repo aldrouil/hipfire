@@ -5806,23 +5806,20 @@ impl Carrier for MapleCarrier {
 }
 
 // ─── DoryCarrier ───────────────────────────────────────────────────────
-// dory (arch_id 19, native BF16 safetensors Dir only). Single-loop native
-// forward: exactly one recurrent-loop pass (the arch crate logs the
-// n_recurrent_loops=2 bring-up note at load). No EP/PP/TP, no spec/MTP/
-// DFlash/drafter, no CASK/adaptive, no VMM. HFQ refused closed in the arch
-// crate; the registry claims the Dir namespace only.
+// dory (arch_id 19, native BF16 safetensors Dir + native HFQM quants).
+// Single-loop native forward: exactly one recurrent-loop pass (the arch
+// crate logs the n_recurrent_loops=2 bring-up note at load). No EP/PP/TP,
+// no spec/MTP/DFlash/drafter, no CASK/adaptive, no VMM. The arch crate
+// admits both namespaces and fails closed on anything else.
 pub struct DoryCarrier;
 impl Carrier for DoryCarrier {
     fn name(&self) -> &'static str {
         "dory"
     }
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
-        // Both namespaces route here (`derive_arch_id` emits 19 for the
-        // model_type dory / DoryForCausalLM dirs; no Dory HFQ container
-        // exists). `carrier_for` probes the HFQ namespace only, so a
-        // Dir-only claim would make the loaded model unresolvable at
-        // bench/spec time; an HFQ 19, if one ever appears, fails closed
-        // inside `load_dory_bundle`.
+        // Both namespaces route here: `derive_arch_id` emits 19 for the
+        // model_type dory / DoryForCausalLM dirs, and native HFQM packs
+        // carry arch_id 19. Anything else fails closed in `load_dory_bundle`.
         arch_id == 19
     }
     fn admit_topology(

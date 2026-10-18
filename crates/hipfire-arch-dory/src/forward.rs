@@ -38,7 +38,9 @@
 
 use crate::dory::{DoryAttnWeights, DoryConfig, DoryMlpWeights, DoryState, DoryWeights};
 use crate::spec_impl::DoryBundle;
-use hipfire_runtime::llama::{weight_gemv, WeightTensor};
+use hipfire_runtime::llama::{
+    embedding_lookup_dispatch, weight_gemv, EmbeddingFormat, WeightTensor,
+};
 use rdna_compute::{Gpu, GpuTensor};
 
 const EPS: f32 = 1e-6;
@@ -273,20 +275,39 @@ pub fn forward_token(
     let n_in = cfg.block_split.0;
     let n_rec = cfg.block_split.1;
     let n_layers = cfg.num_hidden_layers;
-    // Embedding lookup: BF16 table row → host-widen to F32 → device `h`.
-    // No single-token BF16 lookup kernel exists; the row is exactly
-    // h_dim*2 contiguous bytes, widened host-exact (BF16 = upper F32 bits).
-    {
-        let row = weights.token_embd.sub_offset(token as usize * h_dim, h_dim);
-        let bytes = hip(gpu.download_raw_bytes(&row))?;
-        debug_assert_eq!(bytes.len(), h_dim * 2);
-        let vals: Vec<f32> = bytes
-            .chunks_exact(2)
-            .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
-            .collect();
-        let hb = hip(gpu.upload_f32(&vals, &[h_dim]))?;
-        hip(gpu.copy_d2d(&hb, &st.h, h_dim * 4))?;
-        hip(gpu.free_tensor(hb))?;
+    // Embedding lookup: BF16 table rows widen host-exact (upper F32 bits);
+    // Q8 tables stay resident and dequantize on-GPU via the shared lookup
+    // dispatch. No single-token BF16 lookup kernel exists; the BF16 row is
+    // exactly h_dim*2 contiguous bytes.
+    match weights.embd_format {
+        Some(EmbeddingFormat::Q8_0) => {
+            embedding_lookup_dispatch(
+                gpu,
+                EmbeddingFormat::Q8_0,
+                &weights.token_embd,
+                &st.h,
+                token,
+                h_dim,
+            )
+            .map_err(|e| format!("dory: forward embed q8: {e:?}"))?;
+        }
+        None => {
+            let row = weights.token_embd.sub_offset(token as usize * h_dim, h_dim);
+            let bytes = hip(gpu.download_raw_bytes(&row))?;
+            debug_assert_eq!(bytes.len(), h_dim * 2);
+            let vals: Vec<f32> = bytes
+                .chunks_exact(2)
+                .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+                .collect();
+            let hb = hip(gpu.upload_f32(&vals, &[h_dim]))?;
+            hip(gpu.copy_d2d(&hb, &st.h, h_dim * 4))?;
+            hip(gpu.free_tensor(hb))?;
+        }
+        Some(other) => {
+            return Err(format!(
+                "dory: unsupported resident embedding format {other:?} (native BF16 or Q8_0 only)"
+            ));
+        }
     }
     let mut attn_cursor = 0usize;
     run_blocks(gpu, cfg, weights, st, 0..n_in, pos, &mut attn_cursor)?;
@@ -323,7 +344,7 @@ pub fn forward_token(
         st.next_pos = pos + 1;
         return Ok(None);
     }
-    // lm_head (BF16 × F32) then logits *= logit_scale / initializer_range.
+    // lm_head (BF16 or quant codec × F32) then logits *= logit_scale / initializer_range.
     gemv(gpu, &weights.lm_head, &st.h, &st.logits)?;
     hip(gpu.mul_f32(&st.logits, &weights.logit_scale, &st.logits))?;
     hip(gpu.scale_f32(&st.logits, 1.0 / cfg.initializer_range))?;

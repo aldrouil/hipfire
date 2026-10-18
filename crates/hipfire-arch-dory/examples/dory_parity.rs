@@ -4,8 +4,9 @@
 //! Dory one-loop native parity driver: teacher-forced walk over the fixed
 //! 16-token oracle sequence, dumping per-position logits + last-hidden rows.
 //!
-//! Load path: `load_dory_bundle(ModelSource::from_path(dir), &mut LoadCtx)`
-//! (native BF16 safetensors dir; F32 activations/KV on device). Stepping:
+//! Load path: `load_dory_bundle(ModelSource::from_path(path), &mut LoadCtx)`
+//! (native BF16 safetensors dir or native HFQM quant pack; F32
+//! activations/KV on device). Stepping:
 //! `forward_token(true)` on EVERY position (full 131072-wide logits each
 //! step; prefill fast-path `false` is a load-time-equivalent shortcut the
 //! driver deliberately does NOT take, so every compared row is a real lm

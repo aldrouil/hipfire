@@ -6,14 +6,15 @@
 
 ## Purpose
 
-Native BF16 loading, single-loop normalized-GPT forward, and GPU-state ownership
-for Nemotron Dory. See [`src/lib.rs`](src/lib.rs) for the execution contract.
+Native BF16 and quantized HFQM loading, single-loop normalized-GPT forward, and
+GPU-state ownership for Nemotron Dory. See [`src/lib.rs`](src/lib.rs) for the execution contract.
 
 ## Gotchas
 
 - Executes one recurrent pass regardless of the checkpoint's declared one/two-loop setting.
-- Weights remain BF16; activations and KV are F32. Size `max_seq` explicitly for available VRAM.
-- HFQ, quantized weights, speculation, and multi-GPU execution are not supported.
+- Weights retain their encoded precision; activations and KV are F32. Size `max_seq` explicitly for available VRAM.
+- HFQM admits MQ3/4/5/6V2, MQ8 and Q8. Dory MQ2V2 is deliberately refused.
+- Speculation, offload, and multi-GPU execution are not supported.
 
 ## Crate map
 
