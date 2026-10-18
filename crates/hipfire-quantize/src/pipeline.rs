@@ -2282,6 +2282,10 @@ pub(crate) fn run() {
     // (not RMSNorm-anchored) corrupts AWQ saliency for FFN; embed/lm_head are
     // tied + scaled by √3840 making AWQ scale saliency meaningless there.
     let is_gemma4_family = arch_id == 13 || arch_id == 22;
+    // Dory (arch_id 19): dense Nemotron-Dory checkpoint. Not MoE-gated, so the
+    // dense V2 formats stay admissible; disposition is handled by the Dory
+    // branch in the main loop and `handle_main_quant`.
+    let is_dory = arch_id == 19;
     let is_moe_like =
         is_moe || is_deepseek4 || is_lfm2moe || is_minimax || is_cohere2moe || is_gemma4;
     if (use_mq6g256v2 || use_mq5g256v2 || use_mq3g256v2 || use_mq2g256v2) && is_moe_like {
@@ -3470,6 +3474,57 @@ pub(crate) fn run() {
             *file_idx,
         ) {
             continue;
+        }
+        // ── Dory (arch_id 19) ingest ─────────────────────────────────────
+        // Exact nGPT per-vector scales ride F32 (BF16 widened losslessly);
+        // everything else falls through to the shared `handle_main_quant`
+        // below (embed Q8, untied head Q8, projections per --format).
+        // Fail-closed: any Dory tensor not claimed here or in the main
+        // quantizer is a bug, not a droppable row.
+        if is_dory && is_dory_exact_f32(name) {
+            let f32_data = tensor_to_f32_with_optional_fp8_scale(
+                name,
+                raw_data,
+                meta,
+                &fp8_scale_for,
+                &st_files,
+            );
+            let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
+            debug_assert_eq!(f32_data.len(), n_elements);
+            let bytes: Vec<u8> = f32_data.iter().flat_map(|&v| v.to_le_bytes()).collect();
+            eprintln!(
+                "  {:>8}: {} {:?} ({} elements, {:.1} KB -> {:.1} KB) [F32 dory scale]",
+                "F32",
+                name,
+                meta.shape,
+                n_elements,
+                raw_data.len() as f64 / 1024.0,
+                bytes.len() as f64 / 1024.0
+            );
+            hfq_tensors.push(HfqTensor {
+                name: name.to_string(),
+                quant_type: QuantType::F32,
+                shape,
+                group_size: 0,
+                data: bytes,
+                spilled_len: 0,
+            });
+            quantized_params += n_elements as u64;
+            st_files[*file_idx].drop_tensor_pages(name);
+            if let Some(s) = &mut spill {
+                spill_or_exit(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024);
+            }
+            continue;
+        }
+        // Every other Dory tensor reaching the shared quantizer must be a 2-D
+        // matrix (embed table, untied head, or a q/k/v/o/g/gate/up/down
+        // projection). Anything else is a shape the loader never admitted.
+        if is_dory && should_quantize(name) && meta.shape.len() != 2 {
+            eprintln!(
+                "error: dory: unclaimed tensor '{name}' shape {:?}; refusing partial artifact",
+                meta.shape
+            );
+            std::process::exit(2);
         }
 
         // DeepSeek V4's `tid2eid` hash-routing tables: source I64 in safetensors,
@@ -6490,9 +6545,59 @@ fn handle_main_quant(
 
         let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
 
+        // ── Dory (arch 19) disposition ─────────────────────────────────
+        // Exact nGPT scales never reach here (claimed by the loop's F32 arm).
+        // Embed stays Q8F16 on every tier (lookup-sensitive, loader-consumed
+        // as Q8). Head stays Q8F16 by default and under Base/Pro, but follows
+        // the body format under explicit --tier xt so XT stays distinguishable
+        // from Base. Distinct Dory Pro holds o_proj + down_proj at Q8F16
+        // (residual-write projections) while every other body projection
+        // follows --format. An explicit --fixed-tier dtype override still
+        // applies to any of these tensors below.
+        let is_dory = arch_id == 19;
+        if is_dory && is_dory_exact_f32(name) {
+            eprintln!("error: dory: exact-F32 scale '{name}' reached the shared quantizer; refusing partial artifact");
+            std::process::exit(2);
+        }
+        // `fixed_tier_override_applies` (not `fixed_tier_dtype_for(...)`) is
+        // the override test: an explicit `lm_head:q8` maps to no codec (Q8
+        // storage) but must still count as authored, never as XT body.
+        let dory_q8_hold = is_dory
+            && !fixed_tier_override_applies(name)
+            && (is_dory_embedding(name)
+                || (is_dory_lm_head(name) && !matches!(flags.product_tier, Some(ProductTier::Xt)))
+                || (matches!(flags.product_tier, Some(ProductTier::Pro))
+                    && (name.ends_with(".mixer.o_proj.weight")
+                        || name.ends_with(".mixer.down_proj.weight"))));
+        if dory_q8_hold {
+            let q = quantize_q8f16(&f32_data);
+            eprintln!(
+                "  {:>8}: {} {:?} ({} elements, {:.1} KB → {:.1} KB) [dory Q8 hold]",
+                "Q8_F16",
+                name,
+                meta.shape,
+                n_elements,
+                raw_data.len() as f64 / 1024.0,
+                q.len() as f64 / 1024.0
+            );
+            state.hfq_tensors.push(HfqTensor {
+                name: name.to_string(),
+                quant_type: QuantType::Q8F16,
+                shape,
+                group_size: 32,
+                data: q,
+                spilled_len: 0,
+            });
+            return;
+        }
+
         // Q8HFQ path: split-metadata per-row layout (needs M and K)
         // Exclude embeddings — they use a lookup kernel, not GEMV
-        if flags.use_q8hfq && meta.shape.len() == 2 && !name.contains("embed_tokens") {
+        if flags.use_q8hfq
+            && meta.shape.len() == 2
+            && !name.contains("embed_tokens")
+            && !is_dory_embedding(name)
+        {
             let m = meta.shape[0];
             let k = meta.shape[1];
             let (quantized, row_stride) = quantize_q8hfq(&f32_data, m, k);
@@ -6977,9 +7082,10 @@ fn handle_main_quant(
                 let this_q4k = flags.use_q4k_all || flags.use_q4k_q8embed || flags.use_mixed;
 
                 // Embeddings stored as Q8 in HFQ4 mode — Q4 is too lossy for
-                // large-dim models (9B: dim=4096, values ~0.016, Q4 step ~0.007)
-                let is_embed = name.contains("embed_tokens");
-
+                // large-dim models (9B: dim=4096, values ~0.016, Q4 step ~0.007).
+                // Dory's table is spelled `backbone.embeddings.weight`, which
+                // the `embed_tokens` substring never matches.
+                let is_embed = name.contains("embed_tokens") || is_dory_embedding(name);
                 let tier_lift = flags
                     .product_tier
                     .is_some_and(|t| q8_class_of(name).is_some_and(|cls| t.lifts(cls)))
@@ -8933,6 +9039,127 @@ mod handle_main_quant_f16_fallback_tests {
         );
         assert_eq!(hfq_tensors.len(), 1);
         assert_eq!(hfq_tensors[0].quant_type, QuantType::MQ4G256);
+    }
+
+    fn flags_for_mq4v2_dory() -> MainQuantFlags {
+        let mut flags = flags_for_mq4();
+        flags.use_mq4g256 = false;
+        flags.use_mq4v2 = true;
+        flags.arch_id = 19;
+        flags
+    }
+
+    fn run_dory(
+        name: &str,
+        dtype: &str,
+        shape: Vec<usize>,
+        raw: &[u8],
+        flags: &MainQuantFlags,
+    ) -> Vec<HfqTensor> {
+        let kmap: HashMap<String, QuantLevel> = HashMap::new();
+        let outer = MainQuantOuter {
+            kmap: &kmap,
+            hessian_dir: &None,
+        };
+        let mut hfq_tensors: Vec<HfqTensor> = Vec::new();
+        let (mut qp, mut te, mut me, mut ng) = (0u64, 0f64, 0f32, 0u64);
+        let mut spill: Option<TensorSpill> = None;
+        let n_elements: usize = shape.iter().product();
+        let mut state = MainQuantState {
+            hfq_tensors: &mut hfq_tensors,
+            quantized_params: &mut qp,
+            total_quant_error: &mut te,
+            max_quant_error: &mut me,
+            _n_quant_groups: &mut ng,
+            spill: &mut spill,
+        };
+        let ctx = PerTensorCtx {
+            name,
+            file_idx: 0,
+            n_elements,
+            arch_id: 19,
+            is_vision: false,
+        };
+        handle_main_quant(
+            &ctx,
+            &meta(dtype, shape),
+            raw,
+            flags,
+            &outer,
+            &mut state,
+            &HashMap::new(),
+            &Vec::new(),
+        );
+        hfq_tensors
+    }
+
+    /// The untied Dory head stays Q8F16 under `--format mq4` (the 4-bit head
+    /// is a quality cliff); a non-Dory checkpoint with the same spelling is
+    /// unaffected by the arch-scoped gate.
+    #[test]
+    fn dory_lm_head_holds_q8_under_mq4v2() {
+        let flags = flags_for_mq4v2_dory();
+        let shape = vec![4usize, 256];
+        let n: usize = shape.iter().product();
+        let vals: Vec<f32> = (0..n)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.01)
+            .collect();
+        let raw = f16_bytes_of(&vals);
+        let tensors = run_dory("lm_head.weight", "F16", shape.clone(), &raw, &flags);
+        assert_eq!(tensors.len(), 1);
+        assert_eq!(tensors[0].quant_type, QuantType::Q8F16);
+        assert_eq!(tensors[0].group_size, 32);
+        assert_eq!(tensors[0].shape, vec![4, 256]);
+        assert_eq!(tensors[0].data.len(), n.div_ceil(32) * 34);
+    }
+
+    /// Dory's embedding table (spelled `backbone.embeddings.weight`) holds
+    /// Q8F16 under `--format mq4v2` exactly like every `embed_tokens` table.
+    #[test]
+    fn dory_embedding_holds_q8_under_mq4v2() {
+        let flags = flags_for_mq4v2_dory();
+        let shape = vec![8usize, 256];
+        let n: usize = shape.iter().product();
+        let vals: Vec<f32> = (0..n)
+            .map(|i| ((i * 53 % 89) as f32 - 44.0) * 0.01)
+            .collect();
+        let raw = bf16_bytes_of(&vals);
+        let tensors = run_dory(
+            "backbone.embeddings.weight",
+            "BF16",
+            shape.clone(),
+            &raw,
+            &flags,
+        );
+        assert_eq!(tensors.len(), 1);
+        assert_eq!(tensors[0].quant_type, QuantType::Q8F16);
+        assert_eq!(tensors[0].group_size, 32);
+        assert_eq!(tensors[0].shape, vec![8, 256]);
+        // Q8 byte math: ceil(2048/32)*34.
+        assert_eq!(tensors[0].data.len(), n.div_ceil(32) * 34);
+    }
+
+    /// A Dory attention projection follows `--format` (MQ4G256V2, qt=44)
+    /// while the head/embed holds above hold Q8 — the matrix encoding pin.
+    #[test]
+    fn dory_projection_encodes_mq4v2() {
+        let flags = flags_for_mq4v2_dory();
+        let shape = vec![4usize, 256];
+        let n: usize = shape.iter().product();
+        let vals: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.0007).sin()).collect();
+        let raw = f16_bytes_of(&vals);
+        let tensors = run_dory(
+            "backbone.layers.0.mixer.q_proj.weight",
+            "F16",
+            shape,
+            &raw,
+            &flags,
+        );
+        assert_eq!(tensors.len(), 1);
+        assert_eq!(tensors[0].quant_type, QuantType::MQ4G256V2);
+        assert_eq!(tensors[0].group_size, 256);
+        // MQ4V2 byte math: M * (K/256) * 136.
+        assert_eq!(tensors[0].data.len(), 4 * 136);
     }
 }
 

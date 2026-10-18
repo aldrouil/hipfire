@@ -404,15 +404,17 @@ Do not inventory every key here — [CONFIG.md](CONFIG.md) owns defaults and ran
 
 | Flag | Purpose |
 |---|---|
-| `--format <fmt>` | Repeatable: `mq4`, `mq6`, `q8`, `q8f16`, `hf4`, `hf6` (`hfq4`/`hfq4g256` map to `hf4`, `hfq6`/`hfq6g256` to `hf6`). With no `--format` and no `--both` the default is **`mq4`** for safetensors input and **`hf4`** for a `.gguf` file. |
+| `--format <fmt>` | Repeatable: `mq2v2`, `mq3v2`, `mq4`/`mq4v2`, `mq5v2`, `mq6`/`mq6v2`, `mq8`, `q8`, `q8f16`, `hf4`, `hf6` (hfq aliases still normalize to `hf4`/`hf6`). `mq4` selects qt44; legacy `mq6` selects qt15, while `mq6v2` selects qt47. With no format and no `--both`, safetensors defaults to `mq4`; GGUF defaults to `hf4`. |
 | `--both` | Add `mq4` and `mq6` to the requested formats (suppresses the default format). |
+| `--tier <xt\|base\|pro>` | Forward the existing mixed-precision tier policy to `hipfire-quantize`; see [QUANTIZE.md](QUANTIZE.md). |
+| `--fixed-tier <spec>` | Forward explicit per-class codec overrides, e.g. `lm_head:mq6v2`. |
 | `-o` / `--output` | Exact output path; valid with exactly one format. |
 | `--output-dir`, `--stem` | Output directory (default: working directory) and filename stem (default: the input's file/directory name, `.gguf` removed); files are `<stem>.<format>`. |
 | `--install` | Copy into `~/.hipfire/models/`. |
 | `--register <tag>` | Local alias in `~/.hipfire/models.toml`, pointing at the `mq4` artifact when produced, else the first one. |
 | `--upload <owner/repo>`, `--create-repo` | Optional HF publish through the `hf` CLI (`--create-repo` creates the model repo first). |
 
-Supported CLI formats include `mq4`, `mq6`, `q8`/`q8f16`, `hf4`/`hf6` and hfq aliases. Graded MoE recipes need the quantizer binary directly — [QUANTIZE.md](QUANTIZE.md).
+Graded MoE recipes still need the quantizer binary directly — [QUANTIZE.md](QUANTIZE.md).
 
 ### `sidecar-gen` (summary; deprecated since 0.4.0, removal in 0.5.0)
 

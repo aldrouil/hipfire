@@ -885,8 +885,14 @@ struct QuantizeArgs {
     /// deprecated, removal in 0.5.0: GGUF→mqN is lossy double quantization; use llama.cpp for GGUF).
     input: String,
     #[arg(long = "format")]
-    /// Repeatable output format: mq4, mq6, q8, q8f16, hf4, or hf6.
+    /// Repeatable output format: mq2v2, mq3v2, mq4, mq4v2, mq5v2, mq6, mq6v2, mq8, q8, q8f16, hf4, or hf6.
     formats: Vec<String>,
+    #[arg(long, value_name = "TIER")]
+    /// Product tier (xt, base, pro) forwarded to hipfire-quantize.
+    tier: Option<String>,
+    #[arg(long, value_name = "SPEC")]
+    /// Per-class fixed-tier codec overrides forwarded to hipfire-quantize.
+    fixed_tier: Option<String>,
     #[arg(long)]
     /// Produce both MQ4 and MQ6.
     both: bool,
@@ -8957,7 +8963,10 @@ fn quantize_command(paths: &Paths, mut args: QuantizeArgs) -> Result<()> {
     }
     let mut seen = BTreeSet::new();
     args.formats.retain(|format| seen.insert(format.clone()));
-    let valid = ["mq4", "mq6", "q8", "q8f16", "hf4", "hf6"];
+    let valid = [
+        "mq2v2", "mq3v2", "mq4", "mq4v2", "mq5v2", "mq6", "mq6v2", "mq8", "q8", "q8f16", "hf4",
+        "hf6",
+    ];
     for format in &args.formats {
         if !valid.contains(&format.as_str()) {
             bail!(
@@ -8999,16 +9008,21 @@ fn quantize_command(paths: &Paths, mut args: QuantizeArgs) -> Result<()> {
             .clone()
             .unwrap_or_else(|| output_dir.join(format!("{stem}.{format}")));
         eprintln!("quantizing {input} -> {} ({format})", output.display());
-        run_checked(
-            Command::new(&quantizer)
-                .arg("--input")
-                .arg(&input)
-                .arg("--output")
-                .arg(&output)
-                .arg("--format")
-                .arg(format),
-            "hipfire-quantize",
-        )?;
+        let mut command = Command::new(&quantizer);
+        command
+            .arg("--input")
+            .arg(&input)
+            .arg("--output")
+            .arg(&output)
+            .arg("--format")
+            .arg(format);
+        if let Some(tier) = args.tier.as_deref() {
+            command.arg("--tier").arg(tier);
+        }
+        if let Some(spec) = args.fixed_tier.as_deref() {
+            command.arg("--fixed-tier").arg(spec);
+        }
+        run_checked(&mut command, "hipfire-quantize")?;
         if !output.is_file() {
             bail!(
                 "quantizer reported success but {} was not created",
@@ -18307,10 +18321,8 @@ effort = "high"
         );
         assert_eq!(on["mtp_effective"], "auto");
         // An ack with no verdict is null, never a guess.
-        let none = bench_load_speculation_effective(
-            requested,
-            &serde_json::json!({ "type": "loaded" }),
-        );
+        let none =
+            bench_load_speculation_effective(requested, &serde_json::json!({ "type": "loaded" }));
         assert_eq!(none["mtp_effective"], serde_json::Value::Null);
     }
 

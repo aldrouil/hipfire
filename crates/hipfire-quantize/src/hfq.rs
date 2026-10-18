@@ -302,8 +302,6 @@ pub(crate) fn mq6v2_promote_supported(arch_id: u32) -> bool {
     matches!(arch_id, 0 | 1 | 5 | 6 | 7 | 8)
 }
 
-
-
 /// Extract layer index from a tensor name.
 /// Handles both safetensors (`layers.{N}.`) and GGUF (`blk.{N}.`) patterns.
 /// Uses unanchored search to handle any prefix (model.layers, model.language_model.layers, etc.).
@@ -402,6 +400,7 @@ pub(crate) fn kmap_resolve_mode(
     if name.contains("embed_tokens")
         || name.contains("token_embd")
         || name.contains("lm_head")
+        || name == "backbone.embeddings.weight"
         || name.ends_with("output.weight")
     {
         return QuantLevel::Q8;
@@ -725,7 +724,6 @@ fn write_hfq_to(
     tensors: &[HfqTensor],
     spill: Option<&mut TensorSpill>,
 ) -> std::io::Result<()> {
-
     let metadata_bytes = metadata_json.as_bytes();
 
     // Calculate offsets
@@ -866,7 +864,9 @@ mod maple_dtype_tests {
             }
         }
         for (id, qt) in MQ_I4 {
-            let hits = (0u8..=255).filter(|v| QuantType::from_u8(*v) == Some(qt)).count();
+            let hits = (0u8..=255)
+                .filter(|v| QuantType::from_u8(*v) == Some(qt))
+                .count();
             assert_eq!(hits, 1, "{qt:?} (id {id}) must resolve from exactly one id");
         }
     }

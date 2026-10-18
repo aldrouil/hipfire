@@ -20,7 +20,7 @@ Weight streaming: the 7.95 GB BF16 safetensors file is mmapped and each tensor
 is converted BF16->F32 on demand (exact conversion); full-model F32 residency
 (~16 GB) is never required. Peak RSS is ~2.5 GB (lm_head F32 + one layer).
 
-Layout facts (config.json + safetensors header of /mnt/sx8200/dory):
+Layout facts (the reference Dory config.json and safetensors header):
   vocab=131072 hidden=2560 layers=72 inter=7168 heads=16 kv_heads=4 head_dim=256
   n_input=16 n_recurrent=40 n_output=16 | even layer idx = attention, odd = mlp
   sliding window=1024 (sliding layers), full layers theta=1e7, sliding theta=1e4
@@ -729,7 +729,7 @@ def _pkg_ver(name: str):
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Dory one-loop CPU reference oracle")
-    ap.add_argument("--model", default="/mnt/sx8200/dory")
+    ap.add_argument("--model", default="./dory-bf16")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--run", action="store_true")
     ap.add_argument("--bf16twin", action="store_true")

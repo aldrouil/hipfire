@@ -7,7 +7,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-
 // ─── Model Discovery ────────────────────────────────────────────────────────
 
 pub(crate) fn find_safetensors(dir: &Path) -> Vec<PathBuf> {
@@ -39,6 +38,40 @@ pub(crate) fn should_quantize(name: &str) -> bool {
         return false;
     }
     name.contains("weight")
+}
+
+/// Dory (arch 19) nGPT per-vector scales. These carry the normalized-GPT
+/// interpolation coefficients the loader folds at load time (`(v*scale).abs()`,
+/// `(v*scale)^2`, `v*scale`); F16 truncation would corrupt the fold, so the
+/// quantizer widens BF16 → F32 losslessly (qt=2) on every format.
+pub(crate) fn is_dory_exact_f32(name: &str) -> bool {
+    if name == "lm_head.logit_scale" {
+        return true;
+    }
+    if !name.starts_with("backbone.layers.") {
+        return false;
+    }
+    name.ends_with(".sqk")
+        || name.ends_with(".s_gate")
+        || name.ends_with(".suv_gate")
+        || name.ends_with(".suv_up")
+        || name.ends_with(".attn_alpha")
+        || name.ends_with(".mlp_alpha")
+}
+
+/// Dory embedding table. Lookup-sensitive like every other `embed_tokens`
+/// family, but spelled `backbone.embeddings.weight` — the generic
+/// `embed_tokens` substring never matches it, so it needs its own gate.
+pub(crate) fn is_dory_embedding(name: &str) -> bool {
+    name == "backbone.embeddings.weight"
+}
+
+/// Dory untied output head. Held at Q8F16 by default, conservatively matching
+/// the lookup table rather than applying the lower-bit body format to the
+/// vocabulary projection. Explicit `--tier` / `--fixed-tier` choices still
+/// apply; this policy is not a measured Dory quality claim.
+pub(crate) fn is_dory_lm_head(name: &str) -> bool {
+    name == "lm_head.weight"
 }
 
 pub(crate) fn is_deepseek4_keep_f16(name: &str) -> bool {
@@ -292,7 +325,6 @@ pub(crate) fn validate_env_fixed_tier_or_exit() {
     }
 }
 
-
 /// Strict parser for HIPFIRE_FIXED_TIER / --fixed-tier. Returns class->dtype map.
 pub(crate) fn parse_fixed_tier(spec: &str) -> Result<HashMap<String, String>, String> {
     validate_fixed_tier_spec(spec)?;
@@ -504,7 +536,6 @@ pub(crate) fn set_fixed_tier_cli(spec: Option<String>) {
 pub(crate) fn fixed_tier_map_cli() -> Option<HashMap<String, String>> {
     FIXED_TIER_CLI.get().cloned().flatten()
 }
-
 
 static PRODUCT_TIER_CLI: OnceLock<Option<ProductTier>> = OnceLock::new();
 
@@ -799,5 +830,56 @@ mod product_tier_tests {
         assert_eq!(ProductTier::from_flag("base"), Some(ProductTier::Base));
         assert_eq!(ProductTier::from_flag("pro"), Some(ProductTier::Pro));
         assert_eq!(ProductTier::from_flag("unknown"), None);
+    }
+}
+
+#[cfg(test)]
+mod dory_disposition_tests {
+    use super::*;
+
+    #[test]
+    fn dory_exact_scales_are_exactly_the_ngpt_vectors() {
+        for name in [
+            "lm_head.logit_scale",
+            "backbone.layers.0.mixer.sqk",
+            "backbone.layers.0.mixer.s_gate",
+            "backbone.layers.1.mixer.suv_gate",
+            "backbone.layers.1.mixer.suv_up",
+            "backbone.layers.0.attn_alpha",
+            "backbone.layers.1.mlp_alpha",
+        ] {
+            assert!(is_dory_exact_f32(name), "{name} must stay exact F32");
+        }
+        for name in [
+            "backbone.embeddings.weight",
+            "lm_head.weight",
+            "backbone.layers.0.mixer.q_proj.weight",
+            "backbone.layers.0.mixer.g_proj.weight",
+            "backbone.layers.1.mixer.gate_proj.weight",
+            "backbone.layers.1.mixer.down_proj.weight",
+            "model.embed_tokens.weight",
+            "model.layers.0.self_attn.q_proj.weight",
+        ] {
+            assert!(!is_dory_exact_f32(name), "{name} must not take the F32 arm");
+        }
+    }
+
+    #[test]
+    fn dory_embedding_and_head_gates_are_arch_scoped() {
+        assert!(is_dory_embedding("backbone.embeddings.weight"));
+        assert!(!is_dory_embedding("model.embed_tokens.weight"));
+        assert!(is_dory_lm_head("lm_head.weight"));
+        assert!(!is_dory_lm_head("model.language_model.lm_head.weight"));
+        // Dory's table must still reach the shared matrix encoder (it
+        // contains "weight"), and the head gate must not leak onto a
+        // tied-embed checkpoint whose head is an alias.
+        assert!(should_quantize("backbone.embeddings.weight"));
+        assert!(should_quantize("lm_head.weight"));
+        // The generic embed substring never sees Dory's table — this is why
+        // the arch-scoped gate exists.
+        assert!(!"backbone.embeddings.weight".contains("embed_tokens"));
+        // q8_class_of already covers both via the broad substrings.
+        assert_eq!(q8_class_of("backbone.embeddings.weight"), Some("embed"));
+        assert_eq!(q8_class_of("lm_head.weight"), Some("lm_head"));
     }
 }

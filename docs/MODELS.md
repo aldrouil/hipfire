@@ -55,7 +55,7 @@ Set `--max-seq` explicitly for available VRAM. The weights occupy about
 can exceed a 16 GB card's free memory; context is not silently reduced.
 
 ```bash
-HIPFIRE_DEVICES=gfx1201 hipfire run /mnt/sx8200/dory \
+HIPFIRE_DEVICES=gfx1201 hipfire run ./dory-bf16 \
   --max-seq 2048 --spec off -t 0 -n 256 \
   "Name the capital of France in one sentence."
 ```

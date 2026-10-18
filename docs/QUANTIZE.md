@@ -22,10 +22,11 @@ HFP4 family detail: [quant-formats/hfp4.md](quant-formats/hfp4.md).
 | `mq4v1` / `mq4g256` / `magnum` | qt 13 `MQ4G256` | 4 | FWHT | Legacy Magnum v1 only (explicit opt-in) |
 | `mq4c` | qt 45 `MQ4CG256` | 4 | FWHT | V1.5 pad geometry; `hipfire-quantize` direct |
 | `mq6` | qt 15 `MQ6G256` | 6 | FWHT | Qwen 3.5+ v1 when you can spare size for quality |
-| `mq{6,5,3,2}v2` | qt 47/48/49/50 | 6…2 | FWHT | Dense Magnum V2 ladder bodies — **`hipfire-quantize` direct** |
+| `mq{6,5,3,2}v2` | qt 47/48/49/50 | 6…2 | FWHT | Dense Magnum V2 ladder bodies |
 | `hf4` (`hfq4`, `hfq4g256`) | qt 6 | 4 | none | Dense Llama / Mistral / Gemma / older Qwen. **Default for GGUF.** |
 | `hf6` (`hfq6`, `hfq6g256`) | qt 8 | 6 | none | Dense, higher quality |
 | `q8` / `q8f16` | qt 3 | 8 | none | Reference / debug (safetensors path) |
+| `mq8` | qt 14 `MQ8G256` | 8 | FWHT | Existing rotated INT8 format; no MQ8V2 format is defined |
 | `mq3` | qt 17 | 3 | FWHT | Sub-4-bit v1 — **`hipfire-quantize` direct only** (thin CLI rejects it) |
 | `tq2` / `bq1` | qt 40 / 41 | ternary / 1 | none | Bonsai — `hipfire-quantize` direct |
 | `hfp4` / `mfp4` / E8 / Lloyd | varies | see docs | Advanced; usually via `hipfire-quantize` directly |
@@ -36,19 +37,18 @@ apply the **same** `R` to activations (`rotate_x_mq`), not an inverse. On
 Llama-style dense models MQ is correct math but adds rotate cost with little
 quality benefit — prefer HFQ.
 
-**Thin CLI allowlist** (`hipfire quantize`): still only `mq4`, `mq6`, `q8`,
-`q8f16`, and `hf4`/`hf6` aliases. **Unchanged surface** — the wrapper does not
-grow V2/`mq3`/Lloyd/HFP flags. Because the binary maps `mq4` → qt 44, a thin
-CLI `hipfire quantize … --format mq4` produces **MQ4G256V2**. **GGUF input**
-further narrows to `hf4`, `hf6`, `mq4`, `mq6`. Formats such as `mq3`,
-`mq{2,3,5,6}v2`, `mq4v1`, `mq4c`, HFP/MFP, Lloyd, Bonsai, and graded MoE need
-`hipfire-quantize` directly.
+**Thin CLI allowlist** (`hipfire quantize`): `mq2v2`, `mq3v2`, `mq4v2`,
+`mq5v2`, `mq6v2`, `mq8`, plus the existing `mq4`, `mq6`, `q8`, `q8f16`,
+`hf4` and `hf6` spellings. `mq4` selects **MQ4G256V2 (qt44)**; the existing
+`mq6` spelling remains legacy MQ6 (qt15), so use `mq6v2` for qt47.
+The wrapper also forwards `--tier` and `--fixed-tier`. **GGUF input**
+still narrows formats to `hf4`, `hf6`, `mq4`, `mq6`. Legacy `mq3`, `mq4v1`,
+`mq4c`, HFP/MFP, Lloyd, Bonsai and graded MoE need `hipfire-quantize` directly.
 
 **Not produced by the thin CLI path:** graded per-expert MoE recipes
-(`mq4p`, tiered Lloyd, imatrix/Hessian GPTQ-E8, REAP overlays), product-tier
-ladders (`--tier` / `--fixed-tier`), and research formats. Those need extra
-flags on `hipfire-quantize` directly. See the binary’s `--help` and
-QUANTIZATION.md.
+(`mq4p`, tiered Lloyd, imatrix/Hessian GPTQ-E8, REAP overlays) and research
+formats. Those need extra flags on `hipfire-quantize` directly. See the
+binary’s `--help` and QUANTIZATION.md.
 
 **MQ2V2 product rejection:** `--format mq2v2` is wire-legal and runtime-loaded,
 but dense Qwen3.8 ladder KLD rejects it as a product body. Prefer `mq3v2` and
@@ -108,6 +108,41 @@ hipfire quantize ./my-finetune/ --format mq4 -o my-finetune.mq4
 Directory needs `config.json` plus one or more `.safetensors` files. The
 quantizer accepts many architectures; inference only runs if a carrier/loader
 exists for that `arch_id` (see [architecture-ids.md](architecture-ids.md)).
+
+### Nemotron Dory
+
+```bash
+hipfire quantize ./dory-bf16 --format mq4 -o dory-4b.mq4.hfq
+hipfire quantize ./dory-bf16 --format q8 -o dory-4b.q8.hfq
+```
+
+Dory uses architecture 19 and preserves the original Hugging Face tensor
+names. Projection matrices follow `--format`: `mq4` selects MQ4V2
+(`MQ4G256V2`, qt44), not legacy MQ4 (qt13). The embedding table
+(`backbone.embeddings.weight`) and untied language head default to Q8F16.
+All nGPT scale vectors, including `lm_head.logit_scale`, are stored as F32
+by exact BF16 widening, not quantized or narrowed to F16.
+
+Use `mq2v2`, `mq3v2`, `mq5v2` or `mq6v2` for the other V2 body widths;
+`mq8` selects the existing qt14 format. MQ2 support is not a quality
+recommendation. `--tier xt` keeps the embedding at Q8 and lets the language
+head follow the body; `--tier base` keeps both at Q8. Dory's `--tier pro`
+also keeps every attention output (`mixer.o_proj.weight`) and MLP down
+(`mixer.down_proj.weight`) projection at Q8. Other projection matrices
+follow the selected body format. Explicit `--fixed-tier` choices retain
+precedence for the tensor classes they cover. These are supported recipes,
+not measured Dory quality or throughput claims.
+
+```bash
+hipfire quantize ./dory-bf16 --format mq4v2 --tier xt -o dory-4b.mq4v2-xt.hfq
+hipfire quantize ./dory-bf16 --format mq6v2 --tier pro -o dory-4b.mq6v2-pro.hfq
+```
+
+The artifact embeds config, tokenizer, chat template and generation config,
+including EOS IDs. It is self-contained rather than dependent on the source
+directory. Exporter support alone does not establish runtime or quality:
+the Dory loader must support the emitted formats before the artifact can
+generate text. The initial runtime remains single-loop.
 
 ## From GGUF (deprecated, removal in 0.5.0)
 

@@ -23,7 +23,7 @@
 //!
 //! Usage:
 //!   HIPFIRE_DEVICES=gfx1201 cargo run -p hipfire-arch-dory --features lab --example dory_parity -- \
-//!     --model /mnt/sx8200/dory --out /tmp/dory_native.json \
+//!     --model ./dory-bf16 --out ./dory-native.json \
 //!     [--artifact benchmarks/references/dory_one_loop] [--max-seq 64]
 //! Device selection: `Gpu::init()` honors HIPFIRE_DEVICES (arch selector
 //! `gfx1201` = first free card of that arch); the driver then refuses any
@@ -67,8 +67,8 @@ fn main() {
 
 fn run() -> R<()> {
     let argv: Vec<String> = std::env::args().collect();
-    let model = arg_val(&argv, "--model")?.unwrap_or_else(|| "/mnt/sx8200/dory".into());
-    let out = arg_val(&argv, "--out")?.unwrap_or_else(|| "/tmp/dory_native.json".into());
+    let model = arg_val(&argv, "--model")?.unwrap_or_else(|| "./dory-bf16".into());
+    let out = arg_val(&argv, "--out")?.unwrap_or_else(|| "./dory-native.json".into());
     let artifact = arg_val(&argv, "--artifact")?
         .unwrap_or_else(|| "benchmarks/references/dory_one_loop".into());
     let max_seq: usize = arg_val(&argv, "--max-seq")?
