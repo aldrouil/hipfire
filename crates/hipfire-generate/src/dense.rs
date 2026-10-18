@@ -6,10 +6,10 @@
 //! from `crates/hipfire-daemon/src/main.rs` (wave 5 / D3).
 //! See `lib.rs` for the layering rationale.
 
+use gemma4::emit::{GemmaEmit, GemmaThoughtRouter};
 use hipfire_arch_cohere2moe as cohere2moe;
 use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_gemma4 as gemma4;
-use gemma4::emit::{GemmaEmit, GemmaThoughtRouter};
 use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_minimax as minimax;
 use hipfire_arch_muse_glimmer as glimmer;
@@ -2273,11 +2273,7 @@ pub fn generate_gemma4(
         .as_mut()
         .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_loader::Gemma4Bundle>())
     else {
-        emit_error_with_id(
-            stdout,
-            id,
-            "gemma4 bundle missing on arch_id=13 generate",
-        );
+        emit_error_with_id(stdout, id, "gemma4 bundle missing on arch_id=13 generate");
         return;
     };
 
@@ -7740,8 +7736,361 @@ pub fn generate_qwen2(
     }
 }
 
-/// Maple-Preview generate path (arch_id=15, hipfire-arch-maple).
+/// Dory (arch_id=19, hipfire-arch-dory) single-loop native AR generate.
 ///
+/// Shaped after [`generate_qwen2`] with dory specifics:
+///
+///   1. The prompt goes through the model's own `chat_template.jinja`
+///      (Jinja, rendered with `enable_thinking`), honoring the request's
+///      `max_think_tokens`/`enable_thinking` thinking controls. There is no
+///      hand-rolled fallback: without a template we cannot reproduce the
+///      `<|im_start|>assistant<think>` generation prefix, so refuse closed.
+///   2. `forward_token` returns the full logits `Vec<f32>`; sampling runs
+///      host-side via `deepseek4::sampling::sample_token` (greedy argmax at
+///      temp<=0, seeded XorShift otherwise).
+///   3. Stop set: `bundle.eos_tok` (primary 11 `<|im_end|>`) UNION
+///      single-token ids of `["<|im_end|>", "</s>"]`, so config
+///      `eos_token_id=[2,11]` stops on either token.
+///   4. KV: per-layer sliding window of 1024 rows (arch crate slices K/V
+///      sub-views at long positions); fail closed before prefill when
+///      `prompt + max_tokens` exceeds the bundle's `max_seq` (no
+///      eviction, no prefix reuse — cold reset every turn, stateless).
+///   5. No spec/MTP/DFlash/drafter, no grammar/tool parsing (tools refused
+///      above by `supports_tools`), no repeat penalty, no multi-GPU.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_dory(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    temp: f32,
+    top_p: f32,
+    top_k: Option<u32>,
+    max_tokens: usize,
+    max_think_tokens: usize,
+    enable_thinking: bool,
+    request_seed: u32,
+) {
+    use hipfire_runtime::prompt_frame::JinjaChatFrame;
+    if m.tokenizer.is_none() {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            "tokenizer not loaded",
+            "validation",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return;
+    }
+    // Phase 1 — immutable borrows only. Everything leaving this block is
+    // owned, so the mutable prefill/decode phases below never alias it.
+    // (A held `&m.tokenizer` across `m.dory_mut()` / rollback calls does not
+    // compile: the accessor and the rollback take `&mut *m`.)
+    let (stop_set, template, cap) = {
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        let bundle = match m.dory() {
+            Some(b) => b,
+            _ => {
+                emit_active_attempt_error(
+                    stdout,
+                    Some(id),
+                    "dory state missing on arch_id=19 generate",
+                    "validation",
+                    false,
+                    false,
+                );
+                let _ = stdout.flush();
+                return;
+            }
+        };
+        // Stop set: bundle primary UNION single-token surface forms, so both
+        // generation_config ids (2 `</s>`, 11 `<|im_end|>`) terminate the turn.
+        let mut stop_set = vec![bundle.eos_tok];
+        for name in ["<|im_end|>", "</s>"] {
+            if let Some(tok) = tokenizer.special_token_id(name).or_else(|| {
+                let ids = tokenizer.encode(name);
+                (ids.len() == 1).then(|| ids[0])
+            }) {
+                if !stop_set.contains(&tok) {
+                    stop_set.push(tok);
+                }
+            }
+        }
+        // Template is mandatory (see fn doc): without it the generation prefix
+        // cannot be reproduced, and a bare encode would run off-distribution.
+        let Some(template) = m.chat_template.clone() else {
+            emit_active_attempt_error(
+                stdout,
+                Some(id),
+                "dory: no chat template loaded — the model directory must contain chat_template.jinja or a tokenizer_config.json chat_template",
+                "validation",
+                false,
+                false,
+            );
+            let _ = stdout.flush();
+            return;
+        };
+        (stop_set, template, bundle.state.max_seq)
+    };
+    // Prompt render — immutable borrows only; `prompt_ids` is owned.
+    let prompt_ids: Vec<u32> = {
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        let frame = JinjaChatFrame {
+            tokenizer,
+            template: &template,
+            system: system_prompt,
+            user: prompt,
+            enable_thinking: max_think_tokens != 1 && enable_thinking,
+            bos_token: None,
+            reasoning_strength: None,
+            reasoning_effort: None,
+        };
+        if messages_history.is_some() {
+            let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
+            let messages_slice: &[hipfire_runtime::prompt_frame::Message] = match messages_history {
+                Some(h) if !h.is_empty() => h,
+                _ => {
+                    let mut v = Vec::new();
+                    if let Some(sys) = system_prompt {
+                        v.push(hipfire_runtime::prompt_frame::Message {
+                            role: hipfire_runtime::prompt_frame::Role::System,
+                            content: sys.to_string(),
+                            reasoning_content: None,
+                            name: None,
+                            rendered_name: None,
+                            tool_calls: Vec::new(),
+                            tool_call_id: None,
+                            tool_plan: String::new(),
+                        });
+                    }
+                    v.push(hipfire_runtime::prompt_frame::Message {
+                        role: hipfire_runtime::prompt_frame::Role::User,
+                        content: prompt.to_string(),
+                        reasoning_content: None,
+                        name: None,
+                        rendered_name: None,
+                        tool_calls: Vec::new(),
+                        tool_call_id: None,
+                        tool_plan: String::new(),
+                    });
+                    synthesized = v;
+                    &synthesized
+                }
+            };
+            match frame.render_messages(messages_slice, None, None) {
+                Ok(rendered) => tokenizer.encode(&rendered),
+                Err(e) => {
+                    emit_active_attempt_error(
+                        stdout,
+                        Some(id),
+                        &format!("dory jinja render failed: {e}"),
+                        "validation",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                    return;
+                }
+            }
+        } else {
+            match frame.render() {
+                Ok(rendered) => tokenizer.encode(&rendered),
+                Err(e) => {
+                    emit_active_attempt_error(
+                        stdout,
+                        Some(id),
+                        &format!("dory jinja render failed: {e}"),
+                        "validation",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                    return;
+                }
+            }
+        }
+    };
+    if prompt_ids.is_empty() {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            "empty prompt after tokenize",
+            "validation",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return;
+    }
+    // Capacity guard: `cap` is the bundle max_seq snapshotted in phase 1.
+    // A turn that does not fit refuses cleanly instead of failing mid-stream.
+    let max_tokens = crate::common::fit_max_tokens(max_tokens, prompt_ids.len(), cap);
+    if prompt_ids.len().saturating_add(max_tokens) > cap {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            &format!("prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq", prompt_ids.len(), max_tokens, cap),
+            "context_length",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return;
+    }
+    crate::ar::emit_generation_start(
+        crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::DoryAr),
+        stdout,
+        id,
+        false,
+    );
+    // Cold reset AFTER gen_start (gen_start must precede all GPU work that
+    // could fail): stateless single-loop forward, no prefix reuse.
+    {
+        let b = match m.dory_mut() {
+            Some(b) => b,
+            _ => {
+                emit_active_attempt_error(
+                    stdout,
+                    Some(id),
+                    "dory state missing on arch_id=19 generate",
+                    "validation",
+                    false,
+                    false,
+                );
+                let _ = stdout.flush();
+                return;
+            }
+        };
+        b.state.next_pos = 0;
+    }
+    m.seq_pos = 0;
+    m.conversation_tokens.clear();
+    let t0 = Instant::now();
+    // Prefill: all-but-last token with compute_logits=false (identical KV
+    // path, no lm-head work), last token with logits for the first sample.
+    let mut last_logits: Vec<f32> = Vec::new();
+    {
+        let b = m.dory_mut().unwrap();
+        let len = prompt_ids.len();
+        for (i, &tok) in prompt_ids.iter().enumerate() {
+            if check_abort(id) {
+                let ep = production_fail_closed_rollback(m, gpu, None, None);
+                emit_spec_cancel_after_rollback(stdout, id, 0, &ep);
+                return;
+            }
+            match hipfire_arch_dory::forward_token(gpu, b, tok, i + 1 == len) {
+                Ok(Some(logits)) => last_logits = logits,
+                Ok(None) => {}
+                Err(e) => {
+                    dense_fail_closed_error(
+                        m,
+                        gpu,
+                        stdout,
+                        id,
+                        &format!("dory prefill failed: {e}"),
+                    );
+                    return;
+                }
+            }
+        }
+    }
+    for &tok in &prompt_ids {
+        m.conversation_tokens.push(tok);
+    }
+    let prefill_ms = t0.elapsed().as_millis();
+    if take_generation_fault_after_prefill() {
+        dense_fail_closed_error(m, gpu, stdout, id, "injected fault after prefill");
+        return;
+    }
+    let mut rng = deepseek4::sampling::Xorshift::new(request_seed as u64);
+    let top_k = top_k.unwrap_or(0) as usize;
+    let mut generated_count: usize = 0;
+    let decode_t0 = Instant::now();
+    let mut text_stream = TokenTextStream::new();
+    let mut next_tok =
+        deepseek4::sampling::sample_token(&last_logits, temp, top_k, top_p, &mut rng);
+    loop {
+        if check_abort(id) {
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+            return;
+        }
+        if generated_count >= max_tokens {
+            break;
+        }
+        if stop_set.contains(&next_tok) {
+            break;
+        }
+        let frag = {
+            let tok = m.tokenizer.as_ref().unwrap();
+            text_stream.push(tok, next_tok)
+        };
+        emit_dense_token_text(stdout, id, &frag);
+        m.conversation_tokens.push(next_tok);
+        generated_count += 1;
+        if check_abort(id) {
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+            return;
+        }
+        let logits = {
+            let b = m.dory_mut().unwrap();
+            match hipfire_arch_dory::forward_step(gpu, b, next_tok) {
+                Ok(logits) => logits,
+                Err(e) => {
+                    dense_fail_closed_error(
+                        m,
+                        gpu,
+                        stdout,
+                        id,
+                        &format!("dory decode failed: {e}"),
+                    );
+                    return;
+                }
+            }
+        };
+        if generated_count == 1 && take_generation_fault_after_first_decode() {
+            dense_fail_closed_error(m, gpu, stdout, id, "injected fault after first decode");
+            return;
+        }
+        next_tok = deepseek4::sampling::sample_token(&logits, temp, top_k, top_p, &mut rng);
+    }
+    let tail = text_stream.flush();
+    emit_dense_token_text(stdout, id, &tail);
+    m.seq_pos = m.dory().map(|b| b.state.next_pos).unwrap_or(0);
+    let decode_ms = decode_t0.elapsed().as_millis().max(1);
+    let total_ms = t0.elapsed().as_millis().max(1);
+    let tok_s = if generated_count > 0 {
+        (generated_count as f64 * 1000.0) / decode_ms as f64
+    } else {
+        0.0
+    };
+    let pending_done = serde_json::json!({
+        "type": "done",
+        "id": id,
+        "tokens": generated_count,
+        "tok_s": (tok_s * 100.0).round() / 100.0,
+        "prefill_ms": prefill_ms,
+        "total_ms": total_ms,
+        "attempt_id": active_attempt_id(),
+    });
+    match await_client_terminal_commit(stdout, id, &pending_done) {
+        ClientTerminalDecision::Commit => {
+            crate::ar::emit_active_route_done_value(stdout, &pending_done)
+        }
+        ClientTerminalDecision::Abort => {
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+        }
+    }
+}
+
+/// Maple-Preview generate path (arch_id=15, hipfire-arch-maple).
 /// Shaped after [`generate_qwen2`], NOT after `generate_cohere2moe`: Maple has
 /// no bespoke marker state machine. It is plain ChatML with `<|im_end|>`
 /// (151645) as end-of-turn, so the qwen2 shape — get tokenizer, downcast the

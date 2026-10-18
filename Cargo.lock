@@ -1327,6 +1327,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-dory"
+version = "0.4.3"
+dependencies = [
+ "hip-bridge",
+ "hipfire-config",
+ "hipfire-dispatch",
+ "hipfire-runtime",
+ "rdna-compute",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hipfire-arch-dots-ocr"
 version = "0.4.3"
 dependencies = [
@@ -1692,6 +1705,7 @@ dependencies = [
  "hipfire-arch-cohere2moe",
  "hipfire-arch-deepseek4",
  "hipfire-arch-diffusion",
+ "hipfire-arch-dory",
  "hipfire-arch-dots-ocr",
  "hipfire-arch-embeddinggemma2",
  "hipfire-arch-gemma4",
@@ -1726,6 +1740,7 @@ dependencies = [
  "hipfire-arch-cohere2moe",
  "hipfire-arch-deepseek4",
  "hipfire-arch-diffusion",
+ "hipfire-arch-dory",
  "hipfire-arch-dots-ocr",
  "hipfire-arch-embeddinggemma2",
  "hipfire-arch-gemma4",

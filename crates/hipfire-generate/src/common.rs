@@ -919,7 +919,12 @@ impl Drop for FitMaxTokensGuard {
 /// prefix, trailer) minus [`FIT_MAX_TOKENS_MARGIN`]. With no room left the
 /// value is returned unchanged so the prompt itself is refused.
 pub fn fit_max_tokens(max_tokens: usize, used: usize, cap: usize) -> usize {
-    fit_max_tokens_if(FIT_MAX_TOKENS.with(std::cell::Cell::get), max_tokens, used, cap)
+    fit_max_tokens_if(
+        FIT_MAX_TOKENS.with(std::cell::Cell::get),
+        max_tokens,
+        used,
+        cap,
+    )
 }
 
 /// [`fit_max_tokens`] with the fit decision passed explicitly, for paths that
@@ -1516,6 +1521,9 @@ pub fn fail_closed_reset_target_and_spec(
         }
         if let Some(bundle) = m.muse_glimmer_mut() {
             bundle.reset_session_state();
+        }
+        if let Some(bundle) = m.dory_mut() {
+            bundle.state.reset();
         }
         if let Some(ad) = m.kv_adaptive.as_mut() {
             if let Some(b) = m.state.as_mut().and_then(|s| {

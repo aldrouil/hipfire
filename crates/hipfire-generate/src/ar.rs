@@ -870,6 +870,7 @@ pub enum GenerationRoute {
     CohereAr,
     CohereSpec,
     MapleAr,
+    DoryAr,
     MiniMaxAr,
     MiniMaxEp,
     MiniMaxSpec,
@@ -883,7 +884,6 @@ pub enum GenerationRoute {
     DotsOcr,
     Unknown,
 }
-
 impl GenerationRoute {
     /// Every variant — coverage guard for table-driven tests.
     #[allow(dead_code)]
@@ -900,6 +900,7 @@ impl GenerationRoute {
         Self::CohereAr,
         Self::CohereSpec,
         Self::MapleAr,
+        Self::DoryAr,
         Self::MiniMaxAr,
         Self::MiniMaxEp,
         Self::MiniMaxSpec,
@@ -989,6 +990,7 @@ impl GenerationRoute {
             Self::CohereAr => "cohere_ar",
             Self::CohereSpec => "cohere_spec",
             Self::MapleAr => "maple_ar",
+            Self::DoryAr => "dory_ar",
             Self::MiniMaxAr => "minimax_ar",
             Self::MiniMaxEp => "minimax_ep",
             Self::MiniMaxSpec => "minimax_spec",
@@ -1357,6 +1359,7 @@ define_route_start!(deepseek4_spec_route_start, 9);
 define_route_start!(cohere_ar_route_start, 12);
 define_route_start!(cohere_spec_route_start, 12);
 define_route_start!(maple_ar_route_start, 15);
+define_route_start!(dory_ar_route_start, 19);
 define_route_start!(minimax_ar_route_start, 10);
 define_route_start!(minimax_ep_route_start, 10);
 define_route_start!(minimax_spec_route_start, 10);
@@ -1386,6 +1389,7 @@ define_route_terminal!(
 define_route_terminal!(cohere_ar_route_terminal, GenerationRoute::CohereAr);
 define_route_terminal!(cohere_spec_route_terminal, GenerationRoute::CohereSpec);
 define_route_terminal!(maple_ar_route_terminal, GenerationRoute::MapleAr);
+define_route_terminal!(dory_ar_route_terminal, GenerationRoute::DoryAr);
 define_route_terminal!(minimax_ar_route_terminal, GenerationRoute::MiniMaxAr);
 define_route_terminal!(minimax_ep_route_terminal, GenerationRoute::MiniMaxEp);
 define_route_terminal!(minimax_spec_route_terminal, GenerationRoute::MiniMaxSpec);
@@ -1466,6 +1470,11 @@ pub fn generation_route_adapter(route: GenerationRoute) -> Option<GenerationRout
             route,
             start: maple_ar_route_start,
             terminal: maple_ar_route_terminal,
+        },
+        GenerationRoute::DoryAr => GenerationRouteAdapter {
+            route,
+            start: dory_ar_route_start,
+            terminal: dory_ar_route_terminal,
         },
         GenerationRoute::MiniMaxAr => GenerationRouteAdapter {
             route,
@@ -1795,6 +1804,9 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
         // speculator built by the carrier must NOT change the route — an
         // arch-15 turn is always plain AR.
         15 => return GenerationRoute::MapleAr,
+        // Dory (arch 19). No spec variant: the carrier never builds a
+        // speculator and there is no dory verify path — always plain AR.
+        19 => return GenerationRoute::DoryAr,
         10 => {
             let spec_ok = i.has_speculator && (i.temp <= 1e-6 || i.ngram_can_sample);
             return if spec_ok {
@@ -2877,6 +2889,45 @@ pub fn generate(
                 enable_thinking,
                 repeat_penalty,
                 repeat_window,
+            );
+            return;
+        }
+        GenerationRoute::DoryAr => {
+            // Single-loop native AR. No tools (no parser validated on this
+            // path — refused above), no pflash/eviction/spec. `temp`/`top_p`
+            // sample host-side; greedy at temp<=1e-6. Repeat penalties and
+            // explicit `stop` are refused on this route (see selector gates).
+            let _ = (
+                budget_alert_at_tok,
+                budget_alert_text,
+                pflash_state,
+                pflash_cfg,
+                assistant_prefix,
+                reasoning_effort,
+            );
+            let _ = (
+                repeat_penalty,
+                repeat_window,
+                presence_penalty,
+                frequency_penalty,
+                cactus_delta,
+                user_explicit_sampling,
+            );
+            crate::dense::generate_dory(
+                m,
+                gpu,
+                stdout,
+                id,
+                prompt,
+                system_prompt,
+                messages_history,
+                temp,
+                top_p,
+                top_k,
+                max_tokens,
+                max_think_tokens,
+                enable_thinking,
+                request_seed,
             );
             return;
         }
@@ -6391,6 +6442,7 @@ pub fn reset_core_arch_key(arch_id: u32) -> &'static str {
         12 => "cohere2moe",
         13 => "gemma4",
         14 => "muse_glimmer",
+        19 => "dory",
         _ => "unknown",
     }
 }

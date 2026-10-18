@@ -395,6 +395,7 @@ pub fn arch_label(arch_id: u32) -> &'static str {
         16 => "qwen4",
         17 => "qwen3_5_embed",
         18 => "embedding_gemma2",
+        19 => "dory",
         40 => "flux_mmdit",
         45 => "flux2_mmdit",
         _ => "qwen3",
@@ -570,6 +571,7 @@ const REGISTRY: &[&dyn Carrier] = &[
     &Lfm2MoeCarrier,
     &Cohere2MoeCarrier,
     &MapleCarrier,
+    &DoryCarrier,
     &Gemma4Carrier,
     &MuseGlimmerCarrier,
     &FluxDiffusionCarrier,
@@ -1420,6 +1422,20 @@ impl LoadedModel {
         self.state
             .as_deref_mut()
             .and_then(|s| (s as &mut dyn Any).downcast_mut::<hipfire_arch_maple::MapleBundle>())
+    }
+
+    /// Dory (arch_id=19) GPU bundle. Owned by its arch crate (which also
+    /// implements `ArchModel` for it): single-loop native BF16 forward.
+    pub fn dory(&self) -> Option<&hipfire_arch_dory::DoryBundle> {
+        self.state
+            .as_deref()
+            .and_then(|s| (s as &dyn Any).downcast_ref::<hipfire_arch_dory::DoryBundle>())
+    }
+
+    pub fn dory_mut(&mut self) -> Option<&mut hipfire_arch_dory::DoryBundle> {
+        self.state
+            .as_deref_mut()
+            .and_then(|s| (s as &mut dyn Any).downcast_mut::<hipfire_arch_dory::DoryBundle>())
     }
 
     /// DeepSeek V4 bundle if this model is a single-GPU arch_id=9, else None.
@@ -6055,7 +6071,7 @@ mod wire_verb_tests {
         // Every other exercised arch stays a generating model, so a new chat
         // arch needs no change here and only a non-generating one is added
         // explicitly.
-        for a in [0, 1, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 40, 45] {
+        for a in [0, 1, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 19, 40, 45] {
             assert_eq!(wire_verb(a), WireVerb::Generate, "arch {a}");
             assert!(wire_verb(a).is_generate(), "arch {a}");
         }
@@ -6450,6 +6466,7 @@ mod registry_tests {
             }
         );
         assert_eq!(caps_of("cohere2moe"), text_only);
+        assert_eq!(caps_of("dory"), text_only);
         assert_eq!(
             caps_of("gemma4"),
             ArchCaps {
@@ -6506,7 +6523,7 @@ mod registry_tests {
         }
 
         // ── vision_route: 8 -> DotsOcr, 5|6 -> QwenVl, 11 -> Lfm2Vl; gated by supports_images ──
-        for id in 0u32..=14 {
+        for id in (0u32..=14).chain([19]) {
             let want = match id {
                 8 => VisionRoute::DotsOcr,
                 5 | 6 => VisionRoute::QwenVl,

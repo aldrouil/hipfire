@@ -106,6 +106,8 @@ pub const MODEL_TYPE_TO_ARCH_ID: &[(&str, u32)] = &[
     ("embedding_gemma2", 18),
     ("embedding_gemma2_text", 18),
     ("embeddinggemma2", 18),
+    // arch 19 — dory (native BF16 safetensors dir; single recurrent loop)
+    ("dory", 19),
     // arch 22 — gemma4 EAGLE drafter (single-block spec-decode head for arch 13)
     ("gemma4_unified_assistant", 22),
     // arch 23 — muse_glimmer DFlash drafter
@@ -277,10 +279,7 @@ mod tests {
             quantize_arch_id("qwen3_5_moe", ["Qwen3_5MoeForCausalLM"]),
             Some(6)
         );
-        assert_eq!(
-            quantize_arch_id("qwen3_moe", ["Qwen3MoeForCausalLM"]),
-            None
-        );
+        assert_eq!(quantize_arch_id("qwen3_moe", ["Qwen3MoeForCausalLM"]), None);
         assert_eq!(
             quantize_arch_id("qwen3_next", ["Qwen3NextForCausalLM"]),
             None

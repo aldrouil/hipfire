@@ -231,6 +231,19 @@ pub fn retry_candidate_reset_inventory() -> &'static [ResetCoreCoverage] {
             reason: "maple not a serve-hardening retry candidate yet",
         },
     };
+    const DORY: ResetCoreCoverage = ResetCoreCoverage {
+        arch: "dory",
+        recurrent_or_conv: true,
+        s_ef_residual: true,
+        kv_or_aux_caches: true,
+        graphs: false,
+        drafter: true,
+        adaptive: false,
+        host_position_and_conversation: true,
+        eligibility: RetryResetEligibility::Ineligible {
+            reason: "dory not a serve-hardening retry candidate yet",
+        },
+    };
     // Qwen3.5 multi-vector embedding encoder (arch 17): one-shot requests,
     // no KV cache / graphs / drafter state; the GDN scratch resets before
     // every encode, so there is no cross-request state to recover.
@@ -302,6 +315,7 @@ pub fn retry_candidate_reset_inventory() -> &'static [ResetCoreCoverage] {
         GEMMA4,
         MUSE_GLIMMER,
         MAPLE,
+        DORY,
         QWEN35_EMBED,
         EMBEDDING_GEMMA2,
         FLUX,

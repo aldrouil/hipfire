@@ -875,10 +875,7 @@ impl Carrier for Qwen4Carrier {
         let max_k = if qwen4_explicit_mtp_k(ctx.spec).is_some() {
             max_k
         } else {
-            qwen4_auto_mtp_k(
-                &ctx.gpu.arch,
-                loaded.bundle.native_mtp_cpu_window_rows(),
-            )
+            qwen4_auto_mtp_k(&ctx.gpu.arch, loaded.bundle.native_mtp_cpu_window_rows())
         };
         let max_k = if cpu_splice {
             max_k.min(verify_rows - 1)
@@ -2874,7 +2871,10 @@ fn load_qwen4_rank_scoped(
         for (_, kind) in &split_kinds {
             *kinds.entry(kind).or_default() += 1;
         }
-        let by_kind: Vec<String> = kinds.iter().map(|(kind, n)| format!("{n} {kind}")).collect();
+        let by_kind: Vec<String> = kinds
+            .iter()
+            .map(|(kind, n)| format!("{n} {kind}"))
+            .collect();
         let source = if bundle.has_cpu_deferred_experts() {
             "offload_exec=cpu"
         } else {
@@ -5792,6 +5792,151 @@ impl Carrier for MapleCarrier {
         Ok(LoadedModel {
             state: Some(Box::new(bundle)),
             speculator,
+            ..LoadedModel::skeleton(
+                meta.arch_id,
+                meta.tokenizer,
+                ctx.max_seq,
+                ctx.max_seq,
+                ctx.path.to_string(),
+                meta.chat_template,
+                meta.chat_template_source,
+            )
+        })
+    }
+}
+
+// ─── DoryCarrier ───────────────────────────────────────────────────────
+// dory (arch_id 19, native BF16 safetensors Dir only). Single-loop native
+// forward: exactly one recurrent-loop pass (the arch crate logs the
+// n_recurrent_loops=2 bring-up note at load). No EP/PP/TP, no spec/MTP/
+// DFlash/drafter, no CASK/adaptive, no VMM. HFQ refused closed in the arch
+// crate; the registry claims the Dir namespace only.
+pub struct DoryCarrier;
+impl Carrier for DoryCarrier {
+    fn name(&self) -> &'static str {
+        "dory"
+    }
+    fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
+        // Both namespaces route here (`derive_arch_id` emits 19 for the
+        // model_type dory / DoryForCausalLM dirs; no Dory HFQ container
+        // exists). `carrier_for` probes the HFQ namespace only, so a
+        // Dir-only claim would make the loaded model unresolvable at
+        // bench/spec time; an HFQ 19, if one ever appears, fails closed
+        // inside `load_dory_bundle`.
+        arch_id == 19
+    }
+    fn admit_topology(
+        &self,
+        _arch_id: u32,
+        is_dir: bool,
+        pp: usize,
+        _kv_backend: KvBackend,
+    ) -> Result<(), String> {
+        if pp > 1 {
+            return Err(crate::pp_unsupported_message("dory", is_dir, pp));
+        }
+        Ok(())
+    }
+    fn admit_options(
+        &self,
+        draft_path: Option<&str>,
+        options: crate::admission::SourceAdmissionOptions,
+    ) -> Result<(), String> {
+        let spec = options.spec;
+        let unsupported = [
+            (draft_path.is_some(), "draft model (draft_path)"),
+            (options.eagle_drafter, "EAGLE drafter"),
+            (options.kv_adaptive, "adaptive KV"),
+            (
+                spec.dspark.is_some_and(|enabled| enabled),
+                "DSpark (speculation.dspark)",
+            ),
+            (
+                spec.mtp.is_some_and(|enabled| enabled),
+                "MTP (speculation.mtp)",
+            ),
+            (
+                spec.dflash.is_some_and(|enabled| enabled),
+                "DFlash (speculation.dflash)",
+            ),
+            (
+                spec.ngram_draft.is_some_and(|enabled| enabled),
+                "n-gram draft (speculation.ngram_draft)",
+            ),
+            (options.cask, "CASK (memory.cask)"),
+            (
+                options.pflash,
+                "PFlash (prefill_compression; set it to off)",
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(set, name)| set.then_some(name))
+        .collect::<Vec<_>>();
+        if !unsupported.is_empty() {
+            return Err(format!(
+                "dory: unsupported option(s): {}; single-loop native forward only",
+                unsupported.join(", ")
+            ));
+        }
+        Ok(())
+    }
+    fn caps(&self) -> saddle_core::caps::ArchCaps {
+        // Text-only single-loop AR bring-up (qwen2 precedent): the Jinja
+        // template still renders `enable_thinking`, but no history-reasoning
+        // contract is advertised — serve does not forward reasoning_content
+        // for the `dory` label and this path has no think router.
+        saddle_core::caps::ArchCaps {
+            reasoning_contract: saddle_core::caps::ReasoningContract::Unsupported,
+            supports_continuous_batch: false,
+            supports_ep_batch: false,
+            dflash: None,
+            supports_mtp: false,
+            spec_excludes_adaptive: false,
+            semantic_contract_version: None,
+            has_deltanet: false,
+            supports_images: false,
+        }
+    }
+    fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
+        // Local generation_config.json: do_sample, temp 1.0, top_p 0.95.
+        saddle_core::sampling::SamplingDefaults::new(1.0, 0.95, 1.0)
+    }
+    fn bench_prefill(
+        &self,
+        m: &mut crate::LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+        synthetic: &[u32],
+        _n: usize,
+        prefill_err: &mut Option<String>,
+    ) -> Option<bool> {
+        let b = (m.state.as_mut()?.as_mut() as &mut dyn Any)
+            .downcast_mut::<hipfire_arch_dory::DoryBundle>()?;
+        let len = synthetic.len();
+        for (i, &tok) in synthetic.iter().enumerate() {
+            let compute_logits = i + 1 == len;
+            if let Err(e) = hipfire_arch_dory::forward_token(gpu, b, tok, compute_logits) {
+                *prefill_err = Some(e);
+                return Some(false);
+            }
+        }
+        Some(true)
+    }
+    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
+        if ctx.pp > 1 {
+            return Err(crate::pp_unsupported_message(
+                "dory",
+                matches!(src, ModelSource::Dir(_)),
+                ctx.pp,
+            ));
+        }
+        dir_diag(&src);
+        let meta = resolve_source_meta(&src, ctx.path)?;
+        let bundle = hipfire_arch_dory::load_dory_bundle(src, ctx)?;
+        // Single-loop AR only: the n-gram speculator needs a `SpecTarget`
+        // impl the arch crate deliberately does not provide, so never arm one.
+        Ok(LoadedModel {
+            state: Some(Box::new(bundle)),
+            speculator: None,
             ..LoadedModel::skeleton(
                 meta.arch_id,
                 meta.tokenizer,

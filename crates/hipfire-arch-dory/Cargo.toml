@@ -1,0 +1,26 @@
+[package]
+name = "hipfire-arch-dory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Dory dense recurrent text decoder (alternating attention/MLP sublayers, nGPT normalized residual interpolation, per-layer sliding/full RoPE, single-loop bring-up). arch_id=19."
+
+[dependencies]
+hipfire-config = { path = "../hipfire-config" }
+hipfire-runtime = { path = "../hipfire-runtime" }
+hipfire-dispatch = { path = "../hipfire-dispatch" }
+hip-bridge = { path = "../hip-bridge" }
+rdna-compute = { path = "../rdna-compute" }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+
+[features]
+lab = []
+default = ["deltanet"]
+# l2_norm_f32 (justnorm) is deltanet-gated in rdna-compute, mirroring
+# minimax/cohere2/gemma4 which forward the same flag.
+deltanet = ["hipfire-runtime/deltanet", "rdna-compute/deltanet"]
+
+[[example]]
+name = "dory_parity"
+required-features = ["lab"]
