@@ -139,12 +139,12 @@ static CPU_STEPS: AtomicUsize = AtomicUsize::new(0);
 static HOST_MAPPED_GPU_STEPS: AtomicUsize = AtomicUsize::new(0);
 
 /// Cumulative wall time spent *inside* CPU-executed steps, entry to return: the
-/// D2H drain, the multiplication, the H2D. Paired with [`CPU_STEPS`] for the
-/// GPU-idle accounting in [`report_idle`].
+/// D2H readiness boundary, multiplication and H2D submission. Paired with
+/// [`CPU_STEPS`] for [`report_idle`]'s CPU-step wall share. In dense CPU mode the
+/// deferred upload can overlap host work, so this is not GPU-idle accounting.
 ///
 /// A pass-back *split* step is deliberately NOT charged here: its wall contains
-/// real GPU work, so folding it in would inflate the "GPU-idle lower bound" that
-/// [`report_idle`] documents. Split steps have their own counters below.
+/// real GPU work. Split steps have their own counters below.
 static CPU_STEP_WALL_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Pass-back split steps: how many, how many of their output rows went to the
@@ -181,15 +181,11 @@ pub(crate) enum HostExec {
 
 /// Wall-clock partition of a decode run into CPU-step time and everything else.
 ///
-/// A CPU-executed step is a host sync point: its D2H drains the stream, the
-/// multiplication and the H2D run on the host, so the compute units execute
-/// nothing for its whole duration — *provided* nothing else is using the device.
-/// Over a decode-only span (prefill is GPU-side and never enters the seam) the
-/// fraction of the wall spent inside those steps is therefore a **lower bound**
-/// on the GPU's idle fraction, and the headroom a "hand some of the spilled
-/// work back to an idle GPU" scheme would be spending. `HIPFIRE_CPU_EXEC_TRACE=1`
-/// prints it per window; it is not a correctness signal and nothing depends on
-/// it.
+/// Dense CPU mode waits only for its input-ready event and leaves the H2D
+/// queued: CPU-step wall share is not a GPU-idle measurement. Passback's
+/// whole-CPU fallback still completes its transfers, preserving its historical
+/// idle-bound diagnostic. `HIPFIRE_CPU_EXEC_TRACE=1` prints the distinction per
+/// window; nothing depends on it.
 #[derive(Clone, Copy)]
 struct IdleWindow {
     anchor: Instant,
@@ -259,10 +255,18 @@ fn report_idle(steps: usize) {
             split_wall_ns as f64 / 1e6,
         )
     };
+    let (label, meaning) = if host_exec_mode() == HostExecMode::Cpu {
+        (
+            "step-wall",
+            "CPU-step wall share; not a GPU-idle measurement",
+        )
+    } else {
+        ("idle", "GPU-idle lower bound, see report_idle")
+    };
     eprintln!(
-        "cpu exec: idle {:.1}% — window ending at step {steps} covers {window_steps} steps: \
+        "cpu exec: {label} {:.1}% — window ending at step {steps} covers {window_steps} steps: \
          {:.0}ms wall, {:.0}ms on CPU ({per_step_us:.0}us CPU/step) \
-         — GPU-idle lower bound, see report_idle{split_note}",
+         — {meaning}{split_note}",
         100.0 * cpu_ns as f64 / span_ns as f64,
         span_ns as f64 / 1e6,
         cpu_ns as f64 / 1e6,
@@ -525,6 +529,9 @@ pub fn run_host_mapped_gemv(
         out,
         residual: None,
     };
+    if host_exec_mode() == HostExecMode::Cpu {
+        return run_dense_cpu_step(gpu, &plan);
+    }
     let step_start = Instant::now();
     let arm = cpu_arm_prepare(gpu, &plan, 0..w.m)?;
     let (gemv_ns, h2d_ns) = cpu_arm_finish(gpu, &arm, true)?;
@@ -585,8 +592,8 @@ pub(crate) fn prepare_activation(
 /// them: the read is enqueued first, the GPU arm is launched on the same stream,
 /// and only then is the host's read boundary crossed ([`cpu_arm_stage`]) — the
 /// write being the join (sampled) or a queued H2D the stream orders (unsampled),
-/// in both cases after the arm. `memory.offload_exec=cpu` runs the phases back to
-/// back with a blocking write.
+/// in both cases after the arm. Passback's whole-CPU fallback runs the phases
+/// back to back with a blocking write; dense CPU mode uses [`run_dense_cpu_step`].
 pub(crate) struct CpuArm<'a> {
     /// The weight's CPU decoder.
     pub(crate) q: CpuQuant,
@@ -632,8 +639,8 @@ fn split_arm(rows: &Range<usize>, m: usize) -> bool {
 /// Phase one of the CPU arm: enqueue every device read for `rows` and return the
 /// arm.
 ///
-/// The whole-CPU route's reads are blocking pageable copies that complete before
-/// returning. A *split* arm ([`split_arm`]) reads through the reusable pinned
+/// Passback's whole-CPU fallback reads are blocking pageable copies that complete
+/// before returning. A *split* arm ([`split_arm`]) reads through the reusable pinned
 /// staging allocation instead, and returns with a queued read plus an input-ready
 /// marker record set: [`cpu_arm_stage`] crosses the host's read boundary, so a
 /// GPU arm enqueued in between — the pass-back's prefix, on the same stream — is
@@ -926,6 +933,9 @@ pub fn run_host_mapped_gemv_residual(
         out: acc,
         residual: Some(acc),
     };
+    if host_exec_mode() == HostExecMode::Cpu {
+        return run_dense_cpu_step(gpu, &plan);
+    }
     let step_start = Instant::now();
     let arm = cpu_arm_prepare(gpu, &plan, 0..w.m)?;
     let (gemv_ns, h2d_ns) = cpu_arm_finish(gpu, &arm, true)?;
@@ -1447,7 +1457,7 @@ fn moe_cpu_experts_host(
 }
 
 /// Close out an executed step: count it, charge a whole-CPU step's wall time to
-/// the GPU-idle account, and feed the per-shape trace. One call site per executed
+/// the CPU-step account, and feed the per-shape trace. One call site per executed
 /// step, so the counters and the trace can never disagree about how many ran.
 ///
 /// A pass-back split step is counted in [`SPLIT_STEPS`]/[`SPLIT_GPU_ROWS`]/
@@ -1972,6 +1982,9 @@ pub(crate) fn reads_host_mapped_weight(gpu: &Gpu, step: &Step) -> bool {
 ///
 /// The order is the observable contract: D2H x, [D2H acc], gemv, [add], H2D.
 pub(crate) fn run_step(gpu: &Gpu, plan: &CpuStep) -> Result<(), DispatchError> {
+    if host_exec_mode() == HostExecMode::Cpu {
+        return run_dense_cpu_step(gpu, plan);
+    }
     let step_start = Instant::now();
     let arm = cpu_arm_prepare(gpu, plan, 0..plan.w.m)?;
     let (gemv_ns, h2d_ns) = cpu_arm_finish(gpu, &arm, true)?;
@@ -1989,6 +2002,95 @@ pub(crate) fn run_step(gpu: &Gpu, plan: &CpuStep) -> Result<(), DispatchError> {
         },
     );
     Ok(())
+}
+
+/// Dense CPU mode's single staging lease: activation | AWQ | accumulator | output.
+///
+/// All reads use the producer/consumer stream and one input-ready event. Only
+/// that event is host-waited; the return stays queued ahead of GPU consumers on
+/// the same stream. The next step may enqueue its reads behind this upload
+/// without first waiting on the host. Its input-ready event then retires both
+/// transfers before any host reuse. Growth, stream/device changes and teardown
+/// retain the existing pinned owner's drain-or-retain contract.
+///
+/// Compute directly in pinned storage: no pageable upload source, staging copy,
+/// or per-step activation/result allocation. Passback (including share zero)
+/// keeps its existing arm/join policy.
+fn run_dense_cpu_step(gpu: &Gpu, plan: &CpuStep<'_>) -> Result<(), DispatchError> {
+    let step_start = Instant::now();
+    let q = host_mapped_quant(gpu, plan.w)?;
+    let k = plan.w.k;
+    let m = plan.w.m;
+    let scale = plan.w.awq_scale.filter(|_| plan.rotate_input);
+    let scale_len = if scale.is_some() { k } else { 0 };
+    let acc_len = if plan.residual.is_some() { m } else { 0 };
+    let acc_off = k
+        .checked_add(scale_len)
+        .ok_or_else(|| cpu_err("CPU transfer extent overflows"))?;
+    let out_off = acc_off
+        .checked_add(acc_len)
+        .ok_or_else(|| cpu_err("CPU transfer extent overflows"))?;
+    let values = out_off
+        .checked_add(m)
+        .ok_or_else(|| cpu_err("CPU transfer extent overflows"))?;
+    let target = plan.residual.unwrap_or(plan.out);
+    let weights = gpu
+        .host_bytes(plan.w.buf)
+        .ok_or_else(|| cpu_err("weight tensor is host-mapped but has no host pointer"))?;
+    with_cpu_transfer(gpu, values, |transfer| {
+        download_transfer(gpu, transfer, plan.x, 0, k)?;
+        if let Some(scale) = scale {
+            download_transfer(gpu, transfer, scale, k, k)?;
+        }
+        if let Some(acc) = plan.residual {
+            download_transfer(gpu, transfer, acc, acc_off, m)?;
+        }
+        transfer
+            .mark_input_ready(&gpu.hip)
+            .map_err(|e| cpu_err(&format!("D2H input-ready record: {e}")))?;
+        transfer
+            .wait_input_ready(&gpu.hip)
+            .map_err(|e| cpu_err(&format!("D2H input-ready wait: {e}")))?;
+        let (d2h_ns, gemv_ns, t_h2d) = {
+            let staged = transfer_values(transfer, values);
+            let (x, rest) = staged.split_at_mut(k);
+            let (scale, rest) = rest.split_at_mut(scale_len);
+            let (acc, out) = rest.split_at_mut(acc_len);
+            if plan.rotate_input {
+                if scale_len > 0 {
+                    divide_by_awq_scale(x, scale);
+                }
+                rotate_x(x);
+            }
+            let d2h_ns = step_start.elapsed().as_nanos() as u64;
+            let t_gemv = Instant::now();
+            gemv(q, weights, m, k, x, out);
+            let gemv_ns = t_gemv.elapsed().as_nanos() as u64;
+            let t_h2d = Instant::now();
+            if acc_len > 0 {
+                residual_add(acc, out);
+            }
+            (d2h_ns, gemv_ns, t_h2d)
+        };
+        let result_off = if acc_len > 0 { acc_off } else { out_off };
+        // No immediate completion: the owner stays pending and the stream
+        // orders the upload before consumers, including on non-blocking streams.
+        upload_transfer(gpu, transfer, target, result_off, m)?;
+        finish_step(
+            q,
+            plan.w,
+            plan.rotate_input,
+            plan.residual.is_some(),
+            HostExec::Cpu,
+            step_start,
+            StepTiming {
+                d2h_ns,
+                gemv_ns,
+                h2d_ns: t_h2d.elapsed().as_nanos() as u64,
+            },
+        );
+        Ok(())
+    })
 }
 
 /// Count a host-mapped step that is about to be launched on the GPU anyway.
@@ -2176,6 +2278,8 @@ fn upload_transfer(
 /// on a **sampled** step, or merely the enqueue wall (the pinned copy plus the
 /// launch) on an **unsampled** one, whose H2D is left queued for the stream to
 /// order and is never observed.
+/// Dense CPU mode's `h2d_ns` is enqueue wall plus the residual add, not completed
+/// DMA latency. Its `d2h_ns` includes the input-ready event wait and transforms.
 pub(crate) struct StepTiming {
     pub(crate) d2h_ns: u64,
     pub(crate) gemv_ns: u64,
