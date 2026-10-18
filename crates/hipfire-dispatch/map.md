@@ -824,6 +824,7 @@ Workspace crates with a path dependency on this crate:
 
 - `hipfire-arch-cohere2moe`
 - `hipfire-arch-deepseek4`
+- `hipfire-arch-dory`
 - `hipfire-arch-gemma4`
 - `hipfire-arch-lfm2moe`
 - `hipfire-arch-llama`

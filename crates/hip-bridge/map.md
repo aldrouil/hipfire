@@ -342,6 +342,7 @@ Workspace crates with a path dependency on this crate:
 - `hipfire-arch-cohere2moe`
 - `hipfire-arch-deepseek4`
 - `hipfire-arch-diffusion`
+- `hipfire-arch-dory`
 - `hipfire-arch-dots-ocr`
 - `hipfire-arch-embeddinggemma2`
 - `hipfire-arch-gemma4`

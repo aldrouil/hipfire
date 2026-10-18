@@ -212,6 +212,11 @@ Curated weights are published under
 defaults, sidecars and provenance. To bring your own model, use
 `hipfire quantize`.
 
+Nemotron Dory 1.0 4B also has a native **single-loop** path for a local BF16
+safetensors directory (no pull tag yet). This is a correctness bring-up route,
+with F32 activations/KV, not a quantized or multi-loop release. See
+[local Dory support](docs/MODELS.md#local-nemotron-dory).
+
 ### Qwen 3.8 Flash Next split-PLE tiers (0.4.3)
 
 The `hipfire-models/qwen3.8-flash-next` repository publishes three plain

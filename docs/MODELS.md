@@ -36,6 +36,45 @@ Default serve pre-warm tag is `qwen3.5:9b` (`CONFIG.md` → `default_model`). Pe
 
 ---
 
+## Local Nemotron Dory
+
+[`nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16`](https://huggingface.co/nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16)
+loads directly from a local safetensors directory through `DoryCarrier`
+(architecture 19). Keep the original config, tokenizer and chat template
+beside `model.safetensors`. There is no registry pull tag for this route.
+
+The normalized-GPT forward executes **one recurrent pass**, including input
+reinjection, even when the checkpoint declares two loops. The load log states
+the effective loop count. Original BF16 weights stay BF16 on the GPU;
+activations and KV are F32. This is an eager, single-GPU text-only AR route:
+no quantized/HFQ input, multi-loop execution, speculation, tools, or batching.
+
+Set `--max-seq` explicitly for available VRAM. The weights occupy about
+7.95 GB; the current F32 KV allocation adds 294,912 bytes per context token
+(about 604 MB at 2048 tokens), plus scratch. The ordinary 32768-token default
+can exceed a 16 GB card's free memory; context is not silently reduced.
+
+```bash
+HIPFIRE_DEVICES=gfx1201 hipfire run /mnt/sx8200/dory \
+  --max-seq 2048 --spec off -t 0 -n 256 \
+  "Name the capital of France in one sentence."
+```
+
+The native daemon was smoke-tested with two sequential requests on gfx1201;
+the France request completed with “The capital of France is Paris.”
+Reasoning controls are not advertised on this initial route: the model thinks
+by default, and that text is emitted in the ordinary content stream. A short
+token budget can end before the final answer. No throughput benchmark was run.
+
+Forward validation uses `scripts/dory_reference.py` and the architecture's
+`dory_parity` example. On gfx1201 the real BF16 checkpoint matched all 16
+reference top-1 IDs with worst absolute logit error `9e-5` against the
+independent CPU F32 reference. This is numerical bring-up evidence, not a
+throughput or product-admission claim. Equations follow
+[the Dory vLLM implementation](https://github.com/vllm-project/vllm/blob/55076950b6c155f384d6766d63563c3bc20a0e3f/vllm/model_executor/models/dory.py);
+the [llama.cpp Dory PR](https://github.com/ggml-org/llama.cpp/pull/30306)
+provides another implementation reference.
+
 ## Registry tags (from `registry/models.json`)
 
 Fields: **Tag**, **File** (`file`), **Size GB** (`size_gb`), **Min VRAM GB** (`min_vram_gb`), **Default KV** (registry `default_kv_mode` when set; else empty), **Notes** (`desc`, condensed). `default_kv_mode = "q8"` is the universal fallback and is **not** lowered into config: the global `kv_cache=auto` resolves per [`CONFIG.md`](CONFIG.md#mode-k-and-v) (Qwen: native `fp8` on eligible exact gfx1201, otherwise q8). A non-q8 registry value (DeepSeek V4 `f32`, Maple-Preview `bf16`) is lowered to `kv_cache`. KV names `asymN` / `turboN` / `legacy-asymN` are **deprecated since 0.4.0, removal in 0.5.0**; use `fwhtN` or `q8`.

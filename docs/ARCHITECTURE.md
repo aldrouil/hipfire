@@ -52,6 +52,7 @@ crates/
 ├── hipfire-arch-gemma4/      # Gemma 4 text (id 13)
 ├── hipfire-arch-muse-glimmer/# Muse Glimmer dense text (id 14)
 ├── hipfire-arch-maple/       # Maple-Preview natively-ternary MoE (id 15)
+├── hipfire-arch-dory/        # Nemotron Dory normalized-GPT, one loop (id 19)
 ├── hipfire-arch-diffusion/   # FLUX.1 / FLUX.2 image-generation components (ids 40/45)
 ├── hipfire-arch-toy/         # template only (0xFF); never dispatched
 ├── hipfire-ds4-parent/       # DeepSeek V4 parent-checkpoint calibration oracle
@@ -298,7 +299,7 @@ hipfire-loader
 generate(…) ladder (`hipfire_generate::ar::generate`)
   select_generation_route (tool/stop gating) → early routes 13 Gemma4, 14 Muse Glimmer
   → route match: Qwen4 (16, no `m.ep`), EP (`m.ep`: 9/10, Qwen3.5 5/6),
-    Qwen2 / DS4 / LFM / Cohere / Maple (AR only) / MiniMax / dots.ocr,
+    Qwen2 / DS4 / LFM / Cohere / Maple / Dory (AR only) / MiniMax / dots.ocr,
     PP `generate_mesh_carrier`, else qwen35/llama body (DFlash/spec, MTP, VL, …)
         │
         ▼
@@ -369,6 +370,7 @@ one** matching carrier (zero → error; two → ambiguous error).
 | `MuseGlimmerCarrier` | 14 | `hipfire-arch-muse-glimmer`; bundle type lives in `hipfire-loader` |
 | `MapleCarrier` | 15 | `hipfire-arch-maple`; plain AR only (no spec/MTP/DFlash route) |
 | `Qwen4Carrier` | 16 (HFQM artifacts only) | `hipfire-arch-qwen4` (Flash-Next); claims no safetensors directory, so a dir is a conversion input and fails closed |
+| `DoryCarrier` | 19 | `hipfire-arch-dory`; native BF16 safetensors only, one recurrent pass, F32 activations/KV, eager single-GPU AR |
 | `FluxDiffusionCarrier` | 40, 45 | `hipfire-arch-diffusion` (FLUX.1 / FLUX.2 components) |
 
 Canonical numeric registry: [`architecture-ids.md`](architecture-ids.md).
@@ -417,6 +419,7 @@ the facade/re-export plus bring-up/carrier surface. Other runtime-owned pieces
 | `hipfire-arch-gemma4` | Gemma 4 hybrid sliding/full attention text (13), eager dense and lowered/MoE bundles; EAGLE drafter id 22 |
 | `hipfire-arch-muse-glimmer` | Muse Glimmer dense text (14): 3:1 sliding/NoPE-full attention; DFlash drafter id 23 |
 | `hipfire-arch-maple` | Maple-Preview natively-ternary 256-expert MoE (15), plain AR |
+| `hipfire-arch-dory` | Nemotron Dory normalized-GPT (19): alternating attention/MLP sublayers, hybrid sliding/full attention and one recurrent pass; BF16 directory input |
 | `hipfire-arch-diffusion` | Latent image diffusion: FLUX.1 MMDiT (40) and FLUX.2 Klein (45) — components, not chat trunks |
 | `hipfire-arch-qwen35-embed` | Qwen3.5 multi-vector embedding encoder (17) — bidirectional full attention + causal GDN, SigLIP tower, 128-d late-interaction head; served only via the non-chat `embed` verb. Under `serve.multi_slot` its own engine merges concurrent requests into one batched forward (`slot_engine.rs`); the trait hook is the defaulted `SlotEngineHandle::encode`, so the generation engine is untouched. |
 | `hipfire-arch-embeddinggemma2` | EmbeddingGemma 2 single-vector embedding encoder (18) — bidirectional Gemma-4-family encoder (sliding/full hybrid, PLE, per-layer head dims, 768-d Matryoshka head, mean pooling + L2); served only via the non-chat `embed` verb with the arch-17 slot-engine shape. Text-only is the `vision_mode=off` default: with the shared `.vl` pack resolved (`auto`/`on`) the vision and audio towers are resident and media input serves on the `embed` verb; a tower-less load refuses it by modality. Video is not served yet. |
