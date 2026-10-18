@@ -312,17 +312,31 @@ PCIe link (27.1 GB/s measured, §7) instead of device DRAM: this is llama.cpp's
   co-inferenced instead of run wholly on the CPU — measured **+3.8 % / +2.6 %** on
   the 9B at 8 / 16 of 32 spilled (interleaved fresh-process pairs, passback mode;
   § 6.2.2).
-- **Async CPU return.** Routed-expert residuals return with `hipMemcpyAsync`
-  from reusable, owned pinned transfer storage on the active GPU stream
-  (default stream when none is active). The next same-stream D2H batch is
-  enqueued through raw owned extents before exposing host slices. Its existing
-  completion barrier retires the previous upload and makes CPU reuse safe.
-  Normal returns add no host wait or event. Allocation growth, stream/device
-  changes, and teardown retire pending access; a failed drain retains the
-  allocation rather than freeing a live DMA source. Dense CPU steps keep the
-  two-phase `cpu_arm_prepare`/`cpu_arm_finish` arm that `passback` interleaves
-  a GPU launch into. `h2d` timing in the splice trace measures enqueue API wall
-  time, not DMA completion; judge gains using timing-disabled throughput.
+- **Asynchronous dense CPU transfers.** In `memory.offload_exec=cpu`, dense
+  steps use the existing `PinnedTransferBuffer` with layout activation | optional
+  AWQ scale | optional residual | output. Activation, scale and residual D2H
+  copies are batched on the actual producer/consumer stream (default when none
+  is active), followed by one reusable input-ready event. The CPU waits only
+  that event, then applies the same AWQ/FWHT transforms and GEMV directly in the
+  pinned slices, without intermediate activation/result vectors. H2D is enqueued
+  from owned pinned storage without a host completion wait. Same-stream ordering
+  makes GPU consumers wait for the upload; an additional event wait on that same
+  stream would be redundant. No auxiliary stream is introduced.
+  The owner remains pending across returns. The next same-stream D2H batch queues
+  behind that upload, and its input-ready event retires both before host access.
+  Allocation growth, stream/device changes and teardown drain pending access;
+  a failed drain retains storage rather than freeing live DMA memory.
+  A GEMV cannot overlap its own input D2H, but deferred H2D does not block host
+  dispatch. Actual arithmetic/transfer overlap must be measured, not inferred
+  from asynchronous API names. Dense multi-token GEMM paths remain GPU-side.
+  `passback`, including its whole-CPU fallback and share-zero join, retains its
+  existing `cpu_arm_prepare` / `cpu_arm_finish` policy.
+- **Async routed-expert return.** Routed-expert residuals also use owned pinned
+  H2D storage, with their existing completion barrier before host reuse. This
+  dense-transfer change does not alter that splice.
+  CPU trace `h2d` measures submission wall (plus the dense residual add), not DMA
+  completion; `d2h` includes the readiness wait and activation transforms.
+  Judge throughput using timing-disabled runs.
 - **Native MTP with CPU-deferred experts.** Qwen3.5-family MTP is available.
   Narrow verify and accepted-prefix rollback retain the existing `<=4`-row CPU splice;
   wider forwards retain the GPU grouped PCIe read. At the CPU-deferred expert
@@ -397,12 +411,12 @@ PCIe link (27.1 GB/s measured, §7) instead of device DRAM: this is llama.cpp's
   mixes into one flag, the down quant is never printed, and no worker count is
   printed. The `calls=` field on the line is what
   makes the number quotable: a shape's first line is its cold first step.
-  The same flag prints `cpu exec: idle N% — window ending at step S …` on the
-  *global* step count's doubling schedule: the share of a decode window's wall
-  spent inside CPU-executed steps. Because a CPU step is a host sync point and
-  prefill never enters the seam, that share is a **lower bound on the GPU's idle
-  fraction** — the only reason a scheme that hands part of a spilled step back
-  to the GPU could pay. It is a headroom reading, not a correctness signal.
+  The same flag prints `cpu exec: step-wall N% — window ending at step S …` in
+  CPU mode on the *global* step count's doubling schedule: the share of a decode
+  window's wall spent inside CPU-executed steps. Because returns are asynchronous,
+  this is **not a GPU-idle measurement**. Passback retains its historical
+  `cpu exec: idle` diagnostic for whole-CPU fallback steps and excludes split
+  wall from that numerator. Neither diagnostic is a correctness signal.
 - **Not covered, deliberately.** The slots/serve body (`forward_batch_slots` →
   `dense_ffn_body_slots`) and prefill run batched GEMM kernels that never enter
   `execute_steps`, so their spilled weights are still read over PCIe; the seam
@@ -492,9 +506,9 @@ product claim.)*
   same-stream input batch completes it before exposing host slices again.
   The transfer owner retains pending storage across steps; growth, stream/device
   changes and teardown drain outstanding work before reuse or release, retaining
-  storage if a safe drain fails. No auxiliary stream is introduced. Whole-CPU
-  execution and `share = 0` keep their blocking return path; CPU input reads also
-  explicitly order an active non-default producer stream.
+  storage if a safe drain fails. No auxiliary stream is introduced. Passback's
+  whole-CPU fallback and `share = 0` keep their blocking return path and explicit
+  active non-default producer ordering; CPU mode itself uses §6.2.1's async path.
 - **Covered shapes (4).** `Gemv{Raw}`, `Gemv{Prerotated}`,
   `GemvResidual{Prerotated}`, and `GemvResidual{Raw}` when the dtype has a fused
   residual kernel. The mechanism is that every covered kernel indexes its weight as

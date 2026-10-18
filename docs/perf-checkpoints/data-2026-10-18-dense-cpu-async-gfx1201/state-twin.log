@@ -1,0 +1,13 @@
+
+running 1 test
+test resident_lowered_passback_oracle ... [oracle] 1 case(s), model=/home/avery/.hipfire/models/qwen3.5-9b.mq4, steps=12, fixture=9b, kv_mode=q8, artifacts under /home/avery/Documents/vibecoding/hipfire-special/hipfire-passback-opt/.scratch/dense-cpu-async/numeric/state-twin
+[oracle] ── case 0: Case { cut: 16, share: 0.0, nonblocking: false, kind: Twin }
+[oracle] spawning arm cpu (cut=16 share=0 exec=cpu lowered=0 nonblocking=0 kv=q8) -> /home/avery/Documents/vibecoding/hipfire-special/hipfire-passback-opt/.scratch/dense-cpu-async/numeric/state-twin/cut16_share0_nb0/cpu
+[oracle] spawning arm passback0 (cut=16 share=0 exec=passback lowered=1 nonblocking=0 kv=q8) -> /home/avery/Documents/vibecoding/hipfire-special/hipfire-passback-opt/.scratch/dense-cpu-async/numeric/state-twin/cut16_share0_nb0/passback0
+[oracle] cut16 share0 nonblocking0 [cpu vs passback0]: cpu_steps 1488 vs 1488; host_mapped_gpu_steps 0 vs 0
+[oracle] cut16 share0 nonblocking0 [cpu vs passback0]: BYTE-EXACT across 444 tensors (12 logits rows, full valid state)
+[oracle] PASS: every case byte-exact with the all-hand reference; artifacts under /home/avery/Documents/vibecoding/hipfire-special/hipfire-passback-opt/.scratch/dense-cpu-async/numeric/state-twin
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 6.17s
+

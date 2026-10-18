@@ -1,0 +1,137 @@
+{
+  "state-twin": {
+    "returncode": 0,
+    "command": [
+      "/home/avery/Documents/vibecoding/hipfire-special/hipfire-passback-opt/target/release/deps/resident_lowered_passback_hw-3ab08c4591265e9f",
+      "--exact",
+      "resident_lowered_passback_oracle",
+      "--ignored",
+      "--nocapture",
+      "--test-threads=1"
+    ],
+    "env": {
+      "HIPFIRE_RESIDENT_ORACLE_TWIN": "1",
+      "HIPFIRE_RESIDENT_ORACLE_CASES": "4",
+      "HIPFIRE_RESIDENT_ORACLE_MODEL": "/home/avery/.hipfire/models/qwen3.5-9b.mq4",
+      "HIPFIRE_RESIDENT_ORACLE_OUT": "/home/avery/Documents/vibecoding/hipfire-special/hipfire-passback-opt/.scratch/dense-cpu-async/numeric/state-twin",
+      "HIPFIRE_RESIDENT_ORACLE_STEPS": "12",
+      "HIPFIRE_RESIDENT_ORACLE_KV_MODE": "q8"
+    }
+  },
+  "rows2-cpu": {
+    "returncode": 0,
+    "command": [
+      "/home/avery/Documents/vibecoding/hipfire-special/hipfire-passback-opt/target/release/examples/dense_cpu_async_oracle_tmp",
+      "dump",
+      "/home/avery/.hipfire/models/qwen3.5-9b.mq4",
+      "/home/avery/Documents/vibecoding/hipfire-special/hipfire-passback-opt/benchmarks/prompts/gpu_offload_probe.txt",
+      "2",
+      "4",
+      "/home/avery/Documents/vibecoding/hipfire-special/hipfire-passback-opt/.scratch/dense-cpu-async/numeric/rows2-cpu"
+    ],
+    "env": {
+      "HIPFIRE_OFFLOAD_EXEC": "cpu",
+      "HIPFIRE_OFFLOAD_PASSBACK_SHARE": "0",
+      "HIPFIRE_FORWARD_LOWERED": "0"
+    }
+  },
+  "rows2-sync-twin": {
+    "returncode": 0,
+    "command": [
+      "/home/avery/Documents/vibecoding/hipfire-special/hipfire-passback-opt/target/release/examples/dense_cpu_async_oracle_tmp",
+      "dump",
+      "/home/avery/.hipfire/models/qwen3.5-9b.mq4",
+      "/home/avery/Documents/vibecoding/hipfire-special/hipfire-passback-opt/benchmarks/prompts/gpu_offload_probe.txt",
+      "2",
+      "4",
+      "/home/avery/Documents/vibecoding/hipfire-special/hipfire-passback-opt/.scratch/dense-cpu-async/numeric/rows2-sync-twin"
+    ],
+    "env": {
+      "HIPFIRE_OFFLOAD_EXEC": "passback",
+      "HIPFIRE_OFFLOAD_PASSBACK_SHARE": "0",
+      "HIPFIRE_FORWARD_LOWERED": "0"
+    }
+  },
+  "rows2-comparison": {
+    "returncode": 0,
+    "records": 230,
+    "raw_bytes": 87101440,
+    "differences": []
+  },
+  "rows513-cpu": {
+    "returncode": 0,
+    "command": [
+      "/home/avery/Documents/vibecoding/hipfire-special/hipfire-passback-opt/target/release/examples/dense_cpu_async_oracle_tmp",
+      "dump",
+      "/home/avery/.hipfire/models/qwen3.5-9b.mq4",
+      "/home/avery/Documents/vibecoding/hipfire-special/hipfire-passback-opt/benchmarks/prompts/gpu_offload_probe.txt",
+      "513",
+      "4",
+      "/home/avery/Documents/vibecoding/hipfire-special/hipfire-passback-opt/.scratch/dense-cpu-async/numeric/rows513-cpu"
+    ],
+    "env": {
+      "HIPFIRE_OFFLOAD_EXEC": "cpu",
+      "HIPFIRE_OFFLOAD_PASSBACK_SHARE": "0",
+      "HIPFIRE_FORWARD_LOWERED": "0"
+    }
+  },
+  "rows513-sync-twin": {
+    "returncode": 0,
+    "command": [
+      "/home/avery/Documents/vibecoding/hipfire-special/hipfire-passback-opt/target/release/examples/dense_cpu_async_oracle_tmp",
+      "dump",
+      "/home/avery/.hipfire/models/qwen3.5-9b.mq4",
+      "/home/avery/Documents/vibecoding/hipfire-special/hipfire-passback-opt/benchmarks/prompts/gpu_offload_probe.txt",
+      "513",
+      "4",
+      "/home/avery/Documents/vibecoding/hipfire-special/hipfire-passback-opt/.scratch/dense-cpu-async/numeric/rows513-sync-twin"
+    ],
+    "env": {
+      "HIPFIRE_OFFLOAD_EXEC": "passback",
+      "HIPFIRE_OFFLOAD_PASSBACK_SHARE": "0",
+      "HIPFIRE_FORWARD_LOWERED": "0"
+    }
+  },
+  "rows513-comparison": {
+    "returncode": 0,
+    "records": 230,
+    "raw_bytes": 104892416,
+    "differences": []
+  },
+  "redline-refusal": {
+    "returncode": 1,
+    "command": [
+      "/usr/bin/python3",
+      "scripts/redline_daemon_harness.py",
+      "--model",
+      "/home/avery/.hipfire/models/qwen3.5-9b.mq4",
+      "--daemon",
+      "/home/avery/Documents/vibecoding/hipfire-special/hipfire-passback-opt/.scratch/dense-cpu-async/candidate-bin/daemon-cand",
+      "--skip-prefill",
+      "--decode-context",
+      "16",
+      "--capture-repeats",
+      "2",
+      "--measure-repeats",
+      "1",
+      "--decode-iterations",
+      "1",
+      "--shadow-iterations",
+      "2",
+      "--kv-mode",
+      "q8",
+      "--kv-backend",
+      "vmm",
+      "--max-seq",
+      "4096",
+      "--pm4",
+      "--out",
+      "/home/avery/Documents/vibecoding/hipfire-special/hipfire-passback-opt/.scratch/dense-cpu-async/numeric/redline.json",
+      "--log",
+      "/home/avery/Documents/vibecoding/hipfire-special/hipfire-passback-opt/.scratch/dense-cpu-async/numeric/redline-daemon.log"
+    ],
+    "env": {
+      "HIPFIRE_OFFLOAD_EXEC": "cpu"
+    }
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "lifecycle": "historical",
+  "scope": "Candidate rpB2 trace; final 7930 adjacent same-thread hipEventSynchronize-return to hipMemcpyAsync-submit host intervals. Dense CPU transform/GEMV host-region proxy, not an isolated GEMV timer. All profiler-visible DMA spans intersected.",
+  "host_intervals": 7930,
+  "host_region_ns": 2706899244,
+  "dma_overlap_ns": 0,
+  "overlapping_dma_intersections": 0,
+  "coverage_limit": "Memory-copy trace is a subset of HIP copy API calls. Kernel trace was disabled. This does not establish device-kernel overlap or visibility of every copy implementation."
+}

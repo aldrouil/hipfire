@@ -1,0 +1,6 @@
+loaded: {'type': 'loaded', 'arch': 'qwen3_5', 'dim': 4096, 'layers': 32, 'vocab': 248320, 'vl': False, 'reasoning_contract': 'qwen_jinja', 'reasoning_effort_n
+warm-0 done toks=64 decode=3.3
+warm-1 done toks=64 decode=18.3
+warm-2 done toks=64 decode=17.2
+DONE: {"type": "done", "id": "meas-1", "tokens": 64, "tok_s": 15.6, "prefill_tokens": 59, "prefill_ms": 581.7, "prefill_tok_s": 101.4, "decode_tok_s": 18.2, "ttft_ms": 581.7, "cached_tokens": 0, "finish_reason": "length", "attempt_id": 1}
+daemon exit: 0
