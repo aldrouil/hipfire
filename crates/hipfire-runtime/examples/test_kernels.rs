@@ -255,6 +255,14 @@ fn main() {
         });
     }
 
+    eprintln!("\n--- MQ8 signed INT8 GEMV ---");
+    // No quad, full quads, and every tail length, including Dory's K=2560.
+    for k in [256, 1024, 1280, 1792, 2560] {
+        test!(format!("mq8 signed-dot CPU reference K={k}"), {
+            mq8_signed_dot_reference(&mut gpu, k)
+        });
+    }
+
     eprintln!("\n--- GDN (tiled LDS) ---");
     for (label, n_heads, hd) in [
         ("gdn_q8 h=32 hd=128 (9B DeltaNet)", 32, 128),
@@ -449,7 +457,9 @@ fn qwen4_moe_sym_k640_reference(gpu: &mut Gpu) -> Result<(), String> {
         .memcpy_htod_offset(&wt.buf, off, &[w[off] ^ 1])
         .map_err(err)?;
     let refused = !gpu.qwen4_moe_sym_check(&ptrs, M, K, 512, 68).map_err(err)?;
-    gpu.hip.memcpy_htod_offset(&wt.buf, off, &[w[off]]).map_err(err)?;
+    gpu.hip
+        .memcpy_htod_offset(&wt.buf, off, &[w[off]])
+        .map_err(err)?;
     if !refused {
         return Err("asymmetric QT53 header accepted by the header check".into());
     }
@@ -461,17 +471,27 @@ fn qwen4_moe_sym_k640_reference(gpu: &mut Gpu) -> Result<(), String> {
         })
         .collect();
     let ht = gpu.upload_raw(&h, &[h.len()]).map_err(err)?;
-    let sorted: Vec<i32> = (0..ROWS as i32).map(|p| if p < LIVE as i32 { p } else { -1 }).collect();
+    let sorted: Vec<i32> = (0..ROWS as i32)
+        .map(|p| if p < LIVE as i32 { p } else { -1 })
+        .collect();
     let sorted_b: Vec<u8> = sorted.iter().flat_map(|v| v.to_le_bytes()).collect();
     let st = gpu.upload_raw(&sorted_b, &[ROWS]).map_err(err)?;
     let tiles: Vec<u8> = [0i32, -1].iter().flat_map(|v| v.to_le_bytes()).collect();
     let tt = gpu.upload_raw(&tiles, &[2]).map_err(err)?;
-    let y = gpu.upload_raw(&vec![0x5Au8; ROWS * M * 2], &[ROWS * M * 2]).map_err(err)?;
-    let xq = gpu.qwen4_moe_rotate128_i4(&ht, &st, K, ROWS, LIVE).map_err(err)?;
+    let y = gpu
+        .upload_raw(&vec![0x5Au8; ROWS * M * 2], &[ROWS * M * 2])
+        .map_err(err)?;
+    let xq = gpu
+        .qwen4_moe_rotate128_i4(&ht, &st, K, ROWS, LIVE)
+        .map_err(err)?;
     gpu.gemm_qwen4_moe_down_iu4_sym(&ptrs, &tt, &st, &xq, &y, M, K, 1, ROWS, LIVE, false)
         .map_err(err)?;
     gpu.hip.device_synchronize().map_err(err)?;
-    let side = gpu.scratch.qwen4_moe_down_i4_scratch.as_ref().ok_or("no sidecar")?;
+    let side = gpu
+        .scratch
+        .qwen4_moe_down_i4_scratch
+        .as_ref()
+        .ok_or("no sidecar")?;
     let mut xb = vec![0u8; 5 * LIVE * 72];
     gpu.hip.memcpy_dtoh(&mut xb, side).map_err(err)?;
     let got = gpu.download_raw_bytes(&y).map_err(err)?;
@@ -508,4 +528,150 @@ fn qwen4_moe_sym_k640_reference(gpu: &mut Gpu) -> Result<(), String> {
         gpu.free_tensor(t).map_err(err)?;
     }
     Ok(())
+}
+
+/// Check the signed-dot consumer against host integer arithmetic over the
+/// production rotate/quantize producer's bytes. This isolates GEMV's signed
+/// operands, group strides and quad/tail accumulation from activation error.
+fn mq8_signed_dot_reference(gpu: &mut Gpu, k: usize) -> Result<(), String> {
+    const M: usize = 5;
+    let groups = k / 256;
+    let err = |e: hip_bridge::HipError| e.to_string();
+    let mut weights = Vec::with_capacity(M * groups * 258);
+    for row in 0..M {
+        for group in 0..groups {
+            let scale = [0x3400u16, 0x3800, 0x4000][(row + group) % 3];
+            weights.extend_from_slice(&scale.to_le_bytes());
+            // Every signed byte, including -128, appears in each group.
+            weights.extend((0..256).map(|i| ((row * 17 + group * 13 + i * 31) % 256) as u8));
+        }
+    }
+    let input: Vec<f32> = (0..k)
+        .map(|i| ((i * 37 % 103) as f32 - 51.0) * 0.03125)
+        .collect();
+    let a = gpu.upload_raw(&weights, &[weights.len()]).map_err(err)?;
+    let x = gpu.upload_f32(&input, &[k]).map_err(err)?;
+    let y = gpu.alloc_tensor(&[M], DType::F32).map_err(err)?;
+    gpu.gemv_mq8g256_with_rotate(&a, &x, &y, M, k)
+        .map_err(err)?;
+    let actual = gpu.download_f32(&y).map_err(err)?;
+    let mut xq = vec![0u8; k];
+    let mut scales = vec![0u8; groups * 4];
+    gpu.hip
+        .memcpy_dtoh(
+            &mut xq,
+            gpu.scratch
+                .mq_x_q8
+                .as_ref()
+                .ok_or("no MQ8 activation bytes")?,
+        )
+        .map_err(err)?;
+    gpu.hip
+        .memcpy_dtoh(
+            &mut scales,
+            gpu.scratch
+                .mq_x_scales
+                .as_ref()
+                .ok_or("no MQ8 activation scales")?,
+        )
+        .map_err(err)?;
+    // Independently check the producer, rather than allowing a wrong FWHT to
+    // pass merely because the GEMV consumes its own wrong activation bytes.
+    let mut rotated = input;
+    hipfire_cpu::quant::rotate_x(&mut rotated);
+    for (group, values) in rotated.chunks_exact(256).enumerate() {
+        let amax = values.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let expected_scale = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+        let inverse_scale = if amax > 0.0 { 127.0 / amax } else { 0.0 };
+        let got_scale = f32::from_le_bytes(scales[group * 4..group * 4 + 4].try_into().unwrap());
+        if (got_scale - expected_scale).abs() > expected_scale * 1e-6 {
+            return Err(format!(
+                "K={k} group={group}: activation scale {got_scale} != {expected_scale}"
+            ));
+        }
+        for (i, &value) in values.iter().enumerate() {
+            let expected = (value * inverse_scale)
+                .round_ties_even()
+                .clamp(-128.0, 127.0) as i8;
+            let got = xq[group * 256 + i] as i8;
+            if got != expected {
+                return Err(format!(
+                    "K={k} group={group} i={i}: activation {got} != {expected}"
+                ));
+            }
+        }
+    }
+    let mut mismatch = None;
+    for (row, &got) in actual.iter().enumerate() {
+        let mut expected = 0f64;
+        let mut absolute_sum = 0f64;
+        for group in 0..groups {
+            let offset = (row * groups + group) * 258;
+            let ws =
+                f16_bits_to_f32(u16::from_le_bytes([weights[offset], weights[offset + 1]])) as f64;
+            let xs =
+                f32::from_le_bytes(scales[group * 4..group * 4 + 4].try_into().unwrap()) as f64;
+            let mut dot = 0i32;
+            let mut absolute_dot = 0i32;
+            for i in 0..256 {
+                let product =
+                    weights[offset + 2 + i] as i8 as i32 * xq[group * 256 + i] as i8 as i32;
+                dot += product;
+                absolute_dot += product.abs();
+            }
+            expected += ws * xs * dot as f64;
+            absolute_sum += (ws * xs).abs() * absolute_dot as f64;
+        }
+        // Bound F32 scaling and wave/quad reduction error, not quantization.
+        let tolerance = 1e-5 * (1.0 + absolute_sum);
+        if !got.is_finite() || (got as f64 - expected).abs() > tolerance {
+            mismatch = Some(format!(
+                "K={k} row={row}: {got} != {expected} (tolerance {tolerance})"
+            ));
+            break;
+        }
+    }
+    // Poison INT8 scratch after the direct call: dispatch must regenerate it,
+    // not accidentally pass by reusing the direct call's correct activation.
+    gpu.hip
+        .memset(
+            gpu.scratch
+                .mq_x_q8
+                .as_ref()
+                .ok_or("no MQ8 activation bytes")?,
+            0,
+            k,
+        )
+        .map_err(err)?;
+    let w = hipfire_runtime::llama::WeightTensor {
+        buf: a,
+        gpu_dtype: DType::MQ8G256,
+        m: M,
+        k,
+        row_stride: 0,
+        paro: None,
+        awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
+    };
+    let y2 = gpu.alloc_tensor(&[M], DType::F32).map_err(err)?;
+    let dispatch_r =
+        hipfire_runtime::llama::weight_gemv(&mut *gpu, &w, &x, &y2).map_err(|e| e.to_string());
+    let got2 = dispatch_r.and_then(|()| gpu.download_f32(&y2).map_err(err));
+    gpu.free_tensor(y2).map_err(err)?;
+    w.free_all(&mut *gpu);
+    let got2 = got2?;
+    for (i, (&ref_, &got)) in actual.iter().zip(got2.iter()).enumerate() {
+        let tol = 1e-6 * (1.0 + ref_.abs());
+        if !got.is_finite() || (ref_ - got).abs() > tol {
+            return Err(format!(
+                "K={k} row={i}: dispatch path {got} != direct path {ref_} (tolerance {tol})"
+            ));
+        }
+    }
+    for tensor in [x, y] {
+        gpu.free_tensor(tensor).map_err(err)?;
+    }
+    mismatch.map_or(Ok(()), Err)
 }

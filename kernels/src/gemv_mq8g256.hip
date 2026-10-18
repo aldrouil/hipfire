@@ -6,11 +6,8 @@
 
 // MagnumQuant MQ8 GEMV: FWHT-rotated symmetric INT8 with dp4a.
 // x_rot is PRE-ROTATED and PRE-QUANTIZED to INT8 by the caller.
-// Inner loop uses v_dot4_i32_i8 (sdot4) for 4x VALU throughput vs FP32.
-// Both operands are signed int8 (Q8_1 activations + symmetric MQ8 weights),
-// so sdot4 (gfx906+, dot2-insts) is correct. sudot4 (RDNA3+, dot8-insts)
-// is the mixed-mode form for unsigned-weight quants and is gratuitous here;
-// it also fails to compile on gfx906 since the iu8 instruction is RDNA3+.
+// Both operands are signed int8; accumulate four products into int32 without
+// clamping, then apply the weight/activation scales.
 //
 // Weight format per group (258 bytes for 256 elements):
 //   [0:2]   f16 scale
@@ -35,6 +32,16 @@ __device__ __forceinline__ float f16_load(const unsigned char* p) {
     if (exp == 31) return sign ? -__int_as_float(0x7F800000) : __int_as_float(0x7F800000);
     unsigned int f32_bits = (sign << 31) | ((exp + 127 - 15) << 23) | (frac << 13);
     return __int_as_float(f32_bits);
+}
+
+// gfx11/gfx12 lack sdot4's dot1-insts: sudot4 with both selectors true keeps
+// signed x signed semantics (incl. -128). CDNA/gfx906 keep sdot4.
+__device__ __forceinline__ int mq8_dot4_i8x4(int w, int x, int acc) {
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1200__) || defined(__gfx1201__)
+    return __builtin_amdgcn_sudot4(true, w, true, x, acc, false);
+#else
+    return __builtin_amdgcn_sdot4(w, x, acc, false);
+#endif
 }
 
 // 4x unrolled dp4a GEMV: 4 groups in-flight, 8 dp4a per iteration.
@@ -74,8 +81,8 @@ extern "C" __global__ void gemv_mq8g256(
             int wp1 = *(const int*)(wb + w_off + 4); \
             int xp0 = *(const int*)(xb + w_off); \
             int xp1 = *(const int*)(xb + w_off + 4); \
-            int dot = __builtin_amdgcn_sdot4(wp0, xp0, 0, false); \
-            dot = __builtin_amdgcn_sdot4(wp1, xp1, dot, false); \
+            int dot = mq8_dot4_i8x4(wp0, xp0, 0); \
+            dot = mq8_dot4_i8x4(wp1, xp1, dot); \
             acc_var += ws * xs * (float)dot; \
         }
 
@@ -94,8 +101,8 @@ extern "C" __global__ void gemv_mq8g256(
         int wp1 = *(const int*)(wb + w_off + 4);
         int xp0 = *(const int*)(xb + w_off);
         int xp1 = *(const int*)(xb + w_off + 4);
-        int dot = __builtin_amdgcn_sdot4(wp0, xp0, 0, false);
-        dot = __builtin_amdgcn_sdot4(wp1, xp1, dot, false);
+        int dot = mq8_dot4_i8x4(wp0, xp0, 0);
+        dot = mq8_dot4_i8x4(wp1, xp1, dot);
         acc0 += ws * xs * (float)dot;
     }
 

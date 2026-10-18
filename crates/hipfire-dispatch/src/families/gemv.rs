@@ -284,6 +284,19 @@ impl GemvFamily {
                         shape: x.shape.clone(),
                         dtype: x.dtype,
                     }
+                } else if plan == RotationPlan::Mq8Internal {
+                    // MQ8's GEMV consumes INT8 mq_x_q8/mq_x_scales, not F32 mq_x_rot:
+                    // rotate+quantize here. The Prerotated launch below ignores
+                    // x_buf (it reads the internal scratch), so alias x as placeholder.
+                    // Routing through self.rotate() would write F32 FWHT into mq_x_rot
+                    // and leave stale activation bytes for the kernel (garbage logits).
+                    gpu.rotate_quantize_x_mq8(x, w.k)
+                        .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                    GpuTensor {
+                        buf: unsafe { x.buf.alias() },
+                        shape: x.shape.clone(),
+                        dtype: x.dtype,
+                    }
                 } else {
                     let h = self.rotate(ctx, gpu, w, x, &RotateInputs::default())?;
                     h.into_buf()
@@ -399,6 +412,18 @@ impl GemvFamily {
             return Err(reject_mq_i4(w.dtype, "gemv"));
         }
         let plan = crate::types::dtype_rotation_plan(w.dtype);
+        if plan == RotationPlan::Mq8Internal {
+            // MQ8 has no F32 rotation: its activation lives as INT8 mq_x_q8 /
+            // mq_x_scales via `rotate_quantize_x_mq8`. Funneling it through
+            // RotationFamily would write F32 FWHT into `mq_x_rot` and hand a
+            // stale INT8 buffer to the GEMV (the Dory garbled-text failure).
+            return Err(DispatchError::UnsupportedVariant {
+                family: "gemv",
+                variant: "rotate-mq8-internal",
+                arch: "",
+                quant: "",
+            });
+        }
         if plan == RotationPlan::None {
             return Err(DispatchError::UnsupportedVariant {
                 family: "gemv",
