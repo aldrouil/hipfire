@@ -1,0 +1,8 @@
+e6236de7ef397a077270d22c3ad856f20199ae241a6e936ac45f93c5ff117c24  docs/perf-checkpoints/data-2026-10-18-resident-lowered-passback-27b-gfx1201/AB-27B-AUTO/C-r1.json
+6a4972773f0b2d566949aac1f04488add7a300c6732f7e9e902b2dd6c5b09f8e  docs/perf-checkpoints/data-2026-10-18-resident-lowered-passback-27b-gfx1201/AB-27B-AUTO/C-r2.json
+99d1d2728f491bf0239f42006e56f44009ac9800f7b058aef2f0ee81ed6330c7  docs/perf-checkpoints/data-2026-10-18-resident-lowered-passback-27b-gfx1201/AB-27B-AUTO/C-r3.json
+8cf7da356be9862dbbf20d50be34e6d2c1fd7ce81856b0b2f3d5bec034318455  docs/perf-checkpoints/data-2026-10-18-resident-lowered-passback-27b-gfx1201/AB-27B-AUTO/C-r4.json
+985e42e89cbf71010b94321ad43a245f0ee7c2ed6589fc5559bf955d2957bc1a  docs/perf-checkpoints/data-2026-10-18-resident-lowered-passback-27b-gfx1201/AB-27B-AUTO/K-r1.json
+9d2a00d3a589015c162dade80e80225db4ec886d6dcb5d0f7dff9b867291d868  docs/perf-checkpoints/data-2026-10-18-resident-lowered-passback-27b-gfx1201/AB-27B-AUTO/K-r2.json
+d4467b1a49ecfa52dadf7e2dc3de08f0cbfd44ac4f785648296749e3a84c6ab4  docs/perf-checkpoints/data-2026-10-18-resident-lowered-passback-27b-gfx1201/AB-27B-AUTO/K-r3.json
+9652581492273f665becf3df0e4d52d922c870873f3d6e69ac8f4e0ac33a4d9c  docs/perf-checkpoints/data-2026-10-18-resident-lowered-passback-27b-gfx1201/AB-27B-AUTO/K-r4.json

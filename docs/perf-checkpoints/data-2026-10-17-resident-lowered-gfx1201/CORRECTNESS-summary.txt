@@ -1,0 +1,44 @@
+CORRECTNESS SUMMARY — resident lowered passback (runner, 2026-10-17)
+Candidate: /tmp/rl-candidate (exact FINAL2 + feature d46df385… only; base blob verified pre-patch)
+Oracle: resident_lowered_passback_hw.rs SHA256 a5fcb7a6… (parent-fixed Stream ownership + rustfmt)
+
+1. FULL-SHARE STATE ORACLE — PASS (ORACLE_RC=0, 52.79s, ORACLE-run1.log)
+   4 cases x 2 arms = 8 fresh children, 12 teacher-forced tokens each, 9B q8-VMM
+   case 0: cut16/share0.375/nb0 (first resident = DeltaNet) — BYTE-EXACT 444 tensors
+   case 1: cut15/share0.375/nb0 (first resident = FullAttention) — BYTE-EXACT 444 tensors
+   case 2: cut16/share0.5/nb0 — BYTE-EXACT 444 tensors
+   case 3: cut16/share0.375/nb1 (non-blocking stream) — BYTE-EXACT 444 tensors
+   Coverage per oracle: per-step logits all 12 rows + state_initial (asserted zero both arms) +
+   post-token checkpoints 3/6/12 full valid KV (committed prefix only) + GDN codes/scales/conv + EF;
+   split engagement (split_steps>0) + sampled AND unsampled (split_steps>sampled_steps) + pinned Share(f)
+   + per-layer residency == spill prefix. 0 DIFF/FAIL/PANIC lines.
+
+2. TWIN CASE — PASS (TWIN_RC=0, 55.97s, ORACLE-run-twin.log)
+   case 4: cpu vs passback+share0 (lowered ON, falls back all-hand) — BYTE-EXACT 444 tensors.
+
+3. ROUTE ENGAGEMENT (out-of-band, from receipts — counts are metadata, not asserts):
+   case0: hand 528/step -> mixed 504/step (totals 6336 vs 6048; -288 = -24/step x 12)
+   case1: hand 524/step -> mixed 500/step (totals 6288 vs 6000; -288)
+   case2: hand 528/step -> mixed 504/step (6336 vs 6048; -288)
+   case3: hand 528/step -> mixed 504/step (6336 vs 6048; -288)
+   Uniform -24 launches/step on every mixed arm across all cuts/shares/streams = feature engaged
+   (24 fused-away launches per resident layer set per token), NOT an inert all-hand arm.
+   Launches==kernels on every line (no queue-wait inflation in tallies).
+
+4. NATIVE DECODED SMOKE — HEALTHY
+   harness2 (candidate daemon 16c8abdd… via HIPFIRE_DAEMON_BIN): 331 gen tokens, finish=stop,
+   empty/runaway/attractor all false, think-content 84 words/ans 86 words in CHAIN-mode serve (thinking NOT off there — chain harness has no off switch; the PRIMARY timed A/B uses bench with --reasoning-on absent = thinking explicitly off per fixture).
+   Cross-daemon: candidate-daemon decoded content BYTE-IDENTICAL to live-tree daemon
+   (DECODED-CONTENT md5 5dbe2003… both arms, 832 chars — content identity, NOT a daemon/binary hash; one chain-mode content match, not a universal auto identity claim).
+   (Note: first harness run accidentally used live-tree daemon 4c5285df…; reran with candidate
+   override; both retained. Direct `hipfire run` emits no stdout in this env — harness is the
+   decoded authority. `hipfire bench` smoke also rc=0: decode med 20.3, wall 18.6.)
+   Native command health: passback non-determinism notice present (expected), no errors.
+
+5. ARTIFACTS: ORACLE-run1.log, ORACLE-run-twin.log (full stdout incl. all tally vectors),
+   SMOKE-CAND/ (bench JSON/meta/stderr/daemonproof, 2 harness JSON+logs), oracle dump roots
+   /tmp/hipfire-resident-lowered-passback-571881 (run1, ~350-450MB) + -572723 (twin) RETAINED on disk.
+   Full builds: CANDIDATE-build.log (failed E0382, retained), CANDIDATE-build2.log (RC=0),
+   CANDIDATE-fullbuild.log (RC=0; CLI a11eb0a0…, daemon 16c8abdd…).
+
+GATE VERDICT: correctness PASS on all required routes. Proceeding to bounded 9B auto A/B per predeclared protocol.

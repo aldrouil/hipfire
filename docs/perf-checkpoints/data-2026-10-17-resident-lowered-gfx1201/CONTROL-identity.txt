@@ -1,0 +1,11 @@
+EXACT FINAL2 CONTROL PROOF (runner-verified 2026-10-17, no builds, no GPU work)
+Base: ../hipfire-passback-final2 @ b236099f64779b0291f5b48ff4ec0aa68d872b40 (detached worktree; shares gitdir with main checkout — READ-ONLY use, no git mutations run there)
+Patch: FINAL2-production.patch, SHA256 f855d7b92c919e454ee4c364f903e3f762d7ede264b48c80c2f6bc45639d30e0 (matches contract)
+Worktree check: `git diff -- crates/` in worktree is BYTE-IDENTICAL to FINAL2-production.patch (diff-of-diff empty, verified this session)
+  M crates/hip-bridge/src/ffi.rs, M crates/hipfire-arch-qwen35/tests/gpu_gemv_parity.rs, M crates/hipfire-dispatch/src/cpu_exec.rs, M crates/hipfire-dispatch/src/offload_split.rs
+Binaries (preserved, never rebuilt by runner): target/release/hipfire MD5 72ab7a028cf4dfe4adb6638741b84a83; target/release/daemon MD5 fb71e7d781a26671c8d8cb5ae6885e50 — both match ledger FINAL2WT-binaries.md5
+Models: ~/.hipfire/models/qwen3.5-9b.mq4 MD5 296092bf1e6a45d78c1acf815eb93366; ~/.hipfire/models/qwen3.8-27b.mq4 MD5 d1292b4d5bd6046693604201a6ca8074 (both match contract)
+Prompt: benchmarks/prompts/gpu_offload_probe.txt MD5 5835c71e471849b4a72e1dc8e39695e7, 215 bytes / 59 tokens (verified)
+Toolchain: rustc/cargo 1.98.1, HIP 7.2.53211-3d9ef42, driver 7.2.10-1-cachyos, amd clang 22.0.0git
+GPU: RX 9070 XT gfx1201 PCI 0000:03:00.0 (+ Ryzen 7800X3D iGPU gfx1036 0000:14:00.0, unused). Idle at check: 7% busy, VRAM 1.8/17GB, no hipfire procs. Stale lockfiles only (PIDs 502514/530856 dead; flock releases on death, nothing to clean, never rm).
+Control binaries/source UNTOUCHED by runner. No candidate built (gated).

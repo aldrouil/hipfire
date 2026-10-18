@@ -1,0 +1,12 @@
+27B FP8 exact-fixture oracle manifests — per-arm sha256 (original /tmp hashes; copies identical, re-verified below)
+cut7_share0.375_nb0.hand.manifest.json sha256=32fb60adb09e50070cb3063ee657fb9adcbe27900600f4703ca60d9fe58e94c6 entries=876 kinds={'i8': 192, 'f32': 396, 'f16': 192, 'fp8_h4_d256': 96} split=516 sampled=119 launches_total=11628
+cut7_share0.375_nb0.mixed.manifest.json sha256=9b659d785041f2dd07bcf7a9a49eb8a70e866742df8742a241e7798c681e2525 entries=876 kinds={'i8': 192, 'f32': 396, 'f16': 192, 'fp8_h4_d256': 96} split=516 sampled=119 launches_total=9576
+cut8_share0.375_nb0.hand.manifest.json sha256=ee89905154eaece952fa34594471f1e5d65fe7d2ffb5436a2a4b81e692e64705 entries=876 kinds={'i8': 192, 'f32': 396, 'f16': 192, 'fp8_h4_d256': 96} split=600 sampled=138 launches_total=11676
+cut8_share0.375_nb0.mixed.manifest.json sha256=fdd40c8390f05b26f3d0a3a4643fe93e9f9df5a670c19a322fb5080d3270dbc5 entries=876 kinds={'i8': 192, 'f32': 396, 'f16': 192, 'fp8_h4_d256': 96} split=600 sampled=138 launches_total=9660
+cut8_share0.375_nb1.hand.manifest.json sha256=128e202da0c5d8deb7aa2c7cbd33040cc6ee5c39fb1432fe9bd26fb4661f9692 entries=876 kinds={'i8': 192, 'f32': 396, 'f16': 192, 'fp8_h4_d256': 96} split=600 sampled=138 launches_total=11676
+cut8_share0.375_nb1.mixed.manifest.json sha256=600dd28371a98690ed6ce8c7b497d367a6ed82cbe31e2d17f8863406529ae208 entries=876 kinds={'i8': 192, 'f32': 396, 'f16': 192, 'fp8_h4_d256': 96} split=600 sampled=138 launches_total=9660
+cut8_share0.5_nb0.hand.manifest.json sha256=d6897cf8d661c291a8490ffd44513aa9af802c6cbdff7e0f2b915aaa15f6e46f entries=876 kinds={'i8': 192, 'f32': 396, 'f16': 192, 'fp8_h4_d256': 96} split=600 sampled=138 launches_total=11676
+cut8_share0.5_nb0.mixed.manifest.json sha256=842d512936f085ff7f7043c958b4361bbb0e7d10aa800d53f06ed642478ede3a entries=876 kinds={'i8': 192, 'f32': 396, 'f16': 192, 'fp8_h4_d256': 96} split=600 sampled=138 launches_total=9660
+9B Q8 legacy regression manifests:
+cut16_share0.375_nb0.hand.manifest.json sha256=c1010a7d9eae818a76ed1ebe87505a599b1bda13935cf5f2e3c0486c25c6f89c entries=444 split=1200 sampled=282
+cut16_share0.375_nb0.mixed.manifest.json sha256=e58e009f41963324ed31cd04060a8e829bf7f3843d9270dfd0624ee9dfeefcf1 entries=444 split=1200 sampled=282

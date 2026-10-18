@@ -1,0 +1,3 @@
+new_oracle_exe_md5=71a5940c9e69ac25ae575ca5f3c7f95b (target/release/deps/resident_lowered_passback_hw-3ab08c4591265e9f; old 1cc3ebb12d68d21e6e2ee5388e1bc17f SUPERSEDED test-only)
+cli_K=a11eb0a0488b8aada0832220c1a0d935 daemon_K=16c8abdd03c589c436fd46fd072eaa0e (unchanged, no rebuild)
+cli_C+daemon_C re-verified this session (see below)

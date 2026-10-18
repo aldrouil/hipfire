@@ -1,0 +1,3 @@
+9c57732d278082fa82829452ab0518d1eafc97669fc2ed64f29de3c540d59046  /tmp/rl-candidate/crates/hipfire-arch-qwen35/tests/resident_lowered_passback_hw.rs
+9c57732d278082fa82829452ab0518d1eafc97669fc2ed64f29de3c540d59046  crates/hipfire-arch-qwen35/tests/resident_lowered_passback_hw.rs
+d85c712698db21f19586ce41431bc33af107ba898d5fd3fa5debfa4dee1cb3b2  docs/perf-checkpoints/data-2026-10-18-resident-lowered-passback-27b-gfx1201/ORACLE-extension.patch

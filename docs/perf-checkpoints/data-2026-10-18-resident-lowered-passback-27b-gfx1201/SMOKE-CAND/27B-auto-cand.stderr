@@ -1,0 +1,5 @@
+  [serve spawn attempt 1 failed]
+  [serve spawn attempt 2 failed]
+  [serve spawn attempt 3 failed]
+  [serve spawn attempt 4 failed]
+serve_harness: serve failed to warm after retries

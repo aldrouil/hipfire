@@ -1,0 +1,21 @@
+27B resident-lowered passback evidence packaging — 2026-10-18
+
+Versioned compact evidence in this directory: predeclared protocol, frozen IDENTITY,
+source-approval addendum, oracle extension patch + hashes, oracle build record, all-8-arm
+oracle manifests + per-arm child logs + available orchestrator logs, legacy 9B Q8 compact
+pair, smoke receipts incl. the two failed attempts + serve log, A/B per-process JSON/meta/
+stderr/daemonproofs + runner + analysis + SHA256SUMS, cut8-probe failure + Q8-cut16
+supplement receipts.
+
+The large raw-state archive is preserved locally alongside this file but is deliberately
+NOT a Git object (~2.3 GB):
+  ORACLE-27B-FP8-raw.tar.zst (zstd -1 of /tmp/oracle-27b-fp8, 4 cases x 2 arms raw .bin dumps)
+Its SHA-256 is recorded in ORACLE-27B-FP8-raw.sha256. Neither the archive nor the original
+/tmp roots (/tmp/oracle-27b-fp8, /tmp/oracle-9b-q8-legacy, /tmp/oracle-27b-cut16,
+/tmp/oracle-27b-probe) were deleted. The supplementary 27B Q8-cut16 raw dumps remain local
+only at /tmp/oracle-27b-cut16 + /tmp/oracle-27b-probe with manifests in ORACLE-27B-Q8-CUT16/;
+their copies-as-receipts are durable. No remote publication or upload was performed.
+A fresh checkout therefore contains manifests, logs and reproduction instructions, not raw
+tensor bytes; rerun the approved hardware oracle on the documented fixture or obtain the
+archive out of band. A checksum alone is not a downloadable archive. Never claim the raw
+archive is versioned in Git.

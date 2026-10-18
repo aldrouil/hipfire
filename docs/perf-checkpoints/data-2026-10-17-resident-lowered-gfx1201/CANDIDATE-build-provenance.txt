@@ -1,0 +1,9 @@
+CANDIDATE BUILD provenance (isolated /tmp/rl-candidate, standalone copy — shared-git pointer removed, no git mutations)
+base: exact FINAL2 tree copy (forward.rs blob verified 2cc790158… == b236099:forward.rs BEFORE patch)
+feature: FEATURE-forward-rs.patch SHA256 d46df385d1e324d3beef4ae18d1bbfbc5c5fa219a34aa67ced0134b591904b1d (122+/6-, single file, parent-reviewed; UNCHANGED across oracle fix)
+oracle: resident_lowered_passback_hw.rs SHA256 a5fcb7a6fb955e7a144b482bf0f03505e1b4ff7fe48d35903cd76b2e55672d46 (1343 lines; parent Stream-ownership fix E96E + rustfmt; supersedes efa3fad3…)
+attempt1: FAILED E0382 Stream move (oracle case-3) — log CANDIDATE-build.log (BUILD_RC=101), retained; no rerun of old failure
+attempt2: BUILD_RC=0 — log CANDIDATE-build2.log (incremental; lib compiled with feature in attempt1)
+  test exe: target/release/deps/resident_lowered_passback_hw-3ab08c4591265e9f MD5 1cc3ebb12d68d21e6e2ee5388e1bc17f
+toolchain: rustc/cargo 1.98.1, HIP 7.2.53211-3d9ef42 (same as control ledger)
+control tree ../hipfire-passback-final2 UNTOUCHED; main checkout unmodified by build.

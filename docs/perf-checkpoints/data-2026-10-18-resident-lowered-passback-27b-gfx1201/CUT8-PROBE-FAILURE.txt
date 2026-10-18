@@ -1,0 +1,19 @@
+FAILED CUT8 PROBE receipt (unmodified oracle, 27B weights — preserved, not rerun)
+Date: 2026-10-18 ~01:5x UTC. Binary: /tmp/rl-candidate/target/release/deps/resident_lowered_passback_hw-3ab08c4591265e9f (md5 1cc3ebb12d68d21e6e2ee5388e1bc17f).
+Command (both arms identical except ARM/HIPFIRE_FORWARD_LOWERED):
+  HIPFIRE_RESIDENT_ORACLE_MODEL=/home/avery/.hipfire/models/qwen3.8-27b.mq4
+  HIPFIRE_RESIDENT_ORACLE_OUT=/tmp/oracle-27b-probe (mixed) / /tmp/oracle-27b-8spill/hand (hand)
+  HIPFIRE_RESIDENT_ORACLE_ARM=mixed|hand HIPFIRE_RESIDENT_ORACLE_CUT=8
+  HIPFIRE_RESIDENT_ORACLE_SHARE=0.375 HIPFIRE_RESIDENT_ORACLE_STEPS=12
+  HIPFIRE_RESIDENT_ORACLE_NONBLOCKING=0 HIPFIRE_OFFLOAD_EXEC=passback
+  HIPFIRE_OFFLOAD_PASSBACK_SHARE=0.375 (+ HIPFIRE_FORWARD_LOWERED=0 on hand arm)
+Result BOTH arms: panic at crates/hipfire-arch-qwen35/tests/resident_lowered_passback_hw.rs:144:18:
+  `no expected first-resident layer pinned for cut 8` — failed in ~0.3-0.5s before any GPU
+  weight load. No dumps/manifest produced (expected: oracle asserts topology pin pre-load).
+Preflight receipt: worker with ARM unset exits ok/no-op (contract check passed).
+Supplemental Q8 pass (NOT exact-fixture coverage): same command at CUT=16 both arms OK
+  (14.4s mixed / 12.1s hand); 876/876 tensors byte-exact; manifests in ORACLE-27B-Q8-CUT16/.
+  Raw dumps retained on local disk only: /tmp/oracle-27b-probe, /tmp/oracle-27b-cut16 (~472M each).
+Teardown: stray 2-step probe job bg_83 killed; no hipfire/daemon/oracle processes owned;
+  no GPU lock ever acquired or held. Frozen CLI/daemon K untouched.
+Standing by for source-approval message before any oracle-copy/build/benchmark work.

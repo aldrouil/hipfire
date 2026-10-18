@@ -1,0 +1,49 @@
+
+running 1 test
+test resident_lowered_passback_oracle ... [oracle] 5 case(s), model=/home/avery/.hipfire/models/qwen3.5-9b.mq4, steps=12, artifacts under /tmp/hipfire-resident-lowered-passback-572723
+[oracle] ── case 0: Case { cut: 16, share: 0.375, nonblocking: false, kind: Mixed }
+[oracle] spawning arm hand (cut=16 share=0.375 exec=passback lowered=0 nonblocking=0) -> /tmp/hipfire-resident-lowered-passback-572723/cut16_share0.375_nb0/hand
+[oracle] spawning arm mixed (cut=16 share=0.375 exec=passback lowered=1 nonblocking=0) -> /tmp/hipfire-resident-lowered-passback-572723/cut16_share0.375_nb0/mixed
+[oracle] cut16 share0.375 nonblocking0 [hand vs mixed]: kernels/step all-hand=[528, 528, 528, 528, 528, 528, 528, 528, 528, 528, 528, 528]
+[oracle] cut16 share0.375 nonblocking0 [hand vs mixed]: kernels/step mixed   =[504, 504, 504, 504, 504, 504, 504, 504, 504, 504, 504, 504]
+[oracle] cut16 share0.375 nonblocking0 [hand vs mixed]: launches/step all-hand=[528, 528, 528, 528, 528, 528, 528, 528, 528, 528, 528, 528]
+[oracle] cut16 share0.375 nonblocking0 [hand vs mixed]: launches/step mixed   =[504, 504, 504, 504, 504, 504, 504, 504, 504, 504, 504, 504]
+[oracle] cut16 share0.375 nonblocking0 [hand vs mixed]: totals all-hand launches=6336 kernels=6336; mixed launches=6048 kernels=6048
+[oracle] cut16 share0.375 nonblocking0 [hand vs mixed]: BYTE-EXACT across 444 tensors (12 logits rows, full valid state)
+[oracle] ── case 1: Case { cut: 15, share: 0.375, nonblocking: false, kind: Mixed }
+[oracle] spawning arm hand (cut=15 share=0.375 exec=passback lowered=0 nonblocking=0) -> /tmp/hipfire-resident-lowered-passback-572723/cut15_share0.375_nb0/hand
+[oracle] spawning arm mixed (cut=15 share=0.375 exec=passback lowered=1 nonblocking=0) -> /tmp/hipfire-resident-lowered-passback-572723/cut15_share0.375_nb0/mixed
+[oracle] cut15 share0.375 nonblocking0 [hand vs mixed]: kernels/step all-hand=[524, 524, 524, 524, 524, 524, 524, 524, 524, 524, 524, 524]
+[oracle] cut15 share0.375 nonblocking0 [hand vs mixed]: kernels/step mixed   =[500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500]
+[oracle] cut15 share0.375 nonblocking0 [hand vs mixed]: launches/step all-hand=[524, 524, 524, 524, 524, 524, 524, 524, 524, 524, 524, 524]
+[oracle] cut15 share0.375 nonblocking0 [hand vs mixed]: launches/step mixed   =[500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500]
+[oracle] cut15 share0.375 nonblocking0 [hand vs mixed]: totals all-hand launches=6288 kernels=6288; mixed launches=6000 kernels=6000
+[oracle] cut15 share0.375 nonblocking0 [hand vs mixed]: BYTE-EXACT across 444 tensors (12 logits rows, full valid state)
+[oracle] ── case 2: Case { cut: 16, share: 0.5, nonblocking: false, kind: Mixed }
+[oracle] spawning arm hand (cut=16 share=0.5 exec=passback lowered=0 nonblocking=0) -> /tmp/hipfire-resident-lowered-passback-572723/cut16_share0.5_nb0/hand
+[oracle] spawning arm mixed (cut=16 share=0.5 exec=passback lowered=1 nonblocking=0) -> /tmp/hipfire-resident-lowered-passback-572723/cut16_share0.5_nb0/mixed
+[oracle] cut16 share0.5 nonblocking0 [hand vs mixed]: kernels/step all-hand=[528, 528, 528, 528, 528, 528, 528, 528, 528, 528, 528, 528]
+[oracle] cut16 share0.5 nonblocking0 [hand vs mixed]: kernels/step mixed   =[504, 504, 504, 504, 504, 504, 504, 504, 504, 504, 504, 504]
+[oracle] cut16 share0.5 nonblocking0 [hand vs mixed]: launches/step all-hand=[528, 528, 528, 528, 528, 528, 528, 528, 528, 528, 528, 528]
+[oracle] cut16 share0.5 nonblocking0 [hand vs mixed]: launches/step mixed   =[504, 504, 504, 504, 504, 504, 504, 504, 504, 504, 504, 504]
+[oracle] cut16 share0.5 nonblocking0 [hand vs mixed]: totals all-hand launches=6336 kernels=6336; mixed launches=6048 kernels=6048
+[oracle] cut16 share0.5 nonblocking0 [hand vs mixed]: BYTE-EXACT across 444 tensors (12 logits rows, full valid state)
+[oracle] ── case 3: Case { cut: 16, share: 0.375, nonblocking: true, kind: Mixed }
+[oracle] spawning arm hand (cut=16 share=0.375 exec=passback lowered=0 nonblocking=1) -> /tmp/hipfire-resident-lowered-passback-572723/cut16_share0.375_nb1/hand
+[oracle] spawning arm mixed (cut=16 share=0.375 exec=passback lowered=1 nonblocking=1) -> /tmp/hipfire-resident-lowered-passback-572723/cut16_share0.375_nb1/mixed
+[oracle] cut16 share0.375 nonblocking1 [hand vs mixed]: kernels/step all-hand=[528, 528, 528, 528, 528, 528, 528, 528, 528, 528, 528, 528]
+[oracle] cut16 share0.375 nonblocking1 [hand vs mixed]: kernels/step mixed   =[504, 504, 504, 504, 504, 504, 504, 504, 504, 504, 504, 504]
+[oracle] cut16 share0.375 nonblocking1 [hand vs mixed]: launches/step all-hand=[528, 528, 528, 528, 528, 528, 528, 528, 528, 528, 528, 528]
+[oracle] cut16 share0.375 nonblocking1 [hand vs mixed]: launches/step mixed   =[504, 504, 504, 504, 504, 504, 504, 504, 504, 504, 504, 504]
+[oracle] cut16 share0.375 nonblocking1 [hand vs mixed]: totals all-hand launches=6336 kernels=6336; mixed launches=6048 kernels=6048
+[oracle] cut16 share0.375 nonblocking1 [hand vs mixed]: BYTE-EXACT across 444 tensors (12 logits rows, full valid state)
+[oracle] ── case 4: Case { cut: 16, share: 0.0, nonblocking: false, kind: Twin }
+[oracle] spawning arm cpu (cut=16 share=0 exec=cpu lowered=0 nonblocking=0) -> /tmp/hipfire-resident-lowered-passback-572723/cut16_share0_nb0/cpu
+[oracle] spawning arm passback0 (cut=16 share=0 exec=passback lowered=1 nonblocking=0) -> /tmp/hipfire-resident-lowered-passback-572723/cut16_share0_nb0/passback0
+[oracle] cut16 share0 nonblocking0 [cpu vs passback0]: cpu_steps 1488 vs 1488; host_mapped_gpu_steps 0 vs 0
+[oracle] cut16 share0 nonblocking0 [cpu vs passback0]: BYTE-EXACT across 444 tensors (12 logits rows, full valid state)
+[oracle] PASS: every case byte-exact with the all-hand reference; artifacts under /tmp/hipfire-resident-lowered-passback-572723
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 55.97s
+

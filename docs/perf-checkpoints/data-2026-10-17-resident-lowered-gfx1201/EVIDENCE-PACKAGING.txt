@@ -1,0 +1,32 @@
+Resident-lowered passback evidence packaging — 2026-10-18
+
+Versioned compact evidence includes the native A/B JSON/sample arrays, process
+metadata and daemon proofs, oracle stdout and per-arm manifests/child logs,
+serve-smoke receipts, build logs (including the failed first test build), source
+patch/provenance, the predeclared protocol, analysis and raw-archive checksums.
+Ignored *.log receipts are explicitly included; blanket staging is not used.
+
+The two large raw-state archives are preserved locally alongside this file but
+are deliberately NOT Git objects (approximately 1.8 GB combined):
+  ORACLE-dumps-run1.tar.zst
+  ORACLE-dumps-twin.tar.zst
+Their SHA-256 values are recorded in ORACLE-dumps.sha256. Neither the archives
+nor the original /tmp dump roots were deleted. No remote artifact publication
+or upload was performed. A fresh Git checkout therefore contains manifests,
+logs and reproduction instructions, not raw tensor bytes; rerun the ignored
+hardware oracle on the documented fixture or obtain the archives out of band.
+A checksum alone is not a downloadable archive.
+
+The originally copied compact share-zero directories used hand/mixed names and
+were empty because that case actually names its arms cpu/passback0. Additional
+unaltered manifests and child logs were preserved from the original twin dump
+under ORACLE-receipts/run572723/cut16_share0_nb0_{cpu,passback0}/. No new model
+execution, measurement or numerical analysis was performed for this packaging.
+
+FEATURE-provenance.txt is an earlier receipt whose oracle hash efa3fad3... is
+superseded by CANDIDATE-build-provenance.txt's final oracle hash
+ a5fcb7a6fb955e7a144b482bf0f03505e1b4ff7fe48d35903cd76b2e55672d46.
+The original receipts and immutable measurement report are not rewritten.
+
+Earlier Phase 3 untracked reports/data and .tmp-p3prov4/ are outside this
+resident-lowering commit scope and are preserved untouched.

@@ -1,0 +1,58 @@
+9B AUTO A/B — exact FINAL2 control vs exact FINAL2+feature candidate (runner 2026-10-18, gfx1201)
+Config: native bench, 3 warmups + 3 measured, --spec off, thinking off (--reasoning-on absent),
+  passback budget 16, share AUTO (unset), prompt gpu_offload_probe.txt md5 5835c71e…, 59 tokens.
+Order: ABBA (C-r1,K-r1,K-r2,C-r2) then BAAB (K-r3,C-r3,C-r4,K-r4), serialized, fresh process each.
+Control binaries: CLI 72ab7a02… daemon fb71e7d7… (4 procs, daemon-wrap proof each).
+Candidate binaries: CLI a11eb0a0… daemon 16c8abdd… (4 procs, daemon-wrap proof each).
+Uniform: kv q8/vmm 8/8, spec off 8/8, prompt md5 8/8, stderr clean 8/8, all rc=0.
+
+DECODE process-medians (analysis unit = process median):
+  C: [20.5, 20.4, 20.4, 21.0] med 20.45 range 0.60
+  K: [20.5, 20.6, 20.8, 21.0] med 20.70 range 0.50
+  delta +1.22% (20.45 -> 20.70); gap 0.25 < BOTH arm ranges (0.60/0.50)
+WALL process-medians:
+  C: [18.7, 18.5, 18.6, 19.0] med 18.65 range 0.50
+  K: [18.6, 18.7, 18.9, 19.1] med 18.80 range 0.50
+  delta +0.80%; gap 0.15 < both ranges (0.50/0.50)
+Block means (decode):
+  b1 ABBA: C 20.450 K 20.550 d +0.49%
+  b2 BAAB: C 20.700 K 20.900 d +0.97%
+Block means (wall):
+  b1: C 18.600 K 18.650 d +0.27%
+  b2: C 18.800 K 19.000 d +1.06%
+Block-mean shift SEPARATELY BY ARM (b1 ABBA -> b2 BAAB):
+  decode: control 20.450 -> 20.700 (+0.25); candidate 20.550 -> 20.900 (+0.35)
+  wall:   control 18.600 -> 18.800 (+0.20); candidate 18.650 -> 19.000 (+0.35)
+Within-block spread (decode process-medians in block):
+  b1: all-4 range 0.20 (C pair gap 0.10, K pair gap 0.10); block gap K-C = +0.10
+  b2: all-4 range 0.60 (C pair gap 0.60: 20.4/21.0; K pair gap 0.20: 20.8/21.0); block gap K-C = +0.20
+  b1 gap (+0.10) equals the within-block arm-pair gaps (0.10/0.10); b2 gap (+0.20) is one-third
+  of b2's all-4 range (0.60) and equals K's own pair gap (0.20) — neither block's gap exceeds
+  its contemporaneous spread. The b2 range is driven by control's own 0.60 pair split (C-r3 20.4
+  vs C-r4 21.0), i.e. control-side session noise, not a candidate effect.
+
+Per-cell rule (predeclared): delta < observed spread = inconclusive, not a win.
+  Decode gap 0.25 < 0.50 (smaller arm range). Wall gap 0.15 < 0.50.
+  Both blocks favor K in sign, but each block's gap is a fraction of the contemporaneous drift.
+VERDICT: NO RESOLVED GAIN. 9B auto shows +1.2% decode / +0.8% wall at medians, directionally
+consistent across both blocks, but the gap sits INSIDE cell spread on both metrics — inconclusive
+per the predeclared rule. No 27B campaign (gate requires reproducible improvement beyond spread).
+No attribution campaign (rule: if no resolved gain, report attribution-not-established, no extra work).
+Route engagement already proven out-of-band (uniform -24 launches/step, byte-exact) — that stands as
+path proof independent of this wall result; no resident-time inference is drawn from tok/s.
+Throttle: throttle_pct unavailable (thermal-throttle logging lines only); no stderr errors.
+
+CORRECTION NOTE (2026-10-18, no new runs): the original analysis line 'BOTH arms +0.25/+0.20'
+incorrectly collapsed the two arms' block shifts into one shared drift figure. Per-arm shifts are
+control +0.25/+0.20 vs candidate +0.35/+0.35 (decode/wall) — a +0.10 arm difference in shift that is
+itself smaller than any cell spread (0.50+) and therefore not a separable effect. Within-block
+comparison above replaces the collapsed-drift reading. Conclusions unchanged: NO RESOLVED GAIN.
+
+MEASUREMENT DATE: all 8 timed processes ran 2026-10-18T00:55:03Z .. 01:00:56Z UTC (per-process
+meta.log date_utc). Directory prefix '2026-10-17' is the campaign authorization date; the dated
+checkpoint title should reflect actual measurement UTC 2026-10-18.
+
+IDENTITY (full hashes, see provenance files):
+  control CLI md5 72ab7a028cf4dfe4adb6638741b84a83 / daemon md5 fb71e7d781a26671c8d8cb5ae6885e50
+  candidate CLI md5 a11eb0a0488b8aada0832220c1a0d935 / daemon md5 16c8abdd03c589c436fd46fd072eaa0e
+  feature patch SHA256 d46df385d1e324d3beef4ae18d1bbfbc5c5fa219a34aa67ced0134b591904b1d (122+/6-)

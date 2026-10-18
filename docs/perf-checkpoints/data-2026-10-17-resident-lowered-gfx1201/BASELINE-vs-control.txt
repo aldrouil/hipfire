@@ -1,0 +1,10 @@
+CURRENT MAIN HEAD vs EXACT CONTROL — PRODUCTION DIFFERENCES (runner-verified 2026-10-17)
+Main HEAD: 9f826750bab4d711e880069f618cc9c1649080c5 (clean production tree; only pre-existing untracked user artifacts + this runner data dir)
+b236099f is ancestor of HEAD. Commits b236099..HEAD (3):
+  8e618657f perf(passback): owner-coupled input-ready event boundary (PRODUCTION: map.md + ffi.rs/cpu_exec.rs/offload_split.rs + gpu_gemv_parity.rs test)
+  2d22461f7 docs input-ready boundary validation (docs only)
+  9f826750b docs exact FINAL2 throughput comparison (docs only)
+Production crates diff b236099..HEAD: 5 files (map.md 2 lines; ffi.rs 874 lines; gpu_gemv_parity.rs 137; cpu_exec.rs 201; offload_split.rs 79). Full-crates-diff SHA256 7b1f55a470c4a20a32a026cce9f963cd7b2feca08b815625fcd768096bcfea09 (includes map.md; control patch covers the 4 code files only).
+vs FINAL2 worktree: HEAD additionally differs in crates/hip-bridge/map.md (2-line bridge API map entry) — control worktree lacks it; otherwise both descend from same 4-file production delta family (HEAD's 4-file content = FINAL2 patch + input-ready which IS the FINAL2→FINAL3 step; exact FINAL2 = without it).
+Consequence for timing: live HEAD binaries are FINAL3, NOT the control. Timing candidate MUST be isolated exact-FINAL2 + ONLY the MixedForwardImpl feature delta (fresh filesystem copy of control tree excl. target/, feature patch applied, built once). Control arm = preserved binaries above. Candidate all-hand diagnostic (HIPFIRE_FORWARD_LOWERED=0) allowed only to isolate build drift — no extra campaign.
+forward.rs: NO feature branch present (only pre-existing #397 Ship-6 lowered references); MixedForwardImpl owns it, untouched by runner.

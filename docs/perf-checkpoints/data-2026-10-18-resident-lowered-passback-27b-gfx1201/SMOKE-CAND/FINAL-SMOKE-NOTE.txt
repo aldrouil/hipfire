@@ -1,0 +1,7 @@
+
+SMOKE PASS (retry, thinking off, max-seq 4096, candidate daemon 16c8abdd…):
+  rc=0, 5 battery rows, thinking DISABLED (think_w=0 all rows), kv fp8/vmm all rows.
+  finish: 3x stop, 2x length; empty=False all; attractor=False all; runaway=True on the
+  2 length-finish rows (cut off at max tokens, expected — not a loop; answers 71/107 words).
+  Answers coherent (code merge, train distance, seasons tilt). No panics.
+  Files: 27B-auto-cand4096.* (meta/stdout/stderr/harness.json). Earlier 2 failures retained above.

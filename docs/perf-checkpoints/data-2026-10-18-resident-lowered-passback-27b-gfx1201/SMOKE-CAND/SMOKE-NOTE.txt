@@ -1,0 +1,17 @@
+27B decoded-smoke note (candidate daemon 16c8abdd…, thinking OFF, battery, greedy, max-tokens 128)
+Two attempts failed BEFORE any decode:
+  1. First attempt: harness refused locally (max_tokens 128 <= med thinking cap) — harness-side
+     config error, no GPU work. Fixed by adding --thinking off (second attempt shows
+     "thinking DISABLED (sentinel cap 1)" in pre-flight).
+  2. Second attempt (thinking off): daemon pre-warm refused 4x: "Qwen VMM load refused:
+     projected weights, minimum prefill scratch and KV do not fit free VRAM; serving lazily".
+     Serve log retained as 27B-auto-cand.serve.log. Stderr shows 4x "[serve spawn attempt N
+     failed]" then "serve failed to warm after retries" (rc=1).
+VRAM at check after failure: 2.6/17.1 GB used (no leak, no owned procs). Prior 27B bench cells
+  (Phase 3 + this sweep's bench path) load the same model fine via `hipfire bench` with
+  explicit --max-seq 4096; the harness default here was max_seq automatic (model/card), which
+  resolves larger than the bench fixture's 4096 and exceeds the VMM fit check on this card
+  with budget 56. This is a harness-config/smoke-path issue, NOT an oracle or bench-path
+  failure: the exact FP8 oracle (4 cases byte-exact) and the bench timing path both use
+  explicit max-seq 4096.
+Next: retry smoke with explicit --max-seq 4096 to match the timed fixture, then proceed to timing.

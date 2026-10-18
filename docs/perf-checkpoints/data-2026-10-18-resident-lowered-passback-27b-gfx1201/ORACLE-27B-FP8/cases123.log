@@ -1,0 +1,35 @@
+
+running 1 test
+test resident_lowered_passback_oracle ... [oracle] 3 case(s), model=/home/avery/.hipfire/models/qwen3.8-27b.mq4, steps=12, fixture=27b, kv_mode=fp8, artifacts under /tmp/oracle-27b-fp8
+[oracle] ── case 0: Case { cut: 7, share: 0.375, nonblocking: false, kind: Mixed }
+[oracle] spawning arm hand (cut=7 share=0.375 exec=passback lowered=0 nonblocking=0 kv=fp8) -> /tmp/oracle-27b-fp8/cut7_share0.375_nb0/hand
+[oracle] spawning arm mixed (cut=7 share=0.375 exec=passback lowered=1 nonblocking=0 kv=fp8) -> /tmp/oracle-27b-fp8/cut7_share0.375_nb0/mixed
+[oracle] cut7 share0.375 nonblocking0 [hand vs mixed]: kernels/step all-hand=[969, 969, 969, 969, 969, 969, 969, 969, 969, 969, 969, 969]
+[oracle] cut7 share0.375 nonblocking0 [hand vs mixed]: kernels/step mixed   =[798, 798, 798, 798, 798, 798, 798, 798, 798, 798, 798, 798]
+[oracle] cut7 share0.375 nonblocking0 [hand vs mixed]: launches/step all-hand=[969, 969, 969, 969, 969, 969, 969, 969, 969, 969, 969, 969]
+[oracle] cut7 share0.375 nonblocking0 [hand vs mixed]: launches/step mixed   =[798, 798, 798, 798, 798, 798, 798, 798, 798, 798, 798, 798]
+[oracle] cut7 share0.375 nonblocking0 [hand vs mixed]: totals all-hand launches=11628 kernels=11628; mixed launches=9576 kernels=9576
+[oracle] cut7 share0.375 nonblocking0 [hand vs mixed]: BYTE-EXACT across 876 tensors (12 logits rows, full valid state)
+[oracle] ── case 1: Case { cut: 8, share: 0.5, nonblocking: false, kind: Mixed }
+[oracle] spawning arm hand (cut=8 share=0.5 exec=passback lowered=0 nonblocking=0 kv=fp8) -> /tmp/oracle-27b-fp8/cut8_share0.5_nb0/hand
+[oracle] spawning arm mixed (cut=8 share=0.5 exec=passback lowered=1 nonblocking=0 kv=fp8) -> /tmp/oracle-27b-fp8/cut8_share0.5_nb0/mixed
+[oracle] cut8 share0.5 nonblocking0 [hand vs mixed]: kernels/step all-hand=[973, 973, 973, 973, 973, 973, 973, 973, 973, 973, 973, 973]
+[oracle] cut8 share0.5 nonblocking0 [hand vs mixed]: kernels/step mixed   =[805, 805, 805, 805, 805, 805, 805, 805, 805, 805, 805, 805]
+[oracle] cut8 share0.5 nonblocking0 [hand vs mixed]: launches/step all-hand=[973, 973, 973, 973, 973, 973, 973, 973, 973, 973, 973, 973]
+[oracle] cut8 share0.5 nonblocking0 [hand vs mixed]: launches/step mixed   =[805, 805, 805, 805, 805, 805, 805, 805, 805, 805, 805, 805]
+[oracle] cut8 share0.5 nonblocking0 [hand vs mixed]: totals all-hand launches=11676 kernels=11676; mixed launches=9660 kernels=9660
+[oracle] cut8 share0.5 nonblocking0 [hand vs mixed]: BYTE-EXACT across 876 tensors (12 logits rows, full valid state)
+[oracle] ── case 2: Case { cut: 8, share: 0.375, nonblocking: true, kind: Mixed }
+[oracle] spawning arm hand (cut=8 share=0.375 exec=passback lowered=0 nonblocking=1 kv=fp8) -> /tmp/oracle-27b-fp8/cut8_share0.375_nb1/hand
+[oracle] spawning arm mixed (cut=8 share=0.375 exec=passback lowered=1 nonblocking=1 kv=fp8) -> /tmp/oracle-27b-fp8/cut8_share0.375_nb1/mixed
+[oracle] cut8 share0.375 nonblocking1 [hand vs mixed]: kernels/step all-hand=[973, 973, 973, 973, 973, 973, 973, 973, 973, 973, 973, 973]
+[oracle] cut8 share0.375 nonblocking1 [hand vs mixed]: kernels/step mixed   =[805, 805, 805, 805, 805, 805, 805, 805, 805, 805, 805, 805]
+[oracle] cut8 share0.375 nonblocking1 [hand vs mixed]: launches/step all-hand=[973, 973, 973, 973, 973, 973, 973, 973, 973, 973, 973, 973]
+[oracle] cut8 share0.375 nonblocking1 [hand vs mixed]: launches/step mixed   =[805, 805, 805, 805, 805, 805, 805, 805, 805, 805, 805, 805]
+[oracle] cut8 share0.375 nonblocking1 [hand vs mixed]: totals all-hand launches=11676 kernels=11676; mixed launches=9660 kernels=9660
+[oracle] cut8 share0.375 nonblocking1 [hand vs mixed]: BYTE-EXACT across 876 tensors (12 logits rows, full valid state)
+[oracle] PASS: every case byte-exact with the all-hand reference; artifacts under /tmp/oracle-27b-fp8
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 53.45s
+

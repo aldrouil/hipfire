@@ -1,0 +1,58 @@
+=== RL A/B: OUT=docs/perf-checkpoints/data-2026-10-17-resident-lowered-gfx1201/AB-9B-AUTO/C-r1 HN=rl-ab-C1 HOME=/tmp/RL-ab-home-rl-ab-C1 ===
+date_utc=2026-10-18T00:55:03Z
+commit=[candidate-/tmp/rl-candidate-vs-control] cli_md5=72ab7a028cf4dfe4adb6638741b84a83 daemon_md5=fb71e7d781a26671c8d8cb5ae6885e50
+model_md5=296092bf1e6a45d78c1acf815eb93366 model_bytes=5313750016
+prompt_md5=5835c71e471849b4a72e1dc8e39695e7 prompt_bytes=215
+RAYON=[unset]
+HIPFIRE_OFFLOAD_EXEC=passback HIPFIRE_GPU_LAYER_BUDGET=16 HIPFIRE_OFFLOAD_PASSBACK_SHARE=[auto/unset]
+HIPFIRE_SPLIT_DIAG_ambient=[unset]
+HIPFIRE_CPU_EXEC_TRACE_ambient=[unset]
+HIPFIRE_PROFILE_ambient=[unset]
+HIPFIRE_PROFILE_DECODE_ambient=[unset]
+HIPFIRE_MEMSET_DUMP_ambient=[unset]
+HIPFIRE_GRAPH_ambient=[unset]
+HIPFIRE_REPLAY_ambient=[unset]
+HIPFIRE_QWEN_CACHE_TRACE_ambient=[unset]
+HIPFIRE_QWEN_FFW_TRACE_ambient=[unset]
+=== power pre ===
+power1_average_uW=48000000
+power1_cap_uW=374000000
+temp_edge_mC=48000
+temp_junction_mC=50000
+temp_mem_mC=72000
+sclk_Hz=58000000
+mclk_Hz=1258000000
+perf_level=auto
+pp_sclk_star=1: 1379Mhz *
+throttle_log=0000:03:00.0: thermal throttling logging enabled, with interval 60 seconds
+vram_used_B=1820684288
+vram_total_B=17095983104
+gtt_used_B=728129536
+gpu_busy_pct=4
+mem_busy_pct=1
+host_MemAvailable_kB=11541840
+rc=0 date_utc=2026-10-18T00:55:44Z
+=== power post ===
+power1_average_uW=54000000
+power1_cap_uW=374000000
+temp_edge_mC=53000
+temp_junction_mC=55000
+temp_mem_mC=76000
+sclk_Hz=1418000000
+mclk_Hz=1258000000
+perf_level=auto
+pp_sclk_star=1: 1709Mhz *
+throttle_log=0000:03:00.0: thermal throttling logging enabled, with interval 60 seconds
+vram_used_B=4380184576
+vram_total_B=17095983104
+gtt_used_B=728129536
+gpu_busy_pct=100
+mem_busy_pct=31
+host_MemAvailable_kB=11600720
+=== daemon proof ===
+WRAP daemon_md5=fb71e7d781a26671c8d8cb5ae6885e50 cli_md5=72ab7a028cf4dfe4adb6638741b84a83
+kv=q8/vmm spec=[None, None, None] warnings=['prompt is 59 tokens; prefill_tok_s at this length measures launch overhead, not prefill throughput — use --prompt-file with ≥256 tokens for a prefill number']
+samples.decode=[20.4, 20.5, 20.8]
+samples.wall=[18.6, 18.7, 18.9]
+decode={'median': 20.5, 'mean': 20.566666666666666, 'min': 20.4, 'max': 20.8, 'stdev': 0.1699673171197603} wall={'median': 18.7, 'mean': 18.73333333333333, 'min': 18.6, 'max': 18.9, 'stdev': 0.12472191289246363} ttft={'median': 609.4, 'mean': 611.1999999999999, 'min': 608.8, 'max': 615.4, 'stdev': 2.979932885150274}
+prompt_tokens=59 prompt_md5=5835c71e471849b4a72e1dc8e39695e7

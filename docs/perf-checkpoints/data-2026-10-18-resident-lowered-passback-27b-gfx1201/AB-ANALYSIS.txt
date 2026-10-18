@@ -1,0 +1,30 @@
+27B resident-lowered A/B analysis (process medians; 02:28–02:38 UTC 2026-10-18)
+Order executed: C1 K1 K2 C2 | K3 C3 C4 K4. All rc=0, protocol native-generate-v1,
+prompt 59tok md5 match, kv fp8/vmm all 8, daemon-wrap md5s match arm binaries.
+Full raw request arrays in per-process JSON (3 warm + 3 measured each, no drops).
+
+Process medians (decode / wall tok/s):
+  C-r1 17.0 / 16.7   K-r1 18.1 / 17.8   K-r2 18.0 / 17.7   C-r2 18.1 / 17.8
+  K-r3 17.7 / 17.4   C-r3 17.7 / 17.4   C-r4 17.5 / 17.2   K-r4 17.7 / 17.4
+
+Arm medians [min-max] (midpoint of middle two, N=4):
+  C decode 17.60 [17.0-18.1] sd 0.457 | C wall 17.30 [16.7-17.8] sd 0.457
+  K decode 17.85 [17.7-18.1] sd 0.206 | K wall 17.55 [17.4-17.8] sd 0.206
+  Descriptive deltas: decode +0.25 (+1.4%), wall +0.25 (+1.4%).
+
+Block comparison (midpoint of each arm pair; diff = K - C):
+  block1 (C1 K1 K2 C2): decode Cmid 17.55 Kmid 18.05 diff +0.50 | wall Cmid 17.25 Kmid 17.75 diff +0.50
+    within-block ranges: decode C 1.1 / K 0.1; wall C 1.1 / K 0.1
+  block2 (K3 C3 C4 K4): decode Cmid 17.60 Kmid 17.70 diff +0.10 | wall Cmid 17.30 Kmid 17.40 diff +0.10
+    within-block ranges: decode C 0.2 / K 0.0; wall C 0.2 / K 0.0
+
+Rule: BOTH decode+wall improvement beyond spread in BOTH blocks. Block1's +0.50 does not
+clear the control arm's own 1.1 contemporaneous spread (C1 17.0 slow first-cell vs C2 18.1);
+block2's +0.10 is within the 0.2 control pair spread and at K's 0.0 floor. Direction favors
+K in both blocks but neither clears spread: NO RESOLVED GAIN (same conservative rule as 9B).
+Not proof of equivalence/regression/significance. One-decimal native precision; tiny deltas
+must not be overinterpreted. No absolute 9B/27B timing comparison as arm causality.
+Attribution: fewer launches + byte-exact state proven on the fixed-share fixture (orange:
+-168 launches/token at cut8 fp8; -144 at cut16 q8). Reduced resident-layer time NOT measured;
+tok/s alone cannot assign the small positive medians to kernel/dispatch/controller/drift.
+No profiler/optimization campaign per instructions.

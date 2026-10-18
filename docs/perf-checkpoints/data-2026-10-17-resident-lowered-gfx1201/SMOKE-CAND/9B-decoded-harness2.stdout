@@ -1,0 +1,31 @@
+==================== serve_harness pre-flight (CONFIRM before run) ====================
+  model         : /home/avery/.hipfire/models/qwen3.5-9b.mq4
+  registry tag  : qwen3.5:9b
+  kv_mode       : auto [registry(qwen3.5:9b):q8->auto]   kv_backend: automatic [automatic]   mtp_mode: off   mode: chain
+  max_seq       : 4096 [explicit(--max-seq)]
+  dflash        : off   draft: (none / filename auto-match)
+  ngram         : off   ngram_k: (loader default 12)
+  mtp_ngram     : off   (off / default gate 24/48/64 when enabled)
+  speculation   : (derived from --dflash/--mtp above)
+  ds4 experts/tok: (checkpoint default)
+  ds4 placement : single
+  devices       : (runtime default)
+  expert parallel: tp=1
+  seed          : None   prompt_source: benchmarks/prompts/gpu_offload_probe.txt
+  thinking_cap  : 2048 tok (CONCRETE cap) [named-budget(med)]
+  reasoning_effort: auto  (parent prompt semantics; independent of cap)
+  max_tokens     : 2200 [explicit(--max-tokens)]  (> think cap 2048 — model can answer)
+  stop          : (none)
+  sampling (what IS set):
+      temperature       = 0.0      [explicit(greedy)]
+  sampling (NOT set, serve/daemon default applies): top_p, top_k, min_p, presence_penalty, repeat_penalty, reasoning_effort
+=======================================================================================
+  [serve warm; MTP head loaded lines=0]
+  [kv_backend effective: vmm (log-marker)]
+  kv_mode_resolved=UNOBSERVED (requested auto [registry(qwen3.5:9b):q8->auto]; no loaded ACK or KV-cache log line seen, e.g. --no-spawn)
+### RUN qwen3.5-9b.mq4|off|chain  kv=auto sampling={'temperature': 0.0} seed=None ###
+  [prose]t1  finish=stop   ctx=57     cached=0      gen=331  (think 84/ans 86w) prefill=626.0ms/91.1tok/s decode=20.5tok/s tau=None | '```python\ndef longest_substring(s):\n    """\n    Returns the length of the longest substrin'
+[qwen3.5-9b.mq4|off|chain DONE] turns=1 runaway=0 empty=0 attractor=0 retrieval_miss=0 avg_prefill=91.1tok/s avg_decode=20.5tok/s
+  prompt_md5=5835c71e471849b4a72e1dc8e39695e7 request_md5=04e557138f10e2a5943a3c097de61e02 step=
+  daemon_binary_md5=16c8abdd03c589c436fd46fd072eaa0e path=/tmp/rl-candidate/target/release/daemon
+  kv_mode_resolved=UNOBSERVED (requested auto [registry(qwen3.5:9b):q8->auto]; no loaded ACK or KV-cache log line seen, e.g. --no-spawn)

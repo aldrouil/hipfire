@@ -1,0 +1,154 @@
+diff --git a/crates/hipfire-arch-qwen35/src/qwen35/forward.rs b/crates/hipfire-arch-qwen35/src/qwen35/forward.rs
+index 2cc790158..298474a5e 100644
+--- a/crates/hipfire-arch-qwen35/src/qwen35/forward.rs
++++ b/crates/hipfire-arch-qwen35/src/qwen35/forward.rs
+@@ -2347,12 +2347,12 @@ fn forward_scratch_layers(
+     // silently reinstate sequential positions. VL therefore always takes the
+     // hand arms below, which DO branch on `mrope`.
+     //
+-    // Also skipped when the model owns host CPU weights
+-    // (`memory.offload_exec=cpu` over a spilled prefix): the lowered executor
+-    // bypasses the `execute_steps` seam that routes host-mapped weights to the
+-    // CPU splice and refuses them instead, while the hand arms below keep the
+-    // splice. Device-resident and PCIe-spilled models report false here, so
+-    // their lowered routing is unchanged.
++    // The whole-model lowered loop rejects programs reading host CPU weights
++    // (`cpu` or `passback`); hand arms retain their CPU/passback routing.
++    // Device-resident and PCIe-spilled models keep the whole lowered loop.
++    //
++    // Passback can still lower eligible resident dense layers in the hand loop;
++    // spilled layers and hidden-state/mrope requests retain the hand arms.
+     if forward_lowered_enabled()
+         && hidden_rb.is_none()
+         && mrope.is_none()
+@@ -2371,7 +2371,83 @@ fn forward_scratch_layers(
+     let mut delta_layer_idx = 0usize;
+     let mut kv_layer_idx = 0usize;
+ 
++    // Keep CPU mode and passback share=0 on their existing all-hand CPU route.
++    // Eager resident-only lowering does not relax graph/replay restrictions.
++    let lowered_hybrid = forward_lowered_enabled()
++        && hidden_rb.is_none()
++        && mrope.is_none()
++        && gpu.owns_host_cpu_weights()
++        && config.num_experts == 0
++        && passback_split_armed();
++
+     for layer_idx in 0..config.n_layers {
++        // Reject spilled layers before allocating a program. Keep the same
++        // weight/type pairing as the hand arms below.
++        let lowered_dense = if lowered_hybrid
++            && dense_proj_resident(gpu, &weights.layers[layer_idx])
++        {
++            match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
++                (LayerWeights::DeltaNet(_), LayerType::LinearAttention) => {
++                    Some(Q35Variant::DeltaNet)
++                }
++                (LayerWeights::FullAttn(_), LayerType::FullAttention) => Some(Q35Variant::FullAttn),
++                _ => None,
++            }
++        } else {
++            None
++        };
++        if let Some(variant) = lowered_dense {
++            let program = lower_variant(variant);
++            {
++                let mut bind = Qwen35Bindings {
++                    layer: &weights.layers[layer_idx],
++                    s,
++                    config,
++                    kv_cache: &mut *kv_cache,
++                    dn_state: &*dn_state,
++                    pos,
++                    layer_idx,
++                    delta_layer_idx,
++                    k_dim,
++                    v_dim,
++                    n_v_heads,
++                    hd,
++                    // Dense layers have no cross-layer MoE fusion state.
++                    precomputed_attn_x_rot: false,
++                    fa_output_prerotated: false,
++                    defer_routed_combine: false,
++                };
++                superop::run_layer_program(gpu, &ctx, &program, &mut bind)
++                    .map_err(|e| HipError::new(0, &e.to_string()))?;
++            }
++            // Same per-layer epilogue the hand arm this layer replaces would
++            // have run: the finite-trace checkpoint, the layer-kind state
++            // counter, and the per-token hidden dump.
++            match variant {
++                Q35Variant::DeltaNet => {
++                    trace_finite_if_enabled(
++                        gpu,
++                        &format!("layer {layer_idx} LinearAttention residual"),
++                        &s.x,
++                    )?;
++                    delta_layer_idx += 1;
++                }
++                Q35Variant::FullAttn => {
++                    trace_finite_if_enabled(
++                        gpu,
++                        &format!("layer {layer_idx} FullAttention residual"),
++                        &s.x,
++                    )?;
++                    kv_layer_idx += 1;
++                }
++                Q35Variant::DeltaNetMoe | Q35Variant::FullAttnMoe => {
++                    unreachable!("dense_proj_resident rejects MoE variants")
++                }
++            }
++            dump_hidden_localize(gpu, &s.x, 1, pos, config.dim, layer_idx, "pertoken");
++            continue;
++        }
++
+         match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
+             (LayerWeights::DeltaNet(layer), LayerType::LinearAttention) => {
+                 // ── DeltaNet QKVZA via pipeline ──
+@@ -6348,6 +6424,46 @@ fn moe_ffn_host_mapped(gpu: &Gpu, ffn: &MoeFfnWeights) -> bool {
+         || gpu.host_located(&ffn.shared_expert.down.buf)
+ }
+ 
++/// Allocation-free admission for the dense projection weights, before building
++/// a lowered program. Norm/conv/state stay on the GPU by design.
++/// `run_layer_program` retains its independent host-weight refusal.
++fn dense_proj_resident(gpu: &Gpu, layer: &LayerWeights) -> bool {
++    match layer {
++        LayerWeights::DeltaNet(l) => {
++            !(gpu.host_located(&l.wqkv.buf)
++                || gpu.host_located(&l.wz.buf)
++                || gpu.host_located(&l.w_beta.buf)
++                || gpu.host_located(&l.w_alpha.buf)
++                || gpu.host_located(&l.wo.buf)
++                || gpu.host_located(&l.w_gate.buf)
++                || gpu.host_located(&l.w_up.buf)
++                || gpu.host_located(&l.w_down.buf))
++        }
++        LayerWeights::FullAttn(l) => {
++            !(gpu.host_located(&l.wq.buf)
++                || gpu.host_located(&l.wk.buf)
++                || gpu.host_located(&l.wv.buf)
++                || gpu.host_located(&l.wo.buf)
++                || gpu.host_located(&l.w_gate.buf)
++                || gpu.host_located(&l.w_up.buf)
++                || gpu.host_located(&l.w_down.buf))
++        }
++        LayerWeights::DeltaNetMoe(_) | LayerWeights::FullAttnMoe(_) => false,
++    }
++}
++
++/// Keep CPU mode and the documented passback share=0 CPU twin all-hand.
++/// Auto resolves to a positive split; only a pinned zero disables the split.
++fn passback_split_armed() -> bool {
++    if !hipfire_dispatch::passback_enabled() {
++        return false;
++    }
++    match hipfire_config::memory::offload_passback_share() {
++        hipfire_config::memory::PassbackShare::Auto => true,
++        hipfire_config::memory::PassbackShare::Share(v) => v > 0.0,
++    }
++}
++
+ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
+     fn run_proj(
+         &mut self,

@@ -1,0 +1,379 @@
+23,25c23,27
+< //!       - FullAttention layers: the **valid** prefix of `KV` (Q8_0 key + value,
+< //!         the block scale inside each 34-byte block), `committed` tokens only —
+< //!         never the uninitialized capacity;
+---
+> //!       - FullAttention layers: the **valid** prefix of `KV` in the live
+> //!         encoding — Q8_0 key + value (the block scale inside each 34-byte
+> //!         block) by default, or the native E4M3FN token rows
+> //!         `[Hkv*D codes][Hkv f16 scales]` under `HIPFIRE_RESIDENT_ORACLE_KV_MODE=fp8`
+> //!         — `committed` tokens only, never the uninitialized capacity;
+64c66
+< //! Cases (default): dense prefix spill cut at 16 (first resident layer is
+---
+> //! Cases (default `9b`): dense prefix spill cut at 16 (first resident layer is
+72,73c74,93
+< //! Run (needs a real HIP GPU, the default `deltanet` feature and the 9B mq4
+< //! model):
+---
+> //! Fixtures: `HIPFIRE_RESIDENT_ORACLE_FIXTURE=9b` (default) keeps the 9B matrix
+> //! above; `=27b` selects the **Qwen3.8-27B Phase-3** matrix, which spills **8 of
+> //! 64** layers: cut 8 (first resident DeltaNet) and the cut-7 boundary (first
+> //! resident FullAttention), at the same shares/streams, 12 teacher-forced steps.
+> //! Both fixtures use the `L,L,L,F` period; the worker checks the actual model's
+> //! layer type at each selected boundary rather than inferring it from a filename.
+> //!
+> //! KV encoding: `HIPFIRE_RESIDENT_ORACLE_KV_MODE=q8` (default) keeps the
+> //! historical Q8_0 KV cache and its dump. `=fp8` builds the **same** filtered,
+> //! absolute-layer-owned VMM cache in native E4M3FN
+> //! (`KvCache::new_gpu_fp8_vmm_capped_filtered`): one head-major token row
+> //! `[Hkv*D codes][Hkv f16 scales]`, `Hkv*(D+2)` bytes/row, **D=256 only** — the
+> //! 27B production KV (KV auto → FP8/VMM). The dumped KV prefix is then the raw
+> //! FP8 token rows, finite-checked per side (E4M3FN codes and inline f16 scales
+> //! decoded with their own formats — never a scale byte read as a code, never the
+> //! Q8_0 34-byte block math). The GDN state is untouched in both modes: it stays
+> //! `StateQuant::Q8` (its own, independent quantization).
+> //!
+> //! Model + KV mode are selected by environment (the model default follows the
+> //! fixture):
+75a96,103
+> //! # 9B / Q8 (default)
+> //! cargo test -p hipfire-arch-qwen35 --release --test resident_lowered_passback_hw \
+> //!     -- --ignored --nocapture
+> //!
+> //! # Qwen3.8-27B Phase-3: 8 spilled / 56 resident, native FP8 (=E4M3FN) VMM KV
+> //! HIPFIRE_RESIDENT_ORACLE_FIXTURE=27b \
+> //! HIPFIRE_RESIDENT_ORACLE_MODEL="$HOME/.hipfire/models/qwen3.8-27b.mq4" \
+> //! HIPFIRE_RESIDENT_ORACLE_KV_MODE=fp8 \
+109a138,143
+> /// Worker + orchestrator: KV encoding for the FullAttention cache. `q8`
+> /// (default) keeps the historical Q8_0 oracle; `fp8` builds the same filtered
+> /// VMM cache in native E4M3FN for the 27B fixture. Unknown values are refused.
+> const KV_MODE_ENV: &str = "HIPFIRE_RESIDENT_ORACLE_KV_MODE";
+> /// Orchestrator-only: explicit `9b` (default) or `27b` placement matrix.
+> const FIXTURE_ENV: &str = "HIPFIRE_RESIDENT_ORACLE_FIXTURE";
+116c150,152
+< const DEFAULT_MODEL: &str = "qwen3.5-9b.mq4";
+---
+> const DEFAULT_MODEL_9B: &str = "qwen3.5-9b.mq4";
+> /// The Qwen3.8-27B Phase-3 fixture (8 spilled / 56 resident, KV auto → FP8/VMM).
+> const DEFAULT_MODEL_27B: &str = "qwen3.8-27b.mq4";
+139c175,179
+< /// First-resident layer kind the dense 9B fixture must show for a spill cut.
+---
+> /// First-resident layer kind the fixture must show for a spill cut. Both the 9B
+> /// and the 27B stacks use the same `L,L,L,F` period, so a cut pinned here means
+> /// the same layer kind on either fixture; the worker still checks it against the
+> /// model's actual `layer_types`, so an unexpected cut is refused rather than
+> /// silently accepted.
+141a182
+>         // 9B: first resident DeltaNet at 16, FullAttention at 15.
+143a185,187
+>         // 27B (64 layers): index 8 is DeltaNet, index 7 is FullAttention.
+>         8 => LayerType::LinearAttention,
+>         7 => LayerType::FullAttention,
+148,149c192,246
+< fn default_cases() -> Vec<Case> {
+<     let mut cases = vec![
+---
+> /// KV encoding for the FullAttention cache.
+> #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+> enum KvSel {
+>     /// Historical Q8_0 VMM cache and dump (default).
+>     Q8,
+>     /// Native E4M3FN VMM cache and dump (27B fixture; D=256 only).
+>     Fp8,
+> }
+> 
+> impl KvSel {
+>     /// Resolve [`KV_MODE_ENV`]: unset → `q8`; `q8`/`fp8` accepted; anything else
+>     /// (including an empty value) is refused.
+>     fn from_env() -> KvSel {
+>         match std::env::var(KV_MODE_ENV).ok().as_deref() {
+>             None | Some("q8") => KvSel::Q8,
+>             Some("fp8") => KvSel::Fp8,
+>             Some(other) => {
+>                 panic!("{KV_MODE_ENV}={other:?} is not a known KV mode (want q8|fp8)")
+>             }
+>         }
+>     }
+> 
+>     fn as_str(self) -> &'static str {
+>         match self {
+>             KvSel::Q8 => "q8",
+>             KvSel::Fp8 => "fp8",
+>         }
+>     }
+> }
+> 
+> /// Select the placement matrix explicitly; model filenames are not identities.
+> fn fixture_27b() -> bool {
+>     match std::env::var(FIXTURE_ENV).ok().as_deref() {
+>         None | Some("9b") => false,
+>         Some("27b") => true,
+>         Some(other) => panic!("{FIXTURE_ENV}={other:?} is not a known fixture (want 9b|27b)"),
+>     }
+> }
+> 
+> /// Default model path for the selected placement fixture.
+> fn default_model() -> String {
+>     let home = std::env::var("HOME").expect("HOME");
+>     let name = if fixture_27b() {
+>         DEFAULT_MODEL_27B
+>     } else {
+>         DEFAULT_MODEL_9B
+>     };
+>     format!("{home}/.hipfire/models/{name}")
+> }
+> 
+> /// The pinned mixed matrix for a fixture: `cut_la` spills so the first resident
+> /// layer is DeltaNet, `cut_fa` so it is FullAttention; the remaining two cases
+> /// reuse `cut_la` for the share-0.5 and non-blocking variants.
+> fn mixed_cases(cut_la: usize, cut_fa: usize) -> Vec<Case> {
+>     vec![
+151c248
+<             cut: 16,
+---
+>             cut: cut_la,
+157c254
+<             cut: 15,
+---
+>             cut: cut_fa,
+163c260
+<             cut: 16,
+---
+>             cut: cut_la,
+169c266
+<             cut: 16,
+---
+>             cut: cut_la,
+174c271,278
+<     ];
+---
+>     ]
+> }
+> 
+> fn default_cases() -> Vec<Case> {
+>     // 9B: DeltaNet-first at 16, FullAttention-first at 15. 27B (64 layers,
+>     // 8 spilled / 56 resident): DeltaNet-first at 8, FullAttention-first at 7.
+>     let (cut_la, cut_fa) = if fixture_27b() { (8, 7) } else { (16, 15) };
+>     let mut cases = mixed_cases(cut_la, cut_fa);
+177c281
+<             cut: 16,
+---
+>             cut: cut_la,
+283a388,393
+>     /// KV encoding the FullAttention cache was built with (`q8` | `fp8`).
+>     kv_mode: String,
+>     /// Bytes of one KV token row **per side** in that encoding (`q8_0`:
+>     /// `Hkv*(D/32)*34`; `fp8`: `Hkv*(D+2)`). The dumped KV prefix is
+>     /// `committed * kv_row_bytes`.
+>     kv_row_bytes: usize,
+324a435,460
+> /// OCP E4M3FN decode (4-bit exponent, bias 7; 3-bit mantissa, max finite 448).
+> /// The only NaN bit patterns are `0x7f`/`0xff` (exp all-ones, mantissa all-ones),
+> /// which a saturating encoder never emits — a NaN here is a real corruption.
+> fn e4m3fn(code: u8) -> f32 {
+>     let sign = if code & 0x80 != 0 { -1.0 } else { 1.0 };
+>     let e = (code >> 3) & 0x0f;
+>     let m = code & 0x07;
+>     match e {
+>         0 => sign * (m as f32) * 2f32.powi(-9),
+>         15 if m == 7 => f32::NAN,
+>         _ => sign * (1.0 + m as f32 / 8.0) * 2f32.powi(e as i32 - 7),
+>     }
+> }
+> 
+> /// Parse the `fp8_h{Hkv}_d{D}` dump kind into `(Hkv, head_dim)`.
+> fn parse_fp8_kind(kind: &str) -> (usize, usize) {
+>     let (h, d) = kind
+>         .strip_prefix("fp8_h")
+>         .and_then(|rest| rest.split_once("_d"))
+>         .unwrap_or_else(|| panic!("malformed fp8 dump kind {kind:?}"));
+>     (
+>         h.parse().expect("fp8 dump kind Hkv"),
+>         d.parse().expect("fp8 dump kind head_dim"),
+>     )
+> }
+> 
+351a488,513
+>         // Native fp8 token row: `[Hkv*D E4M3FN codes][Hkv inline f16 scales]`.
+>         // Codes and scales are decoded with their own formats — a scale byte is
+>         // never read as a code, and the Q8_0 34-byte block math never applies.
+>         // Every code and every scale of every dumped row is visited.
+>         kind if kind.starts_with("fp8_h") => {
+>             let (hkv, dim) = parse_fp8_kind(kind);
+>             let row = hkv * (dim + 2);
+>             assert_eq!(
+>                 bytes.len() % row,
+>                 0,
+>                 "fp8 dump must be whole `Hkv*(D+2)`-byte token rows"
+>             );
+>             let mut values = Vec::with_capacity((bytes.len() / row) * hkv * (dim + 1));
+>             for r in bytes.chunks_exact(row) {
+>                 let scales = &r[hkv * dim..];
+>                 for k in 0..hkv {
+>                     let scale = half(u16::from_le_bytes([scales[2 * k], scales[2 * k + 1]]));
+>                     for i in 0..dim {
+>                         values.push(scale * e4m3fn(r[k * dim + i]));
+>                     }
+>                     // The inline f16 scale itself, checked for finiteness too.
+>                     values.push(scale);
+>                 }
+>             }
+>             values
+>         }
+355a518,542
+> /// Bytes of one KV token row **per side** for the live cache encoding.
+> fn kv_row_bytes(kv: &KvCache) -> usize {
+>     if kv.quant_fp8 {
+>         kv.fp8_bytes_per_token().expect("fp8 row bytes")
+>     } else {
+>         assert!(
+>             kv.quant_q8 && kv.head_dim.is_multiple_of(32),
+>             "KV row bytes: unsupported encoding (quant_q8={}, quant_fp8={}, head_dim={})",
+>             kv.quant_q8,
+>             kv.quant_fp8,
+>             kv.head_dim
+>         );
+>         kv.n_kv_heads * (kv.head_dim / 32) * 34
+>     }
+> }
+> 
+> /// Dump/decode kind for the live cache encoding.
+> fn kv_dump_kind(kv: &KvCache) -> String {
+>     if kv.quant_fp8 {
+>         format!("fp8_h{}_d{}", kv.n_kv_heads, kv.head_dim)
+>     } else {
+>         "q8_0".into()
+>     }
+> }
+> 
+499,500c686,689
+< /// LinearAttention layer, and the **valid prefix** of the Q8 KV (key + value, the
+< /// block scale inside each 34-byte block) for every FullAttention layer.
+---
+> /// LinearAttention layer, and the **valid prefix** of the KV for every
+> /// FullAttention layer in the live encoding — Q8_0 key + value (the block scale
+> /// inside each 34-byte block) or, under `fp8`, the native E4M3FN token rows
+> /// `[Hkv*D codes][Hkv inline f16 scales]`.
+517a707,709
+>     // Live KV encoding is uniform across FullAttention layers; resolve it once.
+>     let kv_kind = kv_dump_kind(kv);
+>     let kv_prefix = committed_tokens * kv_row_bytes(kv);
+567c759,761
+<             let bytes = committed_tokens * config.n_kv_heads * (config.head_dim / 32) * 34;
+---
+>             // Raw valid prefix of the live KV encoding (`q8_0` blocks or fp8
+>             // token rows), committed tokens only — never the uninitialized
+>             // capacity. The row kind carries the fp8 head geometry.
+573c767
+<                 "q8_0",
+---
+>                 &kv_kind,
+575c769
+<                 bytes,
+---
+>                 kv_prefix,
+583c777
+<                 "q8_0",
+---
+>                 &kv_kind,
+585c779
+<                 bytes,
+---
+>                 kv_prefix,
+598,601c792,793
+<     let model = std::env::var(MODEL_ENV).unwrap_or_else(|_| {
+<         let home = std::env::var("HOME").expect("HOME");
+<         format!("{home}/.hipfire/models/{DEFAULT_MODEL}")
+<     });
+---
+>     let model = std::env::var(MODEL_ENV).unwrap_or_else(|_| default_model());
+>     let kv_sel = KvSel::from_env();
+665c857,858
+<          nonblocking={nonblocking}"
+---
+>          nonblocking={nonblocking} kv_mode={}",
+>         kv_sel.as_str()
+749,756c942,967
+<     let mut kv = KvCache::new_gpu_q8_vmm_capped_filtered(
+<         &mut gpu,
+<         &mask,
+<         config.n_kv_heads,
+<         config.head_dim,
+<         cap,
+<         cap,
+<     )?;
+---
+>     // Same filtered, absolute-layer-owned VMM cache on either encoding: only the
+>     // K/V codec changes (Q8_0 blocks vs native E4M3FN token rows).
+>     let mut kv = match kv_sel {
+>         KvSel::Q8 => KvCache::new_gpu_q8_vmm_capped_filtered(
+>             &mut gpu,
+>             &mask,
+>             config.n_kv_heads,
+>             config.head_dim,
+>             cap,
+>             cap,
+>         )?,
+>         KvSel::Fp8 => KvCache::new_gpu_fp8_vmm_capped_filtered(
+>             &mut gpu,
+>             &mask,
+>             config.n_kv_heads,
+>             config.head_dim,
+>             cap,
+>             cap,
+>         )?,
+>     };
+>     assert_eq!(kv.quant_fp8, kv_sel == KvSel::Fp8, "KV fp8 flag mismatch");
+>     let kv_stride = kv_row_bytes(&kv);
+>     eprintln!(
+>         "[oracle {arm}] KV cache: kind={} row_bytes={kv_stride} (per side)",
+>         kv_dump_kind(&kv)
+>     );
+870a1082,1083
+>         kv_mode: kv_sel.as_str().into(),
+>         kv_row_bytes: kv_stride,
+962a1176
+>     kv: KvSel,
+986a1201
+>         .env(KV_MODE_ENV, kv.as_str())
+1001c1216
+<         "[oracle] spawning arm {} (cut={} share={} exec={} lowered={} nonblocking={}) -> {}",
+---
+>         "[oracle] spawning arm {} (cut={} share={} exec={} lowered={} nonblocking={} kv={}) -> {}",
+1007a1223
+>         kv.as_str(),
+1100a1317,1322
+>     assert_eq!(a.kv_mode, b.kv_mode, "{tag}: KV encoding differs");
+>     assert_eq!(
+>         a.kv_row_bytes, b.kv_row_bytes,
+>         "{tag}: KV row stride differs"
+>     );
+>     assert!(a.kv_row_bytes > 0, "{tag}: KV row stride must be non-zero");
+1251c1473
+< #[ignore = "requires a real HIP GPU + the 9B mq4 fixture; spawns fresh child processes"]
+---
+> #[ignore = "requires a real HIP GPU + the selected mq4 fixture; spawns fresh child processes"]
+1258,1261c1480
+<     let model = std::env::var(MODEL_ENV).unwrap_or_else(|_| {
+<         let home = std::env::var("HOME").expect("HOME");
+<         format!("{home}/.hipfire/models/{DEFAULT_MODEL}")
+<     });
+---
+>     let model = std::env::var(MODEL_ENV).unwrap_or_else(|_| default_model());
+1267a1487
+>     let kv_sel = KvSel::from_env();
+1283c1503,1504
+<         "[oracle] {} case(s), model={model}, steps={steps}, artifacts under {}",
+---
+>         "[oracle] {} case(s), model={model}, steps={steps}, fixture={}, kv_mode={}, \
+>          artifacts under {}",
+1284a1506,1507
+>         if fixture_27b() { "27b" } else { "9b" },
+>         kv_sel.as_str(),
+1294c1517
+<             match spawn_arm(&exe, case, arm, &root, &model, steps) {
+---
+>             match spawn_arm(&exe, case, arm, kv_sel, &root, &model, steps) {

@@ -409,7 +409,7 @@ immediately preceding request, which may be the side conversation.
 | Variable | Status | Scope |
 |---|---|---|
 | `HIPFIRE_LFM2_GRAPH` | LFM graph experiments | Source in LFM crate/daemon |
-| `HIPFIRE_FORWARD_LOWERED` | default on (LFM and several other arches); `=0` opts out | Shared lowered forward escape hatch. For LFM: **unset or any value other than `0`** keeps the lowered path; **`=0`** forces the legacy hand loop. Qwen3.5-family single-token forwards automatically use the CPU-splice-capable hand executor when the loaded model owns CPU-executed host weights, including enabled MTP forced advances and terminal flushes; no override is required. Device-resident and PCIe-offloaded Qwen models retain the lowered route. Recorded on the sealed LFM [`admissions.yml`](admissions.yml) evidence row; **not** an automatic Redline runtime-default opt-out. |
+| `HIPFIRE_FORWARD_LOWERED` | default on (LFM and several other arches); `=0` opts out | Shared lowered forward escape hatch. For LFM: **unset or any value other than `0`** keeps the lowered path; **`=0`** forces the legacy hand loop. Qwen3.5-family CPU-executed spills retain the CPU-splice-capable hand executor. Dense `passback` single-token forwards with an auto/positive share additionally lower eligible device-resident layers; spilled layers remain hand-forward. Hidden-state extraction/mrope requests, `cpu`, share-zero fallback and MoE keep their existing hand routing. `=0` forces all-hand on the partially spilled model. Device-resident and PCIe-offloaded Qwen models retain their existing lowered route. Graph/replay restrictions are unchanged. Recorded on the sealed LFM [`admissions.yml`](admissions.yml) evidence row; **not** an automatic Redline runtime-default opt-out. |
 | Other `HIPFIRE_LFM*` | diag/trace | Inventory |
 
 `HIPFIRE_LFM2_PREFILL_BATCH`, `HIPFIRE_LFM2_PREFILL_MAX_BATCH`, and `HIPFIRE_LFM2_GFX1201_DECODE_FUSION` have **no reader under `crates/`** in this tree: setting them changes nothing, LFM prefill is the eager loop, and there is no batched-prefill or decode-fusion selector. They appear only in design/planning docs, the sealed [`admissions.yml`](admissions.yml) evidence row (historical `explicit_opt_outs`, not runtime opt-outs), and branch-pinned wording (`lfm-redline@692a726dde53508cb53de1a74c720e75a7c9f33e`, absent from `origin/beta@202282de…`). [`admissions.yml`](admissions.yml) remains the sole product-admission authority (schema v2; exactly one earned retained-PM4 product row).
@@ -762,7 +762,7 @@ The `HIPFIRE_REPLAY` row (status `harness`) is a **harness scan token/prefix**, 
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1646
+**Count:** 1658
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -1841,7 +1841,7 @@ The `HIPFIRE_REPLAY` row (status `harness`) is a **harness scan token/prefix**, 
 | `HIPFIRE_NPU_TRUNK_TEST_MODEL` | crates/hipfire-arch-qwen4/tests/npu_trunk_model_sanity.rs | harness |
 | `HIPFIRE_OFFLOAD_DEBUG` | crates/rdna-compute/src/dispatch.rs | developer |
 | `HIPFIRE_OFFLOAD_EXEC` | crates/hipfire-arch-qwen35-embed/src/vision.rs, crates/hipfire-arch-qwen35/tests/gpu_gemv_parity.rs | stable |
-| `HIPFIRE_OFFLOAD_PASSBACK_SHARE` | crates/hipfire-config/src/lib.rs, docs/perf-checkpoints/data-2026-10-16-passback-asynchronous-split-returns/C4SEC-ab_sample_river.sh | stable |
+| `HIPFIRE_OFFLOAD_PASSBACK_SHARE` | crates/hipfire-arch-qwen35/tests/resident_lowered_passback_hw.rs, crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_OOM_GUARD` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/kv_slots.rs | stable |
 | `HIPFIRE_ORACLE_DIVERGE` | crates/hipfire-arch-qwen35/tests/route_oracle_mesh.rs | harness |
 | `HIPFIRE_ORACLE_DUMP` | crates/saddle-lab/examples/tmp_gemm_v2_oracle.rs | harness |
@@ -2059,6 +2059,7 @@ The `HIPFIRE_REPLAY` row (status `harness`) is a **harness scan token/prefix**, 
 | `HIPFIRE_QWEN4_WIDE_TWIN_Q8` | crates/rdna-compute/src/gemv.rs | developer |
 | `HIPFIRE_QWEN4_WIDE_VERIFY_ROWS` | crates/hipfire-arch-qwen4/src/gpu_forward.rs, crates/rdna-compute/src/prefill_invariant.rs | developer |
 | `HIPFIRE_QWEN_CACHE_TRACE` | crates/hipfire-daemon/src/main.rs, crates/hipfire-generate/src/ar.rs | developer |
+| `HIPFIRE_QWEN_FFW_TRACE` | docs/perf-checkpoints/data-2026-10-17-passback-phase3-throughput-gfx1201/SCRIPTS/P3T-one.py, docs/perf-checkpoints/data-2026-10-18-resident-lowered-passback-27b-gfx1201/RL27-one.py | harness |
 | `HIPFIRE_QWEN_KV_DEFAULT_Q8` | crates/hipfire-arch-qwen35/examples/cb_vmm_state_oracle.rs, crates/hipfire-arch-qwen35/examples/prefill_ragged_oracle.rs | developer |
 | `HIPFIRE_QWEN_MOE_FINAL_NORM_RAW` | scripts/test_pr228_spiral_check.sh | harness |
 | `HIPFIRE_QWEN_MTP` | scripts/benchlocal_campaign.py, scripts/serve_harness.py | harness |
@@ -2158,6 +2159,17 @@ The `HIPFIRE_REPLAY` row (status `harness`) is a **harness scan token/prefix**, 
 | `HIPFIRE_REPO_ROOT` | benchmarks/quality-baselines/harness/spe_ablation.sh | harness |
 | `HIPFIRE_REQUIRE_REAP_OVERLAY` | scripts/reap/run_deepseek4_e8_layer_screen.sh, scripts/reap/run_deepseek4_e8_phase_quality.sh | harness |
 | `HIPFIRE_RESET_ROUNDS` | crates/hipfire-generate/tests/qwen35_reset_hw.rs | harness |
+| `HIPFIRE_RESIDENT_ORACLE_ARM` | crates/hipfire-arch-qwen35/tests/resident_lowered_passback_hw.rs | harness |
+| `HIPFIRE_RESIDENT_ORACLE_CASES` | crates/hipfire-arch-qwen35/tests/resident_lowered_passback_hw.rs | harness |
+| `HIPFIRE_RESIDENT_ORACLE_CUT` | crates/hipfire-arch-qwen35/tests/resident_lowered_passback_hw.rs | harness |
+| `HIPFIRE_RESIDENT_ORACLE_FIXTURE` | crates/hipfire-arch-qwen35/tests/resident_lowered_passback_hw.rs, docs/perf-checkpoints/data-2026-10-18-resident-lowered-passback-27b-gfx1201/RL27-one.py | harness |
+| `HIPFIRE_RESIDENT_ORACLE_KV_MODE` | crates/hipfire-arch-qwen35/tests/resident_lowered_passback_hw.rs, docs/perf-checkpoints/data-2026-10-18-resident-lowered-passback-27b-gfx1201/RL27-one.py | harness |
+| `HIPFIRE_RESIDENT_ORACLE_MODEL` | crates/hipfire-arch-qwen35/tests/resident_lowered_passback_hw.rs | harness |
+| `HIPFIRE_RESIDENT_ORACLE_NONBLOCKING` | crates/hipfire-arch-qwen35/tests/resident_lowered_passback_hw.rs | harness |
+| `HIPFIRE_RESIDENT_ORACLE_OUT` | crates/hipfire-arch-qwen35/tests/resident_lowered_passback_hw.rs | harness |
+| `HIPFIRE_RESIDENT_ORACLE_SHARE` | crates/hipfire-arch-qwen35/tests/resident_lowered_passback_hw.rs | harness |
+| `HIPFIRE_RESIDENT_ORACLE_STEPS` | crates/hipfire-arch-qwen35/tests/resident_lowered_passback_hw.rs | harness |
+| `HIPFIRE_RESIDENT_ORACLE_TWIN` | crates/hipfire-arch-qwen35/tests/resident_lowered_passback_hw.rs | harness |
 | `HIPFIRE_RESIDUAL_CPOL` | crates/rdna-compute/src/gemv.rs | developer |
 | `HIPFIRE_RESIDUAL_KERNEL` | crates/rdna-compute/examples/bench_vgpr_cap_sweep.rs, crates/rdna-compute/examples/mq4c_parity.rs | developer |
 | `HIPFIRE_RESIDUAL_KSPLIT_OFF` | crates/rdna-compute/examples/test_mq4v2_residual_ksplit_gfx1100.rs, crates/rdna-compute/src/dflash_draft_fusion.rs | developer |
@@ -2298,7 +2310,7 @@ The `HIPFIRE_REPLAY` row (status `harness`) is a **harness scan token/prefix**, 
 | `HIPFIRE_SPEC_WINDOW_ROLLBACK` | crates/hipfire-config/src/lib.rs | developer |
 | `HIPFIRE_SPE_OUT_ROOT` | benchmarks/quality-baselines/harness/spe_ablation.sh | harness |
 | `HIPFIRE_SPILL_DIR` | crates/hipfire-config/src/lib.rs, crates/hipfire-quantize/src/pipeline.rs | stable |
-| `HIPFIRE_SPLIT_DIAG` | docs/perf-checkpoints/data-2026-10-16-passback-phase2-gfx1201/SCRIPTS/P2-rev-one.py | harness |
+| `HIPFIRE_SPLIT_DIAG` | docs/perf-checkpoints/data-2026-10-16-passback-phase2-gfx1201/SCRIPTS/P2-rev-one.py, docs/perf-checkpoints/data-2026-10-17-passback-phase3-input-ready-gfx1201/P3-one.sh | harness |
 | `HIPFIRE_STATE_QUANT` | crates/hipfire-arch-qwen4/examples/fn_lane_oracle.rs, crates/hipfire-arch-qwen4/examples/fn_prefill_g0.rs | harness |
 | `HIPFIRE_SWEEP_MAX` | scripts/ddtree_budget_sweep.sh | harness |
 | `HIPFIRE_SWEEP_OUT` | scripts/mq3-mq2-sweep.sh, scripts/spec_decode_genre_sweep.sh | harness |

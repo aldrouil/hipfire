@@ -1,0 +1,3 @@
+entries 876 mismatches 0
+mixed launches/step 855 hand 999 delta/step 144
+layer_types[0:8] ['LinearAttention', 'LinearAttention', 'LinearAttention', 'FullAttention', 'LinearAttention', 'LinearAttention', 'LinearAttention', 'FullAttention']

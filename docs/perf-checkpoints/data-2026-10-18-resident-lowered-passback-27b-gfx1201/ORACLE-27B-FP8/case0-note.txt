@@ -1,0 +1,1 @@
+NOTE: case0 (27B fp8 cut8/.375) ran in this shell without a saved orchestrator log — terminal record only (BYTE-EXACT 876 tensors, kernels 973->805/step, PASS, ~24.5s). cases123.log covers cases 1,2,3 (CUT8 .5, CUT8 nb1, CUT7 .375). Per instructions: not fabricated.

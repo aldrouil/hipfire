@@ -1,0 +1,32 @@
+SOURCE-APPROVAL ADDENDUM — 27B FP8 oracle extension (test-only, parent-reviewed)
+Date: 2026-10-18 (UTC). Approval received via Main IRC this session.
+Approved final main test: crates/hipfire-arch-qwen35/tests/resident_lowered_passback_hw.rs
+  SHA256 9c57732d278082fa82829452ab0518d1eafc97669fc2ed64f29de3c540d59046 (verified this session; 1566 lines).
+  Parent: test-only extension finished + reviewed + rustfmt. No production edits.
+  Parent removed filename inference: MUST set HIPFIRE_RESIDENT_ORACLE_FIXTURE=27b explicitly;
+  KV_MODE=fp8; MODEL absolute 27B path. Defaults 9b/q8 unchanged.
+  Review notes carried in approval: existing KvCache::new_gpu_fp8_vmm_capped_filtered;
+  fp8 raw prefix H*(D+2), kind fp8_hH_dD, decoder codes + inline f16 scales finite;
+  byte-exact raw all valid; GDN Q8 + EF unchanged. Cases default 27b: 8/.375, 7/.375 (FA first),
+  8/.5, 8/.375/nonblocking. 12 steps all rows + state initial + 3/6/12. Parent reviewed
+  stream ordering / no intra-token added wait.
+Isolated copy: ONLY the final test source copied into /tmp/rl-candidate at the same path
+  (sha256 re-verified identical after copy). Patch ORACLE-extension.patch = main HEAD vs
+  approved file (379 lines; hashes in ORACLE-EXTENSION-hashes.txt).
+Build scope: ONLY the test binary in /tmp/rl-candidate, release (no CLI/daemon rebuild).
+  Old oracle exe md5 1cc3ebb12d68d21e6e2ee5388e1bc17f explicitly SUPERSEDED (test-only);
+  original perf C/K CLI/daemon identities UNCHANGED and re-verified before timing.
+User override restated: explicit new 27B authorization supersedes the old 9B-only no-27B gate.
+Exact gate commands (run from /tmp/rl-candidate; MODEL absolute):
+  export HIPFIRE_RESIDENT_ORACLE_FIXTURE=27b HIPFIRE_RESIDENT_ORACLE_KV_MODE=fp8
+  export HIPFIRE_RESIDENT_ORACLE_MODEL=/home/avery/.hipfire/models/qwen3.8-27b.mq4
+  [first]  HIPFIRE_RESIDENT_ORACLE_CASES=0 <orchestrator invocation>
+  [rest]   HIPFIRE_RESIDENT_ORACLE_CASES=1,2,3 <orchestrator invocation>
+  [legacy] default 9b/q8 case 0 (Q8 regression smoke; no 9B perf campaign)
+  No loosened byte tolerance. Optional twin not required.
+On failure: STOP before timing, retain all receipts, concrete owner report; no rerun of
+  unmodified known failure, no production change.
+On pass: separate native candidate decoded-health (existing serve harness, correct
+  HIPFIRE_DAEMON_BIN), then balanced 8 auto trace-off processes 3warm3measure
+  C1K1K2C2|K3C3C4K4, frozen binaries, exact Phase-3 budget-56 FP8 fixture.
+  Raw state GB stay local with sha + compact receipts; not claimed in Git.

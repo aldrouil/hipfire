@@ -1,0 +1,67 @@
+PREDECLARED PROTOCOL — resident-lowered 27B A/B (user-authorized 2026-10-17/18; supersedes 9B-only no-27B gate)
+Authorization: user explicitly requested a 27B sweep like the earlier 9B sweep to test the
+change on the larger model. This OVERRIDES the 9B report's "27B gate not met, no 27B campaign"
+stop. Record both truths: the 9B gate failed (no resolved gain), and the 27B run proceeds
+by explicit new authorization, not by gate passage.
+
+Frozen identities (verify before first measurement; never benchmark live checkout/default daemon):
+  Control C: ../hipfire-passback-final2 @ b236099f64779b0291f5b48ff4ec0aa68d872b40
+    + FINAL2 input-ready patch SHA256 f855d7b92c919e454ee4c364f903e3f762d7ede264b48c80c2f6bc45639d30e0.
+    CLI md5 72ab7a028cf4dfe4adb6638741b84a83; daemon md5 fb71e7d781a26671c8d8cb5ae6885e50.
+    Source/binaries untouched (read-only use).
+  Candidate K: /tmp/rl-candidate, isolated exact-FINAL2 copy (no .git) + ONLY the forward
+    feature delta. Candidate tree forward.rs does NOT match the main-checkout format-forward
+    blob e0341dd3... (new whole-file rustfmt after commit e92a1c3); the measured candidate
+    binaries predate that format and match the prior 9B provenance:
+    CLI md5 a11eb0a0488b8aada0832220c1a0d935; daemon md5 16c8abdd03c589c436fd46fd072eaa0e;
+    oracle exe target/release/deps/resident_lowered_passback_hw-3ab08c4591265e9f
+    md5 1cc3ebb12d68d21e6e2ee5388e1bc17f.
+  Live checkout: e92a1c3 (resident lowering + oracle) + format-only changes. NEVER measured.
+
+Fixture: /home/avery/.hipfire/models/qwen3.8-27b.mq4 md5 d1292b4d5bd6046693604201a6ca8074
+  (15.66 GB; established custom Phase-3 artifact loading as qwen3_5 dense 64 layers,
+  NOT the canonical MQ4XTS quality fixture). Placement: 8 spilled + 56 resident
+  (HIPFIRE_GPU_LAYER_BUDGET=56). KV auto MUST resolve fp8/VMM per Phase 3.
+  Do not substitute qwen3.8 MQ4XTS or qwen3.6.
+  Prompt: benchmarks/prompts/gpu_offload_probe.txt md5 5835c71e471849b4a72e1dc8e39695e7,
+  215 bytes / 59 tokens (exact 9B prompt).
+  GPU RX 9070 XT gfx1201, Ryzen 7800X3D, HIP 7.2.53211. Thinking off (no --reasoning-on).
+
+Protocol: native `hipfire bench MODEL --runs 3 --warmups 3 --spec off --backend noslots
+  --workload stateless --max-tokens 128 --max-seq 4096 --kv-mode auto --kv-backend vmm
+  --prompt-file <prompt> --json`. JSON protocol native-generate-v1 (not matrix synthetic).
+  passback, share auto/unset, Rayon unset, HIPFIRE_LOCAL=1, HIPFIRE_NO_REGISTRY_FETCH=1,
+  HIPFIRE_DPM_WARMUP_SECS=10, isolated homes, fresh CLI+daemon per cell, trace/profiles/diags
+  off, graph/replay overrides unset. Same kernel-cache policy as 9B; warm DPM/JIT untimed
+  where actually needed and retain receipts.
+  Eight fresh processes, 4 per arm: order C1 K1 K2 C2 | K3 C3 C4 K4; 3 warm + 3 measured
+  per process. Process medians are the analysis units; full JSON samples retained; no
+  outlier drop; best-of or pooled-request independence claims forbidden.
+
+Correctness before timing (existing infra only, no source edits, no loosened tolerances):
+  The existing oracle crates/hipfire-arch-qwen35/tests/resident_lowered_passback_hw.rs
+  hardcodes Q8_0 KV (decode "q8_0", NewWithQuant Q8, valid-prefix byte math) and accepts a
+  model/cut/cases env contract — but pins first-resident expectations to the 9B fixture
+  (cut16=DeltaNet, cut15=FullAttention) and has no FP8 path. The timed 27B fixture resolves
+  KV auto -> fp8/VMM with Q8 DeltaNet state. If the oracle cannot cover 27B FP8 with
+  existing options, STOP before timing and message parent with the precise test limitation
+  + minimal test-only change needed. Byte-exact multi-step logits + valid KV/GDN state
+  required; failure stops with concrete evidence, no papering over. Share-auto numeric
+  output identity not required (auto is non-deterministic by design); fixed-share oracle
+  first. Separate actual native candidate decoded-output smoke via the existing serve
+  harness with correct HIPFIRE_DAEMON_BIN; inspect text, finish, no empty/attractor;
+  document thinking mode honestly (chain-on vs bench-off is known). No extra batteries.
+
+Acceptance: grounded 27B correctness + decoded health; 8 process-level C/K medians + full
+  raw request arrays + hash proofs; block-spread comparison and verdict; mechanism
+  uncertainty stated (tok/s alone cannot prove resident-kernel or host-dispatch latency
+  reduction). Apply the same conservative 9B rule (both decode+wall improvement beyond
+  spread in both blocks) but 27B runs unconditionally now. Do NOT compare absolute 9B/27B
+  timings as arm causality. Both models share architecture and the passback implementation;
+  86% vs 89% overlap is not distinct-bottleneck evidence.
+Artifacts: NEW dir docs/perf-checkpoints/data-2026-10-18-resident-lowered-passback-27b-gfx1201/
+  (append-only; this file + identity + full commands saved BEFORE first measurement).
+  No edits to prior immutable checkpoints/logs. Parent owns the main new report, not this runner.
+  No production changes, no commits. Owned processes torn down at end; report lock-free.
+GPU lock: runner serializes timed work under the existing lock; no lock held while
+  waiting on parent.

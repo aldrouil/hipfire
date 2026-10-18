@@ -1,0 +1,52 @@
+=== RL smoke: OUT=docs/perf-checkpoints/data-2026-10-17-resident-lowered-gfx1201/SMOKE-CAND/9B-auto-mixed HN=rl-smoke-mixed HOME=/tmp/RL-smoke-home-rl-smoke-mixed ===
+date_utc=2026-10-18T00:51:47Z
+cli_md5=a11eb0a0488b8aada0832220c1a0d935 daemon_md5=16c8abdd03c589c436fd46fd072eaa0e
+model_md5=296092bf1e6a45d78c1acf815eb93366
+prompt_md5=5835c71e471849b4a72e1dc8e39695e7
+HIPFIRE_SPLIT_DIAG_ambient=[unset]
+HIPFIRE_CPU_EXEC_TRACE_ambient=[unset]
+HIPFIRE_PROFILE_ambient=[unset]
+HIPFIRE_PROFILE_DECODE_ambient=[unset]
+HIPFIRE_MEMSET_DUMP_ambient=[unset]
+HIPFIRE_GRAPH_ambient=[unset]
+HIPFIRE_REPLAY_ambient=[unset]
+=== power pre ===
+power1_average_uW=48000000
+power1_cap_uW=374000000
+temp_edge_mC=47000
+temp_junction_mC=49000
+temp_mem_mC=70000
+sclk_Hz=132000000
+mclk_Hz=1258000000
+perf_level=auto
+pp_sclk_star=1: 1124Mhz *
+throttle_log=0000:03:00.0: thermal throttling logging enabled, with interval 60 seconds
+vram_used_B=1820680192
+vram_total_B=17095983104
+gtt_used_B=728129536
+gpu_busy_pct=3
+mem_busy_pct=0
+host_MemAvailable_kB=11369492
+rc=0 date_utc=2026-10-18T00:52:30Z
+=== power post ===
+power1_average_uW=56000000
+power1_cap_uW=374000000
+temp_edge_mC=52000
+temp_junction_mC=54000
+temp_mem_mC=74000
+sclk_Hz=1403000000
+mclk_Hz=1258000000
+perf_level=auto
+pp_sclk_star=1: 1408Mhz *
+throttle_log=0000:03:00.0: thermal throttling logging enabled, with interval 60 seconds
+vram_used_B=5489623040
+vram_total_B=17095983104
+gtt_used_B=728129536
+gpu_busy_pct=100
+mem_busy_pct=26
+host_MemAvailable_kB=11259200
+=== daemon proof ===
+WRAP daemon_md5=16c8abdd03c589c436fd46fd072eaa0e cli_md5=a11eb0a0488b8aada0832220c1a0d935
+decode={'median': 20.3, 'mean': 20.366666666666667, 'min': 20.3, 'max': 20.5, 'stdev': 0.094280904158206} wall={'median': 18.6, 'mean': 18.633333333333336, 'min': 18.6, 'max': 18.7, 'stdev': 0.04714045207910216} ttft={'median': 602.3, 'mean': 601.9666666666667, 'min': 598.7, 'max': 604.9, 'stdev': 2.542090128658319}
+samples.decode=[20.5, 20.3, 20.3]
+kv=q8/vmm spec=[None, None, None] warnings=['prompt is 59 tokens; prefill_tok_s at this length measures launch overhead, not prefill throughput — use --prompt-file with ≥256 tokens for a prefill number']

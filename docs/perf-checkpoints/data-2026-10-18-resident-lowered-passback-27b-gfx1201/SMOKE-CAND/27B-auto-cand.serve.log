@@ -1,0 +1,40 @@
+[gpu-lock] directory=/tmp/hipfire-locks
+[devices] inherited ROCR_VISIBLE_DEVICES=0 HIP_VISIBLE_DEVICES=0
+[hip-bridge] GPU_PINNED_MIN_XFER_SIZE=100000: pageable weight copies staged out of reclaim
+[gpu-lock] reserved /tmp/hipfire-locks/gpu-GPU-0c088c33052923ba.lock
+[devices] logical 0: HIP gfx1201 0000:03:00.0 = index 0 GPU-0c088c33052923ba
+GPU dev 0: gfx1201 (17.1 GB VRAM, HIP 7.2)
+  pre-compiled kernels: /home/avery/.cache/serve_harness_home/.hipfire_kernels/gfx1201
+[hipfire] native serve listening on http://127.0.0.1:11520
+[hipfire-daemon] vision_mode=off — skipping tower sidecar load (/home/avery/.hipfire/models/qwen3.8-27b-vision.hfq)
+[hipfire] pre-warm failed: daemon error: [validation retryable=false rolled_back=false attempt=0] Qwen VMM load refused: projected weights, minimum prefill scratch and KV do not fit free VRAM; serving lazily
+[gpu-lock] directory=/tmp/hipfire-locks
+[devices] inherited ROCR_VISIBLE_DEVICES=0 HIP_VISIBLE_DEVICES=0
+[hip-bridge] GPU_PINNED_MIN_XFER_SIZE=100000: pageable weight copies staged out of reclaim
+[gpu-lock] reserved /tmp/hipfire-locks/gpu-GPU-0c088c33052923ba.lock
+[devices] logical 0: HIP gfx1201 0000:03:00.0 = index 0 GPU-0c088c33052923ba
+GPU dev 0: gfx1201 (17.1 GB VRAM, HIP 7.2)
+  pre-compiled kernels: /home/avery/.cache/serve_harness_home/.hipfire_kernels/gfx1201
+[hipfire] native serve listening on http://127.0.0.1:11520
+[hipfire-daemon] vision_mode=off — skipping tower sidecar load (/home/avery/.hipfire/models/qwen3.8-27b-vision.hfq)
+[hipfire] pre-warm failed: daemon error: [validation retryable=false rolled_back=false attempt=0] Qwen VMM load refused: projected weights, minimum prefill scratch and KV do not fit free VRAM; serving lazily
+[gpu-lock] directory=/tmp/hipfire-locks
+[devices] inherited ROCR_VISIBLE_DEVICES=0 HIP_VISIBLE_DEVICES=0
+[hip-bridge] GPU_PINNED_MIN_XFER_SIZE=100000: pageable weight copies staged out of reclaim
+[gpu-lock] reserved /tmp/hipfire-locks/gpu-GPU-0c088c33052923ba.lock
+[devices] logical 0: HIP gfx1201 0000:03:00.0 = index 0 GPU-0c088c33052923ba
+GPU dev 0: gfx1201 (17.1 GB VRAM, HIP 7.2)
+  pre-compiled kernels: /home/avery/.cache/serve_harness_home/.hipfire_kernels/gfx1201
+[hipfire] native serve listening on http://127.0.0.1:11520
+[hipfire-daemon] vision_mode=off — skipping tower sidecar load (/home/avery/.hipfire/models/qwen3.8-27b-vision.hfq)
+[hipfire] pre-warm failed: daemon error: [validation retryable=false rolled_back=false attempt=0] Qwen VMM load refused: projected weights, minimum prefill scratch and KV do not fit free VRAM; serving lazily
+[gpu-lock] directory=/tmp/hipfire-locks
+[devices] inherited ROCR_VISIBLE_DEVICES=0 HIP_VISIBLE_DEVICES=0
+[hip-bridge] GPU_PINNED_MIN_XFER_SIZE=100000: pageable weight copies staged out of reclaim
+[gpu-lock] reserved /tmp/hipfire-locks/gpu-GPU-0c088c33052923ba.lock
+[devices] logical 0: HIP gfx1201 0000:03:00.0 = index 0 GPU-0c088c33052923ba
+GPU dev 0: gfx1201 (17.1 GB VRAM, HIP 7.2)
+  pre-compiled kernels: /home/avery/.cache/serve_harness_home/.hipfire_kernels/gfx1201
+[hipfire] native serve listening on http://127.0.0.1:11520
+[hipfire-daemon] vision_mode=off — skipping tower sidecar load (/home/avery/.hipfire/models/qwen3.8-27b-vision.hfq)
+[hipfire] pre-warm failed: daemon error: [validation retryable=false rolled_back=false attempt=0] Qwen VMM load refused: projected weights, minimum prefill scratch and KV do not fit free VRAM; serving lazily

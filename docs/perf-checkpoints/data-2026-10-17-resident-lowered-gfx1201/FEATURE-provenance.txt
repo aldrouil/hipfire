@@ -1,0 +1,8 @@
+FINAL FEATURE PATCH provenance (runner-regenerated on SOURCE APPROVAL 2026-10-17)
+source: git diff (worktree vs HEAD 9f826750b) of crates/hipfire-arch-qwen35/src/qwen35/forward.rs ONLY
+base: HEAD blob == FINAL2 blob 2cc790158… (b236099..HEAD log for forward.rs EMPTY — base still exact FINAL2)
+patch: FEATURE-forward-rs.patch, SHA256 d46df385d1e324d3beef4ae18d1bbfbc5c5fa219a34aa67ced0134b591904b1d
+shape: 122 insertions, 6 deletions (6 = parent comment-only guard-explanation correction; behavior per parent review)
+supersedes: 35b7f236d… INTERMEDIATE (comment correction NOT included) and f6ea0620… STALE (pre-review) — do not use
+oracle: crates/…/tests/resident_lowered_passback_hw.rs current main file, SHA256 efa3fad3… (1344 lines; parent rustfmt-formatted, formatting-only change from e71dbe99…; re-staged from main, not stale agent copy)
+rustfmt: NOT run by runner (parent: pre-existing forward.rs debt untouched; new test formatted by parent)

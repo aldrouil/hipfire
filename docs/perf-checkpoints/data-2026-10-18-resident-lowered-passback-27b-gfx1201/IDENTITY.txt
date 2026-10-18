@@ -1,0 +1,12 @@
+=== identity 2026-10-18T01:49:16Z ===
+main_checkout=e92a1c3e98c0bd89147a2b86c9e5bbdd89bf279b
+control_tree=b236099f64779b0291f5b48ff4ec0aa68d872b40 dirty_control= M crates/hip-bridge/src/ffi.rs; M crates/hipfire-arch-qwen35/tests/gpu_gemv_parity.rs; M crates/hipfire-dispatch/src/cpu_exec.rs; M crates/hipfire-dispatch/src/offload_split.rs;?? FINAL2-production.patch;
+control_diff_sha=f855d7b92c919e454ee4c364f903e3f762d7ede264b48c80c2f6bc45639d30e0 EXPECT f855d7b92c919e454ee4c364f903e3f762d7ede264b48c80c2f6bc45639d30e0
+cli_C=72ab7a028cf4dfe4adb6638741b84a83 EXPECT 72ab7a028cf4dfe4adb6638741b84a83
+dae_C=fb71e7d781a26671c8d8cb5ae6885e50 EXPECT fb71e7d781a26671c8d8cb5ae6885e50
+cli_K=a11eb0a0488b8aada0832220c1a0d935 EXPECT a11eb0a0488b8aada0832220c1a0d935
+dae_K=16c8abdd03c589c436fd46fd072eaa0e EXPECT 16c8abdd03c589c436fd46fd072eaa0e
+oracle_exe=1cc3ebb12d68d21e6e2ee5388e1bc17f EXPECT 1cc3ebb12d68d21e6e2ee5388e1bc17f
+model_27b=d1292b4d5bd6046693604201a6ca8074 EXPECT d1292b4d5bd6046693604201a6ca8074 bytes=15662615552
+prompt=5835c71e471849b4a72e1dc8e39695e7 EXPECT 5835c71e471849b4a72e1dc8e39695e7 bytes=215
+toolchain: rustc 1.98.1 (48a229cea 2026-09-01) cargo 1.98.1 (797e8a9bc 2026-08-05)

@@ -1,0 +1,12 @@
+RAW STATE DUMPS stay in /tmp (large: 1.4GB + 1.7GB), locations + hashes:
+/tmp/hipfire-resident-lowered-passback-571881 (run1: 4 cases x 2 arms, 12 tokens)
+/tmp/hipfire-resident-lowered-passback-572723 (twin: 5 cases x 2 arms, 12 tokens)
+Manifests + child logs COPIED here (durable, off-/tmp). Dumps reproducible from manifests + command in CORRECTNESS-summary.
+0aa4b6de386918dc8ebb891e3fba85bce015b2c4c61bc160b062c3388089f017  /tmp/hipfire-resident-lowered-passback-571881/cut16_share0.375_nb0/mixed/manifest.json
+1.4G	/tmp/hipfire-resident-lowered-passback-571881
+1.7G	/tmp/hipfire-resident-lowered-passback-572723
+
+DURABLE (2026-10-17, post-timing — no CPU compression during timing respected):
+ORACLE-dumps-run1.tar.zst (812MB, zstd-19 of 1.4GB /tmp/hipfire-resident-lowered-passback-571881)
+ORACLE-dumps-twin.tar.zst (1015MB, zstd-19 of 1.7GB /tmp/hipfire-resident-lowered-passback-572723)
+sha256 in ORACLE-dumps.sha256 (this dir). Raw /tmp roots retained as well.

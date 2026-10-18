@@ -1,0 +1,17 @@
+
+running 1 test
+test resident_lowered_passback_oracle ... [oracle] 1 case(s), model=/home/avery/.hipfire/models/qwen3.5-9b.mq4, steps=12, fixture=9b, kv_mode=q8, artifacts under /tmp/oracle-9b-q8-legacy
+[oracle] ── case 0: Case { cut: 16, share: 0.375, nonblocking: false, kind: Mixed }
+[oracle] spawning arm hand (cut=16 share=0.375 exec=passback lowered=0 nonblocking=0 kv=q8) -> /tmp/oracle-9b-q8-legacy/cut16_share0.375_nb0/hand
+[oracle] spawning arm mixed (cut=16 share=0.375 exec=passback lowered=1 nonblocking=0 kv=q8) -> /tmp/oracle-9b-q8-legacy/cut16_share0.375_nb0/mixed
+[oracle] cut16 share0.375 nonblocking0 [hand vs mixed]: kernels/step all-hand=[528, 528, 528, 528, 528, 528, 528, 528, 528, 528, 528, 528]
+[oracle] cut16 share0.375 nonblocking0 [hand vs mixed]: kernels/step mixed   =[504, 504, 504, 504, 504, 504, 504, 504, 504, 504, 504, 504]
+[oracle] cut16 share0.375 nonblocking0 [hand vs mixed]: launches/step all-hand=[528, 528, 528, 528, 528, 528, 528, 528, 528, 528, 528, 528]
+[oracle] cut16 share0.375 nonblocking0 [hand vs mixed]: launches/step mixed   =[504, 504, 504, 504, 504, 504, 504, 504, 504, 504, 504, 504]
+[oracle] cut16 share0.375 nonblocking0 [hand vs mixed]: totals all-hand launches=6336 kernels=6336; mixed launches=6048 kernels=6048
+[oracle] cut16 share0.375 nonblocking0 [hand vs mixed]: BYTE-EXACT across 444 tensors (12 logits rows, full valid state)
+[oracle] PASS: every case byte-exact with the all-hand reference; artifacts under /tmp/oracle-9b-q8-legacy
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 7.05s
+

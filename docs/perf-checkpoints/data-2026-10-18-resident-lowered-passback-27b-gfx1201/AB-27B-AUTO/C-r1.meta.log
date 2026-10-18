@@ -1,0 +1,61 @@
+=== RL27 A/B: OUT=docs/perf-checkpoints/data-2026-10-18-resident-lowered-passback-27b-gfx1201/AB-27B-AUTO/C-r1 HN=rl27-C1 HOME=/tmp/RL27-home-rl27-C1 ===
+date_utc=2026-10-18T02:26:43Z
+cli_md5=72ab7a028cf4dfe4adb6638741b84a83 daemon_md5=fb71e7d781a26671c8d8cb5ae6885e50
+model_md5=d1292b4d5bd6046693604201a6ca8074 model_bytes=15662615552
+prompt_md5=5835c71e471849b4a72e1dc8e39695e7 prompt_bytes=215
+RAYON=[unset]
+HIPFIRE_OFFLOAD_EXEC=passback HIPFIRE_GPU_LAYER_BUDGET=56 HIPFIRE_OFFLOAD_PASSBACK_SHARE=[auto/unset]
+HIPFIRE_SPLIT_DIAG_ambient=[unset]
+HIPFIRE_CPU_EXEC_TRACE_ambient=[unset]
+HIPFIRE_PROFILE_ambient=[unset]
+HIPFIRE_PROFILE_DECODE_ambient=[unset]
+HIPFIRE_MEMSET_DUMP_ambient=[unset]
+HIPFIRE_GRAPH_ambient=[unset]
+HIPFIRE_REPLAY_ambient=[unset]
+HIPFIRE_QWEN_CACHE_TRACE_ambient=[unset]
+HIPFIRE_QWEN_FFW_TRACE_ambient=[unset]
+HIPFIRE_FORWARD_LOWERED_ambient=[unset]
+HIPFIRE_RESIDENT_ORACLE_FIXTURE_ambient=[unset]
+HIPFIRE_RESIDENT_ORACLE_KV_MODE_ambient=[unset]
+=== power pre ===
+power1_average_uW=57000000
+power1_cap_uW=374000000
+temp_edge_mC=49000
+temp_junction_mC=51000
+temp_mem_mC=72000
+sclk_Hz=1411000000
+mclk_Hz=1258000000
+perf_level=auto
+pp_sclk_star=1: 1421Mhz *
+throttle_log=0000:03:00.0: thermal throttling logging enabled, with interval 60 seconds
+vram_used_B=1974300672
+vram_total_B=17095983104
+gtt_used_B=1160441856
+gpu_busy_pct=13
+mem_busy_pct=2
+host_MemAvailable_kB=11500260
+rc=0 date_utc=2026-10-18T02:28:29Z
+=== power post ===
+power1_average_uW=58000000
+power1_cap_uW=374000000
+temp_edge_mC=58000
+temp_junction_mC=63000
+temp_mem_mC=84000
+sclk_Hz=1434000000
+mclk_Hz=1258000000
+perf_level=auto
+pp_sclk_star=1: 1434Mhz *
+throttle_log=0000:03:00.0: thermal throttling logging enabled, with interval 60 seconds
+vram_used_B=15928819712
+vram_total_B=17095983104
+gtt_used_B=1072640000
+gpu_busy_pct=100
+mem_busy_pct=15
+host_MemAvailable_kB=12807380
+=== daemon proof ===
+WRAP daemon_md5=fb71e7d781a26671c8d8cb5ae6885e50 cli_md5=72ab7a028cf4dfe4adb6638741b84a83
+decode={'median': 17.0, 'mean': 17.066666666666666, 'min': 17.0, 'max': 17.2, 'stdev': 0.094280904158206} wall={'median': 16.7, 'mean': 16.766666666666666, 'min': 16.7, 'max': 16.9, 'stdev': 0.094280904158206} ttft={'median': 129.4, 'mean': 129.76666666666668, 'min': 126.1, 'max': 133.8, 'stdev': 3.15418593124897}
+samples.decode=[17.0, 17.0, 17.2]
+samples.wall=[16.7, 16.7, 16.9]
+kv=fp8/vmm spec=[None, None, None] warnings=['prompt is 59 tokens; prefill_tok_s at this length measures launch overhead, not prefill throughput — use --prompt-file with ≥256 tokens for a prefill number']
+protocol=native-generate-v1 prompt_tokens=59 prompt_md5=5835c71e471849b4a72e1dc8e39695e7
