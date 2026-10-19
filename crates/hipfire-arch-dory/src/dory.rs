@@ -23,8 +23,8 @@
 //! checkpoint stays compressed on device (BF16 ~7.95 GB; quants smaller).
 //! Per-vector scales (`attn_alpha`, `mlp_alpha`, `sqk`, `s_gate`, `suv_*`,
 //! `logit_scale`) are widened BF16 → F32 once at load (native) or consumed
-//! as exact-F32 HFQ scales. Activations and the KV cache are F32 (KV F32
-//! bring-up at modest `max_seq`).
+//! as exact-F32 HFQ scales. Activations are F32; KV is packed (see
+//! `crate::kv`: `auto`/Q8 default, FWHT2/3/4, F32 reference variant only).
 //! Naming: local safetensors tensors are `backbone.*`; the vLLM reference
 //! packs QKV (`qkv_proj`) and gate/up (`gate_up_proj`) where the checkpoint
 //! stores split `q/k/v_proj` and `gate/up_proj`. The loader maps exact local
@@ -1003,18 +1003,22 @@ pub fn load_weights_from_source(
     })
 }
 
-// ─── State ───────────────────────────────────────────────────────────────
-
-/// Per-decode GPU scratch + F32 KV cache.
+/// Dory decode state: per-token GPU scratch + one packed [`KvCache`].
 ///
 /// Buffers: residual stream `h`, `input_h` (post-input-block snapshot),
 /// `state_h` (recurrent accumulator), `resid`, `out`, `tmp` (hidden),
 /// `q`/`k`/`v`, `gate`, `attn_out`, `gate_mlp`/`up`/`ffn_mid`, `logits`,
-/// `attn_partials` (flash reduce scratch), `pos_buf` (device i32 position),
-/// plus per-attention-layer F32 K/V caches `[max_seq × kv_dim]`.
+/// `attn_partials` (flash reduce scratch), `pos_buf` (absolute position for
+/// RoPE + KV write + full-attention reads), `swa_pos_buf` (sliding `len-1`
+/// for windowed reads — tiles derive `seq_len` from the buffer given), plus
+/// one packed `KvCache` over all 72 physical layers (MLP slots hold
+/// 1-element placeholders; address by PHYSICAL `layer_idx`, not attn
+/// ordinal).
 ///
-/// `max_seq` is the KV budget set at allocation. Stale KV tails are ignored:
-/// `reset()` only rewinds `next_pos`; slots are overwritten in place.
+/// `max_seq` is the logical KV budget at allocation. Stale KV tails are
+/// ignored: `reset()` only rewinds `next_pos`; slots are overwritten in place.
+/// `kv_mode` is the resolved selection (reported at load); `kv_backend`
+/// names the honored storage backend (legacy contiguous or VMM).
 pub struct DoryState {
     pub h: GpuTensor,
     pub input_h: GpuTensor,
@@ -1033,19 +1037,27 @@ pub struct DoryState {
     pub logits: GpuTensor,
     pub attn_partials: GpuTensor,
     pub pos_buf: hip_bridge::DeviceBuffer,
-    pub k_cache: Vec<GpuTensor>,
-    pub v_cache: Vec<GpuTensor>,
-    pub n_attn_layers: usize,
-    pub kv_dim: usize,
+    pub swa_pos_buf: hip_bridge::DeviceBuffer,
+    pub kv: saddle_core::kv::KvCache,
+    pub kv_mode: saddle_core::kv::KvMode,
+    pub kv_backend: hipfire_runtime::kv_backend::KvBackend,
     pub max_seq: usize,
     /// Next free KV slot / absolute position of the next forward step.
     /// Bumped by the forward pass; rewound by `reset()`.
     pub next_pos: usize,
+    /// LAB-ONLY native KV trace sink. `None` (default) = no capture, no
+    /// download, no branch cost beyond one `is_some` check per attention
+    /// layer (field absent entirely without the `lab` feature). The parity
+    /// driver sets `Some(Vec::new())` to capture exact pre-cache `q`/`k`/`v`
+    /// and post-attend `attention` per (position, layer); see
+    /// [`crate::kv::KvTraceRow`]. Never read by production code.
+    #[cfg(feature = "lab")]
+    pub kv_trace: Option<Vec<crate::kv::KvTraceRow>>,
 }
 
-/// Default KV budget for bring-up. 2048 positions × 36 attention layers ×
-/// 2 (K+V) × 1024 × 4 B ≈ 576 MB at F32 — fits beside the ~8 GB BF16
-/// weights on a 14 GB card.
+/// Default KV budget for bring-up. 2048 positions × 36 KV-carrying layers;
+/// packed Q8 ≈ 1.4 MB/layer (1088 B K+V/pos), FWHT tiers smaller — far below
+/// the F32 bring-up sizing this replaces.
 pub const DEFAULT_MAX_SEQ: usize = 2048;
 
 impl DoryState {
@@ -1053,72 +1065,128 @@ impl DoryState {
         Self::new_with_max_seq(gpu, cfg, DEFAULT_MAX_SEQ)
     }
 
+    /// Plain-F32 reference constructor for the internal numeric oracle
+    /// (lab-gated). Same geometry as production, `quantized == false`;
+    /// production never builds through this path.
+    pub fn new_f32_reference(
+        gpu: &mut Gpu,
+        cfg: &DoryConfig,
+        max_seq: usize,
+    ) -> Result<Self, String> {
+        Self::new_inner(
+            gpu,
+            cfg,
+            max_seq,
+            saddle_core::kv::KvMode::Q8,
+            hipfire_runtime::kv_backend::KvBackend::Legacy,
+            true,
+        )
+    }
+
     pub fn new_with_max_seq(
         gpu: &mut Gpu,
         cfg: &DoryConfig,
         max_seq: usize,
     ) -> Result<Self, String> {
+        Self::new_with_kv(
+            gpu,
+            cfg,
+            max_seq,
+            saddle_core::kv::KvMode::Q8,
+            hipfire_runtime::kv_backend::KvBackend::Legacy,
+        )
+    }
+
+    /// Production constructor: build the packed `KvCache` for `kv_mode` on
+    /// `backend` (physical 72-layer mask), with failure-safe teardown of
+    /// every owner on the first error.
+    pub fn new_with_kv(
+        gpu: &mut Gpu,
+        cfg: &DoryConfig,
+        max_seq: usize,
+        kv_mode: saddle_core::kv::KvMode,
+        kv_backend: hipfire_runtime::kv_backend::KvBackend,
+    ) -> Result<Self, String> {
+        Self::new_inner(gpu, cfg, max_seq, kv_mode, kv_backend, false)
+    }
+
+    fn new_inner(
+        gpu: &mut Gpu,
+        cfg: &DoryConfig,
+        max_seq: usize,
+        kv_mode: saddle_core::kv::KvMode,
+        kv_backend: hipfire_runtime::kv_backend::KvBackend,
+        f32_reference: bool,
+    ) -> Result<Self, String> {
         if max_seq == 0 {
             return Err("dory: max_seq must be > 0".into());
+        }
+        if cfg.head_dim != 256 {
+            return Err(format!(
+                "dory: head_dim={} unsupported for KV (packed codecs need D256)",
+                cfg.head_dim
+            ));
         }
         let h = cfg.hidden_size;
         let f = cfg.intermediate_size;
         let q = cfg.num_attention_heads * cfg.head_dim;
-        let kv = cfg.num_key_value_heads * cfg.head_dim;
-        let n_attn = cfg.is_attention.iter().filter(|&&b| b).count();
-        // Failure-safe: every successful allocation is freed on the first
-        // error (caches, then pos_buf, then scratch in order).
-        let mut k_cache = Vec::with_capacity(n_attn);
-        let mut v_cache = Vec::with_capacity(n_attn);
-        macro_rules! scache {
-            ($vec:expr, $alloc:expr) => {
-                match $alloc {
-                    Ok(t) => $vec.push(t),
-                    Err(e) => {
-                        for t in k_cache {
-                            let _ = gpu.free_tensor(t);
-                        }
-                        for t in v_cache {
-                            let _ = gpu.free_tensor(t);
-                        }
-                        return Err(format!("dory: state alloc failed: {e}"));
-                    }
-                }
-            };
-        }
-        for _ in 0..n_attn {
-            scache!(k_cache, gpu.zeros(&[max_seq * kv], DType::F32));
-            scache!(v_cache, gpu.zeros(&[max_seq * kv], DType::F32));
-        }
-        let n_chunks_max = (max_seq + 127) / 128;
+        let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
+        let is_kv_layer: Vec<bool> = cfg.is_attention.clone();
+        // Worst-case flash scratch: the FWHT/Q8 tile kernels read up to the
+        // smallest certified tile (16) in the size ladder, so size partials
+        // for tile 16 regardless of the arch default (oversize is harmless).
+        let n_chunks_max = max_seq.div_ceil(16);
         let attn_partials_len = cfg.num_attention_heads * n_chunks_max * (2 + cfg.head_dim);
+        // Build the packed KV owner FIRST: every later allocation rolls back
+        // through it on failure (legacy frees, VMM tears down arenas).
+        let mut kv = if f32_reference {
+            saddle_core::kv::KvCache::new_gpu(
+                gpu,
+                cfg.num_hidden_layers,
+                cfg.num_key_value_heads,
+                cfg.head_dim,
+                max_seq,
+            )
+            .map_err(|e| format!("dory: F32 reference KV alloc failed: {e}"))?
+        } else {
+            let dims = saddle_core::kv::KvDims {
+                layers: saddle_core::kv::KvLayers::Mask(is_kv_layer.clone()),
+                n_kv_heads: cfg.num_key_value_heads,
+                head_dim: cfg.head_dim,
+                max_seq,
+                physical_cap: Some(max_seq),
+            };
+            saddle_core::kv::KvCache::from_mode_with_backend(kv_mode, kv_backend, gpu, &dims)
+                .map_err(|e| {
+                    format!("dory: packed KV alloc failed ({kv_mode:?}/{kv_backend:?}): {e}")
+                })?
+        };
         let pos_buf = match gpu.hip.malloc(4) {
             Ok(b) => b,
             Err(e) => {
-                for t in k_cache {
-                    let _ = gpu.free_tensor(t);
-                }
-                for t in v_cache {
-                    let _ = gpu.free_tensor(t);
-                }
+                let _ = kv.free_gpu(gpu);
                 return Err(format!("dory: state pos_buf alloc failed: {e}"));
             }
         };
-        // Scratch allocations: collect into a vec so a late failure frees
-        // caches + pos_buf + every scratch buffer so far.
+        let swa_pos_buf = match gpu.hip.malloc(4) {
+            Ok(b) => b,
+            Err(e) => {
+                let _ = kv.free_gpu(gpu);
+                let _ = gpu.hip.free(pos_buf);
+                return Err(format!("dory: state swa_pos_buf alloc failed: {e}"));
+            }
+        };
+        // Scratch allocations: collect into a vec so a late failure frees the
+        // KV owner + pos bufs + every scratch buffer so far.
         let mut scratch: Vec<GpuTensor> = Vec::with_capacity(16);
         macro_rules! salloc {
             ($alloc:expr) => {
                 match $alloc {
                     Ok(t) => scratch.push(t),
                     Err(e) => {
-                        for t in k_cache {
-                            let _ = gpu.free_tensor(t);
-                        }
-                        for t in v_cache {
-                            let _ = gpu.free_tensor(t);
-                        }
+                        let _ = kv.free_gpu(gpu);
                         let _ = gpu.hip.free(pos_buf);
+                        let _ = gpu.hip.free(swa_pos_buf);
                         for t in scratch {
                             let _ = gpu.free_tensor(t);
                         }
@@ -1134,8 +1202,8 @@ impl DoryState {
         salloc!(gpu.alloc_tensor(&[h], DType::F32)); // out
         salloc!(gpu.alloc_tensor(&[h], DType::F32)); // tmp
         salloc!(gpu.alloc_tensor(&[q], DType::F32)); // q
-        salloc!(gpu.alloc_tensor(&[kv], DType::F32)); // k
-        salloc!(gpu.alloc_tensor(&[kv], DType::F32)); // v
+        salloc!(gpu.alloc_tensor(&[kv_dim], DType::F32)); // k
+        salloc!(gpu.alloc_tensor(&[kv_dim], DType::F32)); // v
         salloc!(gpu.alloc_tensor(&[q], DType::F32)); // gate
         salloc!(gpu.alloc_tensor(&[q], DType::F32)); // attn_out
         salloc!(gpu.alloc_tensor(&[f], DType::F32)); // gate_mlp
@@ -1160,6 +1228,35 @@ impl DoryState {
         let ffn_mid = it.next().expect("16 scratch");
         let logits = it.next().expect("16 scratch");
         let attn_partials = it.next().expect("16 scratch");
+        // Zero the sliding position buffer to a valid `len-1 = 0` view: a fresh
+        // state must never hand an uninitialized buffer to a windowed read.
+        let zero: i32 = 0;
+        if let Err(e) = gpu.hip.memcpy_htod(&swa_pos_buf, &zero.to_ne_bytes()) {
+            let _ = kv.free_gpu(gpu);
+            let _ = gpu.hip.free(pos_buf);
+            let _ = gpu.hip.free(swa_pos_buf);
+            for t in [
+                h_b,
+                input_h,
+                state_h,
+                resid,
+                out,
+                tmp,
+                qb,
+                kb,
+                vb,
+                gate,
+                attn_out,
+                gate_mlp,
+                up,
+                ffn_mid,
+                logits,
+                attn_partials,
+            ] {
+                let _ = gpu.free_tensor(t);
+            }
+            return Err(format!("dory: state swa_pos_buf init failed: {e}"));
+        }
         Ok(Self {
             h: h_b,
             input_h,
@@ -1178,23 +1275,30 @@ impl DoryState {
             logits,
             attn_partials,
             pos_buf,
-            k_cache,
-            v_cache,
-            n_attn_layers: n_attn,
-            kv_dim: kv,
+            swa_pos_buf,
+            kv,
+            kv_mode,
+            kv_backend,
             max_seq,
             next_pos: 0,
+            #[cfg(feature = "lab")]
+            kv_trace: None,
         })
     }
 
     /// Fresh-prompt reset: rewind `next_pos` to 0. KV buffers are not
     /// zeroed — slots are overwritten in place as the next prompt fills
-    /// positions from 0, and the forward only reads `[0, next_pos)`.
+    /// positions from 0, and the forward only reads `[0, next_pos)` (full)
+    /// or the trailing window (sliding). `compact_offset` is always 0 on
+    /// Dory (no eviction), so no stale-tail mapping can leak across resets.
     pub fn reset(&mut self) {
         self.next_pos = 0;
+        self.kv.compact_offset = 0;
     }
 
-    /// Release every GPU buffer. Consumes self.
+    /// Release every GPU buffer. Consumes self. The packed `KvCache` frees
+    /// its arenas (legacy) or tears down VMM mappings; pos buffers and all
+    /// scratch follow — exhaustive field-by-field frees.
     pub fn free_gpu(self, gpu: &mut Gpu) {
         let Self {
             h,
@@ -1214,12 +1318,14 @@ impl DoryState {
             logits,
             attn_partials,
             pos_buf,
-            k_cache,
-            v_cache,
-            n_attn_layers: _,
-            kv_dim: _,
+            swa_pos_buf,
+            kv,
+            kv_mode: _,
+            kv_backend: _,
             max_seq: _,
             next_pos: _,
+            #[cfg(feature = "lab")]
+                kv_trace: _,
         } = self;
         for t in [
             h,
@@ -1241,13 +1347,9 @@ impl DoryState {
         ] {
             let _ = gpu.free_tensor(t);
         }
-        for t in k_cache {
-            let _ = gpu.free_tensor(t);
-        }
-        for t in v_cache {
-            let _ = gpu.free_tensor(t);
-        }
+        let _ = kv.free_gpu(gpu);
         let _ = gpu.hip.free(pos_buf);
+        let _ = gpu.hip.free(swa_pos_buf);
     }
 }
 

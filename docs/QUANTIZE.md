@@ -143,8 +143,10 @@ hipfire quantize ./dory-bf16 --format mq6v2 --tier pro -o dory-4b.mq6v2-pro.hfq
 The artifact embeds config, tokenizer, chat template and generation config,
 including EOS IDs. It is self-contained rather than dependent on the source
 directory. The native Dory loader consumes the formats and tier recipes
-above directly, with resident quantized weights and F32 activations/KV.
-Execution remains one recurrent loop. Non-Q8 fixed-tier embedding tables
+above directly, with resident quantized weights and F32 activations. KV
+presets are `auto` (Q8), `q8`, `fwht2`, `fwht3` and `fwht4`; the FWHT presets
+pack K at the selected width and retain Q8 V. Execution remains one recurrent
+loop. Non-Q8 fixed-tier embedding tables
 are explicitly refused by the loader; the standard XT/Base/Pro recipes
 all retain Q8 embeddings.
 

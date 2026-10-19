@@ -59,6 +59,12 @@ impl Architecture for Dory {
     }
 
     fn new_state(gpu: &mut Gpu, cfg: &Self::Config) -> Result<Self::State, String> {
-        DoryState::new(gpu, cfg)
+        DoryState::new_with_kv(
+            gpu,
+            cfg,
+            crate::dory::DEFAULT_MAX_SEQ,
+            saddle_core::kv::KvMode::Q8,
+            hipfire_runtime::kv_backend::KvBackend::Legacy,
+        )
     }
 }

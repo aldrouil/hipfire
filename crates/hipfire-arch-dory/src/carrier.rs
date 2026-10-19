@@ -9,6 +9,8 @@
 //! `n_recurrent_loops=2` checkpoint is intentionally run once.
 
 use crate::dory::{config_from_source, load_weights_from_source, DoryState};
+use crate::kv::dory_kv_backend;
+use crate::kv::resolve_dory_kv;
 use crate::spec_impl::DoryBundle;
 use hipfire_runtime::loader_api::{LoadCtx, ModelSource};
 use hipfire_runtime::model_source::ModelSource as _;
@@ -119,6 +121,25 @@ pub fn load_dory_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<DoryBundl
     if ctx.cask.sidecar.is_some() {
         return Err("dory: CASK eviction unsupported on arch_id=19 (dory bring-up)".into());
     }
+    // KV surface: whole `--kv-mode` string plus the existing axis overrides,
+    // resolved over the shared `DORY_POLICY` (`auto`/empty → Q8 on every
+    // arch; FWHT K always pairs with Q8 V; deprecated aliases and native
+    // presets refuse — never silently folded). Explicit VMM is honored
+    // (reserve == logical budget; no eviction on Dory); anything else the
+    // backend parser rejected before this point.
+    let mode_raw = ctx
+        .kv_mode_override
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| hipfire_runtime::config::get().kv_mode.clone());
+    let kv_mode = resolve_dory_kv(
+        &mode_raw,
+        ctx.kv_k_override,
+        ctx.kv_v_override,
+        ctx.gpu.arch.as_str(),
+        ctx.qwen_default_q8,
+    )?;
+    let kv_backend = dory_kv_backend(ctx);
     match src {
         ModelSource::Hfq(hfq) => {
             // HFQ path: the pack is self-contained (config + tokenizer +
@@ -126,7 +147,7 @@ pub fn load_dory_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<DoryBundl
             // exact-F32 nGPT scales as tensors). Wrap the owned file in the
             // `HfqModelSource` bridge — bare `HfqFile::tensor_data`
             // returns `None` through the generic trait — then share the
-            // exact Dir load path (config admission, codec uploads, F32
+            // exact Dir load path (config admission, codec uploads, packed
             // KV state). `arch_id` is checked before any GPU allocation.
             if hfq.arch_id != crate::ARCH_ID {
                 return Err(format!(
@@ -150,13 +171,17 @@ pub fn load_dory_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<DoryBundl
                 "dory: one-loop bring-up: running exactly ONE recurrent pass (declared n_recurrent_loops admitted: 1 or 2)"
             );
             let weights = load_weights_from_source(&bridge, &config, ctx.gpu)?;
-            let state = match DoryState::new_with_max_seq(ctx.gpu, &config, ctx.max_seq) {
-                Ok(s) => s,
-                Err(e) => {
-                    weights.free_gpu(ctx.gpu);
-                    return Err(format!("dory: DoryState::new_with_max_seq failed: {e}"));
-                }
-            };
+            let state =
+                match DoryState::new_with_kv(ctx.gpu, &config, ctx.max_seq, kv_mode, kv_backend) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        weights.free_gpu(ctx.gpu);
+                        return Err(format!("dory: DoryState::new_with_kv failed: {e}"));
+                    }
+                };
+            eprintln!(
+                "dory: KV cache: requested mode={mode_raw}, effective KV={kv_mode:?} backend={kv_backend:?}"
+            );
             Ok(DoryBundle {
                 config,
                 weights,
@@ -187,16 +212,20 @@ pub fn load_dory_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<DoryBundl
                 "dory: one-loop bring-up: running exactly ONE recurrent pass (declared n_recurrent_loops admitted: 1 or 2)"
             );
             let weights = load_weights_from_source(&source, &config, ctx.gpu)?;
-            let state = match DoryState::new_with_max_seq(ctx.gpu, &config, ctx.max_seq) {
-                Ok(s) => s,
-                Err(e) => {
-                    weights.free_gpu(ctx.gpu);
-                    return Err(format!("dory: DoryState::new_with_max_seq failed: {e}"));
-                }
-            };
+            let state =
+                match DoryState::new_with_kv(ctx.gpu, &config, ctx.max_seq, kv_mode, kv_backend) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        weights.free_gpu(ctx.gpu);
+                        return Err(format!("dory: DoryState::new_with_kv failed: {e}"));
+                    }
+                };
             for name in source.tensor_names() {
                 source.release_tensor_pages(name);
             }
+            eprintln!(
+                "dory: KV cache: requested mode={mode_raw}, effective KV={kv_mode:?} backend={kv_backend:?}"
+            );
             Ok(DoryBundle {
                 config,
                 weights,

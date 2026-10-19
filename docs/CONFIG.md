@@ -531,6 +531,14 @@ constructor); and Qwen3 dense (flat constructor). gfx1200 / gfx11 / gfx94x
 never inherit fp8. Registry Qwen cards leave mode as `auto` (a registry
 `default_kv_mode = "q8"` is not lowered into config).
 
+**Dory:** whole-cache presets are `auto`, `q8`, `fwht2`, `fwht3` and
+`fwht4`. `auto` selects Q8 K/V on every supported GPU; Dory does not meet
+the native-FP8 attention geometry above. FWHT presets use the named K
+bit width with Q8 V, uniformly across attention layers. Deprecated
+`asymN`/`turbo*`/`legacy-asymN` spellings and native `fp8`/`bf16`/`f16`
+presets are refused, rather than aliased or silently replaced.
+
+
 **Non-Qwen families:** Maple keeps BF16/BF16 (registry and direct-path
 auto; explicit `--kv-mode q8` still works). Gemma4 keeps its sliding tier
 Q8 on every variant; its full-attention tier follows `kv_cache`: `auto`/`q8`
@@ -779,6 +787,11 @@ gfx1151 VMM FWHT path, so this refusal also applies when VMM runtime or
 platform support is unavailable. `kv_mode = "fwht3"` without a K override
 retains the ordinary automatic legacy fallback; gfx1100 TP/Givens fallback,
 gfx1201 selection and defaults are unchanged.
+
+Dory's native load route currently uses **legacy** KV storage for every
+admitted preset. Automatic backend selection takes legacy, and an explicit
+`--kv-backend vmm` is refused at central admission.
+
 
 Qwen4 (Flash-Next, arch 16) owns its own QSA context layout. Automatic
 selects **vmm** exactly on gfx1151 or gfx1201 with a certified platform (not Windows,

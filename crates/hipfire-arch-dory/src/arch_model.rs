@@ -27,8 +27,10 @@ impl ArchModel for DoryBundle {
         "dory"
     }
 
-    /// Dory keeps its F32 K/V caches inside `DoryState` (not a `KvCache`),
-    /// so `None` — same pattern as `MuseGlimmerBundle`.
+    /// Dory owns its KV inside `DoryState` (not a `KvCache` field of its own):
+    /// `None` — same pattern as `MuseGlimmerBundle`. The loader admission
+    /// (`admission.rs`) routes `--kv-k/--kv-v` to Qwen only; the Dory carrier
+    /// honors them only when present in `LoadCtx` (never re-reads env).
     fn kv_cache_mut(&mut self) -> Option<&mut KvCache> {
         None
     }

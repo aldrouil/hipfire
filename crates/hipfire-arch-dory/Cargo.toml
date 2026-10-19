@@ -13,6 +13,7 @@ hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+saddle-core = { path = "../saddle-core" }
 
 [features]
 lab = []
@@ -23,4 +24,8 @@ deltanet = ["hipfire-runtime/deltanet", "rdna-compute/deltanet"]
 
 [[example]]
 name = "dory_parity"
+required-features = ["lab"]
+
+[[example]]
+name = "dory_kv_probe"
 required-features = ["lab"]

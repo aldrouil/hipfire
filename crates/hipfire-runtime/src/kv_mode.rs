@@ -358,6 +358,20 @@ pub const QWEN35_HFQ_POLICY: KvModePolicy = KvModePolicy {
     default: Q8,
 };
 
+/// Site 9 — Dory carrier (arch 19, dense single-loop). Accepted K surface is
+/// exactly `q8|fwht2|fwht3|fwht4` (native presets and Givens tiers have no
+/// Dory constructor). `auto`/empty resolves through the shared pair path to
+/// Q8 on every arch: Dory is H16/Hkv4/D256, so the gfx1201 H24/Hkv4/D256
+/// native auto-selection in `qwen_auto_default_pair` never fires. The
+/// `normalize_alias` entry reuses the shared Qwen table (same spelling for
+/// the legacy single-string path); `resolve_kv_pair` is the production entry
+/// and hard-errors anything outside `accepted`.
+pub const DORY_POLICY: KvModePolicy = KvModePolicy {
+    site: "dory",
+    normalize_alias: normalize_qwen,
+    accepted: &[Q8, Fwht2, Fwht3, Fwht4],
+    default: Q8,
+};
 /// Site 2 — qwen35 PaRo loader. `Asym3` absent from `accepted` (no bare
 /// legacy-asym3 constructor arm). `asym3`/`turbo3` parse to `Fwht3` (accepted).
 pub const QWEN35_PARO_POLICY: KvModePolicy = KvModePolicy {

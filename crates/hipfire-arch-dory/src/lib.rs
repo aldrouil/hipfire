@@ -25,7 +25,8 @@
 //! `[n_input, n_input+n_recurrent)` (declared `n_recurrent_loops` admits 1
 //! or 2). Native BF16 weights stay BF16 on device (`gemv_bf16_xf32`);
 //! HFQM quants ride the shared quant codecs; embeddings stay resident
-//! (BF16 verbatim / Q8 lookup). Activations and KV are F32.
+//! (BF16 verbatim / Q8 lookup). Activations are F32; KV is packed (see
+//! `crate::kv`: `auto`/Q8 default, FWHT2/3/4, F32 reference variant only).
 //!
 //! arch_id = 19, arch_key = "dory". See `docs/architecture-ids.md`.
 
@@ -34,11 +35,15 @@ pub mod arch_model;
 pub mod carrier;
 pub mod dory;
 pub mod forward;
+pub mod kv;
 pub mod spec_impl;
 
 pub use arch::Dory;
 pub use carrier::load_dory_bundle;
 pub use forward::{download_last_hidden, forward_step, forward_token};
+#[cfg(feature = "lab")]
+pub use kv::KvTraceRow;
+pub use kv::{dory_kv_attend, dory_kv_prepare, dory_kv_write, resolve_dory_kv};
 pub use spec_impl::DoryBundle;
 
 pub const ARCH_ID: u32 = 19;

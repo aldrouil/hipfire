@@ -51,19 +51,30 @@ projection matrices retain their encoded precision and the Q8 embedding
 table stays resident. Supported bodies are MQ3V2, MQ4V2, MQ5V2, MQ6V2,
 MQ8 and Q8F16; see [Dory quantization](QUANTIZE.md#nemotron-dory)
 for XT, Base and Pro recipes.
-Activations and KV are F32. This is an eager, single-GPU text-only AR route:
-no multi-loop execution, speculation, tools, offload, or batching.
+Activations are F32. KV presets are `auto` (Q8), `q8`, `fwht2`, `fwht3`
+and `fwht4`; the FWHT presets compress K and retain Q8 V. Deprecated
+`asym`/`turbo` spellings are refused. This is an eager, single-GPU text-only
+AR route: no multi-loop execution, speculation, tools, offload, or batching.
 
 Set `--max-seq` explicitly for available VRAM. Original BF16 weights occupy
-about 7.95 GB; quantized artifacts are smaller. The F32 KV allocation adds
-294,912 bytes per context token
-(about 604 MB at 2048 tokens), plus scratch. The ordinary 32768-token default
-can exceed a 16 GB card's free memory; context is not silently reduced.
+about 7.95 GB; quantized artifacts are smaller. For the shipped 36 attention
+layers, four KV heads and head dimension 256, logical KV payload is:
+
+| KV preset | K encoding | V encoding | Bytes per context token |
+|---|---|---|---:|
+| `auto` / `q8` | Q8 | Q8 | 78,336 |
+| `fwht2` | FWHT 2-bit | Q8 | 48,960 |
+| `fwht3` | FWHT 3-bit | Q8 | 53,568 |
+| `fwht4` | FWHT 4-bit | Q8 | 58,176 |
+
+These counts include codec headers, not allocator padding or scratch.
+Native Dory loads use the legacy KV backend; explicit `vmm` is not admitted.
+Context is not silently reduced.
 
 ```bash
 hipfire quantize ./dory-bf16 --format mq4v2 -o dory-4b.mq4v2.hfq
 HIPFIRE_DEVICES=gfx1201 hipfire run ./dory-4b.mq4v2.hfq \
-  --max-seq 2048 --spec off -t 0 -n 256 \
+  --max-seq 2048 --kv-mode auto --spec off -t 0 -n 256 \
   "Name the capital of France in one sentence."
 ```
 
@@ -83,10 +94,22 @@ MQ3V2 through MQ6V2, Q8 and MQ8 produced readable France answers; MQ4V2 Pro
 completed the eight-turn session check at `--max-seq 4096`.
 
 Forward validation uses `scripts/dory_reference.py` and the architecture's
-`dory_parity` example. On gfx1201 both the real BF16 checkpoint and a
-self-contained Q8 HFQM artifact matched all 16 reference top-1 IDs against
-the independent CPU F32 oracle using the same weights. This is numerical
-bring-up evidence, not a throughput or product-admission claim. Equations follow
+`dory_parity` example. Initial F32-KV bring-up on gfx1201 matched all 16
+reference top-1 IDs for BF16 and self-contained Q8 weights. F32 KV remains
+an internal numerical reference, not a production preset. Quantized KV is
+checked against a same-codec CPU reference; `dory_kv_probe` covers all heads,
+full/sliding attention at positions 1023–1025, overwrite and reset. This is
+numerical bring-up evidence, not a throughput or product-admission claim.
+
+Packed KV is not bit-identical between the independent CPU and GPU model
+walks: projection rounding and FWHT summation order can cross discrete
+quantizer thresholds. A 16-token same-weight walk kept all top-token IDs
+but exceeded the strict full-model logit tolerance. Exact-input attention
+replay isolates these effects; an observed FWHT4 threshold crossing changed
+one packed K code and amplified the attention difference. Do not describe
+packed-KV full-model CPU/GPU logits as numerically identical.
+
+Equations follow
 [the Dory vLLM implementation](https://github.com/vllm-project/vllm/blob/55076950b6c155f384d6766d63563c3bc20a0e3f/vllm/model_executor/models/dory.py);
 the [llama.cpp Dory PR](https://github.com/ggml-org/llama.cpp/pull/30306)
 provides another implementation reference.

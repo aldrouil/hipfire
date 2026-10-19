@@ -2,23 +2,25 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Dory one-loop forward pass (single-token decode, F32 activations).
+//! Dory one-loop forward pass (single-token decode, F32 activations, packed KV).
 //!
 //! Exact per-sublayer math (upstream `vllm/model_executor/models/dory.py`):
 //!
 //! - `justnorm(x) = x * rsqrt(sum(x²) + 1e-6)`, F32 accumulation, in place.
 //!   Implemented by composing the audited `l2_norm.hip` kernel
 //!   (`x *= rsqrt(sum(x²) + eps)`, eps passed as 1e-6) invoked with
-//!   `n_heads = 1` for whole-vector norms (`justnorm_hidden`) or the head
-//!   count for headwise norms — one launch per norm, no new kernels.
+//!   `n_heads = 1` for whole-vector norms or the head count for headwise
+//!   norms — one launch per norm, no new kernels.
 //! - Attention sublayer on normalized input `u`:
-//!   `q = Wq u; k = Wk u; v = Wv u; g = Wg u` (BF16 weights × F32 input).
-//!   RoPE (neox halfsplit, in place, F32) with the per-layer theta
-//!   (sliding 10000 / full 10000000). Then headwise qk-norm **after** RoPE:
-//!   `q[h] = justnorm(q[h]) * (sqk[h]*sqk_factor)²`,
-//!   `k[h] = justnorm(k[h])` (K plain). KV write at `next_pos`; GQA
-//!   `attention_flash` over `[0, next_pos]` (full layers) or the trailing
-//!   `min(window, next_pos+1)` rows (sliding layers, via cache sub-views).
+//!   `q = Wq u; k = Wk u; v = Wv u; g = Wg u` (weight codec × F32 input).
+//!   RoPE (neox halfsplit, in place, F32, ABSOLUTE position) with the
+//!   per-layer theta (sliding 10000 / full 10000000). Then headwise qk-norm
+//!   **after** RoPE: `q[h] = justnorm(q[h]) * (sqk[h]*sqk_factor)²`,
+//!   `k[h] = justnorm(k[h])` (K plain). Packed KV write at `next_pos` via
+//!   `dory_kv_write` (Q8 / FWHT2/3/4 codecs); GQA flash over `[0, next_pos]`
+//!   (full layers) or the trailing `min(window, next_pos+1)` rows (sliding
+//!   layers, via stride-exact `sub_offset` views + a `len-1` position view)
+//!   via `dory_kv_attend`.
 //!   Output gate: `o = attn * sigmoid(g * (s_gate*s_gate_factor)²)`,
 //!   `o = justnorm(o)`, `o = Wo o` (F32).
 //! - MLP sublayer on `u`: `gt = Wgate u * (suv_gate*suv)`,
@@ -34,9 +36,8 @@
 //!
 //! Decode-only bring-up: one token per call. Prefill is N sequential
 //! `forward_token` calls (non-final tokens with `compute_logits=false`
-//! skip the 131072-wide lm head). No batched kernels, no graphs.
-
 use crate::dory::{DoryAttnWeights, DoryConfig, DoryMlpWeights, DoryState, DoryWeights};
+use crate::kv::{dory_kv_attend, dory_kv_prepare, dory_kv_write};
 use crate::spec_impl::DoryBundle;
 use hipfire_runtime::llama::{
     embedding_lookup_dispatch, weight_gemv, EmbeddingFormat, WeightTensor,
@@ -105,14 +106,15 @@ fn slerp_residual(
 }
 
 /// Single attention sublayer + slerp residual, `h` updated in place.
-/// `attn_idx` indexes the layer's K/V cache pair.
+/// `layer_idx` is the PHYSICAL layer index (the packed `KvCache` carries a
+/// 72-slot mask; MLP slots hold placeholders). `pos` is the absolute
+/// position (`next_pos`); sliding reads trail it via `kv.rs` views.
 fn attn_sublayer(
     gpu: &mut Gpu,
     cfg: &DoryConfig,
     w: &DoryAttnWeights,
     st: &mut DoryState,
     layer_idx: usize,
-    attn_idx: usize,
     pos: usize,
     is_full: bool,
 ) -> Result<(), String> {
@@ -124,14 +126,15 @@ fn attn_sublayer(
     } else {
         cfg.sliding_theta
     };
-    // 1. Projections from h (BF16 × F32 → F32).
+    // 1. Projections from h (weight codec × F32 → F32).
     gemv(gpu, &w.wq, &st.h, &st.q)?;
     gemv(gpu, &w.wk, &st.h, &st.k)?;
     gemv(gpu, &w.wv, &st.h, &st.v)?;
     gemv(gpu, &w.wg, &st.h, &st.gate)?;
-    // 2. RoPE after projections (neox halfsplit), then upload pos.
-    let pos_i32 = pos as i32;
-    hip(gpu.hip.memcpy_htod(&st.pos_buf, &pos_i32.to_ne_bytes()))?;
+    // 2. RoPE after projections (neox halfsplit, in place), absolute
+    // position. `dory_kv_prepare` (called once per `forward_token`) already
+    // uploaded `pos` to `pos_buf` and `len-1` to `swa_pos_buf` — reuse the
+    // prepared buffer here; no per-layer copy.
     hip(gpu.rope_f32(&st.q, &st.k, &st.pos_buf, n_heads, n_kv, hd, theta))?;
     // 3. Headwise qk-norm after RoPE.
     justnorm_heads(gpu, &st.q, n_heads, hd)?;
@@ -139,50 +142,47 @@ fn attn_sublayer(
     // justnorm then scale; square folded into the stored vector).
     hip(gpu.mul_f32(&st.q, &w.sqk, &st.q))?;
     justnorm_heads(gpu, &st.k, n_kv, hd)?;
-    // 4. KV write at pos.
-    hip(gpu.kv_cache_write(&st.k_cache[attn_idx], &st.k, &st.pos_buf, st.kv_dim))?;
-    hip(gpu.kv_cache_write(&st.v_cache[attn_idx], &st.v, &st.pos_buf, st.kv_dim))?;
-    // Sliding layers attend the trailing `min(window, pos+1)` rows. The
-    // flash partial kernel indexes `cache[t * kv_dim + ...]` for `t` in
-    // `[0, seq_len)` with no max_seq stride (max_seq is unused there —
-    // verified against kernels/src/attention_flash.hip), so a
-    // `sub_offset(start*kv_dim, len*kv_dim)` view of the contiguous cache
-    // presents rows `[start, start+len)` as `[0, len)`. Causal masking
-    // holds (scores/softmax cover only the window); RoPE stays absolute
-    // via pos_buf — only the attended history slides.
-    if is_full {
-        hip(Gpu::attention_flash(
-            gpu,
-            &st.q,
-            &st.k_cache[attn_idx],
-            &st.v_cache[attn_idx],
-            &st.attn_out,
-            &st.attn_partials,
-            pos + 1,
-            n_heads,
-            n_kv,
-            hd,
-            st.max_seq,
-        ))?;
+    // LAB-ONLY trace: capture exact pre-cache q/k/v BEFORE the write and raw
+    // attention AFTER the read. Compiled out without `lab` (zero production
+    // math/branch change); downloads happen ONLY when `kv_trace` is `Some`.
+    #[cfg(feature = "lab")]
+    let (trace_q, trace_k, trace_v) = if st.kv_trace.is_some() {
+        (
+            Some(hip(gpu.download_f32(&st.q))?),
+            Some(hip(gpu.download_f32(&st.k))?),
+            Some(hip(gpu.download_f32(&st.v))?),
+        )
     } else {
-        let start = (pos + 1).saturating_sub(cfg.sliding_window);
-        let len = pos + 1 - start;
-        // Views alias the cache buffers (do NOT free); they outlive the call.
-        let k_view = st.k_cache[attn_idx].sub_offset(start * st.kv_dim, len * st.kv_dim);
-        let v_view = st.v_cache[attn_idx].sub_offset(start * st.kv_dim, len * st.kv_dim);
-        hip(Gpu::attention_flash(
-            gpu,
-            &st.q,
-            &k_view,
-            &v_view,
-            &st.attn_out,
-            &st.attn_partials,
-            len,
-            n_heads,
-            n_kv,
-            hd,
-            st.max_seq,
-        ))?;
+        (None, None, None)
+    };
+    // 4. KV write + flash attention through the ONE production helper pair
+    // (packed Q8 / FWHT2/3/4 codecs; F32 reference when built as such).
+    // Buffers are already prepared for this `pos` — no mapping/uploads here.
+    dory_kv_write(gpu, &st.kv, layer_idx, &st.k, &st.v, &st.pos_buf)?;
+    dory_kv_attend(
+        gpu,
+        &mut st.kv,
+        layer_idx,
+        &st.q,
+        &st.attn_out,
+        &st.attn_partials,
+        &st.pos_buf,
+        &st.swa_pos_buf,
+        pos,
+        is_full,
+        cfg.sliding_window,
+        n_heads,
+    )?;
+    #[cfg(feature = "lab")]
+    if let Some(rows) = st.kv_trace.as_mut() {
+        rows.push(crate::kv::KvTraceRow {
+            position: pos,
+            layer: layer_idx,
+            q: trace_q.expect("dory: kv_trace q missing"),
+            k: trace_k.expect("dory: kv_trace k missing"),
+            v: trace_v.expect("dory: kv_trace v missing"),
+            attention: hip(gpu.download_f32(&st.attn_out))?,
+        });
     }
     // gate *= (s_gate*s_gate_factor)² — folded at load; then
     // attn_out *= sigmoid(gate) via the fused epilogue (reference order:
@@ -222,17 +222,14 @@ fn run_blocks(
     st: &mut DoryState,
     range: std::ops::Range<usize>,
     pos: usize,
-    attn_cursor: &mut usize,
 ) -> Result<(), String> {
     for i in range {
         if cfg.is_attention[i] {
             let is_full = cfg.is_full_attention[i];
-            let idx = *attn_cursor;
-            *attn_cursor += 1;
             let w = weights.attn[i]
                 .as_ref()
                 .ok_or_else(|| format!("dory: attention weights missing at layer {i}"))?;
-            attn_sublayer(gpu, cfg, w, st, i, idx, pos, is_full)?;
+            attn_sublayer(gpu, cfg, w, st, i, pos, is_full)?;
         } else {
             let w = weights.mlp[i]
                 .as_ref()
@@ -309,8 +306,12 @@ pub fn forward_token(
             ));
         }
     }
-    let mut attn_cursor = 0usize;
-    run_blocks(gpu, cfg, weights, st, 0..n_in, pos, &mut attn_cursor)?;
+    // ONE per-token KV prepare: VMM map + absolute pos + sliding len-1
+    // uploads. Every attention layer below consumes these buffers — no
+    // per-layer mapping scans or position copies.
+    let window = cfg.sliding_window;
+    dory_kv_prepare(gpu, &mut st.kv, &st.pos_buf, &st.swa_pos_buf, pos, window)?;
+    run_blocks(gpu, cfg, weights, st, 0..n_in, pos)?;
     hip(gpu.copy_d2d(&st.h, &st.input_h, h_dim * 4))?;
     // Single recurrent loop with reinjection:
     // combined = justnorm(state + input_h); end with state = justnorm(h).
@@ -318,28 +319,11 @@ pub fn forward_token(
     hip(gpu.copy_d2d(&st.state_h, &st.h, h_dim * 4))?;
     hip(gpu.add_inplace_f32(&st.h, &st.input_h))?;
     justnorm_all(gpu, &st.h)?;
-    run_blocks(
-        gpu,
-        cfg,
-        weights,
-        st,
-        n_in..n_in + n_rec,
-        pos,
-        &mut attn_cursor,
-    )?;
+    run_blocks(gpu, cfg, weights, st, n_in..n_in + n_rec, pos)?;
     hip(gpu.copy_d2d(&st.h, &st.state_h, h_dim * 4))?;
     justnorm_all(gpu, &st.state_h)?;
     hip(gpu.copy_d2d(&st.state_h, &st.h, h_dim * 4))?;
-    run_blocks(
-        gpu,
-        cfg,
-        weights,
-        st,
-        n_in + n_rec..n_layers,
-        pos,
-        &mut attn_cursor,
-    )?;
-    debug_assert_eq!(attn_cursor, st.n_attn_layers);
+    run_blocks(gpu, cfg, weights, st, n_in + n_rec..n_layers, pos)?;
     if !compute_logits {
         st.next_pos = pos + 1;
         return Ok(None);
