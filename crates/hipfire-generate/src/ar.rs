@@ -2893,7 +2893,7 @@ pub fn generate(
             return;
         }
         GenerationRoute::DoryAr => {
-            // Single-loop native AR. No tools (no parser validated on this
+            // Multi-loop native AR. No tools (no parser validated on this
             // path — refused above), no pflash/eviction/spec. `temp`/`top_p`
             // sample host-side; greedy at temp<=1e-6. Repeat penalties and
             // explicit `stop` are refused on this route (see selector gates).

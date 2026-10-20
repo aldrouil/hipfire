@@ -3,7 +3,7 @@ name = "hipfire-arch-dory"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Dory dense recurrent text decoder (alternating attention/MLP sublayers, nGPT normalized residual interpolation, per-layer sliding/full RoPE, single-loop bring-up). arch_id=19."
+description = "Dory dense recurrent text decoder (shared recurrent blocks, configurable loop count and KV ownership, nGPT normalized residual interpolation, per-layer sliding/full RoPE). arch_id=19."
 
 [dependencies]
 hipfire-config = { path = "../hipfire-config" }

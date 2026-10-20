@@ -1425,7 +1425,7 @@ impl LoadedModel {
     }
 
     /// Dory (arch_id=19) GPU bundle. Owned by its arch crate (which also
-    /// implements `ArchModel` for it): single-loop native BF16 forward.
+    /// implements `ArchModel` for it): multi-loop native forward.
     pub fn dory(&self) -> Option<&hipfire_arch_dory::DoryBundle> {
         self.state
             .as_deref()
@@ -2914,6 +2914,10 @@ pub fn load_model_with_gemma4_drafter(
             ),
             expert_count_override: deepseek4_experts_per_token.is_some(),
             pflash: false,
+            // Offline entry: no staged Dory recurrence (daemon threads the
+            // wire params instead). Carrier gets `None` below, matching.
+            dory_loops: None,
+            dory_recurrent_kv_cache_mode: None,
         },
     )?;
     let warning = crate::admission::legacy_warning(
@@ -2924,6 +2928,8 @@ pub fn load_model_with_gemma4_drafter(
         admission,
         path,
         max_seq,
+        None,
+        None,
         deepseek4_experts_per_token,
         deepseek4_compute_placement,
         draft_path,
@@ -3448,6 +3454,8 @@ pub fn load_admitted_with_gemma4_drafter(
     admission: crate::admission::SourceAdmission,
     path: &str,
     _max_seq: usize,
+    dory_loops: Option<usize>,
+    dory_recurrent_kv_cache_mode: Option<hipfire_config::DoryRecurrentKvCacheMode>,
     deepseek4_experts_per_token: Option<usize>,
     deepseek4_compute_placement: hipfire_config::Deepseek4ComputePlacement,
     draft_path: Option<&str>,
@@ -3523,6 +3531,8 @@ pub fn load_admitted_with_gemma4_drafter(
             }),
         deepseek4_compute_placement,
         deepseek4_experts_per_token,
+        dory_loops,
+        dory_recurrent_kv_cache_mode,
         draft_path,
         vision_path,
         mtp_path: mtp_path.map(Path::to_path_buf),

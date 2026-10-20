@@ -358,7 +358,7 @@ pub const QWEN35_HFQ_POLICY: KvModePolicy = KvModePolicy {
     default: Q8,
 };
 
-/// Site 9 — Dory carrier (arch 19, dense single-loop). Accepted K surface is
+/// Site 9 — Dory carrier (arch 19, dense latent recurrence). Accepted K surface is
 /// exactly `q8|fwht2|fwht3|fwht4` (native presets and Givens tiers have no
 /// Dory constructor). `auto`/empty resolves through the shared pair path to
 /// Q8 on every arch: Dory is H16/Hkv4/D256, so the gfx1201 H24/Hkv4/D256

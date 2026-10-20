@@ -113,9 +113,19 @@ enum Route {
     F16ExactKept,
 }
 
-fn views(case: &Case, x: &GpuTensor, y: &[GpuTensor], row0: usize, n: usize) -> (GpuTensor, Vec<GpuTensor>) {
+fn views(
+    case: &Case,
+    x: &GpuTensor,
+    y: &[GpuTensor],
+    row0: usize,
+    n: usize,
+) -> (GpuTensor, Vec<GpuTensor>) {
     let xv = x.sub_offset(row0 * case.k, n * case.k);
-    let ys = y.iter().zip(&case.ms).map(|(t, &m)| t.sub_offset(row0 * m, n * m)).collect();
+    let ys = y
+        .iter()
+        .zip(&case.ms)
+        .map(|(t, &m)| t.sub_offset(row0 * m, n * m))
+        .collect();
     (xv, ys)
 }
 
@@ -132,7 +142,12 @@ fn iu4_gemms(gpu: &mut Gpu, case: &Case, xq: *mut c_void, ys: &[GpuTensor], n: u
 }
 
 /// A4 producer over rows `xv` (N rows of K); returns the prepared handle.
-fn slab_prepare(gpu: &mut Gpu, case: &Case, xv: &GpuTensor, n: usize) -> R<rdna_compute::Int4MmqPrepared> {
+fn slab_prepare(
+    gpu: &mut Gpu,
+    case: &Case,
+    xv: &GpuTensor,
+    n: usize,
+) -> R<rdna_compute::Int4MmqPrepared> {
     let k = case.k;
     let res = gpu.reserve_int4_mmq(k, n)?;
     Ok(match case.slab.ok_or("no slab producer for this case")? {
@@ -153,10 +168,18 @@ fn slab_prepare(gpu: &mut Gpu, case: &Case, xv: &GpuTensor, n: usize) -> R<rdna_
             k,
             n,
         )?,
-        Slab::Sigmoid(awq) => {
-            gpu.sigmoid_mul_rotate_x_mq_awq_i4_gfx12_batched(xv, rdna_compute::gemv::SigmoidGate::Rows(xv), awq, None, res, k, n)?
+        Slab::Sigmoid(awq) => gpu.sigmoid_mul_rotate_x_mq_awq_i4_gfx12_batched(
+            xv,
+            rdna_compute::gemv::SigmoidGate::Rows(xv),
+            awq,
+            None,
+            res,
+            k,
+            n,
+        )?,
+        Slab::Silu(awq) => {
+            gpu.fused_silu_mul_rotate_mq_i4_gfx12_batched(xv, xv, awq, None, res, k, n)?
         }
-        Slab::Silu(awq) => gpu.fused_silu_mul_rotate_mq_i4_gfx12_batched(xv, xv, awq, None, res, k, n)?,
     })
 }
 
@@ -170,12 +193,25 @@ fn slab_produce(gpu: &mut Gpu, case: &Case, xv: &GpuTensor, n: usize) -> R<(*mut
 
 /// The slab route's consumers from a prepared handle (`h`: the FFN chain's
 /// h scratch view, rows `[row0, row0 + n)`).
-fn slab_consume(gpu: &mut Gpu, case: &Case, prep: &rdna_compute::Int4MmqPrepared, ys: &[GpuTensor], h: Option<&GpuTensor>, n: usize) -> R<()> {
+fn slab_consume(
+    gpu: &mut Gpu,
+    case: &Case,
+    prep: &rdna_compute::Int4MmqPrepared,
+    ys: &[GpuTensor],
+    h: Option<&GpuTensor>,
+    n: usize,
+) -> R<()> {
     let (w, m, k) = (&case.w, &case.ms, case.k);
     match case.fam {
         Fam::GateUpSilu => {
-            if !gpu.gemm_gate_up_silu_mq4g256v2_iu4_prepared(w[0], w[1], prep, &ys[0], m[0], m[0], k, n)? {
-                return Err(format!("{}: the F1-lite gate/up+SwiGLU GEMM was not admitted", case.name).into());
+            if !gpu.gemm_gate_up_silu_mq4g256v2_iu4_prepared(
+                w[0], w[1], prep, &ys[0], m[0], m[0], k, n,
+            )? {
+                return Err(format!(
+                    "{}: the F1-lite gate/up+SwiGLU GEMM was not admitted",
+                    case.name
+                )
+                .into());
             }
         }
         Fam::FfnA4 => {
@@ -198,7 +234,16 @@ fn slab_consume(gpu: &mut Gpu, case: &Case, prep: &rdna_compute::Int4MmqPrepared
     Ok(())
 }
 
-fn launch(gpu: &mut Gpu, case: &Case, route: Route, x: &GpuTensor, y: &[GpuTensor], h: Option<&GpuTensor>, row0: usize, n: usize) -> R<()> {
+fn launch(
+    gpu: &mut Gpu,
+    case: &Case,
+    route: Route,
+    x: &GpuTensor,
+    y: &[GpuTensor],
+    h: Option<&GpuTensor>,
+    row0: usize,
+    n: usize,
+) -> R<()> {
     let (xv, ys) = views(case, x, y, row0, n);
     let (w, m, k) = (&case.w, &case.ms, case.k);
     match route {
@@ -217,12 +262,21 @@ fn launch(gpu: &mut Gpu, case: &Case, route: Route, x: &GpuTensor, y: &[GpuTenso
             }
             match case.fam {
                 Fam::Qkvza => gpu.gemm_qkvza_mq4g256v2_verify_exact(
-                    w[0], w[1], w[2], w[3], &xv, &ys[0], &ys[1], &ys[2], &ys[3], m[0], m[1], m[2], m[3], k, n,
+                    w[0], w[1], w[2], w[3], &xv, &ys[0], &ys[1], &ys[2], &ys[3], m[0], m[1], m[2],
+                    m[3], k, n,
                 )?,
-                Fam::Qkv => gpu.gemm_qkv_mq4g256v2_verify_exact(w[0], w[1], w[2], &xv, &ys[0], &ys[1], &ys[2], m[0], m[1], m[2], k, n)?,
-                Fam::GateUp => gpu.gemm_gate_up_mq4g256v2_verify_exact(w[0], w[1], &xv, &ys[0], &ys[1], m[0], m[1], k, n)?,
-                Fam::Residual => gpu.gemm_mq4g256v2_residual_verify_exact(w[0], &xv, &ys[0], m[0], k, n)?,
-                Fam::GateUpSilu | Fam::FfnA4 => return Err(format!("{}: no F16 twin", case.name).into()),
+                Fam::Qkv => gpu.gemm_qkv_mq4g256v2_verify_exact(
+                    w[0], w[1], w[2], &xv, &ys[0], &ys[1], &ys[2], m[0], m[1], m[2], k, n,
+                )?,
+                Fam::GateUp => gpu.gemm_gate_up_mq4g256v2_verify_exact(
+                    w[0], w[1], &xv, &ys[0], &ys[1], m[0], m[1], k, n,
+                )?,
+                Fam::Residual => {
+                    gpu.gemm_mq4g256v2_residual_verify_exact(w[0], &xv, &ys[0], m[0], k, n)?
+                }
+                Fam::GateUpSilu | Fam::FfnA4 => {
+                    return Err(format!("{}: no F16 twin", case.name).into())
+                }
             }
         }
     }
@@ -238,7 +292,9 @@ fn m_hidden(case: &Case) -> usize {
 }
 
 fn hash3(a: u64, b: u64, c: u64) -> u64 {
-    let mut h = a.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ b.wrapping_mul(0xC2B2_AE3D_27D4_EB4F) ^ c.wrapping_mul(0x1656_67B1_9E37_79F9);
+    let mut h = a.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ b.wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
+        ^ c.wrapping_mul(0x1656_67B1_9E37_79F9);
     h ^= h >> 33;
     h = h.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
     h ^= h >> 33;
@@ -318,7 +374,12 @@ struct Outs {
 }
 
 fn alloc_outs(gpu: &mut Gpu, case: &Case, seed: u64) -> R<Outs> {
-    let mut o = Outs { y: Vec::new(), init_dev: Vec::new(), init: Vec::new(), h: None };
+    let mut o = Outs {
+        y: Vec::new(),
+        init_dev: Vec::new(),
+        init: Vec::new(),
+        h: None,
+    };
     for (i, &m) in case.ms.iter().enumerate() {
         let init = gen_init(seed, i, m, case.add());
         let n = NMAX * m + CANARY;
@@ -384,7 +445,11 @@ fn first_diff(got: &[Vec<u8>], want: &[Vec<u8>], ms: &[usize]) -> Option<String>
             if gc != wc {
                 total += 1;
                 if first.is_none() {
-                    let (r, c) = if wi < NMAX * m { (format!("{}", wi / m), format!("{}", wi % m)) } else { ("canary".into(), format!("{}", wi - NMAX * m)) };
+                    let (r, c) = if wi < NMAX * m {
+                        (format!("{}", wi / m), format!("{}", wi % m))
+                    } else {
+                        ("canary".into(), format!("{}", wi - NMAX * m))
+                    };
                     first = Some(format!(
                         "out{o} batchrow {r} outrow {c}: got {:08x} want {:08x}",
                         u32::from_le_bytes(gc.try_into().unwrap()),
@@ -428,11 +493,18 @@ fn median(v: &mut [f64]) -> f64 {
 }
 
 /// Relative / absolute L2 of `got` vs `want` over rows [0, NMAX) (init subtracted for residual).
-fn distance(got: &[Vec<u8>], want: &[Vec<u8>], init: &[Vec<u8>], ms: &[usize], residual: bool) -> (f64, f64, usize) {
+fn distance(
+    got: &[Vec<u8>],
+    want: &[Vec<u8>],
+    init: &[Vec<u8>],
+    ms: &[usize],
+    residual: bool,
+) -> (f64, f64, usize) {
     let (mut num, mut den, mut nonfinite) = (0f64, 0f64, 0usize);
     for ((g, w), (i, &m)) in got.iter().zip(want).zip(init.iter().zip(ms)) {
         for idx in 0..NMAX * m {
-            let f = |b: &[u8]| f32::from_le_bytes(b[idx * 4..idx * 4 + 4].try_into().unwrap()) as f64;
+            let f =
+                |b: &[u8]| f32::from_le_bytes(b[idx * 4..idx * 4 + 4].try_into().unwrap()) as f64;
             let base = if residual { f(i) } else { 0.0 };
             let (a, b) = (f(g) - base, f(w) - base);
             if !a.is_finite() || !b.is_finite() {
@@ -459,7 +531,15 @@ fn main() {
 }
 
 /// Byte oracle of one route against its own 8 x 16-row reference.
-fn oracle(gpu: &mut Gpu, rep: &mut Report, case: &Case, route: Route, x: &GpuTensor, outs: &Outs, tag: &str) -> R<Vec<Vec<u8>>> {
+fn oracle(
+    gpu: &mut Gpu,
+    rep: &mut Report,
+    case: &Case,
+    route: Route,
+    x: &GpuTensor,
+    outs: &Outs,
+    tag: &str,
+) -> R<Vec<Vec<u8>>> {
     let ms = &case.ms;
     let (y, h) = (&outs.y, outs.h.as_ref());
     reset(gpu, outs)?;
@@ -483,10 +563,18 @@ fn oracle(gpu: &mut Gpu, rep: &mut Report, case: &Case, route: Route, x: &GpuTen
     for n in [32usize, 64, 128] {
         reset(gpu, outs)?;
         launch(gpu, case, route, x, y, h, 0, n)?;
-        let ok = rep.cmp(&format!("{tag} N={n}"), &read(gpu, outs)?, &expect(&refb, &outs.init, ms, n), ms);
+        let ok = rep.cmp(
+            &format!("{tag} N={n}"),
+            &read(gpu, outs)?,
+            &expect(&refb, &outs.init, ms, n),
+            ms,
+        );
         v.push(format!("N={n}:{}", if ok { "same" } else { "DIFF" }));
     }
-    for (name, set) in [("64+64", vec![(0usize, 64usize), (64, 64)]), ("48+48+32", vec![(0, 48), (48, 48), (96, 32)])] {
+    for (name, set) in [
+        ("64+64", vec![(0usize, 64usize), (64, 64)]),
+        ("48+48+32", vec![(0, 48), (48, 48), (96, 32)]),
+    ] {
         reset(gpu, outs)?;
         for (r0, n) in set {
             launch(gpu, case, route, x, y, h, r0, n)?;
@@ -502,15 +590,25 @@ fn oracle(gpu: &mut Gpu, rep: &mut Report, case: &Case, route: Route, x: &GpuTen
 fn run() -> R<usize> {
     let mut model = String::new();
     let mut out = String::new();
-    let mut ops: Vec<String> =
-        "qkvza,qkvzaf,dn_o,gate_up,down,qkv,fa_o,head,gate_up_silu,ffn_a4".split(',').map(String::from).collect();
+    let mut ops: Vec<String> = "qkvza,qkvzaf,dn_o,gate_up,down,qkv,fa_o,head,gate_up_silu,ffn_a4"
+        .split(',')
+        .map(String::from)
+        .collect();
     let mut seeds: Vec<u64> = vec![1, 2];
     let mut reps = 30usize;
-    let mut tests: Vec<String> = "oracle,slab,dist,time".split(',').map(String::from).collect();
+    let mut tests: Vec<String> = "oracle,slab,dist,time"
+        .split(',')
+        .map(String::from)
+        .collect();
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
         let v = it.next().ok_or_else(|| format!("{k}: missing value"))?;
-        let list = |v: &str| v.split(',').filter(|s| !s.is_empty()).map(String::from).collect::<Vec<_>>();
+        let list = |v: &str| {
+            v.split(',')
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect::<Vec<_>>()
+        };
         match k.as_str() {
             "--model" => model = v,
             "--out" => out = v,
@@ -526,11 +624,18 @@ fn run() -> R<usize> {
     }
     std::fs::create_dir_all(&out)?;
     let has = |t: &str| tests.iter().any(|x| x == t);
-    let mut rep = Report { text: String::new(), fails: 0, checks: 0 };
+    let mut rep = Report {
+        text: String::new(),
+        fails: 0,
+        checks: 0,
+    };
 
     let mut gpu = Gpu::init()?;
     rep.line(format!("arch {} model {model}", gpu.arch));
-    let mut env: Vec<String> = std::env::vars().filter(|(k, _)| k.starts_with("HIPFIRE_")).map(|(k, v)| format!("{k}={v}")).collect();
+    let mut env: Vec<String> = std::env::vars()
+        .filter(|(k, _)| k.starts_with("HIPFIRE_"))
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
     env.sort();
     rep.line(format!("env {env:?}"));
 
@@ -539,8 +644,14 @@ fn run() -> R<usize> {
     let mut lc = LoadCtx {
         path: &model,
         max_seq: 4096,
-        sequence: Some(SequenceHint { model_ctx: 4096, automatic: true, card_cap: 0 }),
+        sequence: Some(SequenceHint {
+            model_ctx: 4096,
+            automatic: true,
+            card_cap: 0,
+        }),
         deepseek4_compute_placement: Default::default(),
+        dory_loops: None,
+        dory_recurrent_kv_cache_mode: None,
         deepseek4_experts_per_token: None,
         draft_path: None,
         vision_path: None,
@@ -573,10 +684,42 @@ fn run() -> R<usize> {
         gpu.a4_slab_active(),
         gpu.flags.cb_verify_pm
     ));
-    let n_dn = b.weights.layers.iter().filter(|l| matches!(l, LayerWeights::DeltaNet(_))).count();
-    let n_fa = b.weights.layers.iter().filter(|l| matches!(l, LayerWeights::FullAttn(_))).count();
-    let dn = b.weights.layers.iter().find_map(|l| if let LayerWeights::DeltaNet(d) = l { Some(d) } else { None }).ok_or("no DeltaNet layer")?;
-    let fa = b.weights.layers.iter().find_map(|l| if let LayerWeights::FullAttn(f) = l { Some(f) } else { None }).ok_or("no FullAttn layer")?;
+    let n_dn = b
+        .weights
+        .layers
+        .iter()
+        .filter(|l| matches!(l, LayerWeights::DeltaNet(_)))
+        .count();
+    let n_fa = b
+        .weights
+        .layers
+        .iter()
+        .filter(|l| matches!(l, LayerWeights::FullAttn(_)))
+        .count();
+    let dn = b
+        .weights
+        .layers
+        .iter()
+        .find_map(|l| {
+            if let LayerWeights::DeltaNet(d) = l {
+                Some(d)
+            } else {
+                None
+            }
+        })
+        .ok_or("no DeltaNet layer")?;
+    let fa = b
+        .weights
+        .layers
+        .iter()
+        .find_map(|l| {
+            if let LayerWeights::FullAttn(f) = l {
+                Some(f)
+            } else {
+                None
+            }
+        })
+        .ok_or("no FullAttn layer")?;
     let kd = b.config.dim;
     let eps = b.config.norm_eps;
     let row_bytes = kd / 256 * 136;
@@ -592,9 +735,21 @@ fn run() -> R<usize> {
     ));
     let slab = |norm: &'static str| -> Option<Slab> {
         match norm {
-            "dn_attn" => dn.wqkv.awq_scale.as_ref().map(|a| Slab::Norm(&dn.attn_norm, a, eps)),
-            "fa_attn" => fa.wq.awq_scale.as_ref().map(|a| Slab::Norm(&fa.attn_norm, a, eps)),
-            "dn_ffn" => dn.w_gate.awq_scale.as_ref().map(|a| Slab::Norm(&dn.ffn_norm, a, eps)),
+            "dn_attn" => dn
+                .wqkv
+                .awq_scale
+                .as_ref()
+                .map(|a| Slab::Norm(&dn.attn_norm, a, eps)),
+            "fa_attn" => fa
+                .wq
+                .awq_scale
+                .as_ref()
+                .map(|a| Slab::Norm(&fa.attn_norm, a, eps)),
+            "dn_ffn" => dn
+                .w_gate
+                .awq_scale
+                .as_ref()
+                .map(|a| Slab::Norm(&dn.ffn_norm, a, eps)),
             "dn_o" => Some(Slab::GatedNorm(
                 &dn.norm_weight,
                 dn.wo.awq_scale.as_ref(),
@@ -613,24 +768,127 @@ fn run() -> R<usize> {
     };
     let head_mq4 = b.weights.output.gpu_dtype == DType::MQ4G256V2;
     let mut all = vec![
-        Case { name: "qkvza", fam: Fam::Qkvza, w: vec![&dn.wqkv.buf, &dn.wz.buf, &dn.w_beta.buf, &dn.w_alpha.buf], ms: vec![dn.wqkv.m, dn.wz.m, dn.w_beta.m, dn.w_alpha.m], k: kd, layers: n_dn, f16: true, slab: slab("dn_attn"), iu4: true },
-        Case { name: "dn_o", fam: Fam::Residual, w: vec![&dn.wo.buf], ms: vec![dn.wo.m], k: dn.wo.k, layers: n_dn, f16: true, slab: slab("dn_o"), iu4: true },
-        Case { name: "gate_up", fam: Fam::GateUp, w: vec![&dn.w_gate.buf, &dn.w_up.buf], ms: vec![dn.w_gate.m, dn.w_up.m], k: kd, layers: n_dn + n_fa, f16: true, slab: slab("dn_ffn"), iu4: true },
-        Case { name: "down", fam: Fam::Residual, w: vec![&dn.w_down.buf], ms: vec![dn.w_down.m], k: dn.w_down.k, layers: n_dn + n_fa, f16: true, slab: slab("down"), iu4: true },
-        Case { name: "qkv", fam: Fam::Qkv, w: vec![&fa.wq.buf, &fa.wk.buf, &fa.wv.buf], ms: vec![fa.wq.m, fa.wk.m, fa.wv.m], k: kd, layers: n_fa, f16: true, slab: slab("fa_attn"), iu4: true },
-        Case { name: "fa_o", fam: Fam::Residual, w: vec![&fa.wo.buf], ms: vec![fa.wo.m], k: fa.wo.k, layers: n_fa, f16: true, slab: slab("fa_o"), iu4: true },
+        Case {
+            name: "qkvza",
+            fam: Fam::Qkvza,
+            w: vec![&dn.wqkv.buf, &dn.wz.buf, &dn.w_beta.buf, &dn.w_alpha.buf],
+            ms: vec![dn.wqkv.m, dn.wz.m, dn.w_beta.m, dn.w_alpha.m],
+            k: kd,
+            layers: n_dn,
+            f16: true,
+            slab: slab("dn_attn"),
+            iu4: true,
+        },
+        Case {
+            name: "dn_o",
+            fam: Fam::Residual,
+            w: vec![&dn.wo.buf],
+            ms: vec![dn.wo.m],
+            k: dn.wo.k,
+            layers: n_dn,
+            f16: true,
+            slab: slab("dn_o"),
+            iu4: true,
+        },
+        Case {
+            name: "gate_up",
+            fam: Fam::GateUp,
+            w: vec![&dn.w_gate.buf, &dn.w_up.buf],
+            ms: vec![dn.w_gate.m, dn.w_up.m],
+            k: kd,
+            layers: n_dn + n_fa,
+            f16: true,
+            slab: slab("dn_ffn"),
+            iu4: true,
+        },
+        Case {
+            name: "down",
+            fam: Fam::Residual,
+            w: vec![&dn.w_down.buf],
+            ms: vec![dn.w_down.m],
+            k: dn.w_down.k,
+            layers: n_dn + n_fa,
+            f16: true,
+            slab: slab("down"),
+            iu4: true,
+        },
+        Case {
+            name: "qkv",
+            fam: Fam::Qkv,
+            w: vec![&fa.wq.buf, &fa.wk.buf, &fa.wv.buf],
+            ms: vec![fa.wq.m, fa.wk.m, fa.wv.m],
+            k: kd,
+            layers: n_fa,
+            f16: true,
+            slab: slab("fa_attn"),
+            iu4: true,
+        },
+        Case {
+            name: "fa_o",
+            fam: Fam::Residual,
+            w: vec![&fa.wo.buf],
+            ms: vec![fa.wo.m],
+            k: fa.wo.k,
+            layers: n_fa,
+            f16: true,
+            slab: slab("fa_o"),
+            iu4: true,
+        },
         // The F1-lite gate/up+SwiGLU GEMM (h out) and the whole verify FFN.
-        Case { name: "gate_up_silu", fam: Fam::GateUpSilu, w: vec![&dn.w_gate.buf, &dn.w_up.buf], ms: vec![dn.w_gate.m], k: kd, layers: n_dn + n_fa, f16: false, slab: slab("dn_ffn"), iu4: false },
-        Case { name: "ffn_a4", fam: Fam::FfnA4, w: vec![&dn.w_gate.buf, &dn.w_up.buf, &dn.w_down.buf], ms: vec![dn.w_down.m], k: kd, layers: n_dn + n_fa, f16: false, slab: slab("ffn"), iu4: false },
+        Case {
+            name: "gate_up_silu",
+            fam: Fam::GateUpSilu,
+            w: vec![&dn.w_gate.buf, &dn.w_up.buf],
+            ms: vec![dn.w_gate.m],
+            k: kd,
+            layers: n_dn + n_fa,
+            f16: false,
+            slab: slab("dn_ffn"),
+            iu4: false,
+        },
+        Case {
+            name: "ffn_a4",
+            fam: Fam::FfnA4,
+            w: vec![&dn.w_gate.buf, &dn.w_up.buf, &dn.w_down.buf],
+            ms: vec![dn.w_down.m],
+            k: kd,
+            layers: n_dn + n_fa,
+            f16: false,
+            slab: slab("ffn"),
+            iu4: false,
+        },
     ];
     if z_rows == dn.wz.m + 128 {
         // IU4-only form of qkvza on the loader's Z fold: 2 SET launches.
-        all.push(Case { name: "qkvzaf", fam: Fam::GateUp, w: vec![&dn.wqkv.buf, &dn.wz.buf], ms: vec![dn.wqkv.m, z_rows], k: kd, layers: n_dn, f16: false, slab: slab("dn_attn"), iu4: true });
+        all.push(Case {
+            name: "qkvzaf",
+            fam: Fam::GateUp,
+            w: vec![&dn.wqkv.buf, &dn.wz.buf],
+            ms: vec![dn.wqkv.m, z_rows],
+            k: kd,
+            layers: n_dn,
+            f16: false,
+            slab: slab("dn_attn"),
+            iu4: true,
+        });
     }
     if head_mq4 {
-        all.push(Case { name: "head", fam: Fam::Residual, w: vec![&b.weights.output.buf], ms: vec![b.weights.output.m], k: kd, layers: 1, f16: true, slab: None, iu4: true });
+        all.push(Case {
+            name: "head",
+            fam: Fam::Residual,
+            w: vec![&b.weights.output.buf],
+            ms: vec![b.weights.output.m],
+            k: kd,
+            layers: 1,
+            f16: true,
+            slab: None,
+            iu4: true,
+        });
     } else {
-        rep.line(format!("head dtype {:?}: not MQ4G256V2, skipped", b.weights.output.gpu_dtype));
+        rep.line(format!(
+            "head dtype {:?}: not MQ4G256V2, skipped",
+            b.weights.output.gpu_dtype
+        ));
     }
     for c in &all {
         rep.line(format!(
@@ -649,7 +907,10 @@ fn run() -> R<usize> {
             return Err(format!("{}: K {} not a multiple of 256", c.name, c.k).into());
         }
     }
-    let cases: Vec<&Case> = all.iter().filter(|c| ops.iter().any(|o| o == c.name)).collect();
+    let cases: Vec<&Case> = all
+        .iter()
+        .filter(|c| ops.iter().any(|o| o == c.name))
+        .collect();
     let kmax = cases.iter().map(|c| c.k).max().unwrap_or(kd);
     let x = gpu.zeros(&[NMAX * kmax], DType::F32)?;
     let load_x = |gpu: &mut Gpu, v: &[f32]| -> R<()> {
@@ -671,12 +932,32 @@ fn run() -> R<usize> {
             rep.line(format!("{} x_fnv={xh:016x}", tag("inputs")));
             let mut iu4_ref = None;
             if has("oracle") && case.iu4 {
-                iu4_ref = Some(oracle(&mut gpu, &mut rep, case, Route::Iu4, &x, &outs, &tag("iu4"))?);
+                iu4_ref = Some(oracle(
+                    &mut gpu,
+                    &mut rep,
+                    case,
+                    Route::Iu4,
+                    &x,
+                    &outs,
+                    &tag("iu4"),
+                )?);
             }
             if has("slab") && case.slab.is_some() {
                 let probe = slab_produce(&mut gpu, case, &x.sub_offset(0, 16 * case.k), 16)?;
-                rep.line(format!("{} slab producer wrote slab layout: {}", tag("slab"), probe.1));
-                oracle(&mut gpu, &mut rep, case, Route::Slab, &x, &outs, &tag("slab"))?;
+                rep.line(format!(
+                    "{} slab producer wrote slab layout: {}",
+                    tag("slab"),
+                    probe.1
+                ));
+                oracle(
+                    &mut gpu,
+                    &mut rep,
+                    case,
+                    Route::Slab,
+                    &x,
+                    &outs,
+                    &tag("slab"),
+                )?;
             }
             if has("dist") && case.f16 {
                 let iu4b = match iu4_ref {
@@ -691,7 +972,10 @@ fn run() -> R<usize> {
                 launch(&mut gpu, case, Route::F16Exact, &x, &outs.y, None, 0, NMAX)?;
                 let f16b = read(&mut gpu, &outs)?;
                 let (rel, abs, nf) = distance(&iu4b, &f16b, &outs.init, ms, case.add());
-                rep.line(format!("{} iu4-vs-f16 rel_l2={rel:.3e} abs_l2={abs:.3e} nonfinite={nf}", tag("dist")));
+                rep.line(format!(
+                    "{} iu4-vs-f16 rel_l2={rel:.3e} abs_l2={abs:.3e} nonfinite={nf}",
+                    tag("dist")
+                ));
             }
             free_outs(&mut gpu, outs)?;
         }
@@ -721,15 +1005,21 @@ fn run() -> R<usize> {
                 let tf = |ms: f64| 2.0 * tm as f64 * n as f64 * case.k as f64 / (ms * 1e-3) / 1e12;
                 let (f16cvt, f16) = if case.f16 {
                     (
-                        time(&mut gpu, &mut |g| launch(g, case, Route::F16Exact, &x, &outs.y, None, 0, n))?,
-                        time(&mut gpu, &mut |g| launch(g, case, Route::F16ExactKept, &x, &outs.y, None, 0, n))?,
+                        time(&mut gpu, &mut |g| {
+                            launch(g, case, Route::F16Exact, &x, &outs.y, None, 0, n)
+                        })?,
+                        time(&mut gpu, &mut |g| {
+                            launch(g, case, Route::F16ExactKept, &x, &outs.y, None, 0, n)
+                        })?,
                     )
                 } else {
                     (f64::NAN, f64::NAN)
                 };
                 let (xv, ys) = views(case, &x, &outs.y, 0, n);
                 let (iu4q, iu4g) = if case.iu4 {
-                    let q = time(&mut gpu, &mut |g| launch(g, case, Route::Iu4, &x, &outs.y, None, 0, n))?;
+                    let q = time(&mut gpu, &mut |g| {
+                        launch(g, case, Route::Iu4, &x, &outs.y, None, 0, n)
+                    })?;
                     let xq = gpu.ensure_int4_mmq_x(&xv, n, case.k)?;
                     (q, time(&mut gpu, &mut |g| iu4_gemms(g, case, xq, &ys, n))?)
                 } else {
@@ -737,7 +1027,9 @@ fn run() -> R<usize> {
                 };
                 let (slabp, slabg) = if case.slab.is_some() {
                     let h = outs.h.as_ref();
-                    let p = time(&mut gpu, &mut |g| launch(g, case, Route::Slab, &x, &outs.y, h, 0, n))?;
+                    let p = time(&mut gpu, &mut |g| {
+                        launch(g, case, Route::Slab, &x, &outs.y, h, 0, n)
+                    })?;
                     let sp = slab_prepare(&mut gpu, case, &xv, n)?;
                     let gm = time(&mut gpu, &mut |g| slab_consume(g, case, &sp, &ys, h, n))?;
                     (p, gm)
@@ -753,7 +1045,10 @@ fn run() -> R<usize> {
                     floor_ms / iu4g,
                     case.layers
                 ));
-                timing_rows.push(format!("{},{},{},{},{f16cvt},{f16},{iu4q},{iu4g},{slabp},{slabg},{floor_ms}", case.name, n, case.layers, tm));
+                timing_rows.push(format!(
+                    "{},{},{},{},{f16cvt},{f16},{iu4q},{iu4g},{slabp},{slabg},{floor_ms}",
+                    case.name, n, case.layers, tm
+                ));
             }
             free_outs(&mut gpu, outs)?;
         }
@@ -767,7 +1062,11 @@ fn run() -> R<usize> {
         std::fs::write(format!("{out}/timing.csv"), csv)?;
     }
     rep.line(format!("checks {} fails {}", rep.checks, rep.fails));
-    rep.line(if rep.fails == 0 { "VERDICT PASS".into() } else { "VERDICT FAIL".into() });
+    rep.line(if rep.fails == 0 {
+        "VERDICT PASS".into()
+    } else {
+        "VERDICT FAIL".into()
+    });
     std::fs::write(format!("{out}/report.txt"), &rep.text)?;
     gpu.free_tensor(x)?;
     Ok(rep.fails)

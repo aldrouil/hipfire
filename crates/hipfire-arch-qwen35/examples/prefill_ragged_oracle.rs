@@ -104,7 +104,8 @@ impl Args {
         Ok(Self(map))
     }
     fn req(&self, key: &str) -> Result<&str> {
-        self.opt(key).ok_or_else(|| format!("missing --{key}").into())
+        self.opt(key)
+            .ok_or_else(|| format!("missing --{key}").into())
     }
     fn opt(&self, key: &str) -> Option<&str> {
         self.0.get(key).map(String::as_str)
@@ -113,7 +114,10 @@ impl Args {
 
 /// Create `path` exclusively (never overwrite) and write `bytes`.
 fn write_new(path: &str, bytes: &[u8]) -> Result<()> {
-    let mut f = fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
     f.write_all(bytes)?;
     f.sync_all()?;
     Ok(())
@@ -130,11 +134,20 @@ fn require_absent(path: Option<&str>) -> Result<()> {
 }
 
 /// Synchronize, then read `bytes` of `tensor` (f32 elements) back raw.
-fn download(gpu: &Gpu, tensor: &GpuTensor, elems: usize, what: &str) -> Result<(Vec<f32>, Vec<u8>)> {
+fn download(
+    gpu: &Gpu,
+    tensor: &GpuTensor,
+    elems: usize,
+    what: &str,
+) -> Result<(Vec<f32>, Vec<u8>)> {
     gpu.hip.device_synchronize()?;
     let bytes = elems * 4;
     if bytes > tensor.buf.size() {
-        return Err(format!("{what}: {bytes} bytes exceeds allocation {}", tensor.buf.size()).into());
+        return Err(format!(
+            "{what}: {bytes} bytes exceeds allocation {}",
+            tensor.buf.size()
+        )
+        .into());
     }
     let mut raw = vec![0u8; bytes];
     gpu.hip.memcpy_dtoh(&mut raw, &tensor.buf)?;
@@ -150,7 +163,9 @@ fn download(gpu: &Gpu, tensor: &GpuTensor, elems: usize, what: &str) -> Result<(
 
 fn recorded_env() -> Value {
     let mut vars: Vec<(String, String)> = std::env::vars()
-        .filter(|(k, _)| k.starts_with("HIPFIRE_") || k.starts_with("ROCR_") || k.starts_with("HIP_"))
+        .filter(|(k, _)| {
+            k.starts_with("HIPFIRE_") || k.starts_with("ROCR_") || k.starts_with("HIP_")
+        })
         .collect();
     vars.sort();
     let mut env = Map::new();
@@ -166,7 +181,9 @@ fn recorded_env() -> Value {
 fn load_bundle(model: &str, max_seq: usize, gpu: &mut Gpu) -> Result<Qwen35Bundle> {
     let cask = CaskConfig::default();
     let qwen_default_q8 = !matches!(
-        hipfire_config::developer_var("HIPFIRE_QWEN_KV_DEFAULT_Q8").ok().as_deref(),
+        hipfire_config::developer_var("HIPFIRE_QWEN_KV_DEFAULT_Q8")
+            .ok()
+            .as_deref(),
         Some("0")
     );
     let mut lc = LoadCtx {
@@ -174,6 +191,8 @@ fn load_bundle(model: &str, max_seq: usize, gpu: &mut Gpu) -> Result<Qwen35Bundl
         max_seq,
         sequence: None,
         deepseek4_compute_placement: Default::default(),
+        dory_loops: None,
+        dory_recurrent_kv_cache_mode: None,
         deepseek4_experts_per_token: None,
         draft_path: None,
         vision_path: None,
@@ -207,7 +226,11 @@ fn prompt_ids(args: &Args) -> Result<Vec<u32>> {
         Some(path) => {
             let bytes = fs::read(path)?;
             if bytes.is_empty() || bytes.len() % 4 != 0 {
-                return Err(format!("{path}: {} bytes is not a non-empty u32le id array", bytes.len()).into());
+                return Err(format!(
+                    "{path}: {} bytes is not a non-empty u32le id array",
+                    bytes.len()
+                )
+                .into());
             }
             let ids: Vec<u32> = bytes
                 .chunks_exact(4)
@@ -261,8 +284,9 @@ fn route_receipt(gpu: &Gpu, config: &Qwen35Config, bundle: &Qwen35Bundle, max_se
 /// Errors when no `HIPFIRE_DEVICES` selection is active: nothing to verify.
 fn verify_devices(gpu: &Gpu) -> Result<()> {
     use hipfire_config::devices::{DeviceRoot, IdentitySource, ObservedDevice};
-    let active = hipfire_config::devices::active_devices()
-        .ok_or("no active HIPFIRE_DEVICES selection: set HIPFIRE_DEVICES so the GPU can be verified")?;
+    let active = hipfire_config::devices::active_devices().ok_or(
+        "no active HIPFIRE_DEVICES selection: set HIPFIRE_DEVICES so the GPU can be verified",
+    )?;
     let with_uuid = DeviceRoot::system().identity_source() == IdentitySource::Hip;
     let count = gpu.hip.device_count()?;
     if count < 1 {
@@ -274,7 +298,11 @@ fn verify_devices(gpu: &Gpu) -> Result<()> {
                 logical: id as usize,
                 arch: gpu.hip.get_arch(id)?,
                 pci_bus_id: gpu.hip.device_pci_bus_id(id)?,
-                uuid: if with_uuid { Some(gpu.hip.device_uuid(id)?) } else { None },
+                uuid: if with_uuid {
+                    Some(gpu.hip.device_uuid(id)?)
+                } else {
+                    None
+                },
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -305,7 +333,11 @@ fn run(raw: &[String]) -> Result<()> {
     };
     // Prompt rows plus 31 fed decode tokens address positions < n + 31.
     if n + GREEDY_TOKENS - 1 > max_seq {
-        return Err(format!("n {n} + {} decode positions exceeds max_seq {max_seq}", GREEDY_TOKENS - 1).into());
+        return Err(format!(
+            "n {n} + {} decode positions exceeds max_seq {max_seq}",
+            GREEDY_TOKENS - 1
+        )
+        .into());
     }
     let logits_out = args.opt("logits-out");
     let hidden_out = args.opt("hidden-out");
@@ -365,7 +397,8 @@ fn run(raw: &[String]) -> Result<()> {
         None,
         None,
     )?;
-    let (values, logits_raw) = download(&gpu, &bundle.scratch.logits, vocab, "final-position logits")?;
+    let (values, logits_raw) =
+        download(&gpu, &bundle.scratch.logits, vocab, "final-position logits")?;
     let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1e3;
     // `scratch.tmp` is the last row's post-output-norm hidden (the head's input),
     // left by the legacy last-token path of the final chunk.

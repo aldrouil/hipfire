@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 hipfire contributors — see LICENSE and NOTICE in the project root.
-"""Independent CPU (NumPy, float32) reference oracle for Dory-4B, ONE recurrent loop.
+"""Independent CPU (NumPy, float32) reference oracle for Dory-4B, configurable
+multi-loop inference (loops 1..=4) with per_loop / last_loop KV semantics.
 
 Math source (adapted equations, Apache-2.0):
   https://raw.githubusercontent.com/vllm-project/vllm/55076950b6c155f384d6766d63563c3bc20a0e3f/vllm/model_executor/models/dory.py
   (DoryForCausalLM / DoryBackbone / DoryAttention / DoryMLP / justnorm / slerp_norm.)
 
 Purpose: ground-truth logits + last-hidden states for the native hipfire
-`hipfire-arch-dory` bring-up, which runs exactly ONE recurrent loop regardless
-of the config default (n_recurrent_loops=2). Native baseline: BF16 weights kept
+`hipfire-arch-dory` bring-up (I->R^N->O: input block once, shared recurrent
+block N=1..4 passes with justnorm(state+input_h) reinjection each pass, output
+block once; same absolute position every loop). Native baseline: BF16 weights kept
 at exact BF16 values, F32 accumulation, NO global BF16 activation rounding in
 the primary oracle. A `--bf16twin` mode rounds every matmul input/output to
 BF16 (round-to-nearest-even, F32 accumulate) for precision diagnostics only.
@@ -44,17 +46,20 @@ Usage:
       # tiny deterministic fixture: F32 fast path vs float64 reference,
       # one attention + one MLP layer incl. rope/qk-norm/gate/slerp,
       # plus Q8F16 signed-scale and F32 bit-exactness decoder checks.
-  python3 scripts/dory_reference.py --run --model ./dory-bf16 --out DIR
-      # full model: prefill S[:prefill], KV-cached decode of S[prefill:],
-      # prefill-vs-decode self-consistency check, emits artifact DIR/.
   python3 scripts/dory_reference.py --run --model dory-4b.q8.hfq --out DIR
-      # same 16-token teacher-forced run from the self-contained Q8 file
-      # (config/tokenizer from embedded HFQ metadata, no sidecar dir).
-
-Native JSON schema for --compare:
+      # canonical same-weight pack (config/tokenizer from embedded HFQ
+      # metadata, no sidecar dir): F32-reference schedule (per_loop bulk
+      # prefill + tokenwise decode; last_loop fully tokenwise) with
+      # same-schedule self-consistency; emits artifact DIR/.
+      # Never mix a BF16-dir CPU run against a Q8 native dump.
+Native JSON schema for --compare (EFFECTIVE kv_mode; F32 canonical, packed honest):
   {"tokens": [...], "logits": [[...131072 floats...], ...],
    "hidden": [[...2560...], ...] (optional, for cosine),
-   "positions": "prefill+decode", "loops": 1}
+   "loops": N, "recurrent_kv_cache_mode": "per_loop"|"last_loop",
+   "kv_mode": EFFECTIVE f32|q8|fwht2|fwht3|fwht4 (never raw auto).
+   Packed whole-model keeps the strict 0.02 max|dlogit| bar and may honestly
+   FAIL; --kv-trace replay then isolates codec vs state causes.}
+   "positions": "prefill+decode"}
 """
 from __future__ import annotations
 
@@ -792,14 +797,43 @@ KV_ATOL = {
 
 
 class DoryRef:
-    """One-loop Dory forward. Set bf16=True for the activation-rounded twin."""
+    """Multi-loop Dory forward (I -> R^N -> O, shared recurrent block).
+
+    Architecture (upstream vllm dory.py): 8 input / 20 recurrent / 8 output
+    transformer BLOCKS; the checkpoint encodes each block as 2 physical
+    attention/MLP sublayers: split 16/40/16 = 72 physical sublayers.
+    Per token: input block once -> snapshot input_h; state=input_h; each loop
+    h=justnorm(state+input_h), shared physical recurrent block, state=justnorm(h);
+    output block once; lmhead once. Same absolute token position every loop;
+    next_pos advances ONCE after all loops. No weight duplication.
+
+    KV semantics (mirror DoryConfig::kv_layer_index):
+    - per_loop: dense virtual cache; input physical i; recurrent i+loop_idx*n_rec;
+      output i+(N-1)*n_rec. Layers 72+40*(N-1). Batched/incremental invariant:
+      bulk prefill == chunked prefill == tokenwise decode.
+    - last_loop: cache index = physical i; each loop overwrites the CURRENT
+      absolute position row; previous tokens retain final-loop KV. 72 slots.
+      Mode-aware schedule: parity walks T==1 tokenwise steps (native prefill
+      IS tokenwise); a bulk call is NOT parity-equivalent (bulk loop-0 token1
+      attends token0 loop-0, native tokenwise attends token0 final-loop) and
+      stays research-only.
+    Set bf16=True for the activation-rounded twin.
+    """
 
     def __init__(self, cfg: dict, reader: STReader, n_loops: int = 1,
+                 recurrent_mode: str = "per_loop",
                  bf16: bool = False, kv_mode: str = "f32"):
+        if recurrent_mode not in ("per_loop", "last_loop"):
+            raise ValueError(
+                f"recurrent_mode {recurrent_mode!r} not in ('per_loop','last_loop')")
+        if not isinstance(n_loops, int) or not (1 <= n_loops <= 4):
+            raise ValueError(f"n_loops={n_loops!r} must be an integer 1..4")
         self.c = cfg
         self.r = reader
         self.n_loops = n_loops
+        self.recurrent_mode = recurrent_mode
         self.bf16 = bf16
+
         H = cfg["hidden_size"]
         self.alpha_scale = cfg["ngpt_alpha_init"] / cfg["initializer_range"]
         self.sqk_factor = (cfg["head_dim"] ** 0.5) / cfg["initializer_range"]
@@ -829,7 +863,47 @@ class DoryRef:
         # + raw pre-gate attention out. None = disabled. Never affects math.
         self.kv_trace = None
 
-    # -- linear helper -----------------------------------------------------
+    # -- linear + recurrence helpers -----------------------------------------
+    def n_virtual_layers(self) -> int:
+        c = self.c
+        if self.recurrent_mode == "per_loop":
+            return (c["num_hidden_layers"]
+                    + c["n_recurrent_layers"] * (self.n_loops - 1))
+        return c["num_hidden_layers"]
+
+    def kv_layer_index(self, physical: int, loop_index: int) -> int:
+        c = self.c
+        n_in = c["n_input_layers"]
+        n_rec = c["n_recurrent_layers"]
+        if self.recurrent_mode == "last_loop":
+            return physical
+        if physical < n_in:
+            return physical
+        if physical < n_in + n_rec:
+            return physical + loop_index * n_rec
+        return physical + (self.n_loops - 1) * n_rec
+
+    def kv_layer_mask(self) -> List[bool]:
+        n_virt = self.n_virtual_layers()
+        phys_attn = [(t != "mlp") for t in self.c["layer_types"]]
+        n_in = self.c["n_input_layers"]
+        n_rec = self.c["n_recurrent_layers"]
+        mask = [False] * n_virt
+        for vi in range(n_virt):
+            if self.recurrent_mode == "last_loop":
+                mask[vi] = phys_attn[vi]
+                continue
+            if vi < n_in:
+                mask[vi] = phys_attn[vi]
+            elif vi < n_in + self.n_loops * n_rec:
+                mask[vi] = phys_attn[n_in + (vi - n_in) % n_rec]
+            else:
+                mask[vi] = phys_attn[vi - (self.n_loops - 1) * n_rec]
+        return mask
+
+    def _new_caches(self) -> List[dict | None]:
+        return [None] * self.n_virtual_layers()
+
     def lin(self, x: np.ndarray, w: np.ndarray) -> np.ndarray:
         if self.bf16:
             x = bf16_round(x)
@@ -839,7 +913,9 @@ class DoryRef:
 
     # -- sublayers ----------------------------------------------------------
     def attn(self, h: np.ndarray, pos: np.ndarray, li: int,
-             kv: dict | None) -> Tuple[np.ndarray, dict | None]:
+             kv: dict | None, loop_index: int = 0, cache_layer: int | None = None) -> Tuple[np.ndarray, dict | None]:
+        if cache_layer is None:
+            cache_layer = self.kv_layer_index(li, loop_index)
         c = self.c
         T = h.shape[0]
         q = self.lin(h, self.r.bf16_f32(f"backbone.layers.{li}.mixer.q_proj.weight"))
@@ -862,14 +938,30 @@ class DoryRef:
         k_cur, v_cur = k, v
         was_decode = kv is not None
         if self.kv_mode != "f32":
-            return self.attn_kv_quant(h, q, k, v, g, pos, li, kv, was_decode)
+            return self.attn_kv_quant(h, q, k, v, g, pos, li, kv, was_decode, loop_index, cache_layer)
+        # NOTE (research-only bulk path): under last_loop a bulk call with T>1
+        # is NOT native-equivalent — bulk loop-0 token1 attends token0 loop-0
+        # while native tokenwise attends token0 final-loop. run_full and the
+        # parity drivers always walk T==1 steps; this path stays only for
+        # offline research, never for parity verdicts.
         if was_decode:
-            # decode: append pre-expanded KV (rope already applied at abs pos)
-            k = np.concatenate([kv["k"], k], axis=0)
-            v = np.concatenate([kv["v"], v], axis=0)
-        # ALWAYS (re)populate the cache: prefill seeds it, decode extends it.
-        # (vLLM prefill fills the KV cache for the whole prompt; decode reuses it.
-        # Branch on was_decode (the INPUT cache state), not on kv below.)
+            if self.recurrent_mode == "last_loop":
+                # Overwrite (never append): last-loop owns the CURRENT absolute
+                # position row; earlier tokens keep final-loop KV. Decode cache
+                # holds exactly the walked prefix; a fresh pos == len extends it.
+                p0 = int(pos[0])
+                assert T == 1 and p0 <= len(kv["k"]), \
+                    f"layer {li}: last_loop decode pos {p0} outside cache {len(kv['k'])}"
+                if p0 == len(kv["k"]):
+                    k = np.concatenate([kv["k"], k], axis=0)
+                    v = np.concatenate([kv["v"], v], axis=0)
+                else:
+                    k = np.concatenate([kv["k"][:p0], k, kv["k"][p0 + 1:]], axis=0)
+                    v = np.concatenate([kv["v"][:p0], v, kv["v"][p0 + 1:]], axis=0)
+            else:
+                # decode: append pre-expanded KV (rope already applied at abs pos)
+                k = np.concatenate([kv["k"], k], axis=0)
+                v = np.concatenate([kv["v"], v], axis=0)
         kv = {"k": k, "v": v}
         kh = np.repeat(k, self.rep, axis=1)  # (S,nH,hd)
         vh = np.repeat(v, self.rep, axis=1)
@@ -909,6 +1001,8 @@ class DoryRef:
                 self.kv_trace.append({
                     "position": int(pos[t]),
                     "layer": int(li),
+                    "loop_index": int(loop_index),
+                    "cache_layer": int(cache_layer),
                     "q": q[t].reshape(-1).astype(np.float32).tolist(),
                     "k": k_cur[t].reshape(-1).astype(np.float32).tolist(),
                     "v": v_cur[t].reshape(-1).astype(np.float32).tolist(),
@@ -929,53 +1023,115 @@ class DoryRef:
 
     def attn_kv_quant(self, h: np.ndarray, q: np.ndarray, k: np.ndarray,
                       v: np.ndarray, g: np.ndarray, pos: np.ndarray, li: int,
-                      kv: dict | None, was_decode: bool) -> Tuple[np.ndarray, dict | None]:
-        """KV-quantized attention: encode-on-write, dequantize-on-read.
-
-        Cache rows hold PACKED blobs (bit-parity with kv_encode_pos above) so
-        a wrong packed offset/layer index/rotation/norm/Q8 fallback shows as
-        attention error; the equality check against a re-decode of the stored
-        blob (independent fwht_decode_k_rotated/q8_decode_blob path) pins the
-        fault to encode vs attend. Mirrors the production fused write (K+V at
-        each position, V always Q8) and the sub_offset sliding views (packed
-        row views [start..start+len), absolute-RoPE rows, len-1 attend pos).
-        """
+                      kv: dict | None, was_decode: bool,
+                      loop_index: int = 0, cache_layer: int | None = None) -> Tuple[np.ndarray, dict | None]:
+        if cache_layer is None:
+            cache_layer = self.kv_layer_index(li, loop_index)
+        # Cache rows hold PACKED blobs (bit-parity with kv_encode_pos): a wrong
+        # packed offset/layer index/rotation/norm/Q8 fallback shows as attention
+        # error. Mirrors the fused write (K+V at each position, V always Q8).
         c = self.c
         T = q.shape[0]
         mode = self.kv_mode
         hd = c["head_dim"]
         s1, s2 = self.kv_s1, self.kv_s2
+        last_loop = self.recurrent_mode == "last_loop"
         if kv is None or "kblob" not in kv:
             kv = {"kblob": [], "vblob": [], "kdec": [], "vdec": []}
         if not was_decode:
-            kv = {"kblob": [], "vblob": [], "kdec": [], "vdec": []}
-            for t in range(T):
+            if last_loop:
+                # Scheduling caveat (research-only bulk path): bulk loop-0
+                # token1 attends token0 loop-0 while native tokenwise attends
+                # token0 final-loop, so bulk is NOT parity-equivalent. run_full
+                # walks T==1 steps; the exact-position write below also serves
+                # contiguous bulk research calls without appending duplicates.
+                assert T == int(pos[T - 1]) - int(pos[0]) + 1, \
+                    "last_loop prefill requires contiguous tokenwise positions"
+                p0 = int(pos[0])
+                need = p0 + T
+                while len(kv["kdec"]) // max(1, self.nKV) < need:
+                    kv["kblob"].extend([b""] * self.nKV)
+                    kv["vblob"].extend([b""] * self.nKV)
+                    kv["kdec"].extend([np.zeros(hd, dtype=np.float32)] * self.nKV)
+                    kv["vdec"].extend([np.zeros(hd, dtype=np.float32)] * self.nKV)
+                for t in range(T):
+                    for hh in range(self.nKV):
+                        kb, vb, kd, vd = kv_encode_pos(
+                            k[t, hh].astype(np.float32), v[t, hh].astype(np.float32),
+                            mode, s1, s2)
+                        idx = (p0 + t) * self.nKV + hh
+                        kv["kblob"][idx] = kb
+                        kv["vblob"][idx] = vb
+                        kv["kdec"][idx] = kd
+                        kv["vdec"][idx] = vd
+                    assert q8_decode_blob(
+                        kv["vblob"][(p0 + t) * self.nKV], hd).max() is not None
+                S = len(kv["kdec"]) // self.nKV
+                kv["kk"] = [kv["kdec"][s * self.nKV:(s + 1) * self.nKV]
+                            for s in range(S)]
+                kv["vv"] = [kv["vdec"][s * self.nKV:(s + 1) * self.nKV]
+                            for s in range(S)]
+            else:
+                kv = {"kblob": [], "vblob": [], "kdec": [], "vdec": []}
+                for t in range(T):
+                    for hh in range(self.nKV):
+                        kb, vb, kd, vd = kv_encode_pos(
+                            k[t, hh].astype(np.float32), v[t, hh].astype(np.float32),
+                            mode, s1, s2)
+                        assert q8_decode_blob(vb, hd).max() is not None  # shape guard
+                        kv["kblob"].append(kb)
+                        kv["vblob"].append(vb)
+                        kv["kdec"].append(kd)
+                        kv["vdec"].append(vd)
+                kv["kk"] = [kv["kdec"][t * self.nKV:(t + 1) * self.nKV] for t in range(T)]
+                kv["vv"] = [kv["vdec"][t * self.nKV:(t + 1) * self.nKV] for t in range(T)]
+        else:
+            assert T == 1, "decode path is single-query"
+            if last_loop:
+                assert kv and "kdec" in kv and len(kv["kdec"]) > 0, \
+                    f"layer {li}: last_loop decode with empty cache"
+                p0 = int(pos[0])
+                S = len(kv["kdec"]) // self.nKV
+                assert 0 <= p0 <= S, \
+                    f"layer {li}: last_loop decode pos {p0} outside cache {S}"
+                if p0 == S:
+                    for hh in range(self.nKV):
+                        kb, vb, kd, vd = kv_encode_pos(
+                            k[0, hh].astype(np.float32), v[0, hh].astype(np.float32),
+                            mode, s1, s2)
+                        kv["kblob"].append(kb)
+                        kv["vblob"].append(vb)
+                        kv["kdec"].append(kd)
+                        kv["vdec"].append(vd)
+                    S += 1
+                else:
+                    for hh in range(self.nKV):
+                        kb, vb, kd, vd = kv_encode_pos(
+                            k[0, hh].astype(np.float32), v[0, hh].astype(np.float32),
+                            mode, s1, s2)
+                        idx = p0 * self.nKV + hh
+                        kv["kblob"][idx] = kb
+                        kv["vblob"][idx] = vb
+                        kv["kdec"][idx] = kd
+                        kv["vdec"][idx] = vd
+                kv["kk"] = [kv["kdec"][s * self.nKV:(s + 1) * self.nKV]
+                            for s in range(S)]
+                kv["vv"] = [kv["vdec"][s * self.nKV:(s + 1) * self.nKV]
+                            for s in range(S)]
+            else:
                 for hh in range(self.nKV):
                     kb, vb, kd, vd = kv_encode_pos(
-                        k[t, hh].astype(np.float32), v[t, hh].astype(np.float32),
+                        k[0, hh].astype(np.float32), v[0, hh].astype(np.float32),
                         mode, s1, s2)
-                    assert q8_decode_blob(vb, hd).max() is not None  # shape guard
                     kv["kblob"].append(kb)
                     kv["vblob"].append(vb)
                     kv["kdec"].append(kd)
                     kv["vdec"].append(vd)
-            kv["kk"] = [kv["kdec"][t * self.nKV:(t + 1) * self.nKV] for t in range(T)]
-            kv["vv"] = [kv["vdec"][t * self.nKV:(t + 1) * self.nKV] for t in range(T)]
-        else:
-            assert T == 1, "decode path is single-query"
-            for hh in range(self.nKV):
-                kb, vb, kd, vd = kv_encode_pos(
-                    k[0, hh].astype(np.float32), v[0, hh].astype(np.float32),
-                    mode, s1, s2)
-                kv["kblob"].append(kb)
-                kv["vblob"].append(vb)
-                kv["kdec"].append(kd)
-                kv["vdec"].append(vd)
-            S = len(kv["kdec"]) // self.nKV
-            kv["kk"] = [kv["kdec"][t * self.nKV:(t + 1) * self.nKV]
-                        for t in range(S)]
-            kv["vv"] = [kv["vdec"][t * self.nKV:(t + 1) * self.nKV]
-                        for t in range(S)]
+                S = len(kv["kdec"]) // self.nKV
+                kv["kk"] = [kv["kdec"][t * self.nKV:(t + 1) * self.nKV]
+                            for t in range(S)]
+                kv["vv"] = [kv["vdec"][t * self.nKV:(t + 1) * self.nKV]
+                            for t in range(S)]
         o_heads = np.empty((T, self.nH, hd), dtype=np.float32)
         S = len(kv["kk"])
         # ATTEND-PATH SELF-CHECK (independent decode): re-decode the stored
@@ -999,8 +1155,14 @@ class DoryRef:
         for t in range(T):
             absp = int(pos[t])
             if was_decode:
-                assert absp == S - 1, f"layer {li}: abs pos {absp} != cache end {S - 1}"
-                rows = list(range(0 if win <= 0 else max(0, S - win), S))
+                if last_loop:
+                    # Overwritten in place: cache covers the walked prefix, the
+                    # query row is the current absolute position.
+                    assert 0 <= absp < S, f"layer {li}: abs pos {absp} outside cache {S}"
+                    rows = list(range(0 if win <= 0 else max(0, absp - win + 1), absp + 1))
+                else:
+                    assert absp == S - 1, f"layer {li}: abs pos {absp} != cache end {S - 1}"
+                    rows = list(range(0 if win <= 0 else max(0, S - win), S))
             else:
                 # prefill: keys are exactly the query positions; replicate the
                 # F32 path's window mask (tk > tq | tq - tk >= win -> -inf).
@@ -1039,6 +1201,8 @@ class DoryRef:
                 self.kv_trace.append({
                     "position": int(pos[t]),
                     "layer": int(li),
+                    "loop_index": int(loop_index),
+                    "cache_layer": int(cache_layer),
                     "q": q[t].reshape(-1).astype(np.float32).tolist(),
                     "k": k[t].reshape(-1).astype(np.float32).tolist(),
                     "v": v[t].reshape(-1).astype(np.float32).tolist(),
@@ -1068,35 +1232,45 @@ class DoryRef:
         return self.lin(m, self.r.bf16_f32(f"backbone.layers.{li}.mixer.down_proj.weight"))
 
     def layer(self, h: np.ndarray, pos: np.ndarray, li: int,
-              kv: dict | None):
+              kv: dict | None, loop_index: int = 0,
+              cache_layer: int | None = None):
+        if cache_layer is None:
+            cache_layer = self.kv_layer_index(li, loop_index)
         if self.is_attn[li]:
-            out, kv = self.attn(h, pos, li, kv)
+            out, kv = self.attn(h, pos, li, kv, loop_index, cache_layer)
             a = self.r.bf16_f32(f"backbone.layers.{li}.attn_alpha")
             return slerp_alpha(h, out, a, self.alpha_scale), kv
         out = self.mlp(h, li)
         a = self.r.bf16_f32(f"backbone.layers.{li}.mlp_alpha")
         return slerp_alpha(h, out, a, self.alpha_scale), kv
 
-    # -- backbone ------------------------------------------------------------
+    # -- backbone: I -> R^N -> O (shared recurrent block, reinjected input) --
     def backbone(self, emb: np.ndarray, pos: np.ndarray,
                  caches: List[dict | None] | None = None):
         c = self.c
         n_in, n_rec = c["n_input_layers"], c["n_recurrent_layers"]
         h = emb.astype(np.float32, copy=False)
         if caches is None:
-            caches = [None] * c["num_hidden_layers"]
+            caches = self._new_caches()
+        assert len(caches) == self.n_virtual_layers(), \
+            f"caches {len(caches)} != virtual layers {self.n_virtual_layers()}"
+        # Input block once; snapshot input_h; state starts AT input_h.
         for li in range(n_in):
-            h, caches[li] = self.layer(h, pos, li, caches[li])
+            vi = self.kv_layer_index(li, 0)
+            h, caches[vi] = self.layer(h, pos, li, caches[vi], 0, vi)
         input_h = h
         state = input_h
-        for _ in range(self.n_loops):
+        for loop in range(self.n_loops):
             h = justnorm(state + input_h)
             for li in range(n_in, n_in + n_rec):
-                h, caches[li] = self.layer(h, pos, li, caches[li])
+                vi = self.kv_layer_index(li, loop)
+                h, caches[vi] = self.layer(h, pos, li, caches[vi], loop, vi)
             state = justnorm(h)
+        # Output block once from the post-recurrent state.
         h = state
         for li in range(n_in + n_rec, c["num_hidden_layers"]):
-            h, caches[li] = self.layer(h, pos, li, caches[li])
+            vi = self.kv_layer_index(li, self.n_loops - 1)
+            h, caches[vi] = self.layer(h, pos, li, caches[vi], 0, vi)
         return h, caches
 
     def logits(self, h: np.ndarray) -> np.ndarray:
@@ -1131,29 +1305,36 @@ def cosine(a: np.ndarray, b: np.ndarray) -> float:
 # Lab KV trace (diagnostic only; never affects the oracle math above)
 # ----------------------------------------------------------------------------
 #
-# Schema (agreed with the native driver; both sides join on position+layer):
-#   {"schema":"dory_kv_trace_v1","kv_mode":EFFECTIVE,"n_heads":..,
+# Schema dory_kv_trace_v2 (agreed with the native driver; both sides join on
+# position+layer+loop_index; KV histories key by cache_layer):
+#   {"schema":"dory_kv_trace_v2","kv_mode":EFFECTIVE,"loops":N,
+#    "recurrent_kv_cache_mode":MODE,"n_heads":..,
 #    "n_kv_heads":..,"head_dim":..,"sliding_window":..,
 #    "is_full_attention":[bool x num_layers],"input_source":{...},"rows":[
-#    {"position":..,"layer":..,"q":[H*D],"k":[Hkv*D],"v":[Hkv*D],
-#     "attention":[H*D]}]}
+#    {"position":..,"layer":..,"loop_index":..,"cache_layer":..,
+#     "q":[H*D],"k":[Hkv*D],"v":[Hkv*D],"attention":[H*D]}]}
+# Input/output rows use loop_index 0; recurrent rows use their loop pass.
 # q/k/v are PRE-cache floats (post-RoPE/norm, pre-quantization); attention is
 # RAW pre-gate output. Native pre-KV inputs are channel STIMULI: the CPU-side
 # expected attention (kv_encode_pos + kv_attention_ref on THOSE exact rows)
 # stays independent of this oracle's own forward — a separate whole-model CPU
 # run (--run without --kv-trace) remains the model-level oracle.
 
-TRACE_SCHEMA = "dory_kv_trace_v1"
+TRACE_SCHEMA = "dory_kv_trace_v2"
 
 
 def dump_kv_trace(path: str, cfg: dict, kv_mode: str, tokens: List[int],
-                   model_label: str, weight_fp: str,
-                   rows: List[dict]) -> None:
-    """Write the lab KV trace doc, sorted by (position, layer)."""
-    rows_sorted = sorted(rows, key=lambda r: (r["position"], r["layer"]))
+                  model_label: str, weight_fp: str,
+                  rows: List[dict], loops: int = 1,
+                  recurrent_mode: str = "per_loop") -> None:
+    """Write the lab KV trace doc, sorted by (position, layer, loop_index)."""
+    rows_sorted = sorted(rows, key=lambda r: (r["position"], r["layer"],
+                                              r.get("loop_index", 0)))
     doc = {
         "schema": TRACE_SCHEMA,
         "kv_mode": kv_mode,
+        "loops": loops,
+        "recurrent_kv_cache_mode": recurrent_mode,
         "n_heads": cfg["num_attention_heads"],
         "n_kv_heads": cfg["num_key_value_heads"],
         "head_dim": cfg["head_dim"],
@@ -1165,6 +1346,8 @@ def dump_kv_trace(path: str, cfg: dict, kv_mode: str, tokens: List[int],
             "model": model_label,
             "weight_fingerprint": weight_fp,
             "kv_mode": kv_mode,
+            "loops": loops,
+            "recurrent_kv_cache_mode": recurrent_mode,
             "tokens": list(tokens),
         },
         "rows": rows_sorted,
@@ -1172,7 +1355,8 @@ def dump_kv_trace(path: str, cfg: dict, kv_mode: str, tokens: List[int],
     with open(path, "w") as f:
         json.dump(doc, f)
     print(f"kv-trace: wrote {path} "
-          f"(schema={TRACE_SCHEMA} kv_mode={kv_mode} rows={len(rows_sorted)})",
+          f"(schema={TRACE_SCHEMA} kv_mode={kv_mode} loops={loops} "
+          f"mode={recurrent_mode} rows={len(rows_sorted)})",
           flush=True)
 
 # ----------------------------------------------------------------------------
@@ -1418,7 +1602,183 @@ def run_selftest_main() -> int:
         dr = float(np.abs(got.astype(np.float64) - want.astype(np.float64)).max())
         print(f"selftest kv-{m} overwrite maxabs = {dr:.3e} (tol 0)")
         ok = ok and dr == 0.0
-    # --- F32 bit-exactness fixture ---
+    # --- recurrence fixtures (deterministic miniature I/R/O stack, F32) ---
+    # Tiny stack: n_in=2 (attn,mlp), n_rec=2 (attn,mlp), n_out=2 (attn,mlp);
+    # 6 sublayers, 3 attention layers, H=32. Encodes block counts (mimics the
+    # real 8/20/8 blocks -> 16/40/16 sublayers) with real config plumbing.
+    class _FakeReader:
+        def __init__(self, H: int, F: int, nH: int, nKV: int, hd: int):
+            self.H, self.F = H, F
+            self.nH, self.nKV, self.hd = nH, nKV, hd
+            rr = np.random.default_rng(999)
+            def w(r: int, c: int) -> np.ndarray:
+                return (rr.standard_normal((r, c)) * np.float32(std)).astype(np.float32)
+            def v(n: int) -> np.ndarray:
+                return (rr.standard_normal(n) * np.float32(std)).astype(np.float32)
+            self.t = {}
+            for li in range(6):
+                if li % 2 == 0:
+                    self.t[f"backbone.layers.{li}.mixer.q_proj.weight"] = w(nH * hd, H)
+                    self.t[f"backbone.layers.{li}.mixer.k_proj.weight"] = w(nKV * hd, H)
+                    self.t[f"backbone.layers.{li}.mixer.v_proj.weight"] = w(nKV * hd, H)
+                    self.t[f"backbone.layers.{li}.mixer.g_proj.weight"] = w(nH * hd, H)
+                    self.t[f"backbone.layers.{li}.mixer.o_proj.weight"] = w(H, nH * hd)
+                    self.t[f"backbone.layers.{li}.mixer.sqk"] = v(nH * hd)
+                    self.t[f"backbone.layers.{li}.mixer.s_gate"] = v(nH * hd)
+                    self.t[f"backbone.layers.{li}.attn_alpha"] = v(H)
+                else:
+                    self.t[f"backbone.layers.{li}.mixer.gate_proj.weight"] = w(F, H)
+                    self.t[f"backbone.layers.{li}.mixer.up_proj.weight"] = w(F, H)
+                    self.t[f"backbone.layers.{li}.mixer.down_proj.weight"] = w(H, F)
+                    self.t[f"backbone.layers.{li}.mixer.suv_gate"] = (
+                        rr.standard_normal(F) + 2.0).astype(np.float32)
+                    self.t[f"backbone.layers.{li}.mixer.suv_up"] = (
+                        rr.standard_normal(F) + 2.0).astype(np.float32)
+                    self.t[f"backbone.layers.{li}.mlp_alpha"] = v(H)
+            self.t["backbone.embeddings.weight"] = w(64, H)
+            self.t["lm_head.weight"] = w(64, H)
+            self.t["lm_head.logit_scale"] = np.ones(64, dtype=np.float32)
+
+        def bf16_f32(self, name: str) -> np.ndarray:
+            return self.t[name].astype(np.float32)
+
+        def row_gather_f32(self, name: str, ids: np.ndarray) -> np.ndarray:
+            return self.t[name][np.asarray(ids)].astype(np.float32)
+
+    tcfg = {
+        "hidden_size": H, "num_hidden_layers": 6, "vocab_size": 64,
+        "intermediate_size": F, "num_attention_heads": nH,
+        "num_key_value_heads": nKV, "head_dim": hd, "sliding_window": 1024,
+        "ngpt_alpha_init": a_init, "initializer_range": std,
+        "attention_output_gate_logit_scale_init": None,
+        "layer_types": ["sliding_attention", "mlp"] * 3,
+        "n_input_layers": 2, "n_recurrent_layers": 2, "n_output_layers": 2,
+        "n_recurrent_loops": 2,
+    }
+    fr = _FakeReader(H, F, nH, nKV, hd)
+    rng_t = np.random.default_rng(20261019)
+    emb_t = rng_t.standard_normal((3, H)).astype(np.float32)
+    pos_t = np.arange(3)
+    # (i) invalid counts/modes fail closed before any math.
+    for bad in (0, 5, -1, "2", 2.0):
+        try:
+            DoryRef(tcfg, fr, n_loops=bad, recurrent_mode="per_loop")
+            print(f"selftest recur invalid-loops {bad!r}: NO ERROR (FAIL)")
+            ok = False
+        except ValueError:
+            pass
+    try:
+        DoryRef(tcfg, fr, n_loops=2, recurrent_mode="bogus")
+        print("selftest recur invalid-mode: NO ERROR (FAIL)")
+        ok = False
+    except ValueError:
+        pass
+    print("selftest recur invalid counts/modes fail closed (tol exact)")
+    # (ii) indexing: per_loop dense virtual layers 6+2*(N-1), last_loop flat.
+    # Loops 1..4 including 3 (explicit user requirement).
+    for N in (1, 2, 3, 4):
+        rp = DoryRef(tcfg, fr, n_loops=N, recurrent_mode="per_loop")
+        assert rp.n_virtual_layers() == 6 + 2 * (N - 1), N
+        assert sum(rp.kv_layer_mask()) == 3 + 1 * (N - 1), N
+        # input layer identity, recurrent stride, output shift.
+        assert rp.kv_layer_index(0, 0) == 0, N
+        assert rp.kv_layer_index(2, N - 1) == 2 + (N - 1) * 2, N
+        assert rp.kv_layer_index(5, 0) == 5 + (N - 1) * 2, N
+        rl = DoryRef(tcfg, fr, n_loops=N, recurrent_mode="last_loop")
+        assert rl.n_virtual_layers() == 6, N
+        assert all(v == p for p, v in
+                   enumerate(rl.kv_layer_index(p, 0) for p in range(6))), N
+    print("selftest recur indexing per_loop/last_loop exact (tol exact)")
+    # (iii) per_loop: chunked prefill == full prefill AND == tokenwise decode
+    # (batched/incremental invariance); N=1..4 including 3.
+    for N in (1, 2, 3, 4):
+        rp = DoryRef(tcfg, fr, n_loops=N, recurrent_mode="per_loop")
+        full, _ = rp.backbone(emb_t, pos_t)
+        pre, c1 = rp.backbone(emb_t[:2], pos_t[:2])
+        tail, _ = rp.backbone(emb_t[2:], pos_t[2:], c1)
+        d_chunk = float(np.abs(full[2:].astype(np.float64)
+                               - tail.astype(np.float64)).max())
+        print(f"selftest recur-N{N} per_loop prefill-chunk maxabs = {d_chunk:.3e} (tol 0)")
+        ok = ok and d_chunk == 0.0
+        _, cd = rp.backbone(emb_t[:1], pos_t[:1])
+        rows = []
+        for j in range(1, 3):
+            h, cd = rp.backbone(emb_t[j:j + 1], pos_t[j:j + 1], cd)
+            rows.append(h[0])
+        d_tok = float(np.abs(full[1:].astype(np.float64)
+                             - np.stack(rows).astype(np.float64)).max())
+        print(f"selftest recur-N{N} per_loop tokenwise maxabs = {d_tok:.3e} (tol 0)")
+        ok = ok and d_tok == 0.0
+    # (iv) last_loop: tokenwise prefill == tokenwise decode; last-pass history
+    # retained and CURRENT-row overwrite on the walked prefix. N=1..4 incl 3.
+    for N in (1, 2, 3, 4):
+        rl = DoryRef(tcfg, fr, n_loops=N, recurrent_mode="last_loop")
+        pre_cache = None
+        rows = []
+        for j in range(3):
+            h, pre_cache = rl.backbone(emb_t[j:j + 1], pos_t[j:j + 1], pre_cache)
+            rows.append(h[0])
+        tokwise = np.stack(rows)
+        _, dec_cache = rl.backbone(emb_t[:1], pos_t[:1])
+        drows = []
+        for j in range(1, 3):
+            h, dec_cache = rl.backbone(emb_t[j:j + 1], pos_t[j:j + 1], dec_cache)
+            drows.append(h[0])
+        dwalk = float(np.abs(tokwise[1:].astype(np.float64)
+                             - np.stack(drows).astype(np.float64)).max())
+        print(f"selftest recur-N{N} last_loop tokenwise maxabs = {dwalk:.3e} (tol 1e-5)")
+        ok = ok and dwalk < 1e-5
+        # Overwrite proof: re-walk position 1 with a DIFFERENT embedding; the
+        # walked prefix must change at 1 (current row overwritten) and keep
+        # history at 0. Compare full-row outputs for determinism.
+        alt = (emb_t[1:2] * np.float32(3.0) + np.float32(1.0))
+        hA, _ = rl.backbone(alt, pos_t[1:2], pre_cache)
+        hB, _ = rl.backbone(emb_t[1:2], pos_t[1:2], pre_cache)
+        d_ow = float(np.abs(hA.astype(np.float64) - hB.astype(np.float64)).max())
+        print(f"selftest recur-N{N} last_loop current-row-overwrite diff = {d_ow:.3e} (expect >0)")
+        ok = ok and d_ow > 0.0
+        # History independence: earlier positions keep FINAL-pass KV while the
+        # current row is overwritten per pass. Decode position 2 from the
+        # walked prefix must equal a fresh tokenwise walk of 0..2 (same N,
+        # same schedule) — stale earlier-pass rows would diverge.
+        fresh = None
+        frows = []
+        for j in range(3):
+            h, fresh = rl.backbone(emb_t[j:j + 1], pos_t[j:j + 1], fresh)
+            frows.append(h[0])
+        d_hist = float(np.abs(np.stack(frows).astype(np.float64)
+                              - tokwise.astype(np.float64)).max())
+        print(f"selftest recur-N{N} last_loop history-independence maxabs = {d_hist:.3e} (tol 1e-5)")
+        ok = ok and d_hist < 1e-5
+        # Reset: a fresh cache (None) over the same inputs reproduces the
+        # walked rows exactly — no positional state leaks across resets.
+        rst = None
+        rrows = []
+        for j in range(3):
+            h, rst = rl.backbone(emb_t[j:j + 1], pos_t[j:j + 1], rst)
+            rrows.append(h[0])
+        d_rst = float(np.abs(np.stack(rrows).astype(np.float64)
+                             - tokwise.astype(np.float64)).max())
+        print(f"selftest recur-N{N} last_loop reset maxabs = {d_rst:.3e} (tol 0)")
+        ok = ok and d_rst == 0.0
+    # (v) per_loop history independence + reset: per-loop slots never alias,
+    # so a fresh walk reproduces chunked rows exactly for N=1..4 incl 3.
+    for N in (1, 2, 3, 4):
+        rp = DoryRef(tcfg, fr, n_loops=N, recurrent_mode="per_loop")
+        w1 = None
+        a = []
+        for j in range(3):
+            h, w1 = rp.backbone(emb_t[j:j + 1], pos_t[j:j + 1], w1)
+            a.append(h[0])
+        A = np.stack(a)
+        w2 = None
+        b = []
+        for j in range(3):
+            h, w2 = rp.backbone(emb_t[j:j + 1], pos_t[j:j + 1], w2)
+            b.append(h[0])
+        d_rst = float(np.abs(A.astype(np.float64) - np.stack(b).astype(np.float64)).max())
+        print(f"selftest recur-N{N} per_loop reset maxabs = {d_rst:.3e} (tol 0)")
+        ok = ok and d_rst == 0.0
     fvals = np.array([1.0, -2.5, 0.0, 3.140625], dtype=np.float32)
     back = np.frombuffer(fvals.tobytes(), dtype="<f4").astype(np.float32)
     df = float(np.abs(back.astype(np.float64) - fvals.astype(np.float64)).max())
@@ -1475,7 +1835,17 @@ def _open_source(model: str):
 def run_full(args) -> int:
     model_arg = args.model
     cfg, reader, model_label, encode_fn, kind = _open_source(model_arg)
-    assert cfg["n_recurrent_loops"] == 2, "config changed; oracle pins 1 loop explicitly"
+    loops = getattr(args, "loops", None)
+    if loops is None:
+        loops = int(cfg.get("n_recurrent_loops", 2))
+    if not isinstance(loops, int) or not (1 <= loops <= 4):
+        raise SystemExit(f"--loops {loops!r} must be an integer 1..4")
+    rmode = getattr(args, "recurrent_kv_cache_mode", None) or cfg.get(
+        "recurrent_kv_cache_mode", "per_loop")
+    if rmode not in ("per_loop", "last_loop"):
+        raise SystemExit(
+            f"--recurrent-kv-cache-mode {rmode!r} must be per_loop|last_loop; "
+            "checkpoint default is per_loop")
     if kind == "dir":
         nparams = sum(int(np.prod(v["shape"])) for k, v in reader.header.items()
                       if k != "__metadata__")
@@ -1492,54 +1862,108 @@ def run_full(args) -> int:
         raise SystemExit(f"prompt encodes to {len(toks)} ids < --seq {args.seq}")
     P, D = args.prefill, S[args.prefill:args.seq]
     print(f"tokens[{len(S)}] = {S} (prefill {P}, decode {len(D)})", flush=True)
-    ref = DoryRef(cfg, reader, n_loops=1, bf16=False, kv_mode=args.kv_mode)
+    print(f"loops={loops} recurrent_kv_cache_mode={rmode} "
+          f"(checkpoint n_recurrent_loops={cfg.get('n_recurrent_loops')})", flush=True)
+    ref = DoryRef(cfg, reader, n_loops=loops, recurrent_mode=rmode,
+                  bf16=False, kv_mode=args.kv_mode)
     if args.kv_trace:
         # Lab diagnostic only: capture precache q/k/v + raw attention rows.
         # No math change (attn methods only append when this is not None).
         ref.kv_trace = []
 
-    # prefill
+    # Schedule by policy (native prefill is tokenwise):
+    # - per_loop is batched/incremental invariant: bulk prefill S[:P] +
+    #   tokenwise decode of the tail; reference is a bulk prefill over S.
+    # - last_loop is tokenwise-only (NOT bulk-prefill-equivalent): a bulk
+    #   loop-0 token1 would attend token0's loop-0 row, while native tokenwise
+    #   scheduling attends token0's final-loop row. Every recurrent pass
+    #   overwrites the CURRENT absolute-position row of the shared physical
+    #   slot, so the CPU reference walks tokenwise (prefix + tail + a fresh
+    #   full walk) to match native scheduling.
     import time
     t0 = time.time()
-    emb = reader.row_gather_f32("backbone.embeddings.weight", np.array(S[:P]))
-    h_pre, caches = ref.backbone(emb, np.arange(P))
-    log_pre = ref.logits(h_pre)
-    t1 = time.time()
-    print(f"prefill {P} tok: {t1 - t0:.1f}s", flush=True)
-
-    # KV-cached decode of the tail, one token at a time
-    h_dec_rows, log_dec_rows = [], []
-    t0 = time.time()
-    for j, tid in enumerate(D):
-        pos = np.array([P + j])
-        e = reader.row_gather_f32("backbone.embeddings.weight", np.array([tid]))
-        h, caches = ref.backbone(e, pos, caches)
-        h_dec_rows.append(h[0])
-        log_dec_rows.append(ref.logits(h)[0])
-    t1 = time.time()
-    print(f"decode {len(D)} tok: {t1 - t0:.1f}s", flush=True)
-    h_dec = np.stack(h_dec_rows).astype(np.float32)
-    log_dec = np.stack(log_dec_rows).astype(np.float32)
-    if args.kv_trace:
-        # Lab diagnostic: detach the measured prefill+decode rows BEFORE the
-        # self-consistency re-prefill below (which must not pollute the trace).
-        traced = ref.kv_trace or []
-        ref.kv_trace = None
-        dump_kv_trace(args.kv_trace, cfg, args.kv_mode, S, model_label,
-                      reader.header_fingerprint(), traced)
-
-    # self-consistency: decode rows must reproduce a full-prefill reference.
-    # (full prefill over S reuses no cache; compares at tail positions)
-    emb_full = reader.row_gather_f32("backbone.embeddings.weight", np.array(S))
-    h_full, _ = ref.backbone(emb_full, np.arange(len(S)))
-    log_full = ref.logits(h_full)
+    if rmode == "per_loop":
+        emb = reader.row_gather_f32("backbone.embeddings.weight", np.array(S[:P]))
+        h_pre, caches = ref.backbone(emb, np.arange(P))
+        log_pre = ref.logits(h_pre)
+        t1 = time.time()
+        print(f"prefill {P} tok: {t1 - t0:.1f}s", flush=True)
+        # KV-cached decode of the tail, one token at a time
+        h_dec_rows, log_dec_rows = [], []
+        t0 = time.time()
+        for j, tid in enumerate(D):
+            pos = np.array([P + j])
+            e = reader.row_gather_f32("backbone.embeddings.weight", np.array([tid]))
+            h, caches = ref.backbone(e, pos, caches)
+            h_dec_rows.append(h[0])
+            log_dec_rows.append(ref.logits(h)[0])
+        t1 = time.time()
+        print(f"decode {len(D)} tok: {t1 - t0:.1f}s", flush=True)
+        h_dec = np.stack(h_dec_rows).astype(np.float32)
+        log_dec = np.stack(log_dec_rows).astype(np.float32)
+        if args.kv_trace:
+            # Lab diagnostic: detach the measured prefill+decode rows BEFORE
+            # the self-consistency re-prefill below (must not pollute trace).
+            traced = ref.kv_trace or []
+            ref.kv_trace = None
+            dump_kv_trace(args.kv_trace, cfg, args.kv_mode, S, model_label,
+                          reader.header_fingerprint(), traced, loops, rmode)
+        # self-consistency: decode rows must reproduce a full-prefill
+        # reference (full prefill over S reuses no cache; tail positions).
+        emb_full = reader.row_gather_f32("backbone.embeddings.weight", np.array(S))
+        h_full, _ = ref.backbone(emb_full, np.arange(len(S)))
+        log_full = ref.logits(h_full)
+    else:
+        # last_loop tokenwise prefill of S[:P] (rows flow into caches;
+        # the fresh full walk below is the emitted reference)
+        caches = None
+        for i in range(P):
+            pos = np.array([i])
+            e = reader.row_gather_f32("backbone.embeddings.weight",
+                                      np.array([S[i]]))
+            h, caches = ref.backbone(e, pos, caches)
+        t1 = time.time()
+        print(f"prefill {P} tok (tokenwise): {t1 - t0:.1f}s", flush=True)
+        # KV-cached decode of the tail, one token at a time
+        h_dec_rows, log_dec_rows = [], []
+        t0 = time.time()
+        for j, tid in enumerate(D):
+            pos = np.array([P + j])
+            e = reader.row_gather_f32("backbone.embeddings.weight", np.array([tid]))
+            h, caches = ref.backbone(e, pos, caches)
+            h_dec_rows.append(h[0])
+            log_dec_rows.append(ref.logits(h)[0])
+        t1 = time.time()
+        print(f"decode {len(D)} tok: {t1 - t0:.1f}s", flush=True)
+        h_dec = np.stack(h_dec_rows).astype(np.float32)
+        log_dec = np.stack(log_dec_rows).astype(np.float32)
+        if args.kv_trace:
+            # Lab diagnostic: detach the measured tokenwise rows BEFORE the
+            # fresh reference walk below (must not pollute the trace).
+            traced = ref.kv_trace or []
+            ref.kv_trace = None
+            dump_kv_trace(args.kv_trace, cfg, args.kv_mode, S, model_label,
+                          reader.header_fingerprint(), traced, loops, rmode)
+        # self-consistency: a FRESH full tokenwise walk over S must reproduce
+        # the walked prefix+tail rows (same scheduling both sides).
+        h_full_rows, log_full_rows = [], []
+        caches_full = None
+        for i in range(len(S)):
+            pos = np.array([i])
+            e = reader.row_gather_f32("backbone.embeddings.weight",
+                                      np.array([S[i]]))
+            h, caches_full = ref.backbone(e, pos, caches_full)
+            h_full_rows.append(h[0])
+            log_full_rows.append(ref.logits(h)[0])
+        h_full = np.stack(h_full_rows).astype(np.float32)
+        log_full = np.stack(log_full_rows).astype(np.float32)
+    # Verdict over the measured tail (decode rows) vs same-schedule reference.
     dh = np.abs(h_full[P:].astype(np.float64) - h_dec.astype(np.float64)).max()
     dl = np.abs(log_full[P:].astype(np.float64) - log_dec.astype(np.float64)).max()
     cosmin = min(cosine(h_full[P + j], h_dec[j]) for j in range(len(D)))
-    print(f"self-consistency decode-vs-prefill: max|dhid|={dh:.3e} "
-          f"max|dlogit|={dl:.3e} mincos={cosmin:.8f}")
+    print(f"self-consistency decode-vs-prefill ({rmode} schedule): "
+          f"max|dhid|={dh:.3e} max|dlogit|={dl:.3e} mincos={cosmin:.8f}")
 
-    # greedy next token from the last position (informational only)
     last_top = topk(log_full[-1], 8)
     print("last-position top8:", last_top,
           [round(float(log_full[-1][i]), 3) for i in last_top])
@@ -1547,15 +1971,17 @@ def run_full(args) -> int:
     out = args.out
     os.makedirs(out, exist_ok=True)
     km = args.kv_mode
-    suffix = f"_{km}"
-    np.save(os.path.join(out, f"logits{suffix}.npy"), log_full.astype(np.float32))
-    np.save(os.path.join(out, f"hidden{suffix}.npy"), h_full.astype(np.float32))
-    man_name = "dory_one_loop_f32.json" if km == "f32" else f"dory_one_loop_{km}.json"
+    tag = f"loops{loops}_{rmode}_{km}"
+    np.save(os.path.join(out, f"logits_{tag}.npy"), log_full.astype(np.float32))
+    np.save(os.path.join(out, f"hidden_{tag}.npy"), h_full.astype(np.float32))
+    man_name = f"dory_loops{loops}_{rmode}_{km}.json"
     manifest = {
         "source_math": SRC_ATTRIBUTION,
         "model_dir": model_label,
         "model_kind": kind,
         "kv_mode": km,
+        "loops": loops,
+        "recurrent_kv_cache_mode": rmode,
         "kv_signs": {"seeds": [42, 1042],
                      "fwht3_width": 256, "fwht2_fwht4_width": 128,
                      "boundary_layers": 0, "layer_is_boundary": [],
@@ -1567,7 +1993,7 @@ def run_full(args) -> int:
             "n_recurrent_loops", "sliding_window", "ngpt_alpha_init",
             "initializer_range", "attention_output_gate_logit_scale_init",
             "tie_word_embeddings", "layer_types")},
-        "loops_executed": 1,
+        "loops_executed": loops,
         "precision": (("F32 accumulate, Q8F16/F32 dequant weights, "
                        "no activation rounding"
                        if kind == "hfq" else
@@ -1594,11 +2020,11 @@ def run_full(args) -> int:
         "last_position_top8": [int(x) for x in last_top],
         "deps": {"numpy": np.__version__, "safetensors": _pkg_ver("safetensors"),
                  "tokenizers": _pkg_ver("tokenizers"), "torch": None},
-        "files": {"logits": f"logits{suffix}.npy", "hidden": f"hidden{suffix}.npy"},
+        "files": {"logits": f"logits_{tag}.npy", "hidden": f"hidden_{tag}.npy"},
     }
     with open(os.path.join(out, man_name), "w") as f:
         json.dump(manifest, f, indent=2)
-    print(f"wrote {out}/{man_name} + logits{suffix}.npy + hidden{suffix}.npy")
+    print(f"wrote {out}/{man_name} + logits_{tag}.npy + hidden_{tag}.npy")
     if km == "f32":
         ok = dh < 1e-4 and dl < 5e-2 and cosmin > 0.99999
     else:
@@ -1617,30 +2043,96 @@ def run_full(args) -> int:
 def run_bf16twin(args) -> int:
     """Measure the BF16-activation envelope over all artifact positions.
 
-    Runs prefill over the artifact's tokens in twin mode and compares
-    all-position logits/hidden against the F32 artifact. The measured
-    deltas ground the native-parity tolerances.
+    Resolves the SAME loop count / cache policy as the F32 artifact being
+    twinned (flags win, else the artifact's own manifest) and runs the same
+    schedule the twin's F32 artifact used: bulk prefill over the full token
+    sequence for per_loop, a fresh full tokenwise walk for last_loop. Native
+    F32 parity reference tags the EFFECTIVE resolved mode (never "auto").
     """
     art = args.artifact
-    man = json.load(open(os.path.join(art, "dory_one_loop_f32.json")))
+    loops_req = getattr(args, "loops", None)
+    rmode_req = getattr(args, "recurrent_kv_cache_mode", None)
+    man = None
+    if loops_req is not None or rmode_req is not None:
+        if not isinstance(loops_req if loops_req is not None else 2, int):
+            raise SystemExit(f"--loops {loops_req!r} must be an integer 1..4")
+        loops_probe = loops_req if loops_req is not None else None
+        rmode_probe = rmode_req if rmode_req is not None else None
+        # Resolve the artifact identity from explicit flags (exact match, no
+        # guessing); flags omitted below fall back to manifest discovery.
+        for f in sorted(os.listdir(art)):
+            if not (f.startswith("dory_loops") and f.endswith("_f32.json")):
+                continue
+            try:
+                m = json.load(open(os.path.join(art, f)))
+            except OSError:
+                continue
+            if loops_probe is not None and int(m.get("loops", -1)) != loops_probe:
+                continue
+            if rmode_probe is not None and m.get("recurrent_kv_cache_mode") != rmode_probe:
+                continue
+            if man is None or f < man[0]:
+                man = (f, m)
+        if man is None:
+            raise SystemExit("--bf16twin: no dory_loops*_f32.json manifest in "
+                             f"{art} matches loops={loops_req} mode={rmode_req}")
+        man_name = man[0]
+        man = man[1]
+    else:
+        cands = sorted(f for f in os.listdir(art)
+                       if f.startswith("dory_loops") and f.endswith("_f32.json"))
+        if not cands:
+            raise SystemExit(f"--bf16twin: no dory_loops<N>_<mode>_f32.json in {art}; "
+                             "run --run --kv-mode f32 with --loops/--recurrent-kv-cache-mode first")
+        if len(cands) > 1:
+            raise SystemExit(f"--bf16twin: ambiguous {len(cands)} F32 manifests "
+                             f"{cands}; pass --loops/--recurrent-kv-cache-mode")
+        man_name = cands[0]
+        man = json.load(open(os.path.join(art, man_name)))
+    loops = int(man["loops"])
+    rmode = man["recurrent_kv_cache_mode"]
+    if loops_req is not None and loops_req != loops:
+        raise SystemExit(f"--bf16twin: --loops {loops_req} != artifact {loops} ({man_name})")
+    if rmode_req is not None and rmode_req != rmode:
+        raise SystemExit(f"--bf16twin: --recurrent-kv-cache-mode {rmode_req} != "
+                         f"artifact {rmode} ({man_name})")
+    if rmode not in ("per_loop", "last_loop"):
+        raise SystemExit(f"--bf16twin: artifact mode {rmode!r} invalid")
     model_src = man["model_dir"]
     cfg, reader, _, _, _ = _open_source(model_src)
     S = man["tokens"]
-    ref = DoryRef(cfg, reader, n_loops=1, bf16=True)
+    tag = f"loops{loops}_{rmode}_f32"
+    ref = DoryRef(cfg, reader, n_loops=loops, recurrent_mode=rmode, bf16=True)
     import time
     t0 = time.time()
-    emb = reader.row_gather_f32("backbone.embeddings.weight", np.array(S))
-    h, _ = ref.backbone(emb, np.arange(len(S)))
-    log = ref.logits(h)
-    print(f"twin prefill {len(S)} tok: {time.time() - t0:.1f}s", flush=True)
-    log_f32 = np.load(os.path.join(art, "logits_f32.npy"))
-    hid_f32 = np.load(os.path.join(art, "hidden_f32.npy"))
+    if rmode == "per_loop":
+        emb = reader.row_gather_f32("backbone.embeddings.weight", np.array(S))
+        h, _ = ref.backbone(emb, np.arange(len(S)))
+        log = ref.logits(h)
+    else:
+        h_rows, log_rows = [], []
+        caches = None
+        for i in range(len(S)):
+            e = reader.row_gather_f32("backbone.embeddings.weight", np.array([S[i]]))
+            h_i, caches = ref.backbone(e, np.array([i]), caches)
+            h_rows.append(h_i[0])
+            log_rows.append(ref.logits(h_i)[0])
+        h = np.stack(h_rows).astype(np.float32)
+        log = np.stack(log_rows).astype(np.float32)
+    print(f"twin {'prefill' if rmode == 'per_loop' else 'tokenwise walk'} "
+          f"{len(S)} tok (loops={loops} mode={rmode}): {time.time() - t0:.1f}s",
+          flush=True)
+    log_f32 = np.load(os.path.join(art, f"logits_{tag}.npy"))
+    hid_f32 = np.load(os.path.join(art, f"hidden_{tag}.npy"))
     dl = np.abs(log.astype(np.float64) - log_f32.astype(np.float64))
     dh = np.abs(h.astype(np.float64) - hid_f32.astype(np.float64))
     top1_same = sum(int(np.argmax(log[i])) == int(np.argmax(log_f32[i]))
                     for i in range(len(S)))
     env = {
         "mode": "BF16 activation rounding (RNE) on every matmul in/out, F32 accumulate",
+        "loops": loops,
+        "recurrent_kv_cache_mode": rmode,
+        "artifact": man_name,
         "max_abs_logit_diff": float(dl.max()),
         "mean_abs_logit_diff": float(dl.mean()),
         "p99_abs_logit_diff": float(np.quantile(dl, 0.99)),
@@ -1649,7 +2141,7 @@ def run_bf16twin(args) -> int:
         "top1_match": f"{top1_same}/{len(S)}",
     }
     print(json.dumps(env, indent=2))
-    with open(os.path.join(art, "bf16_envelope.json"), "w") as f:
+    with open(os.path.join(art, f"bf16_envelope_loops{loops}_{rmode}.json"), "w") as f:
         json.dump(env, f, indent=2)
     return 0
 
@@ -1812,42 +2304,66 @@ TOL = {
     "min_hidden_cosine": 0.99999,
     "max_abs_logit_diff": 2e-2,   # hard FAIL above; WARN above 1e-3
     "warn_abs_logit_diff": 1e-3,
-    "required_top1_match": 16,    # all positions must agree
+    "required_top1_match": 16,    # all positions must agree (16-token oracle)
 }
 
 
 def run_compare(args) -> int:
+    # Whole-model parity: F32 canonical plus packed honesty. The native dump
+    # MUST tag the EFFECTIVE resolved KV mode (raw "auto" is rejected — it
+    # silently skips files); old one-loop dumps without loop identity are
+    # rejected rather than aliased. Packed whole-model comparison KEEPS the
+    # strict 0.02 max|dlogit| bar and may honestly FAIL (known packed-model
+    # discrepancy vs F32 at the same weights); exact-input --kv-trace replay
+    # then isolates codec/state causes. Trace replay stays the independent
+    # packed diagnostic; it does not replace the whole-model verdict.
     art = args.artifact
     km = getattr(args, "kv_mode", "f32") or "f32"
     assert km in KV_MODES, f"--kv-mode {km} not in {KV_MODES}"
-    suffix = "" if km == "f32" else f"_{km}"
-    man_name = "dory_one_loop_f32.json" if km == "f32" else f"dory_one_loop_{km}.json"
-    man = json.load(open(os.path.join(art, man_name)))
+    loops = getattr(args, "loops", None)
+    rmode = getattr(args, "recurrent_kv_cache_mode", None)
     nat = json.load(open(args.compare))
-    assert nat.get("loops", 1) == 1, "native dump must be one-loop"
+    for key in ("loops", "recurrent_kv_cache_mode", "kv_mode"):
+        if key not in nat:
+            raise SystemExit(f"native dump missing required identity field {key!r}")
+    if loops is None:
+        loops = nat["loops"]
+    if rmode is None:
+        rmode = nat["recurrent_kv_cache_mode"]
+    if not isinstance(loops, int) or not (1 <= loops <= 4):
+        raise SystemExit(f"--loops {loops!r} must be an integer 1..4")
+    if rmode not in ("per_loop", "last_loop"):
+        raise SystemExit(
+            f"--recurrent-kv-cache-mode {rmode!r} must be per_loop|last_loop")
+    tag = f"loops{loops}_{rmode}_{km}"
+    man = json.load(open(os.path.join(art, f"dory_loops{loops}_{rmode}_{km}.json")))
+    assert nat["loops"] == loops, \
+        f"native loops {nat.get('loops')} != {loops}"
+    assert nat["recurrent_kv_cache_mode"] == rmode, \
+        f"native mode {nat.get('recurrent_kv_cache_mode')} != {rmode}"
+    assert nat.get("kv_mode") == km, \
+        f"native kv_mode {nat.get('kv_mode')!r} != effective {km!r} (dumps tag EFFECTIVE; raw auto rejected)"
+    assert man.get("kv_mode", km) == km, \
+        f"artifact kv_mode {man.get('kv_mode')} != --kv-mode {km}"
     assert list(nat["tokens"]) == list(man["tokens"]), \
         f"token mismatch: native {nat['tokens']} vs ref {man['tokens']}"
-    log_r = np.load(os.path.join(art, f"logits_{km}.npy")).astype(np.float64)
-    hid_r = np.load(os.path.join(art, f"hidden_{km}.npy")).astype(np.float64)
+    log_r = np.load(os.path.join(art, f"logits_{tag}.npy")).astype(np.float64)
+    hid_r = np.load(os.path.join(art, f"hidden_{tag}.npy")).astype(np.float64)
     log_n = np.asarray(nat["logits"], dtype=np.float64)
     assert log_n.shape == log_r.shape, f"{log_n.shape} vs {log_r.shape}"
     npos = log_r.shape[0]
     dl = np.abs(log_n - log_r)
-    if km != "f32":
-        man_mode = man.get("kv_mode", km)
-        assert man_mode == km, f"artifact kv_mode {man_mode} != --kv-mode {km}"
-        nat_mode = nat.get("kv_mode", km)
-        assert nat_mode == km, f"native kv_mode {nat_mode} != --kv-mode {km}"
     top1 = sum(int(np.argmax(log_n[i])) == int(np.argmax(log_r[i])) for i in range(npos))
     if km == "f32":
-        print(f"positions={npos} max|dlogit|={dl.max():.5f} "
+        print(f"positions={npos} loops={loops} mode={rmode} kv=f32 "
+              f"max|dlogit|={dl.max():.5f} "
               f"(FAIL>{TOL['max_abs_logit_diff']:.1e} WARN>{TOL['warn_abs_logit_diff']:.1e}) "
               f"mean={dl.mean():.5f} top1={top1}/{npos}")
     else:
-        tol = KV_ATOL[km]
-        print(f"positions={npos} kv={km} max|dlogit|={dl.max():.5f} "
-              f"(FAIL>{tol['logits']:.1e}) mean={dl.mean():.5f} top1={top1}/{npos}")
-    env_path = os.path.join(art, "bf16_envelope.json")
+        print(f"positions={npos} loops={loops} mode={rmode} kv={km} "
+              f"max|dlogit|={dl.max():.5f} (strict FAIL>2e-2; may honestly FAIL) "
+              f"mean={dl.mean():.5f} top1={top1}/{npos}")
+    env_path = os.path.join(art, f"bf16_envelope_loops{loops}_{rmode}.json")
     if os.path.exists(env_path):
         env = json.load(open(env_path))
         print(f"(context only, NOT the bar: BF16-twin max|dlogit|={env['max_abs_logit_diff']:.4f} "
@@ -1860,6 +2376,12 @@ def run_compare(args) -> int:
             print("WARN max|dlogit| above 1e-3 aim (triage reduction order before widening)");
         if top1 < npos:
             print("FAIL top-1 mismatch"); ok = False
+    else:
+        # Packed whole model: strict 0.02 bar, unchanged; a FAIL here is an
+        # honest known-discrepancy verdict, not a tolerance to widen.
+        if dl.max() > 2e-2:
+            print(f"FAIL kv={km} max|dlogit| above strict 2e-2 (honest packed verdict; "
+                  "use --kv-trace replay to isolate codec vs state)"); ok = False
     if "hidden" in nat and nat["hidden"] is not None:
         hid_n = np.asarray(nat["hidden"], dtype=np.float64)
         cosmin = min(cosine(hid_n[i], hid_r[i]) for i in range(npos))
@@ -1877,15 +2399,11 @@ def run_compare(args) -> int:
               f"nat_top1={int(np.argmax(log_n[i])):6d} "
               f"max|dlogit|={dl[i].max():.5f}{mark}")
         if mark:
-            # Same-codec: top-1 agreement is REQUIRED (a packed-offset or
+            # Top-1 agreement is REQUIRED incl. packed (a packed-offset or
             # rotation fault flips decisions); no lossy exemption.
             ok = False
-    if km != "f32":
-        if dl.max() > 2e-2:
-            print(f"FAIL kv={km} max|dlogit| above 2e-2"); ok = False
     print("NATIVE PARITY " + ("PASS" if ok else "FAIL"))
     return 0 if ok else 1
-
 
 def _pkg_ver(name: str):
     try:
@@ -1896,15 +2414,33 @@ def _pkg_ver(name: str):
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Dory one-loop CPU reference oracle")
-    ap.add_argument("--model", default="./dory-bf16",
-                    help="BF16 safetensors dir or self-contained Dory .hfq "
-                         "(qt=3 Q8F16 + qt=2 F32)")
-    ap.add_argument("--selftest", action="store_true")
-    ap.add_argument("--run", action="store_true")
-    ap.add_argument("--bf16twin", action="store_true")
-    ap.add_argument("--compare", metavar="NATIVE_JSON", default=None)
-    ap.add_argument("--artifact", default="benchmarks/references/dory_one_loop")
+    ap = argparse.ArgumentParser(description="Dory multi-loop CPU reference oracle "
+                                "(loops 1..4, per_loop/last_loop; F32 canonical + packed honest)")
+    ap.add_argument("--model", default="./dory-4b.q8.hfq",
+                    help="canonical same-weight pack (local dory-4b.q8.hfq) or a "
+                         "BF16 safetensors dir; both decode through the same F32 "
+                         "forward (Q8F16/F32 dequant vs exact BF16->F32)")
+    ap.add_argument("--selftest", action="store_true",
+                    help="miniature I/R/O fixtures: math fast-path, codec "
+                         "re-decode/overwrite, loop indexing, per_loop "
+                         "chunk/tokenwise invariance, last_loop tokenwise + "
+                         "overwrite/reset (no weights needed)")
+    ap.add_argument("--run", action="store_true",
+                    help="teacher-forced run: per_loop bulk prefill + tokenwise "
+                         "decode, last_loop fully tokenwise; emits "
+                         "logits_/hidden_<loops>_<mode>_<kv>.npy + "
+                         "dory_loops<loops>_<mode>_<kv>.json")
+    ap.add_argument("--bf16twin", action="store_true",
+                    help="BF16-activation envelope for one F32 artifact "
+                         "(same loops/mode; flags select, else unambiguous "
+                         "manifest discovery)")
+    ap.add_argument("--compare", metavar="NATIVE_JSON", default=None,
+                    help="native dump vs the matching CPU artifact (same "
+                         "loops/mode/EFFECTIVE kv_mode; F32 canonical, packed "
+                         "honest at the strict 0.02 bar)")
+    ap.add_argument("--artifact", default="benchmarks/references/dory_multiloop",
+                    help="artifact dir for --run manifests/npy + --bf16twin "
+                         "envelopes (no old one-loop names)")
     ap.add_argument("--prompt", default="The capital of France is Paris. The capital of Germany is Berlin. The capital of Italy is",
                     help="prompt; first --seq ids form the fixed sequence")
     ap.add_argument("--seq", type=int, default=16)
@@ -1912,9 +2448,23 @@ def main() -> int:
     ap.add_argument("--out", default=None)
     ap.add_argument("--kv-mode", default="f32", choices=list(KV_MODES),
                     help="KV encoding for --run/--compare/--kv-probe: f32 "
-                         "(internal F32 reference, default), q8, fwht2/3/4 "
-                         "(K packed per turbo_common.h, V always Q8_0; signs "
-                         "42/1042, fwht3 256-wide, fwht2/4 128-wide halves)")
+                         "(internal F32 reference, default, canonical parity), "
+                         "q8, fwht2/3/4 (K packed per turbo_common.h, V always "
+                         "Q8_0; signs 42/1042, fwht3 256-wide, fwht2/4 128 "
+                         "halves). Packed whole-model keeps the strict 0.02 "
+                         "bar and may honestly FAIL; --kv-trace replay "
+                         "isolates codec vs state causes.")
+    ap.add_argument("--loops", type=int, default=None,
+                    help="recurrent passes 1..4 for --run/--bf16twin/--compare "
+                         "(default: checkpoint n_recurrent_loops; --compare "
+                         "falls back to the native dump; --bf16twin selects "
+                         "the matching F32 manifest)")
+    ap.add_argument("--recurrent-kv-cache-mode", default=None,
+                    choices=["per_loop", "last_loop"],
+                    help="KV semantics for --run/--bf16twin/--compare "
+                         "(default: checkpoint recurrent_kv_cache_mode, "
+                         "else per_loop; --compare falls back to the native "
+                         "dump's mode)")
     ap.add_argument("--kv-probe", action="store_true",
                     help="focused numeric KV probe: deterministic Q/K/V "
                          "(Hkv=4,D=256), all 4 packed modes + F32, full + "
@@ -1925,11 +2475,12 @@ def main() -> int:
                     help="probe JSON output path (default: "
                          "<artifact>/dory_kv_probe.json)")
     ap.add_argument("--kv-trace", metavar="PATH", default=None,
-                    help="lab diagnostic for --run: dump per-(position,layer) "
-                         "precache q/k/v + raw pre-gate attention to PATH "
-                         "(schema dory_kv_trace_v1; joins with the native "
-                         "parity --kv-trace dump on position+layer; never "
-                         "affects the oracle math or verdicts)")
+                    help="lab diagnostic for --run: dump per-(position,layer,"
+                         "loop_index) precache q/k/v + raw pre-gate attention "
+                         "to PATH (schema dory_kv_trace_v2; joins with the "
+                         "native parity --kv-trace dump on "
+                         "position+layer+loop_index, histories by cache_layer; "
+                         "never affects the oracle math or verdicts)")
     args = ap.parse_args()
     if args.selftest:
         return run_selftest_main()

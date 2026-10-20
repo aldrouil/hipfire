@@ -4920,6 +4920,28 @@ pub(crate) fn load_params(
     if pp > 1 {
         params["pp"] = serde_json::json!(pp);
     }
+    // Dory recurrence (I->R^N->O): forwarded only when authored (null default
+    // = checkpoint loops, `auto` = checkpoint KV mode), so built-in/registry
+    // provenance without a Dory override loads checkpoint defaults.
+    if let Some(dory_loops) = config_optional_u64(resolved, "model.dory_loops")? {
+        params["dory_loops"] = serde_json::json!(dory_loops);
+    }
+    let dory_kv_mode_source = &resolved
+        .get("model.dory_recurrent_kv_cache_mode")
+        .expect("schema field")
+        .source;
+    if matches!(
+        dory_kv_mode_source,
+        ConfigSource::GlobalUser { .. }
+            | ConfigSource::ModelUser { .. }
+            | ConfigSource::OneShot { .. }
+            | ConfigSource::LegacyEnv { .. }
+    ) {
+        let dory_kv_mode = config_string(resolved, "model.dory_recurrent_kv_cache_mode")?;
+        if dory_kv_mode != "auto" {
+            params["dory_recurrent_kv_cache_mode"] = serde_json::json!(dory_kv_mode);
+        }
+    }
     if let Some(experts_per_token) =
         config_optional_u64(resolved, "model.deepseek4_experts_per_token")?
     {
@@ -15877,6 +15899,8 @@ effort = "high"
                     continuous_batch_history: false,
                     current_max_seq: 0,
                     cache_capable: false,
+                    current_dory_loops: None,
+                    current_dory_recurrent_kv_cache_mode: None,
                     kv_override: None,
                     kv_k_override: None,
                     kv_v_override: None,

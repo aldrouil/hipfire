@@ -2155,6 +2155,58 @@ fn main() {
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string());
+                let dory_loops = match msg.get("params").and_then(|p| p.get("dory_loops")) {
+                    None | Some(serde_json::Value::Null) => None,
+                    Some(value) => match value.as_u64().filter(|n| (1..=4).contains(n)) {
+                        Some(value) => Some(value as usize),
+                        None => {
+                            emit_uncorrelated_error(
+                                &mut stdout,
+                                None,
+                                "invalid Dory loops: expected an integer in 1..=4 or null",
+                                "validation",
+                                false,
+                                false,
+                            );
+                            let _ = stdout.flush();
+                            continue;
+                        }
+                    },
+                };
+                let dory_recurrent_kv_cache_mode = match msg
+                    .get("params")
+                    .and_then(|p| p.get("dory_recurrent_kv_cache_mode"))
+                {
+                    None | Some(serde_json::Value::Null) => None,
+                    Some(value) => match value
+                        .as_str()
+                        .ok_or_else(|| "expected auto, per_loop or last_loop".to_string())
+                        .and_then(|raw| {
+                            if raw == "auto" {
+                                Ok(None)
+                            } else {
+                                raw.parse::<hipfire_config::DoryRecurrentKvCacheMode>()
+                                    .map(Some)
+                            }
+                        }) {
+                        Ok(mode) => mode,
+                        Err(error) => {
+                            emit_uncorrelated_error(
+                                &mut stdout,
+                                None,
+                                &format!("invalid Dory recurrent KV cache mode: {error}"),
+                                "validation",
+                                false,
+                                false,
+                            );
+                            let _ = stdout.flush();
+                            continue;
+                        }
+                    },
+                };
+                // Architecture-specific overrides resolve after admission
+                // classifies the source. Dory recurrence applies only on the
+                // Dory path; other carriers ignore these two fields.
                 let deepseek4_experts_per_token = msg
                     .get("params")
                     .and_then(|p| p.get("deepseek4_experts_per_token"))
@@ -2215,6 +2267,12 @@ fn main() {
                     ),
                     expert_count_override: deepseek4_experts_per_token.is_some(),
                     pflash: pflash_drafter.is_some() || pflash_mode_str != "off",
+                    // Dory staged recurrence: admission validates these exact
+                    // controls against the checkpoint before teardown, and the
+                    // load below allocates the same pair. `auto` KV arrives
+                    // as `None` (= checkpoint default `PerLoop`).
+                    dory_loops,
+                    dory_recurrent_kv_cache_mode,
                 };
                 let backend_request =
                     match hipfire_loader::admission::KvBackendRequest::from_override(
@@ -2369,6 +2427,8 @@ fn main() {
                         admission,
                         path,
                         max_seq,
+                        dory_loops,
+                        dory_recurrent_kv_cache_mode,
                         deepseek4_experts_per_token,
                         deepseek4_compute_placement,
                         draft_path.as_deref(),
@@ -4895,7 +4955,9 @@ mod tests {
         let arm = prod.find("\"generate\" => {").expect("generate arm");
         let arm_end = arm + prod[arm..].find("\"decide\" => {").expect("decide arm");
         let arm = &prod[arm..arm_end];
-        let guard = arm.find("let _ple_serving = m.ple_serving_guard();").expect("guard");
+        let guard = arm
+            .find("let _ple_serving = m.ple_serving_guard();")
+            .expect("guard");
         for later in [
             "activate_terminal_control(id, gen_attempt_id)",
             "batch_request_eligible_for_route(",
@@ -4908,10 +4970,17 @@ mod tests {
             assert!(guard < at, "guard must precede {later}");
         }
         let bench = include_str!("bench.rs");
-        assert_eq!(bench.matches("let _ple_serving = m.ple_serving_guard();").count(), 2);
+        assert_eq!(
+            bench
+                .matches("let _ple_serving = m.ple_serving_guard();")
+                .count(),
+            2
+        );
         for handler in ["fn handle_bench_prefill(", "fn handle_bench_decode("] {
             let body = &bench[bench.find(handler).expect(handler)..];
-            let guard = body.find("let _ple_serving = m.ple_serving_guard();").expect("bench guard");
+            let guard = body
+                .find("let _ple_serving = m.ple_serving_guard();")
+                .expect("bench guard");
             assert!(guard < body.find("m.bench_topology(").expect("topology"));
         }
     }

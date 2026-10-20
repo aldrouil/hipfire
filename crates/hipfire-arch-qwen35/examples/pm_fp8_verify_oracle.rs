@@ -74,7 +74,9 @@ use hipfire_arch_qwen35::load_qwen35_bundle;
 use hipfire_arch_qwen35::qwen35::LayerWeights;
 use hipfire_runtime::kv_backend::KvBackend;
 use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource, SequenceHint, SpecLoadCfg};
-use rdna_compute::{fp8_verify_tile, DType, Fp8VerifyOp, Fp8VerifyTile, Fp8VerifyX, Gpu, GpuTensor};
+use rdna_compute::{
+    fp8_verify_tile, DType, Fp8VerifyOp, Fp8VerifyTile, Fp8VerifyX, Gpu, GpuTensor,
+};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::ffi::c_void;
@@ -87,7 +89,8 @@ const CANARY: usize = 256;
 const SENTINEL: u32 = 0x7FBA_DBAD;
 /// Weight-stream reference bandwidth (BATCH-OVERHEAD §2).
 const STREAM_GBS: f64 = 640.0;
-const DEFAULT_MODEL: &str = "/home/kaden/qcal/release-0.4.0/fp8-tp-ep-geo/models/qwen3.8-27b.mq4-xts";
+const DEFAULT_MODEL: &str =
+    "/home/kaden/qcal/release-0.4.0/fp8-tp-ep-geo/models/qwen3.8-27b.mq4-xts";
 const TILES: [(u8, u8); 7] = [(1, 1), (2, 4), (2, 8), (4, 4), (4, 8), (8, 4), (8, 8)];
 /// CPU-reference sample: weight rows per matrix.
 const CPU_ROWS: usize = 64;
@@ -167,28 +170,58 @@ impl Panel {
         // SAFETY: only pointer arithmetic inside the owned allocations.
         let x8 = unsafe { (self.x8.buf.as_ptr() as *mut u8).add(row0 * self.k) } as *mut c_void;
         let s = unsafe { (self.s.buf.as_ptr() as *mut u8).add(row0 * 4) } as *mut c_void;
-        Fp8VerifyX { x8, scales: s, n, k: self.k }
+        Fp8VerifyX {
+            x8,
+            scales: s,
+            n,
+            k: self.k,
+        }
     }
 }
 
-fn call_exact(gpu: &mut Gpu, c: &Case, x: &GpuTensor, y: &[GpuTensor], n: usize, kept: bool) -> Result<(), rdna_compute::HipError> {
+fn call_exact(
+    gpu: &mut Gpu,
+    c: &Case,
+    x: &GpuTensor,
+    y: &[GpuTensor],
+    n: usize,
+    kept: bool,
+) -> Result<(), rdna_compute::HipError> {
     let (w, m, k) = (&c.w, &c.ms, c.k);
     match c.fam {
-        Fam::Qkvza => gpu.gemm_qkvza_mq4g256v2_verify_exact(w[0], w[1], w[2], w[3], x, &y[0], &y[1], &y[2], &y[3], m[0], m[1], m[2], m[3], k, n),
-        Fam::Qkv => gpu.gemm_qkv_mq4g256v2_verify_exact(w[0], w[1], w[2], x, &y[0], &y[1], &y[2], m[0], m[1], m[2], k, n),
-        Fam::GateUp => gpu.gemm_gate_up_mq4g256v2_verify_exact(w[0], w[1], x, &y[0], &y[1], m[0], m[1], k, n),
+        Fam::Qkvza => gpu.gemm_qkvza_mq4g256v2_verify_exact(
+            w[0], w[1], w[2], w[3], x, &y[0], &y[1], &y[2], &y[3], m[0], m[1], m[2], m[3], k, n,
+        ),
+        Fam::Qkv => gpu.gemm_qkv_mq4g256v2_verify_exact(
+            w[0], w[1], w[2], x, &y[0], &y[1], &y[2], m[0], m[1], m[2], k, n,
+        ),
+        Fam::GateUp => {
+            gpu.gemm_gate_up_mq4g256v2_verify_exact(w[0], w[1], x, &y[0], &y[1], m[0], m[1], k, n)
+        }
         Fam::Residual => gpu.gemm_mq4g256v2_residual_verify_exact(w[0], x, &y[0], m[0], k, n),
         Fam::Head if kept => gpu.gemm_mq4g256v2_residual_verify_exact(w[0], x, &y[0], m[0], k, n),
         Fam::Head => gpu.gemm_mq4g256v2_lmhead_verify_exact(w[0], x, &y[0], m[0], k, n),
     }
 }
 
-fn call_fp8(gpu: &mut Gpu, c: &Case, x: &GpuTensor, y: &[GpuTensor], n: usize) -> Result<(), rdna_compute::HipError> {
+fn call_fp8(
+    gpu: &mut Gpu,
+    c: &Case,
+    x: &GpuTensor,
+    y: &[GpuTensor],
+    n: usize,
+) -> Result<(), rdna_compute::HipError> {
     let (w, m, k) = (&c.w, &c.ms, c.k);
     match c.fam {
-        Fam::Qkvza => gpu.gemm_qkvza_mq4g256v2_verify_fp8(w[0], w[1], w[2], w[3], x, &y[0], &y[1], &y[2], &y[3], m[0], m[1], m[2], m[3], k, n),
-        Fam::Qkv => gpu.gemm_qkv_mq4g256v2_verify_fp8(w[0], w[1], w[2], x, &y[0], &y[1], &y[2], m[0], m[1], m[2], k, n),
-        Fam::GateUp => gpu.gemm_gate_up_mq4g256v2_verify_fp8(w[0], w[1], x, &y[0], &y[1], m[0], m[1], k, n),
+        Fam::Qkvza => gpu.gemm_qkvza_mq4g256v2_verify_fp8(
+            w[0], w[1], w[2], w[3], x, &y[0], &y[1], &y[2], &y[3], m[0], m[1], m[2], m[3], k, n,
+        ),
+        Fam::Qkv => gpu.gemm_qkv_mq4g256v2_verify_fp8(
+            w[0], w[1], w[2], x, &y[0], &y[1], &y[2], m[0], m[1], m[2], k, n,
+        ),
+        Fam::GateUp => {
+            gpu.gemm_gate_up_mq4g256v2_verify_fp8(w[0], w[1], x, &y[0], &y[1], m[0], m[1], k, n)
+        }
         Fam::Residual => gpu.gemm_mq4g256v2_residual_verify_fp8(w[0], x, &y[0], m[0], k, n),
         Fam::Head => gpu.gemm_mq4g256v2_lmhead_verify_fp8(w[0], x, &y[0], m[0], k, n),
     }
@@ -198,16 +231,38 @@ fn call_fp8(gpu: &mut Gpu, c: &Case, x: &GpuTensor, y: &[GpuTensor], n: usize) -
 /// (and of the owned packed `panel` for `Kind::Pre`), outputs at the same row
 /// offsets of `y`.
 #[allow(clippy::too_many_arguments)]
-fn launch(gpu: &mut Gpu, case: &Case, kind: Kind, x: &GpuTensor, panel: &Panel, y: &[GpuTensor], row0: usize, n: usize) -> R<()> {
+fn launch(
+    gpu: &mut Gpu,
+    case: &Case,
+    kind: Kind,
+    x: &GpuTensor,
+    panel: &Panel,
+    y: &[GpuTensor],
+    row0: usize,
+    n: usize,
+) -> R<()> {
     let k = case.k;
-    let ys: Vec<GpuTensor> = y.iter().zip(&case.ms).map(|(t, &m)| t.sub_offset(row0 * m, n * m)).collect();
+    let ys: Vec<GpuTensor> = y
+        .iter()
+        .zip(&case.ms)
+        .map(|(t, &m)| t.sub_offset(row0 * m, n * m))
+        .collect();
     let xv = x.sub_offset(row0 * k, n * k);
     let prev = gpu.fp8_verify_scope;
     let r = match kind {
         Kind::Pre(t) => {
             let xq = panel.view(row0, n);
             let yr: Vec<&GpuTensor> = ys.iter().collect();
-            gpu.gemm_mq4g256v2_verify_fp8_prepacked(case.fam.op(), t, &case.w, &xq, &yr, &case.ms, k, n)
+            gpu.gemm_mq4g256v2_verify_fp8_prepacked(
+                case.fam.op(),
+                t,
+                &case.w,
+                &xq,
+                &yr,
+                &case.ms,
+                k,
+                n,
+            )
         }
         Kind::Prod => {
             gpu.fp8_verify_scope = true;
@@ -233,7 +288,9 @@ fn launch(gpu: &mut Gpu, case: &Case, kind: Kind, x: &GpuTensor, panel: &Panel, 
 }
 
 fn hash3(a: u64, b: u64, c: u64) -> u64 {
-    let mut h = a.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ b.wrapping_mul(0xC2B2_AE3D_27D4_EB4F) ^ c.wrapping_mul(0x1656_67B1_9E37_79F9);
+    let mut h = a.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ b.wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
+        ^ c.wrapping_mul(0x1656_67B1_9E37_79F9);
     h ^= h >> 33;
     h = h.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
     h ^= h >> 33;
@@ -325,7 +382,11 @@ struct Outs {
 }
 
 fn alloc_outs(gpu: &mut Gpu, case: &Case, seed: u64) -> R<Outs> {
-    let mut o = Outs { y: Vec::new(), init_dev: Vec::new(), init: Vec::new() };
+    let mut o = Outs {
+        y: Vec::new(),
+        init_dev: Vec::new(),
+        init: Vec::new(),
+    };
     for (i, &m) in case.ms.iter().enumerate() {
         let init = gen_init(seed, i, m, case.resid());
         let n = NMAX * m + CANARY;
@@ -381,11 +442,21 @@ fn expect(refb: &[Vec<u8>], init: &[Vec<u8>], ms: &[usize], n: usize) -> Vec<Vec
         .collect()
 }
 
-fn matches_prefix(got: &[Vec<u8>], refb: &[Vec<u8>], init: &[Vec<u8>], ms: &[usize], n: usize) -> bool {
-    got.iter().zip(refb).zip(init).zip(ms).all(|(((g, r), i), &m)| {
-        let cut = n * m * 4;
-        g[..cut] == r[..cut] && g[cut..] == i[cut..]
-    })
+fn matches_prefix(
+    got: &[Vec<u8>],
+    refb: &[Vec<u8>],
+    init: &[Vec<u8>],
+    ms: &[usize],
+    n: usize,
+) -> bool {
+    got.iter()
+        .zip(refb)
+        .zip(init)
+        .zip(ms)
+        .all(|(((g, r), i), &m)| {
+            let cut = n * m * 4;
+            g[..cut] == r[..cut] && g[cut..] == i[cut..]
+        })
 }
 
 fn first_diff(got: &[Vec<u8>], want: &[Vec<u8>], ms: &[usize]) -> Option<String> {
@@ -399,7 +470,11 @@ fn first_diff(got: &[Vec<u8>], want: &[Vec<u8>], ms: &[usize]) -> Option<String>
             if gc != wc {
                 total += 1;
                 if first.is_none() {
-                    let (r, c) = if wi < NMAX * m { (format!("{}", wi / m), format!("{}", wi % m)) } else { ("canary".into(), format!("{}", wi - NMAX * m)) };
+                    let (r, c) = if wi < NMAX * m {
+                        (format!("{}", wi / m), format!("{}", wi % m))
+                    } else {
+                        ("canary".into(), format!("{}", wi - NMAX * m))
+                    };
                     first = Some(format!(
                         "out{o} batchrow {r} outrow {c}: got {:08x} want {:08x}",
                         u32::from_le_bytes(gc.try_into().unwrap()),
@@ -437,7 +512,16 @@ impl Report {
     }
     /// Complete-buffer compare against the reference rows [0, n) + untouched rest.
     #[allow(clippy::too_many_arguments)]
-    fn cmp_prefix(&mut self, group: &'static str, tag: &str, got: &[Vec<u8>], refb: &[Vec<u8>], init: &[Vec<u8>], ms: &[usize], n: usize) -> bool {
+    fn cmp_prefix(
+        &mut self,
+        group: &'static str,
+        tag: &str,
+        got: &[Vec<u8>],
+        refb: &[Vec<u8>],
+        init: &[Vec<u8>],
+        ms: &[usize],
+        n: usize,
+    ) -> bool {
         if matches_prefix(got, refb, init, ms, n) {
             return self.tally(group, true, tag.to_string());
         }
@@ -445,14 +529,24 @@ impl Report {
         let d = first_diff(got, &want, ms).unwrap_or_else(|| "mismatch".into());
         self.tally(group, false, format!("{tag}: {d}"))
     }
-    fn cmp_want(&mut self, group: &'static str, tag: &str, got: &[Vec<u8>], want: &[Vec<u8>], ms: &[usize]) -> bool {
+    fn cmp_want(
+        &mut self,
+        group: &'static str,
+        tag: &str,
+        got: &[Vec<u8>],
+        want: &[Vec<u8>],
+        ms: &[usize],
+    ) -> bool {
         match first_diff(got, want, ms) {
             None => self.tally(group, true, tag.to_string()),
             Some(d) => self.tally(group, false, format!("{tag}: {d}")),
         }
     }
     fn gated_fails(&self) -> usize {
-        ["rows", "perm", "graph", "pack"].iter().map(|g| self.groups.get(g).map_or(0, |e| e.1)).sum()
+        ["rows", "perm", "graph", "pack"]
+            .iter()
+            .map(|g| self.groups.get(g).map_or(0, |e| e.1))
+            .sum()
     }
 }
 
@@ -463,11 +557,18 @@ fn median(v: &mut [f64]) -> f64 {
 
 /// Numeric distance of `got` from `want` over rows [0, NMAX) of every output
 /// (finite pairs; for residual outputs the init is subtracted from both).
-fn distance(got: &[Vec<u8>], want: &[Vec<u8>], init: &[Vec<u8>], ms: &[usize], residual: bool) -> (f64, f64, usize) {
+fn distance(
+    got: &[Vec<u8>],
+    want: &[Vec<u8>],
+    init: &[Vec<u8>],
+    ms: &[usize],
+    residual: bool,
+) -> (f64, f64, usize) {
     let (mut num, mut den, mut nonfinite) = (0f64, 0f64, 0usize);
     for ((g, w), (i, &m)) in got.iter().zip(want).zip(init.iter().zip(ms)) {
         for idx in 0..NMAX * m {
-            let f = |b: &[u8]| f32::from_le_bytes(b[idx * 4..idx * 4 + 4].try_into().unwrap()) as f64;
+            let f =
+                |b: &[u8]| f32::from_le_bytes(b[idx * 4..idx * 4 + 4].try_into().unwrap()) as f64;
             let base = if residual { f(i) } else { 0.0 };
             let (a, b) = (f(g) - base, f(w) - base);
             if !a.is_finite() || !b.is_finite() {
@@ -507,7 +608,11 @@ fn e4m3(b: u8) -> f64 {
     if e == 0xF && m == 7.0 {
         return f64::NAN;
     }
-    s * if e == 0 { m / 8.0 * 2f64.powi(-6) } else { (1.0 + m / 8.0) * 2f64.powi(e - 7) }
+    s * if e == 0 {
+        m / 8.0 * 2f64.powi(-6)
+    } else {
+        (1.0 + m / 8.0) * 2f64.powi(e - 7)
+    }
 }
 
 /// Copy `bytes` from a raw device address into `scratch` and read them back.
@@ -515,7 +620,10 @@ fn snap(gpu: &mut Gpu, scratch: &GpuTensor, src: *mut c_void, bytes: usize) -> R
     gpu.hip.device_synchronize()?;
     // SAFETY: `src` is a live pack buffer of this Gpu holding at least `bytes`;
     // `scratch` is a distinct allocation of at least that size.
-    unsafe { gpu.hip.memcpy_dtod_raw(scratch.buf.as_ptr(), src as *const c_void, bytes)? };
+    unsafe {
+        gpu.hip
+            .memcpy_dtod_raw(scratch.buf.as_ptr(), src as *const c_void, bytes)?
+    };
     gpu.hip.device_synchronize()?;
     let mut v = vec![0u8; bytes];
     gpu.hip.memcpy_dtoh_at(&mut v, &scratch.buf, 0)?;
@@ -538,8 +646,10 @@ fn fill_panel(gpu: &mut Gpu, panel: &Panel, x: &GpuTensor, k: usize) -> R<()> {
     // SAFETY: pack buffers are live until the next pack; destinations are the
     // owned panel allocations sized for NMAX*kmax bytes / NMAX words.
     unsafe {
-        gpu.hip.memcpy_dtod_raw(panel.x8.buf.as_ptr(), px.x8 as *const c_void, NMAX * k)?;
-        gpu.hip.memcpy_dtod_raw(panel.s.buf.as_ptr(), px.scales as *const c_void, NMAX * 4)?;
+        gpu.hip
+            .memcpy_dtod_raw(panel.x8.buf.as_ptr(), px.x8 as *const c_void, NMAX * k)?;
+        gpu.hip
+            .memcpy_dtod_raw(panel.s.buf.as_ptr(), px.scales as *const c_void, NMAX * 4)?;
     }
     gpu.hip.device_synchronize()?;
     Ok(())
@@ -548,7 +658,14 @@ fn fill_panel(gpu: &mut Gpu, panel: &Panel, x: &GpuTensor, k: usize) -> R<()> {
 /// CPU f64 reference of the contract arithmetic on sampled weight rows vs the
 /// GPU singleton reference buffers. Returns (max token rel-L2 outside the tiny
 /// row class, its token, max token rel-L2 over the tiny class, rows sampled).
-fn cpu_reference(gpu: &mut Gpu, case: &Case, x8: &[u8], scales: &[f32], refb: &[Vec<u8>], init: &[Vec<u8>]) -> R<(f64, usize, f64, usize)> {
+fn cpu_reference(
+    gpu: &mut Gpu,
+    case: &Case,
+    x8: &[u8],
+    scales: &[f32],
+    refb: &[Vec<u8>],
+    init: &[Vec<u8>],
+) -> R<(f64, usize, f64, usize)> {
     let k = case.k;
     let lut: Vec<f64> = (0..256).map(|b| e4m3(b as u8)).collect();
     let xdec: Vec<f64> = x8[..NMAX * k].iter().map(|&b| lut[b as usize]).collect();
@@ -557,7 +674,10 @@ fn cpu_reference(gpu: &mut Gpu, case: &Case, x8: &[u8], scales: &[f32], refb: &[
     let mut den = vec![0f64; NMAX];
     let mut rows_total = 0usize;
     for (oi, &m) in case.ms.iter().enumerate() {
-        let mut rows: Vec<usize> = [0usize, 1, 2, 3, m.saturating_sub(1), m.saturating_sub(2)].iter().map(|&r| r.min(m - 1)).collect();
+        let mut rows: Vec<usize> = [0usize, 1, 2, 3, m.saturating_sub(1), m.saturating_sub(2)]
+            .iter()
+            .map(|&r| r.min(m - 1))
+            .collect();
         for i in 0..CPU_ROWS - rows.len().min(CPU_ROWS) {
             rows.push((hash3(0xC0FFEE, oi as u64, i as u64) % m as u64) as usize);
         }
@@ -566,7 +686,8 @@ fn cpu_reference(gpu: &mut Gpu, case: &Case, x8: &[u8], scales: &[f32], refb: &[
         for &r in &rows {
             rows_total += 1;
             let mut rb = vec![0u8; row_bytes];
-            gpu.hip.memcpy_dtoh_at(&mut rb, &case.w[oi].buf, r * row_bytes)?;
+            gpu.hip
+                .memcpy_dtoh_at(&mut rb, &case.w[oi].buf, r * row_bytes)?;
             let mut t_acc = vec![0f64; NMAX];
             for g in 0..k / 256 {
                 let base = g * 136;
@@ -594,7 +715,11 @@ fn cpu_reference(gpu: &mut Gpu, case: &Case, x8: &[u8], scales: &[f32], refb: &[
             for t in 0..NMAX {
                 let idx = (t * m + r) * 4;
                 let got = f32::from_le_bytes(refb[oi][idx..idx + 4].try_into().unwrap()) as f64;
-                let yold = if case.resid() { f32::from_le_bytes(init[oi][idx..idx + 4].try_into().unwrap()) as f64 } else { 0.0 };
+                let yold = if case.resid() {
+                    f32::from_le_bytes(init[oi][idx..idx + 4].try_into().unwrap()) as f64
+                } else {
+                    0.0
+                };
                 let want = yold + scales[t] as f64 * t_acc[t];
                 let d = got - want;
                 num[t] += if d.is_nan() { f64::INFINITY } else { d * d };
@@ -636,7 +761,12 @@ struct Args {
 }
 
 fn parse_args() -> R<Args> {
-    let list = |v: &str| v.split(',').filter(|s| !s.is_empty()).map(String::from).collect::<Vec<_>>();
+    let list = |v: &str| {
+        v.split(',')
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect::<Vec<_>>()
+    };
     let mut a = Args {
         model: DEFAULT_MODEL.into(),
         out: String::new(),
@@ -709,10 +839,21 @@ fn run() -> R<usize> {
     if gpu.arch != "gfx1201" {
         return Err(format!("gfx1201 required, got {}", gpu.arch).into());
     }
-    let mut env: Vec<String> = std::env::vars().filter(|(k, _)| k.starts_with("HIPFIRE_") || k.starts_with("HIP_") || k.starts_with("ROCR_") || k.starts_with("HSA_")).map(|(k, v)| format!("{k}={v}")).collect();
+    let mut env: Vec<String> = std::env::vars()
+        .filter(|(k, _)| {
+            k.starts_with("HIPFIRE_")
+                || k.starts_with("HIP_")
+                || k.starts_with("ROCR_")
+                || k.starts_with("HSA_")
+        })
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
     env.sort();
     rep.line(format!("env {env:?}"));
-    rep.line(format!("flags cb_verify_fp8={} cb_verify_pm={} {:?}", gpu.flags.cb_verify_fp8, gpu.flags.cb_verify_pm, gpu.flags));
+    rep.line(format!(
+        "flags cb_verify_fp8={} cb_verify_pm={} {:?}",
+        gpu.flags.cb_verify_fp8, gpu.flags.cb_verify_pm, gpu.flags
+    ));
     rep.line(format!(
         "args ops={:?} seeds={:?} tests={:?} reps={} warm={} tile_sweep={}",
         args.ops, args.seeds, args.tests, args.reps, args.warm, args.tile_sweep
@@ -722,7 +863,17 @@ fn run() -> R<usize> {
     {
         let exe = std::env::current_exe()?;
         let sha = hex(&Sha256::digest(std::fs::read(&exe)?));
-        let git = cmd_out("git", &["-C", env!("CARGO_MANIFEST_DIR"), "describe", "--always", "--dirty", "--tags"]);
+        let git = cmd_out(
+            "git",
+            &[
+                "-C",
+                env!("CARGO_MANIFEST_DIR"),
+                "describe",
+                "--always",
+                "--dirty",
+                "--tags",
+            ],
+        );
         let mut id = String::new();
         let _ = writeln!(id, "binary {}", exe.display());
         let _ = writeln!(id, "binary_sha256 {sha}");
@@ -741,8 +892,14 @@ fn run() -> R<usize> {
     let mut lc = LoadCtx {
         path: &args.model,
         max_seq: 4096,
-        sequence: Some(SequenceHint { model_ctx: 4096, automatic: true, card_cap: 0 }),
+        sequence: Some(SequenceHint {
+            model_ctx: 4096,
+            automatic: true,
+            card_cap: 0,
+        }),
         deepseek4_compute_placement: Default::default(),
+        dory_loops: None,
+        dory_recurrent_kv_cache_mode: None,
         deepseek4_experts_per_token: None,
         draft_path: None,
         vision_path: None,
@@ -769,27 +926,123 @@ fn run() -> R<usize> {
     let b = load_qwen35_bundle(src, &mut lc).map_err(|e| e.to_string())?;
     rep.line(format!("mq4v2_symmetric={}", gpu.mq4v2_symmetric));
     if !gpu.mq4v2_symmetric {
-        return Err("model is not MQ4G256V2 symmetric (FP8 verify requires symmetric weights)".into());
+        return Err(
+            "model is not MQ4G256V2 symmetric (FP8 verify requires symmetric weights)".into(),
+        );
     }
-    let n_dn = b.weights.layers.iter().filter(|l| matches!(l, LayerWeights::DeltaNet(_))).count();
-    let n_fa = b.weights.layers.iter().filter(|l| matches!(l, LayerWeights::FullAttn(_))).count();
-    let dn = b.weights.layers.iter().find_map(|l| if let LayerWeights::DeltaNet(d) = l { Some(d) } else { None }).ok_or("no DeltaNet layer")?;
-    let fa = b.weights.layers.iter().find_map(|l| if let LayerWeights::FullAttn(f) = l { Some(f) } else { None }).ok_or("no FullAttn layer")?;
+    let n_dn = b
+        .weights
+        .layers
+        .iter()
+        .filter(|l| matches!(l, LayerWeights::DeltaNet(_)))
+        .count();
+    let n_fa = b
+        .weights
+        .layers
+        .iter()
+        .filter(|l| matches!(l, LayerWeights::FullAttn(_)))
+        .count();
+    let dn = b
+        .weights
+        .layers
+        .iter()
+        .find_map(|l| {
+            if let LayerWeights::DeltaNet(d) = l {
+                Some(d)
+            } else {
+                None
+            }
+        })
+        .ok_or("no DeltaNet layer")?;
+    let fa = b
+        .weights
+        .layers
+        .iter()
+        .find_map(|l| {
+            if let LayerWeights::FullAttn(f) = l {
+                Some(f)
+            } else {
+                None
+            }
+        })
+        .ok_or("no FullAttn layer")?;
     let kd = b.config.dim;
     let all = vec![
-        Case { name: "qkvza", fam: Fam::Qkvza, w: vec![&dn.wqkv.buf, &dn.wz.buf, &dn.w_beta.buf, &dn.w_alpha.buf], ms: vec![dn.wqkv.m, dn.wz.m, dn.w_beta.m, dn.w_alpha.m], k: kd, layers: n_dn, in_step: true },
-        Case { name: "dn_o", fam: Fam::Residual, w: vec![&dn.wo.buf], ms: vec![dn.wo.m], k: dn.wo.k, layers: n_dn, in_step: true },
-        Case { name: "gate_up", fam: Fam::GateUp, w: vec![&dn.w_gate.buf, &dn.w_up.buf], ms: vec![dn.w_gate.m, dn.w_up.m], k: kd, layers: n_dn + n_fa, in_step: true },
-        Case { name: "down", fam: Fam::Residual, w: vec![&dn.w_down.buf], ms: vec![dn.w_down.m], k: dn.w_down.k, layers: n_dn + n_fa, in_step: true },
-        Case { name: "qkv", fam: Fam::Qkv, w: vec![&fa.wq.buf, &fa.wk.buf, &fa.wv.buf], ms: vec![fa.wq.m, fa.wk.m, fa.wv.m], k: kd, layers: n_fa, in_step: true },
-        Case { name: "fa_o", fam: Fam::Residual, w: vec![&fa.wo.buf], ms: vec![fa.wo.m], k: fa.wo.k, layers: n_fa, in_step: true },
-        Case { name: "lm_head", fam: Fam::Head, w: vec![&b.weights.output.buf], ms: vec![b.weights.output.m], k: kd, layers: 1, in_step: false },
+        Case {
+            name: "qkvza",
+            fam: Fam::Qkvza,
+            w: vec![&dn.wqkv.buf, &dn.wz.buf, &dn.w_beta.buf, &dn.w_alpha.buf],
+            ms: vec![dn.wqkv.m, dn.wz.m, dn.w_beta.m, dn.w_alpha.m],
+            k: kd,
+            layers: n_dn,
+            in_step: true,
+        },
+        Case {
+            name: "dn_o",
+            fam: Fam::Residual,
+            w: vec![&dn.wo.buf],
+            ms: vec![dn.wo.m],
+            k: dn.wo.k,
+            layers: n_dn,
+            in_step: true,
+        },
+        Case {
+            name: "gate_up",
+            fam: Fam::GateUp,
+            w: vec![&dn.w_gate.buf, &dn.w_up.buf],
+            ms: vec![dn.w_gate.m, dn.w_up.m],
+            k: kd,
+            layers: n_dn + n_fa,
+            in_step: true,
+        },
+        Case {
+            name: "down",
+            fam: Fam::Residual,
+            w: vec![&dn.w_down.buf],
+            ms: vec![dn.w_down.m],
+            k: dn.w_down.k,
+            layers: n_dn + n_fa,
+            in_step: true,
+        },
+        Case {
+            name: "qkv",
+            fam: Fam::Qkv,
+            w: vec![&fa.wq.buf, &fa.wk.buf, &fa.wv.buf],
+            ms: vec![fa.wq.m, fa.wk.m, fa.wv.m],
+            k: kd,
+            layers: n_fa,
+            in_step: true,
+        },
+        Case {
+            name: "fa_o",
+            fam: Fam::Residual,
+            w: vec![&fa.wo.buf],
+            ms: vec![fa.wo.m],
+            k: fa.wo.k,
+            layers: n_fa,
+            in_step: true,
+        },
+        Case {
+            name: "lm_head",
+            fam: Fam::Head,
+            w: vec![&b.weights.output.buf],
+            ms: vec![b.weights.output.m],
+            k: kd,
+            layers: 1,
+            in_step: false,
+        },
     ];
     for c in &all {
         let dts: Vec<String> = c.w.iter().map(|t| format!("{:?}", t.dtype)).collect();
         rep.line(format!(
             "shape {} fam={:?} ms={:?} total_m={} k={} layers={} weight_MB={:.1} dtype={dts:?}",
-            c.name, c.fam, c.ms, c.total_m(), c.k, c.layers, c.weight_bytes() as f64 / 1e6
+            c.name,
+            c.fam,
+            c.ms,
+            c.total_m(),
+            c.k,
+            c.layers,
+            c.weight_bytes() as f64 / 1e6
         ));
         if c.k % 256 != 0 {
             return Err(format!("{}: K {} not a multiple of 256", c.name, c.k).into());
@@ -805,11 +1058,18 @@ fn run() -> R<usize> {
             return Err(format!("unknown op {o}").into());
         }
     }
-    let cases: Vec<&Case> = all.iter().filter(|c| args.ops.iter().any(|o| o == c.name)).collect();
+    let cases: Vec<&Case> = all
+        .iter()
+        .filter(|c| args.ops.iter().any(|o| o == c.name))
+        .collect();
     let kmax = cases.iter().map(|c| c.k).max().unwrap_or(kd);
     let x = gpu.zeros(&[NMAX * kmax], DType::F32)?;
     let mk_panel = |gpu: &mut Gpu, k: usize| -> R<Panel> {
-        Ok(Panel { x8: gpu.zeros(&[(NMAX * kmax) / 4 + 1], DType::F32)?, s: gpu.zeros(&[NMAX], DType::F32)?, k })
+        Ok(Panel {
+            x8: gpu.zeros(&[(NMAX * kmax) / 4 + 1], DType::F32)?,
+            s: gpu.zeros(&[NMAX], DType::F32)?,
+            k,
+        })
     };
     let mut panel = mk_panel(&mut gpu, kmax)?;
     let mut digests = String::from("# shape seed N per-output word-digests (production entry, scope on); ref16 = singleton reference\n");
@@ -839,7 +1099,10 @@ fn run() -> R<usize> {
                     let oks = ls == os;
                     let detail = |what: &str, a: &[u8], b: &[u8]| -> String {
                         match a.iter().zip(b).position(|(p, q)| p != q) {
-                            Some(i) => format!("{what} first diff byte {i}: lean {:02x} existing {:02x}", a[i], b[i]),
+                            Some(i) => format!(
+                                "{what} first diff byte {i}: lean {:02x} existing {:02x}",
+                                a[i], b[i]
+                            ),
                             None => String::new(),
                         }
                     };
@@ -847,7 +1110,8 @@ fn run() -> R<usize> {
                     if okx && oks {
                         rep.tally("pack", true, tag);
                     } else {
-                        let d = format!("{} {}", detail("x8", &lx, &ox), detail("scales", &ls, &os));
+                        let d =
+                            format!("{} {}", detail("x8", &lx, &ox), detail("scales", &ls, &os));
                         rep.tally("pack", false, format!("{tag}: {d}"));
                     }
                 }
@@ -874,21 +1138,59 @@ fn run() -> R<usize> {
             // Singleton reference: tile (1,1), 16-row chunks at row offsets.
             reset(&mut gpu, &outs)?;
             for c in 0..NMAX / 16 {
-                launch(&mut gpu, case, Kind::Pre(Some(tile(1, 1))), &x, &panel, &outs.y, c * 16, 16)?;
+                launch(
+                    &mut gpu,
+                    case,
+                    Kind::Pre(Some(tile(1, 1))),
+                    &x,
+                    &panel,
+                    &outs.y,
+                    c * 16,
+                    16,
+                )?;
             }
             let refb = read(&mut gpu, &outs)?;
             reset(&mut gpu, &outs)?;
             for c in 0..NMAX / 16 {
-                launch(&mut gpu, case, Kind::Pre(Some(tile(1, 1))), &x, &panel, &outs.y, c * 16, 16)?;
+                launch(
+                    &mut gpu,
+                    case,
+                    Kind::Pre(Some(tile(1, 1))),
+                    &x,
+                    &panel,
+                    &outs.y,
+                    c * 16,
+                    16,
+                )?;
             }
             let got = read(&mut gpu, &outs)?;
-            rep.cmp_prefix("rows", &tag("rows", "ref16 rerun"), &got, &refb, &outs.init, ms, NMAX);
+            rep.cmp_prefix(
+                "rows",
+                &tag("rows", "ref16 rerun"),
+                &got,
+                &refb,
+                &outs.init,
+                ms,
+                NMAX,
+            );
             // Reference must have written every row (no sentinel left in rows < NMAX).
-            let untouched = refb.iter().zip(ms).any(|(r, &m)| r[..NMAX * m * 4].chunks_exact(4).any(|w| w == SENTINEL.to_le_bytes()) && !case.resid());
-            rep.tally("rows", !untouched, tag("rows", "ref16 wrote every output word"));
+            let untouched = refb.iter().zip(ms).any(|(r, &m)| {
+                r[..NMAX * m * 4]
+                    .chunks_exact(4)
+                    .any(|w| w == SENTINEL.to_le_bytes())
+                    && !case.resid()
+            });
+            rep.tally(
+                "rows",
+                !untouched,
+                tag("rows", "ref16 wrote every output word"),
+            );
             let rh: Vec<String> = refb.iter().map(|r| format!("{:016x}", digest(r))).collect();
             let xh = digest(&xv.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>());
-            rep.line(format!("{} x_digest={xh:016x} ref16_digest={rh:?}", tag("inputs", "")));
+            rep.line(format!(
+                "{} x_digest={xh:016x} ref16_digest={rh:?}",
+                tag("inputs", "")
+            ));
             let _ = writeln!(digests, "{} {seed} ref16 {}", case.name, rh.join(","));
 
             if has("rows") {
@@ -897,22 +1199,56 @@ fn run() -> R<usize> {
                     reset(&mut gpu, &outs)?;
                     launch(&mut gpu, case, Kind::Prod, &x, &panel, &outs.y, 0, n)?;
                     let got = read(&mut gpu, &outs)?;
-                    let d: Vec<String> = got.iter().map(|g| format!("{:016x}", digest(g))).collect();
+                    let d: Vec<String> =
+                        got.iter().map(|g| format!("{:016x}", digest(g))).collect();
                     let _ = writeln!(digests, "{} {seed} {n} {}", case.name, d.join(","));
-                    rep.cmp_prefix("rows", &tag("rows", &format!("prod N={n}")), &got, &refb, &outs.init, ms, n);
+                    rep.cmp_prefix(
+                        "rows",
+                        &tag("rows", &format!("prod N={n}")),
+                        &got,
+                        &refb,
+                        &outs.init,
+                        ms,
+                        n,
+                    );
                 }
                 // Direct `_verify_fp8` entries.
                 for n in [1usize, 16, 17, 33, 64, 65, 100, 128] {
                     reset(&mut gpu, &outs)?;
                     launch(&mut gpu, case, Kind::Direct, &x, &panel, &outs.y, 0, n)?;
-                    rep.cmp_prefix("rows", &tag("rows", &format!("direct N={n}")), &read(&mut gpu, &outs)?, &refb, &outs.init, ms, n);
+                    rep.cmp_prefix(
+                        "rows",
+                        &tag("rows", &format!("direct N={n}")),
+                        &read(&mut gpu, &outs)?,
+                        &refb,
+                        &outs.init,
+                        ms,
+                        n,
+                    );
                 }
                 // Explicit tiles, pre-packed.
                 for &(bt, w) in &TILES {
                     for n in [1usize, 16, 17, 33, 65, 100, 128] {
                         reset(&mut gpu, &outs)?;
-                        launch(&mut gpu, case, Kind::Pre(Some(tile(bt, w))), &x, &panel, &outs.y, 0, n)?;
-                        rep.cmp_prefix("rows", &tag("rows", &format!("tile ({bt},{w}) N={n}")), &read(&mut gpu, &outs)?, &refb, &outs.init, ms, n);
+                        launch(
+                            &mut gpu,
+                            case,
+                            Kind::Pre(Some(tile(bt, w))),
+                            &x,
+                            &panel,
+                            &outs.y,
+                            0,
+                            n,
+                        )?;
+                        rep.cmp_prefix(
+                            "rows",
+                            &tag("rows", &format!("tile ({bt},{w}) N={n}")),
+                            &read(&mut gpu, &outs)?,
+                            &refb,
+                            &outs.init,
+                            ms,
+                            n,
+                        );
                     }
                 }
                 // Chunkings at row offsets (production entry per chunk).
@@ -927,15 +1263,34 @@ fn run() -> R<usize> {
                     for &(r0, n) in ch {
                         launch(&mut gpu, case, Kind::Prod, &x, &panel, &outs.y, r0, n)?;
                     }
-                    rep.cmp_prefix("rows", &tag("rows", &format!("chunks prod {name}")), &read(&mut gpu, &outs)?, &refb, &outs.init, ms, NMAX);
+                    rep.cmp_prefix(
+                        "rows",
+                        &tag("rows", &format!("chunks prod {name}")),
+                        &read(&mut gpu, &outs)?,
+                        &refb,
+                        &outs.init,
+                        ms,
+                        NMAX,
+                    );
                 }
                 // One-row launches.
-                for (name, kind) in [("prod", Kind::Prod), ("tile(8,8) prepacked", Kind::Pre(Some(tile(8, 8))))] {
+                for (name, kind) in [
+                    ("prod", Kind::Prod),
+                    ("tile(8,8) prepacked", Kind::Pre(Some(tile(8, 8)))),
+                ] {
                     reset(&mut gpu, &outs)?;
                     for r in 0..NMAX {
                         launch(&mut gpu, case, kind, &x, &panel, &outs.y, r, 1)?;
                     }
-                    rep.cmp_prefix("rows", &tag("rows", &format!("one-row x128 {name}")), &read(&mut gpu, &outs)?, &refb, &outs.init, ms, NMAX);
+                    rep.cmp_prefix(
+                        "rows",
+                        &tag("rows", &format!("one-row x128 {name}")),
+                        &read(&mut gpu, &outs)?,
+                        &refb,
+                        &outs.init,
+                        ms,
+                        NMAX,
+                    );
                 }
             }
 
@@ -963,7 +1318,13 @@ fn run() -> R<usize> {
                     }
                     launch(&mut gpu, case, Kind::Prod, &x, &panel, &outs.y, 0, n)?;
                     let got = read(&mut gpu, &outs)?;
-                    rep.cmp_want("perm", &tag("perm", &format!("prod N={n} permuted rows")), &got, &want, ms);
+                    rep.cmp_want(
+                        "perm",
+                        &tag("perm", &format!("prod N={n} permuted rows")),
+                        &got,
+                        &want,
+                        ms,
+                    );
                 }
                 load_x(&mut gpu, &x, &xv)?;
             }
@@ -988,10 +1349,22 @@ fn run() -> R<usize> {
                         launch(&mut gpu, case, Kind::Prod, &x, &panel, &outs.y, r0, n)?;
                     }
                     let eager = read(&mut gpu, &outs)?;
-                    let eager_ok = rep.cmp_prefix("graph", &tag("graph", &format!("{name} eager (prewarm)")), &eager, &refb, &outs.init, ms, n_total);
+                    let eager_ok = rep.cmp_prefix(
+                        "graph",
+                        &tag("graph", &format!("{name} eager (prewarm)")),
+                        &eager,
+                        &refb,
+                        &outs.init,
+                        ms,
+                        n_total,
+                    );
                     reset(&mut gpu, &outs)?;
                     let dev = gpu.device_id;
-                    gpu.graphs.begin_graph_capture(&gpu.hip, dev, gpu.active_stream.as_ref().unwrap())?;
+                    gpu.graphs.begin_graph_capture(
+                        &gpu.hip,
+                        dev,
+                        gpu.active_stream.as_ref().unwrap(),
+                    )?;
                     let mut lr: R<()> = Ok(());
                     for &(r0, n) in ch {
                         lr = launch(&mut gpu, case, Kind::Prod, &x, &panel, &outs.y, r0, n);
@@ -999,24 +1372,52 @@ fn run() -> R<usize> {
                             break;
                         }
                     }
-                    let er = gpu.graphs.end_graph_capture(&gpu.hip, dev, gpu.active_stream.as_ref().unwrap());
+                    let er = gpu.graphs.end_graph_capture(
+                        &gpu.hip,
+                        dev,
+                        gpu.active_stream.as_ref().unwrap(),
+                    );
                     lr?;
                     er?;
                     // Capture must not have executed anything.
                     let not_run = first_diff(&read(&mut gpu, &outs)?, &outs.init, ms).is_none();
-                    rep.tally("graph", not_run, tag("graph", &format!("{name} capture executed nothing")));
+                    rep.tally(
+                        "graph",
+                        not_run,
+                        tag("graph", &format!("{name} capture executed nothing")),
+                    );
                     let mut all_ok = eager_ok && not_run;
                     for i in 0..2 {
                         reset(&mut gpu, &outs)?;
-                        gpu.graphs.graph_launch(&gpu.hip, dev, gpu.active_stream.as_ref().unwrap())?;
+                        gpu.graphs.graph_launch(
+                            &gpu.hip,
+                            dev,
+                            gpu.active_stream.as_ref().unwrap(),
+                        )?;
                         let got = read(&mut gpu, &outs)?;
-                        all_ok &= rep.cmp_prefix("graph", &tag("graph", &format!("{name} replay{i} == eager bytes")), &got, &eager, &outs.init, ms, n_total);
+                        all_ok &= rep.cmp_prefix(
+                            "graph",
+                            &tag("graph", &format!("{name} replay{i} == eager bytes")),
+                            &got,
+                            &eager,
+                            &outs.init,
+                            ms,
+                            n_total,
+                        );
                     }
                     gpu.hip.device_synchronize()?;
                     gpu.graphs.drop_captured_graph(&gpu.hip, dev);
                     let s = gpu.active_stream.take().unwrap();
                     gpu.hip.stream_destroy(s)?;
-                    rep.line(format!("{} {name} {}", tag("graph", "summary"), if all_ok { "eager+2 replays same" } else { "DIFF" }));
+                    rep.line(format!(
+                        "{} {name} {}",
+                        tag("graph", "summary"),
+                        if all_ok {
+                            "eager+2 replays same"
+                        } else {
+                            "DIFF"
+                        }
+                    ));
                 }
             }
 
@@ -1026,14 +1427,21 @@ fn run() -> R<usize> {
                 launch(&mut gpu, case, Kind::F16, &x, &panel, &outs.y, 0, NMAX)?;
                 let f16b = read(&mut gpu, &outs)?;
                 let (rel, abs, nf) = distance(&refb, &f16b, &outs.init, ms, case.resid());
-                rep.line(format!("{} fp8-vs-f16 rel_l2={rel:.3e} abs_l2={abs:.3e} nonfinite={nf}", tag("dist", "")));
+                rep.line(format!(
+                    "{} fp8-vs-f16 rel_l2={rel:.3e} abs_l2={abs:.3e} nonfinite={nf}",
+                    tag("dist", "")
+                ));
                 // CPU f64 reference of the contract arithmetic.
                 let mut x8 = vec![0u8; NMAX * k];
                 gpu.hip.memcpy_dtoh_at(&mut x8, &panel.x8.buf, 0)?;
                 let mut sb = vec![0u8; NMAX * 4];
                 gpu.hip.memcpy_dtoh_at(&mut sb, &panel.s.buf, 0)?;
-                let scales: Vec<f32> = sb.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
-                let (worst, wt, tiny, nrows) = cpu_reference(&mut gpu, case, &x8, &scales, &refb, &outs.init)?;
+                let scales: Vec<f32> = sb
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                    .collect();
+                let (worst, wt, tiny, nrows) =
+                    cpu_reference(&mut gpu, case, &x8, &scales, &refb, &outs.init)?;
                 let ok = worst <= CPU_TOL;
                 rep.tally(
                     "dist",
@@ -1073,14 +1481,28 @@ fn run() -> R<usize> {
             let floor_ms = case.weight_bytes() as f64 / (STREAM_GBS * 1e9) * 1e3;
             let tf = |ms: f64, n: usize| 2.0 * tm as f64 * n as f64 * k as f64 / (ms * 1e-3) / 1e12;
             let mut row = |kind: &str, n: usize, tl: &str, ms: f64| {
-                timing.push(format!("{kind},{},{n},{tl},{},{tm},{ms},{},{floor_ms},{}", case.name, case.layers, tf(ms, n), floor_ms / ms));
+                timing.push(format!(
+                    "{kind},{},{n},{tl},{},{tm},{ms},{},{floor_ms},{}",
+                    case.name,
+                    case.layers,
+                    tf(ms, n),
+                    floor_ms / ms
+                ));
             };
             for n in [16usize, 128] {
-                let f16cvt = time(&mut gpu, &mut |g| launch(g, case, Kind::F16, &x, &panel, &outs.y, 0, n))?;
+                let f16cvt = time(&mut gpu, &mut |g| {
+                    launch(g, case, Kind::F16, &x, &panel, &outs.y, 0, n)
+                })?;
                 gpu.invalidate_fp16_cache();
-                let f16 = time(&mut gpu, &mut |g| launch(g, case, Kind::F16Kept, &x, &panel, &outs.y, 0, n))?;
-                let fp8 = time(&mut gpu, &mut |g| launch(g, case, Kind::Prod, &x, &panel, &outs.y, 0, n))?;
-                let fp8g = time(&mut gpu, &mut |g| launch(g, case, Kind::Pre(None), &x, &panel, &outs.y, 0, n))?;
+                let f16 = time(&mut gpu, &mut |g| {
+                    launch(g, case, Kind::F16Kept, &x, &panel, &outs.y, 0, n)
+                })?;
+                let fp8 = time(&mut gpu, &mut |g| {
+                    launch(g, case, Kind::Prod, &x, &panel, &outs.y, 0, n)
+                })?;
+                let fp8g = time(&mut gpu, &mut |g| {
+                    launch(g, case, Kind::Pre(None), &x, &panel, &outs.y, 0, n)
+                })?;
                 let pt = fp8_verify_tile(n, tm);
                 rep.line(format!(
                     "time {} N={n} | f16 cvt+gemm {f16cvt:.4} ms ({:.1} TF, floor/t {:.2}) | f16 gemm {f16:.4} ms ({:.1} TF, {:.2}) | fp8 pack+gemm {fp8:.4} ms ({:.1} TF, {:.2}) | fp8 gemm {fp8g:.4} ms ({:.1} TF, {:.2}) tile ({},{}) | floor {floor_ms:.4} ms | x{} layers",
@@ -1092,10 +1514,22 @@ fn run() -> R<usize> {
                     pt.bt, pt.waves,
                     case.layers
                 ));
-                for (kind, v) in [("f16_cvt_gemm", f16cvt), ("f16_gemm", f16), ("fp8_pack_gemm", fp8), ("fp8_gemm", fp8g)] {
-                    let tl = if kind == "fp8_gemm" { format!("({}/{})", pt.bt, pt.waves) } else { String::new() };
+                for (kind, v) in [
+                    ("f16_cvt_gemm", f16cvt),
+                    ("f16_gemm", f16),
+                    ("fp8_pack_gemm", fp8),
+                    ("fp8_gemm", fp8g),
+                ] {
+                    let tl = if kind == "fp8_gemm" {
+                        format!("({}/{})", pt.bt, pt.waves)
+                    } else {
+                        String::new()
+                    };
                     row(kind, n, &tl, v);
-                    steps.entry((kind, n)).or_default().push((v, case.layers, case.in_step));
+                    steps
+                        .entry((kind, n))
+                        .or_default()
+                        .push((v, case.layers, case.in_step));
                 }
             }
             if args.tile_sweep {
@@ -1103,11 +1537,28 @@ fn run() -> R<usize> {
                     let pt = fp8_verify_tile(n, tm);
                     let mut parts = Vec::new();
                     for &(bt, w) in &TILES {
-                        let ms = time(&mut gpu, &mut |g| launch(g, case, Kind::Pre(Some(tile(bt, w))), &x, &panel, &outs.y, 0, n))?;
+                        let ms = time(&mut gpu, &mut |g| {
+                            launch(
+                                g,
+                                case,
+                                Kind::Pre(Some(tile(bt, w))),
+                                &x,
+                                &panel,
+                                &outs.y,
+                                0,
+                                n,
+                            )
+                        })?;
                         parts.push(format!("({bt},{w}) {ms:.4} ms {:.1} TF", tf(ms, n)));
                         row("tile", n, &format!("({bt}/{w})"), ms);
                     }
-                    rep.line(format!("tile-sweep {} N={n} production ({},{}) | {}", case.name, pt.bt, pt.waves, parts.join(" | ")));
+                    rep.line(format!(
+                        "tile-sweep {} N={n} production ({},{}) | {}",
+                        case.name,
+                        pt.bt,
+                        pt.waves,
+                        parts.join(" | ")
+                    ));
                 }
             }
             gpu.hip.event_destroy(e0)?;
@@ -1123,7 +1574,14 @@ fn run() -> R<usize> {
             let s6: f64 = six.iter().map(|e| e.0 * e.1 as f64).sum();
             let head: f64 = v.iter().filter(|e| !e.2).map(|e| e.0 * e.1 as f64).sum();
             let has_head = v.iter().any(|e| !e.2);
-            rep.line(format!("step {kind} N={n}: six shapes {s6:.3} ms{}", if has_head { format!(", with lm_head {:.3} ms", s6 + head) } else { String::new() }));
+            rep.line(format!(
+                "step {kind} N={n}: six shapes {s6:.3} ms{}",
+                if has_head {
+                    format!(", with lm_head {:.3} ms", s6 + head)
+                } else {
+                    String::new()
+                }
+            ));
             timing.push(format!("step6_{kind},STEP,{n},,1,0,{s6},,,"));
             if has_head {
                 timing.push(format!("step7_{kind},STEP,{n},,1,0,{},,,", s6 + head));
@@ -1131,7 +1589,8 @@ fn run() -> R<usize> {
         }
     }
     if !timing.is_empty() {
-        let mut csv = String::from("kind,shape,n,tile,layers,total_m,ms,tflops,floor_ms,floor_over_ms\n");
+        let mut csv =
+            String::from("kind,shape,n,tile,layers,total_m,ms,tflops,floor_ms,floor_over_ms\n");
         for r in &timing {
             csv.push_str(r);
             csv.push('\n');
@@ -1147,10 +1606,21 @@ fn run() -> R<usize> {
     ));
     std::fs::write(format!("{out}/digests.txt"), &digests)?;
     let gated = rep.gated_fails();
-    let summary: Vec<String> = rep.groups.iter().map(|(g, (c, f))| format!("{g}: {c} checks {f} fails")).collect();
+    let summary: Vec<String> = rep
+        .groups
+        .iter()
+        .map(|(g, (c, f))| format!("{g}: {c} checks {f} fails"))
+        .collect();
     rep.line(format!("checks {}", summary.join(" | ")));
-    rep.line(format!("gated fails {gated} (rows/perm/graph/pack); dist fails {} (diagnostic)", rep.groups.get("dist").map_or(0, |e| e.1)));
-    rep.line(if gated == 0 { "VERDICT PASS".into() } else { "VERDICT FAIL".into() });
+    rep.line(format!(
+        "gated fails {gated} (rows/perm/graph/pack); dist fails {} (diagnostic)",
+        rep.groups.get("dist").map_or(0, |e| e.1)
+    ));
+    rep.line(if gated == 0 {
+        "VERDICT PASS".into()
+    } else {
+        "VERDICT FAIL".into()
+    });
     std::fs::write(format!("{out}/report.txt"), &rep.text)?;
     gpu.free_tensor(x)?;
     gpu.free_tensor(panel.x8)?;

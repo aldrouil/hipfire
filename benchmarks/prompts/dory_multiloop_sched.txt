@@ -1,0 +1,220 @@
+You are implementing a complete, correct Python module. Repair and complete the
+starting implementation at the bottom of this prompt so that it satisfies the
+specification below EXACTLY. Only the Python standard library may be used.
+
+## 1. Purpose
+
+`jobsched` is a small dependency-aware job scheduler / state machine. Jobs are
+added with dependencies on other jobs; a job becomes ready only when every job
+it depends on has succeeded. Failures and cancellations propagate to
+dependents, failed jobs can retry a bounded number of times, and dependency
+cycles are rejected.
+
+## 2. Public API (exact)
+
+All names, parameters, and defaults below are normative. Do not add required
+parameters, do not rename anything, and do not change the meaning of any
+return value.
+
+```python
+class JobScheduler:
+    def __init__(self) -> None: ...
+    def add_job(self, job_id: str, priority: int = 0,
+                deps: tuple | list = (), max_retries: int = 0) -> None: ...
+    def add_dependency(self, job_id: str, dep_id: str) -> None: ...
+    def start(self, job_id: str) -> None: ...
+    def complete(self, job_id: str, ok: bool = True) -> None: ...
+    def cancel(self, job_id: str) -> None: ...
+    def status(self, job_id: str) -> str: ...
+    def attempts(self, job_id: str) -> int: ...
+    def ready_queue(self) -> list: ...
+```
+
+State names are the exact strings
+`"PENDING"`, `"READY"`, `"RUNNING"`, `"SUCCEEDED"`, `"FAILED"`, `"CANCELLED"`.
+
+Every misuse listed in this spec raises `ValueError` (never `KeyError`,
+`AssertionError`, or a silent no-op). `status()` and `attempts()` raise
+`ValueError` for an unknown `job_id`.
+
+## 3. Job admission
+
+- `job_id` must be a non-empty string. A duplicate `job_id` raises
+  `ValueError` with no state change.
+- `priority` must be an `int` (bools are not valid priorities); `max_retries`
+  must be an `int >= 0` (`True`/`False` are accepted as `1`/`0`, since only
+  `priority` excludes bools). Otherwise `ValueError`, no state change.
+- `deps` lists job ids the new job depends on. Every entry must name an
+  already-added job, otherwise `ValueError` with no state change. Duplicate
+  entries in `deps` are collapsed (they do not create duplicate edges).
+  Depending on itself raises `ValueError` (cycle), no state change.
+- The initial state of an admitted job is decided from its dependencies:
+  no dependencies, or all dependencies `SUCCEEDED` -> `READY`; any dependency
+  `FAILED` -> `FAILED`; else any dependency `CANCELLED` -> `CANCELLED`;
+  otherwise -> `PENDING`. (`FAILED` takes precedence over `CANCELLED`.)
+- Insertion order is recorded per job (a sequence number starting at 0 in
+  admission order) and is used for tie-breaking in `ready_queue()`.
+
+## 4. Dependencies after admission
+
+- `add_dependency(job_id, dep_id)` adds one edge: both ids must exist,
+  otherwise `ValueError`. It raises `ValueError` (no state change) when
+  `job_id == dep_id`, when the edge already exists, when `job_id` is in any
+  terminal state (`SUCCEEDED`, `FAILED`, `CANCELLED`), or when `job_id` is
+  `RUNNING`.
+- It raises `ValueError` (no state change) if the new edge would create a
+  dependency cycle of any length, including an indirect one
+  (e.g. A depends on B, B depends on C, then C depending on A is rejected).
+- After a legal edge is added, the dependent job is re-evaluated with the rule
+  in section 6 (so a `READY` job that gains an unfinished dependency goes back
+  to `PENDING`; one that gains a `FAILED` dependency goes to `FAILED`).
+
+## 5. Starting and completing
+
+- `start(job_id)` moves `READY` -> `RUNNING` and increments that job's attempt
+  counter by one. Calling it on a job in any other state (`PENDING`,
+  `RUNNING`, terminal), or on an unknown id, raises `ValueError` with no state
+  change. In particular a `PENDING` job is NEVER auto-promoted by `start`.
+- `complete(job_id, ok=True)` requires the job to be `RUNNING`, otherwise
+  `ValueError` with no state change.
+  - `ok=True`: the job becomes `SUCCEEDED`; then dependents are re-evaluated
+    (section 6), cascading transitively.
+  - `ok=False`: if the job still has retries left (`retries_left > 0`,
+    initialized to `max_retries`), decrement `retries_left` by one and
+    re-evaluate the job itself with the rule in section 6 (normally back to
+    `READY`, but `PENDING`/`FAILED`/`CANCELLED` if its dependencies no longer
+    all succeed); otherwise the job becomes `FAILED` and dependents are
+    re-evaluated, cascading transitively.
+- `attempts(job_id)` returns how many times `start()` has succeeded for that
+  job (0 for a never-started job).
+
+## 6. Dependent re-evaluation (propagation)
+
+Whenever a job enters `SUCCEEDED`, `FAILED`, or `CANCELLED` (including via
+retry exhaustion, cancellation, or edge addition), every direct dependent is
+recomputed, and any dependent that itself changes to a terminal state
+propagates further, transitively:
+
+- terminal dependents (`SUCCEEDED`, `FAILED`, `CANCELLED`) never change;
+- a non-terminal dependent with any `FAILED` dependency becomes `FAILED`;
+- else a non-terminal dependent with any `CANCELLED` dependency becomes
+  `CANCELLED`;
+- else a non-terminal dependent whose dependencies are all `SUCCEEDED`
+  becomes `READY`;
+- otherwise it becomes (or stays) `PENDING`.
+
+A `RUNNING` job's dependencies are necessarily all `SUCCEEDED` already, and
+`SUCCEEDED` never changes, so propagation never alters a `RUNNING` job.
+
+## 7. Cancellation
+
+- `cancel(job_id)` on a `PENDING`, `READY`, or `RUNNING` job moves it to
+  `CANCELLED` and propagates to dependents with section 6 (a dependent with no
+  `FAILED` dependency but a `CANCELLED` one becomes `CANCELLED`).
+- `cancel()` on a terminal job or an unknown id raises `ValueError` with no
+  state change.
+
+## 8. Ready queue
+
+- `ready_queue()` returns the ids of all jobs currently `READY`, ordered by
+  `(priority ascending, insertion sequence ascending)`. Smaller `priority`
+  integers mean more urgent (run first). Ties keep admission order (FIFO).
+  It returns a fresh list; mutating it must not affect the scheduler.
+
+## 9. Starting implementation (known to be buggy — repair it)
+
+The module below is incomplete and wrong: ordering is inverted, transitions
+are missing, retries are miscounted, propagation is absent, and cycle checks
+are shallow. Rewrite it into a fully correct module. Keep the exact public
+API of section 2.
+
+```python
+from collections import deque
+
+
+class JobScheduler:
+    PENDING = "PENDING"
+    READY = "READY"
+    RUNNING = "RUNNING"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+    def __init__(self):
+        self._jobs = {}
+        self._seq = 0
+
+    def _lookup(self, job_id):
+        return self._jobs[job_id]
+
+    def add_job(self, job_id, priority=0, deps=(), max_retries=0):
+        if job_id in self._jobs:
+            raise ValueError("duplicate job")
+        deps = list(deps or [])
+        if job_id in deps:
+            raise ValueError("cycle")
+        self._seq += 1
+        self._jobs[job_id] = {
+            "state": "PENDING",
+            "priority": priority,
+            "deps": deps,
+            "retries_left": max_retries,
+            "attempts": 0,
+            "seq": self._seq,
+        }
+        if not deps:
+            self._jobs[job_id]["state"] = "READY"
+
+    def add_dependency(self, job_id, dep_id):
+        job = self._lookup(job_id)
+        self._lookup(dep_id)
+        job["deps"].append(dep_id)
+
+    def start(self, job_id):
+        job = self._lookup(job_id)
+        if job["state"] not in ("READY", "PENDING"):
+            raise ValueError("not startable")
+        job["state"] = "RUNNING"
+        job["attempts"] += 1
+
+    def complete(self, job_id, ok=True):
+        job = self._lookup(job_id)
+        if job["state"] != "RUNNING":
+            raise ValueError("not running")
+        if ok:
+            job["state"] = "SUCCEEDED"
+        else:
+            if job["retries_left"] >= 0:
+                job["retries_left"] -= 1
+                job["state"] = "READY"
+            else:
+                job["state"] = "FAILED"
+
+    def cancel(self, job_id):
+        job = self._lookup(job_id)
+        job["state"] = "CANCELLED"
+
+    def status(self, job_id):
+        return self._lookup(job_id)["state"]
+
+    def attempts(self, job_id):
+        return self._lookup(job_id)["attempts"]
+
+    def ready_queue(self):
+        ready = [jid for jid, j in self._jobs.items()
+                 if j["state"] == "READY"]
+        ready.sort(key=lambda jid: (-self._jobs[jid]["priority"],
+                                    self._jobs[jid]["seq"]))
+        return ready
+```
+
+## 10. Required output
+
+Return the COMPLETE corrected module — not a patch, not a single function, not
+pseudocode. It must be importable as-is (pure stdlib only; no third-party
+imports) and expose `JobScheduler` with exactly the API of section 2 plus no
+new required parameters.
+
+Put the complete module in a single ```python fenced code block. Do not emit
+any other code blocks. A correct solution is roughly 150-300 lines including
+docstrings and comments.

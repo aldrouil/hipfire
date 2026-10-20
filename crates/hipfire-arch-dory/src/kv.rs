@@ -12,10 +12,11 @@
 //! Qwen aliases, native presets, unknown names — hard-errors through the
 //! one shared parser; no parallel name/default tables live here.
 //!
-//! Per-token position work happens ONCE in [`dory_kv_prepare`] (VMM map +
-//! absolute `pos_buf` upload + sliding `len-1` upload). [`dory_kv_write`] /
-//! [`dory_kv_attend`] consume the already-prepared buffers — no per-layer
-//! mapping scans, no per-layer position copies. The F32 reference
+//! Per-token position work happens ONCE in [`dory_kv_prepare`] (capacity
+//! ensure — no-op on Dory's legacy backend — + absolute `pos_buf` upload +
+//! sliding `len-1` upload). [`dory_kv_write`] / [`dory_kv_attend`] consume
+//! the already-prepared buffers — no per-layer mapping scans, no per-layer
+//! position copies. The F32 reference
 //! (`quantized == false`, built only by `DoryState::new_f32_reference`)
 //! rides the same split: never a silent mode fallback.
 //!
@@ -45,22 +46,29 @@ fn hip<T>(r: Result<T, hip_bridge::HipError>) -> Result<(), String> {
     r.map(|_| ()).map_err(|e| format!("dory: kv: {e}"))
 }
 /// LAB-ONLY native KV trace row: exact pre-cache intermediates per
-/// (position, attention layer). Compiled out of production (no `lab`
-/// feature → no type, no alloc, no branch in the forward path).
+/// (position, attention layer, recurrent pass). Compiled out of production
+/// (no `lab` feature → no type, no alloc, no branch in the forward path).
 ///
-/// Contract (agreed with the CPU trace owner):
+/// Schema `dory_kv_trace_v2` (agreed with the CPU trace owner; native/CPU
+/// join keys are `(position, layer, loop_index)`, KV history keys are
+/// `cache_layer`):
 /// - `q`: `n_heads × head_dim` flattened (Dory: 16 × 256 = 4096),
 ///   captured BEFORE [`dory_kv_write`] (post-RoPE, post-qk-norm, post-sqk).
 /// - `k`/`v`: `n_kv_heads × head_dim` flattened (Dory: 4 × 256 = 1024),
 ///   captured BEFORE [`dory_kv_write`] (post-RoPE; k post-qk-norm).
 /// - `attention`: `n_heads × head_dim` flattened, captured AFTER
 ///   [`dory_kv_attend`] and BEFORE the sigmoid gate / justnorm / `Wo`.
-/// - `layer` is the PHYSICAL layer index; `position` is absolute `next_pos`.
+/// - `position` is absolute `next_pos` (same every recurrent pass);
+///   `layer` is the PHYSICAL sublayer index; `loop_index` is the 0-based
+///   recurrent pass (input/output passes use 0); `cache_layer` is the
+///   virtual [`crate::dory::DoryConfig::kv_layer_index`] slot written/read.
 #[cfg(feature = "lab")]
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct KvTraceRow {
     pub position: usize,
     pub layer: usize,
+    pub loop_index: usize,
+    pub cache_layer: usize,
     pub q: Vec<f32>,
     pub k: Vec<f32>,
     pub v: Vec<f32>,
@@ -129,12 +137,13 @@ pub fn dory_kv_backend(ctx: &LoadCtx) -> KvBackend {
     ctx.kv_backend
 }
 
-/// ONE per-token prepare step: map VMM capacity for `pos+1` (no-op on
-/// legacy), upload absolute `pos` to `pos_buf` and sliding `len-1` to
-/// `swa_pos_buf`, where `len = min(window, pos+1)`. Called ONCE per
-/// `forward_token` (and once per probe token) — never per layer. The
-/// write/attend helpers below consume these buffers and do NO mapping or
-/// position uploads of their own.
+/// ONE per-token prepare step: `ensure_mapped_capacity(pos+1)` (no-op on
+/// Dory's legacy-contiguous backend — VMM is refused at admission — and the
+/// growth path for VMM owners), upload absolute `pos` to `pos_buf` and
+/// sliding `len-1` to `swa_pos_buf`, where `len = min(window, pos+1)`.
+/// Called ONCE per `forward_token` (and once per probe token) — never per
+/// layer. The write/attend helpers below consume these buffers and do NO
+/// mapping or position uploads of their own.
 pub fn dory_kv_prepare(
     gpu: &mut Gpu,
     kv: &mut KvCache,
@@ -152,28 +161,30 @@ pub fn dory_kv_prepare(
     Ok(())
 }
 
-/// One production KV write for physical `layer_idx`. Consumes the buffers
+/// One production KV write for virtual cache slot `cache_layer` (see
+/// [`crate::dory::DoryConfig::kv_layer_index`]: physical sublayer selects
+/// math in the forward, this slot selects storage). Consumes the buffers
 /// [`dory_kv_prepare`] uploaded (absolute `pos_buf`; NO mapping or uploads
 /// here) and dispatches on the cache's live tier flags — never on a
 /// caller-supplied mode (selection and storage cannot diverge).
 pub fn dory_kv_write(
     gpu: &mut Gpu,
     kv: &KvCache,
-    layer_idx: usize,
+    cache_layer: usize,
     k_src: &GpuTensor,
     v_src: &GpuTensor,
     pos_buf: &hip_bridge::DeviceBuffer,
 ) -> Result<(), String> {
-    if layer_idx >= kv.k_gpu.len() || layer_idx >= kv.v_gpu.len() {
+    if cache_layer >= kv.k_gpu.len() || cache_layer >= kv.v_gpu.len() {
         return Err(format!(
-            "dory: kv_write layer {layer_idx} out of range ({} layers)",
+            "dory: kv_write cache slot {cache_layer} out of range ({} slots)",
             kv.k_gpu.len()
         ));
     }
     if !kv.quantized {
         // F32 internal numeric reference (lab/oracle only).
-        hip(gpu.kv_cache_write(&kv.k_gpu[layer_idx], k_src, pos_buf, kv.kv_dim))?;
-        hip(gpu.kv_cache_write(&kv.v_gpu[layer_idx], v_src, pos_buf, kv.kv_dim))?;
+        hip(gpu.kv_cache_write(&kv.k_gpu[cache_layer], k_src, pos_buf, kv.kv_dim))?;
+        hip(gpu.kv_cache_write(&kv.v_gpu[cache_layer], v_src, pos_buf, kv.kv_dim))?;
         return Ok(());
     }
     if kv.quant_q8
@@ -185,14 +196,14 @@ pub fn dory_kv_write(
         && !kv.quant_bf16
     {
         hip(gpu.kv_cache_write_q8_0(
-            &kv.k_gpu[layer_idx],
+            &kv.k_gpu[cache_layer],
             k_src,
             pos_buf,
             kv.n_kv_heads,
             kv.head_dim,
         ))?;
         hip(gpu.kv_cache_write_q8_0(
-            &kv.v_gpu[layer_idx],
+            &kv.v_gpu[cache_layer],
             v_src,
             pos_buf,
             kv.n_kv_heads,
@@ -220,7 +231,7 @@ pub fn dory_kv_write(
         .as_ref()
         .ok_or_else(|| "dory: kv_write: FWHT cache missing signs2".to_string())?;
     let vm = kv.v_mode_bits();
-    let (k_dst, v_dst) = (&kv.k_gpu[layer_idx], &kv.v_gpu[layer_idx]);
+    let (k_dst, v_dst) = (&kv.k_gpu[cache_layer], &kv.v_gpu[cache_layer]);
     if kv.quant_fwht && kv.quant_asym2 && !kv.quant_asym3 && !kv.quant_asym4 {
         hip(gpu.kv_cache_write_fwht2_fused(
             k_dst,
@@ -272,8 +283,9 @@ pub fn dory_kv_write(
     ))
 }
 
-/// One production flash-attention read for physical `layer_idx`. Consumes
-/// the buffers [`dory_kv_prepare`] uploaded — NO mapping or uploads here.
+/// One production flash-attention read for virtual cache slot `cache_layer` (same
+/// slot [`dory_kv_write`] wrote via [`crate::dory::DoryConfig::kv_layer_index`]).
+/// Consumes the buffers [`dory_kv_prepare`] uploaded — NO mapping or uploads here.
 /// Full layers read `[0, pos]` via `pos_buf` (absolute); sliding layers read
 /// the trailing `min(window, pos+1)` rows via `sub_offset` views (below)
 /// with `swa_pos_buf` holding `len-1`. Exactly ONE full-vs-SWA view/len
@@ -283,7 +295,7 @@ pub fn dory_kv_write(
 pub fn dory_kv_attend(
     gpu: &mut Gpu,
     kv: &KvCache,
-    layer_idx: usize,
+    cache_layer: usize,
     q: &GpuTensor,
     out: &GpuTensor,
     partials: &GpuTensor,
@@ -294,9 +306,9 @@ pub fn dory_kv_attend(
     window: usize,
     n_heads: usize,
 ) -> Result<(), String> {
-    if layer_idx >= kv.k_gpu.len() || layer_idx >= kv.v_gpu.len() {
+    if cache_layer >= kv.k_gpu.len() || cache_layer >= kv.v_gpu.len() {
         return Err(format!(
-            "dory: kv_attend layer {layer_idx} out of range ({} layers)",
+            "dory: kv_attend cache slot {cache_layer} out of range ({} slots)",
             kv.k_gpu.len()
         ));
     }
@@ -312,9 +324,9 @@ pub fn dory_kv_attend(
         Windowed(GpuTensor, GpuTensor),
     }
     let view: View<'_> = if is_full {
-        View::Full(&kv.k_gpu[layer_idx], &kv.v_gpu[layer_idx])
+        View::Full(&kv.k_gpu[cache_layer], &kv.v_gpu[cache_layer])
     } else {
-        let (k_view, v_view, _) = swa_views(kv, layer_idx, pos, window)?;
+        let (k_view, v_view, _) = swa_views(kv, cache_layer, pos, window)?;
         View::Windowed(k_view, v_view)
     };
     let (k_cache, v_cache, seq_pos, seq_len) = match &view {
@@ -390,7 +402,7 @@ pub fn dory_kv_attend(
 /// view metadata; its aliased buffers must not be freed.
 fn swa_views(
     kv: &KvCache,
-    layer_idx: usize,
+    cache_layer: usize,
     pos: usize,
     window: usize,
 ) -> Result<(GpuTensor, GpuTensor, usize), String> {
@@ -412,8 +424,8 @@ fn swa_views(
     };
     let start = (pos + 1).saturating_sub(window);
     let len = pos + 1 - start;
-    let k_view = kv.k_gpu[layer_idx].sub_offset(start * k_row, len * k_row);
-    let v_view = kv.v_gpu[layer_idx].sub_offset(start * v_row, len * v_row);
+    let k_view = kv.k_gpu[cache_layer].sub_offset(start * k_row, len * k_row);
+    let v_view = kv.v_gpu[cache_layer].sub_offset(start * v_row, len * v_row);
     Ok((k_view, v_view, len))
 }
 

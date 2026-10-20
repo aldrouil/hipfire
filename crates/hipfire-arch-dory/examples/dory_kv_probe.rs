@@ -9,18 +9,23 @@
 //! independent CPU oracle (`scripts/dory_reference.py --kv-probe`).
 //! Coverage: all 5 user presets (`f32` reference + `q8`/`fwht2`/`fwht3`/`fwht4`),
 //! full + sliding-window attention at 1023/1024/1025 (plus overwrite of
-//! 1024/1025 with different values, catching stale-tail reads), and
-//! reset/overwrite tails. Numerics catch wrong packed offsets / layer-index /
-//! rotation-norm / Q8-fallback bugs. GPU output is NEVER used as the expected
-//! cache — the consumer comparison is an independent CPU snapshot (the JSON
-//! from `--kv-probe`), plus a layered channel check (write → download raw
-//! bytes → independent CPU dequant vs `kv_attention_ref`).
+//! 1024/1025 with different values, catching stale-tail reads), reset +
+//! fresh-prefix rows 0..8, and recurrence history independence across
+//! `--loops 1..4` / `--recurrent-kv-cache-mode per_loop|last_loop` (real
+//! virtual-slot mapping from `DoryConfig::kv_layer_index`: per_loop disjoint
+//! slots per pass, last_loop one shared slot with current-row overwrite).
+//! Numerics catch wrong packed offsets / layer-index / rotation-norm /
+//! Q8-fallback / cross-loop slot leaks. GPU output is NEVER used as the
+//! expected cache — the consumer comparison is an independent CPU snapshot
+//! (the JSON from `--kv-probe`), plus a layered channel check (write →
+//! download raw bytes → independent CPU dequant vs `kv_attention_ref`).
 //!
 //! No model weights needed. No full benchmark.
 //!
 //! Usage:
 //!   HIPFIRE_DEVICES=gfx1201 cargo run -p hipfire-arch-dory --features lab --example dory_kv_probe -- \
-//!     --probe benchmarks/references/dory_one_loop/dory_kv_probe.json [--max-seq 2048] [--kv-backend legacy|vmm]
+//!     --probe benchmarks/references/dory_multiloop/dory_kv_probe.json [--max-seq 2048] [--kv-backend legacy|vmm]
+//!     [--loops 2] [--recurrent-kv-cache-mode per_loop]
 //! Backend honors the shared storage enum (legacy contiguous default; vmm =
 //! the production VMM arenas). F32 reference stays legacy and is labeled so.
 //! Parent runs the SAME CPU expectations under both backends.
@@ -74,7 +79,7 @@ fn flat_f32(v: &serde_json::Value) -> R<Vec<f32>> {
 fn run() -> R<()> {
     let argv: Vec<String> = std::env::args().collect();
     let probe = arg_val(&argv, "--probe")?
-        .unwrap_or_else(|| "benchmarks/references/dory_one_loop/dory_kv_probe.json".into());
+        .unwrap_or_else(|| "benchmarks/references/dory_multiloop/dory_kv_probe.json".into());
     let backend_raw = arg_val(&argv, "--kv-backend")?.unwrap_or_else(|| "legacy".into());
     let backend: hipfire_runtime::kv_backend::KvBackend =
         backend_raw
@@ -89,6 +94,31 @@ fn run() -> R<()> {
     if max_seq < 1026 {
         return Err(format!("--max-seq {max_seq} < 1026 probe rows"));
     }
+    // Recurrence mapping under test: which virtual cache slots the probe
+    // writes/reads (per_loop repeats the shared recurrent block per pass;
+    // last_loop aliases physical layers and overwrites the current row).
+    let loops: usize = arg_val(&argv, "--loops")?
+        .map(|s| {
+            s.parse::<usize>()
+                .map_err(|e| format!("--loops: {e}"))
+                .and_then(|n| {
+                    if (1..=4).contains(&n) {
+                        Ok(n)
+                    } else {
+                        Err(format!("--loops {n} not in 1..=4"))
+                    }
+                })
+        })
+        .transpose()?
+        .unwrap_or(1);
+    let rmode: hipfire_config::DoryRecurrentKvCacheMode =
+        arg_val(&argv, "--recurrent-kv-cache-mode")?
+            .map(|s| {
+                s.parse::<hipfire_config::DoryRecurrentKvCacheMode>()
+                    .map_err(|e| format!("--recurrent-kv-cache-mode: {e}"))
+            })
+            .transpose()?
+            .unwrap_or_default();
 
     let mut gpu = rdna_compute::Gpu::init().map_err(|e| format!("gpu init: {e}"))?;
     eprintln!("dory_kv_probe: gpu arch = {}", gpu.arch);
@@ -116,7 +146,12 @@ fn run() -> R<()> {
             "probe geometry hd={hd} nh={n_heads} nkv={nkv} n_pos={n_pos} win={window} != 256/16/4/1026/1024"
         ));
     }
-    eprintln!("dory_kv_probe: backend={backend} (F32 reference always legacy)");
+    eprintln!(
+        "dory_kv_probe: backend={backend} loops={loops} mode={rmode} (F32 reference always legacy)"
+    );
+    // Same I8/R20/O8 block split and default loop policy as production: the
+    // checkpoint default is 1 loop here only because this codec probe has no
+    // model weights — the mapping under test comes from --loops/--mode.
     let cfg = DoryConfig {
         hidden_size: 2560,
         num_hidden_layers: 72,
@@ -132,6 +167,8 @@ fn run() -> R<()> {
         is_attention: (0..72).map(|i| i % 2 == 0).collect(),
         is_full_attention: (0..72).map(|i| i % 4 == 2).collect(),
         block_split: (16, 40, 16),
+        n_recurrent_loops: loops,
+        recurrent_kv_cache_mode: rmode,
         alpha_scale: 0.05 / 0.0177,
         s_gate_factor: 2560f32.sqrt().sqrt() / 0.0177,
         sqk_factor: 256f32.sqrt() / 0.0177,
@@ -211,10 +248,37 @@ fn run() -> R<()> {
             DoryState::new_with_kv(&mut gpu, &cfg, max_seq, *mode, use_backend)
         }
         .map_err(|e| format!("probe {name}: state alloc: {e}"))?;
-        // Physical layer 0 (attention under the even/odd alternation; packed
-        // caches carry Mask(72) placeholders, F32 reference is flat — the
-        // same physical index is valid on both).
-        let layer_idx = 0usize;
+        // Probe the first RECURRENT attention layer; input layers execute
+        // once and correctly ignore loop_index. per_loop must use disjoint
+        // slots across recurrent passes; last_loop aliases one slot and
+        // overwrites the current row each pass. A physical-vs-virtual mixup
+        // shows as a cross-loop read leak (the independence probe below).
+        let recurrent_layer = cfg.block_split.0;
+        assert!(cfg.is_attention[recurrent_layer]);
+        let cache_layers: Vec<(usize, usize)> = (0..loops)
+            .map(|l| (l, cfg.kv_layer_index(recurrent_layer, l)))
+            .collect::<Vec<_>>();
+        let distinct: std::collections::HashSet<usize> =
+            cache_layers.iter().map(|(_, c)| *c).collect();
+        if rmode == hipfire_config::DoryRecurrentKvCacheMode::PerLoop {
+            if distinct.len() != loops {
+                return Err(format!(
+                    "probe: per_loop loops={loops} expects {loops} distinct slots, got {cache_layers:?}"
+                ));
+            }
+        } else if distinct.len() != 1 {
+            return Err(format!(
+                "probe: last_loop loops={loops} expects 1 shared slot, got {cache_layers:?}"
+            ));
+        }
+        if cfg.kv_layer_count() != st.kv.k_gpu.len() {
+            return Err(format!(
+                "probe {name}: KV slots {} != kv_layer_count {} (loops={loops} mode={rmode})",
+                st.kv.k_gpu.len(),
+                cfg.kv_layer_count(),
+            ));
+        }
+        let layer_idx = cache_layers[0].1;
         let kv_dim = nkv * hd;
         if k_all.len() != n_pos * nkv * hd || v_all.len() != n_pos * nkv * hd {
             return Err("probe: k/v wrong length".into());
@@ -522,7 +586,98 @@ fn run() -> R<()> {
                 failures += 1;
             }
         }
-
+        // Recurrence history independence + overwrite + reset (real slot
+        // mapping, not config echo): each loop pass writes a DISTINCT
+        // sentinel row to its virtual slot at position 7, then reads it
+        // back; per_loop must return each pass's own row, last_loop the
+        // FINAL pass's row from the shared slot. A cross-slot leak or stale
+        // overwrite shifts the sentinel-dominated mean by O(1).
+        for (loop_index, cache_layer) in cache_layers.iter().copied() {
+            // Full-prefix rewrite (0..=7): the independence attend at 7 reads
+            // the trailing window, so a single-row write would drown in the
+            // earlier codec-probe rows. Rewriting the whole prefix makes the
+            // slot under test dominate the mean.
+            let sentinel = (loop_index as f32 + 1.0) * 8.0;
+            let k_s = vec![sentinel; kv_dim];
+            let v_s = vec![sentinel + 0.5; kv_dim];
+            let kb: Vec<u8> = k_s.iter().flat_map(|v| v.to_ne_bytes()).collect();
+            let vb: Vec<u8> = v_s.iter().flat_map(|v| v.to_ne_bytes()).collect();
+            for p in 0..8usize {
+                gpu.hip
+                    .memcpy_htod(&ks_buf.buf, &kb)
+                    .map_err(|e| format!("probe {name}: upload sentinel k: {e:?}"))?;
+                gpu.hip
+                    .memcpy_htod(&vs_buf.buf, &vb)
+                    .map_err(|e| format!("probe {name}: upload sentinel v: {e:?}"))?;
+                dory_kv_prepare(
+                    &mut gpu,
+                    &mut st.kv,
+                    &st.pos_buf,
+                    &st.swa_pos_buf,
+                    p,
+                    window,
+                )
+                .map_err(|e| format!("probe {name}: prepare sentinel: {e}"))?;
+                dory_kv_write(
+                    &mut gpu,
+                    &mut st.kv,
+                    cache_layer,
+                    &ks_buf,
+                    &vs_buf,
+                    &st.pos_buf,
+                )
+                .map_err(|e| format!("probe {name}: write sentinel: {e}"))?;
+            }
+        }
+        for (loop_index, cache_layer) in cache_layers.iter().copied() {
+            dory_kv_prepare(
+                &mut gpu,
+                &mut st.kv,
+                &st.pos_buf,
+                &st.swa_pos_buf,
+                7,
+                window,
+            )
+            .map_err(|e| format!("probe {name}: prepare reindependence: {e}"))?;
+            dory_kv_attend(
+                &mut gpu,
+                &mut st.kv,
+                cache_layer,
+                &q_t,
+                &out_t,
+                &st.attn_partials,
+                &st.pos_buf,
+                &st.swa_pos_buf,
+                7,
+                true,
+                window,
+                n_heads,
+            )
+            .map_err(|e| format!("probe {name}: attend reindependence: {e}"))?;
+            let got = gpu
+                .download_f32(&out_t)
+                .map_err(|e| format!("probe {name}: download reindependence: {e:?}"))?;
+            // Exact (not dominated): rows 0..=7 of this slot are ALL the
+            // pass's sentinel V, so any convex attention combination over the
+            // full window equals the sentinel; the 1.0 bar only absorbs codec
+            // dequant noise (Q8 exact, FWHT ~1e-5 scale).
+            let mean = got.iter().map(|v| *v as f64).sum::<f64>() / got.len() as f64;
+            let want = if rmode == hipfire_config::DoryRecurrentKvCacheMode::PerLoop {
+                (loop_index as f64 + 1.0) * 8.0 + 0.5
+            } else {
+                (loops as f64) * 8.0 + 0.5
+            };
+            if (mean - want).abs() > 1.0 {
+                eprintln!(
+                    "dory_kv_probe: {name} rec-independence loops={loops} mode={rmode} pass={loop_index}: mean={mean:.3} want~{want:.3} FAIL"
+                );
+                failures += 1;
+            } else {
+                eprintln!(
+                    "dory_kv_probe: {name} rec-independence loops={loops} mode={rmode} pass={loop_index}: mean={mean:.3} ok"
+                );
+            }
+        }
         gpu.free_tensor(q_t)
             .map_err(|e| format!("probe {name}: free q: {e:?}"))?;
         gpu.free_tensor(out_t)
@@ -537,7 +692,7 @@ fn run() -> R<()> {
     if failures > 0 {
         return Err(format!("dory_kv_probe: {failures} comparison(s) failed"));
     }
-    eprintln!("dory_kv_probe: all modes passed");
+    eprintln!("dory_kv_probe: all modes passed (loops={loops} mode={rmode} backend={backend})");
     Ok(())
 }
 

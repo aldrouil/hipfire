@@ -13,8 +13,8 @@ use crate::process_identity::{
 };
 use crate::{
     apply_kv_axis_overrides, apply_speculation_selector, config_bool, config_f64, config_i64,
-    config_string, config_u64, find_daemon, find_model_path, http_get_json, list_local_models,
-    load_params, port_in_use, probe_host, pull_command, reap_install_daemons,
+    config_optional_u64, config_string, config_u64, find_daemon, find_model_path, http_get_json,
+    list_local_models, load_params, port_in_use, probe_host, pull_command, reap_install_daemons,
     resolve_dflash_sidecar, resolve_mtp_sidecar, resolved_for_model, resolved_global, ListArgs,
     Paths, PullArgs, ServeArgs, ServiceEndpoint, StopArgs,
 };
@@ -386,6 +386,13 @@ pub(crate) struct ServeRuntime {
     pub(crate) continuous_batch_history: bool,
     pub(crate) current_max_seq: u64,
     pub(crate) cache_capable: bool,
+    /// Resolved Dory recurrence identity of the resident model
+    /// (`model.dory_loops` / `model.dory_recurrent_kv_cache_mode` as
+    /// projected on the load wire). `None` loops = checkpoint default;
+    /// `None` mode = `auto`. Part of the same-model reuse identity: a
+    /// changed pair reloads rather than reusing incompatible KV.
+    pub(crate) current_dory_loops: Option<u64>,
+    pub(crate) current_dory_recurrent_kv_cache_mode: Option<String>,
     pub(crate) kv_override: Option<String>,
     pub(crate) kv_k_override: Option<String>,
     pub(crate) kv_v_override: Option<String>,
@@ -1334,7 +1341,9 @@ pub(crate) fn resolve_serve_positionals(
         }
         let is_model = registry.model(value).is_some()
             || crate::find_local_model_path(paths, &registry, value).is_some()
-            || crate::model_card(paths, &registry, value).retired().is_some();
+            || crate::model_card(paths, &registry, value)
+                .retired()
+                .is_some();
         if is_model && model.is_none() {
             model = Some(value.clone());
         } else if host.replace(value.clone()).is_some() {
@@ -1828,6 +1837,8 @@ pub(crate) fn serve_foreground(
             paths: paths.clone(),
             registry: registry.clone(),
             current_path: None,
+            current_dory_loops: None,
+            current_dory_recurrent_kv_cache_mode: None,
             current_arch: None,
             current_reasoning_contract: saddle_core::caps::ReasoningContract::Unsupported,
             current_reasoning_effort_native: false,
@@ -2194,7 +2205,30 @@ impl ServeRuntime {
         let path =
             path.ok_or_else(|| ModelNotFound(format!("model not found locally: {model}")))?;
         let resolved = resolved_for_model(&self.paths, model, tag.as_deref(), entry)?;
-        if self.current_path.as_ref() != Some(&path) {
+        // Dory recurrence identity: the wire pair `load_params` projects
+        // for this config (`dory_loops` only when authored, KV mode only
+        // when non-`auto`). Same path + same pair reuses; a changed pair
+        // reloads so the resident KV geometry always matches the request.
+        // Non-Dory models project neither key, so the pair is `(None, None)`
+        // and identity reduces to the historical path-only check.
+        let want_dory_loops = config_optional_u64(&resolved, "model.dory_loops")?;
+        let want_dory_mode_raw = config_string(&resolved, "model.dory_recurrent_kv_cache_mode")?;
+        let want_dory_mode_source = &resolved
+            .get("model.dory_recurrent_kv_cache_mode")
+            .expect("schema field")
+            .source;
+        let want_dory_mode = (want_dory_mode_raw != "auto"
+            && matches!(
+                want_dory_mode_source,
+                ConfigSource::GlobalUser { .. }
+                    | ConfigSource::ModelUser { .. }
+                    | ConfigSource::OneShot { .. }
+                    | ConfigSource::LegacyEnv { .. }
+            ))
+        .then_some(want_dory_mode_raw);
+        let same_recurrence = self.current_dory_loops == want_dory_loops
+            && self.current_dory_recurrent_kv_cache_mode == want_dory_mode;
+        if self.current_path.as_ref() != Some(&path) || !same_recurrence {
             if origin == ModelOrigin::Request && !self.request_may_load(&path, entry) {
                 return Err(ModelNotFound(format!(
                     "model not found: {model} (a request may name only installed models; \
@@ -2309,6 +2343,8 @@ impl ServeRuntime {
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
             self.current_path = Some(path);
+            self.current_dory_loops = want_dory_loops;
+            self.current_dory_recurrent_kv_cache_mode = want_dory_mode;
             self.current_arch = loaded
                 .get("arch")
                 .and_then(serde_json::Value::as_str)
@@ -2444,6 +2480,8 @@ impl ServeRuntime {
     /// Ported from #787.
     pub(crate) fn clear_resident(&mut self, meta: &Mutex<ServeMeta>) {
         self.current_path = None;
+        self.current_dory_loops = None;
+        self.current_dory_recurrent_kv_cache_mode = None;
         self.current_arch = None;
         self.current_reasoning_contract = saddle_core::caps::ReasoningContract::Unsupported;
         self.current_reasoning_effort_native = false;
@@ -3947,6 +3985,8 @@ mod tests {
             continuous_batch_history: false,
             current_max_seq: 32768,
             cache_capable: true,
+            current_dory_loops: Some(2),
+            current_dory_recurrent_kv_cache_mode: Some("per_loop".to_owned()),
             kv_override: Some("q8".to_owned()),
             kv_k_override: None,
             kv_v_override: None,
@@ -3999,6 +4039,8 @@ mod tests {
         });
         runtime.clear_resident(&meta);
         assert!(runtime.current_path.is_none());
+        assert!(runtime.current_dory_loops.is_none());
+        assert!(runtime.current_dory_recurrent_kv_cache_mode.is_none());
         assert!(runtime.current_arch.is_none());
         assert_eq!(
             runtime.current_reasoning_contract,

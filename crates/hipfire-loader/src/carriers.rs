@@ -805,6 +805,8 @@ impl Carrier for Qwen4Carrier {
             ),
             expert_count_override: ctx.deepseek4_experts_per_token.is_some(),
             pflash: false,
+            dory_loops: None,
+            dory_recurrent_kv_cache_mode: None,
         };
         qwen4_ep_option_refusal(ep, ctx.draft_path, &options)?;
         self.admit_options(ctx.draft_path, options)?;
@@ -3633,6 +3635,8 @@ fn load_qwen4_pp_model(src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedMode
         ),
         expert_count_override: ctx.deepseek4_experts_per_token.is_some(),
         pflash: false,
+        dory_loops: None,
+        dory_recurrent_kv_cache_mode: None,
     };
     crate::admission::qwen4_pp_option_refusal(pp, ctx.draft_path, &options)?;
     Qwen4Carrier.admit_options(ctx.draft_path, options)?;
@@ -5807,10 +5811,10 @@ impl Carrier for MapleCarrier {
 
 // ─── DoryCarrier ───────────────────────────────────────────────────────
 // dory (arch_id 19, native BF16 safetensors Dir + native HFQM quants).
-// Single-loop native forward: exactly one recurrent-loop pass (the arch
-// crate logs the n_recurrent_loops=2 bring-up note at load). No EP/PP/TP,
-// no spec/MTP/DFlash/drafter, no CASK/adaptive, no VMM. The arch crate
-// admits both namespaces and fails closed on anything else.
+// Multi-loop native forward (I->R^N->O, N=1..=4): the carrier validates
+// staged recurrence in admission and the arch crate resolves it before
+// weights/state. No EP/PP/TP, no spec/MTP/DFlash/drafter, no CASK/adaptive.
+// The arch crate admits both namespaces and fails closed on anything else.
 pub struct DoryCarrier;
 impl Carrier for DoryCarrier {
     fn name(&self) -> &'static str {
@@ -5871,14 +5875,14 @@ impl Carrier for DoryCarrier {
         .collect::<Vec<_>>();
         if !unsupported.is_empty() {
             return Err(format!(
-                "dory: unsupported option(s): {}; single-loop native forward only",
+                "dory: unsupported option(s): {}; multi-loop native forward only",
                 unsupported.join(", ")
             ));
         }
         Ok(())
     }
     fn caps(&self) -> saddle_core::caps::ArchCaps {
-        // Text-only single-loop AR bring-up (qwen2 precedent): the Jinja
+        // Text-only multi-loop AR (qwen2 precedent): the Jinja
         // template still renders `enable_thinking`, but no history-reasoning
         // contract is advertised — serve does not forward reasoning_content
         // for the `dory` label and this path has no think router.
@@ -5929,7 +5933,7 @@ impl Carrier for DoryCarrier {
         dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;
         let bundle = hipfire_arch_dory::load_dory_bundle(src, ctx)?;
-        // Single-loop AR only: the n-gram speculator needs a `SpecTarget`
+        // Plain AR only: the n-gram speculator needs a `SpecTarget`
         // impl the arch crate deliberately does not provide, so never arm one.
         Ok(LoadedModel {
             state: Some(Box::new(bundle)),

@@ -200,6 +200,41 @@ impl std::str::FromStr for Deepseek4CompressorCache {
     }
 }
 
+/// Dory recurrent-block KV cache mode. This is model-specific so the
+/// Dory loop selection can never alter Qwen or any other architecture.
+/// `PerLoop` keeps an independent KV for every recurrent pass (plus one
+/// input/output cache); `LastLoop` reuses the physical cache, each loop
+/// overwriting the current absolute position. Checkpoint default is
+/// `PerLoop` (upstream `recurrent_kv_cache_mode='per_loop'`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DoryRecurrentKvCacheMode {
+    #[default]
+    PerLoop,
+    LastLoop,
+}
+
+impl fmt::Display for DoryRecurrentKvCacheMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::PerLoop => "per_loop",
+            Self::LastLoop => "last_loop",
+        })
+    }
+}
+
+impl std::str::FromStr for DoryRecurrentKvCacheMode {
+    type Err = String;
+
+    fn from_str(raw: &str) -> std::result::Result<Self, Self::Err> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "per_loop" => Ok(Self::PerLoop),
+            "last_loop" => Ok(Self::LastLoop),
+            _ => Err("Dory recurrent KV cache mode must be per_loop or last_loop".to_string()),
+        }
+    }
+}
+
 impl fmt::Display for Deepseek4ComputePlacement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -888,6 +923,30 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         None,
         "DeepSeek V4 routed experts per token; null preserves the checkpoint default."
+    ),
+    field!(
+        "model.dory_loops",
+        "dory_loops",
+        Experimental,
+        ModelLoad,
+        DefaultValue::Null,
+        ValueRule::NullableInteger { min: 1, max: 4 },
+        true,
+        false,
+        Some("HIPFIRE_DORY_LOOPS"),
+        "Dory recurrent-block passes (I->R^N->O: one input block, N shared recurrent passes with input reinjection, one output block); null preserves the checkpoint default (2). 36 transformer blocks are encoded as 72 physical attention/MLP sublayers; only the recurrent block repeats."
+    ),
+    field!(
+        "model.dory_recurrent_kv_cache_mode",
+        "dory_recurrent_kv_cache_mode",
+        Experimental,
+        ModelLoad,
+        DefaultValue::String("auto"),
+        ValueRule::Enum(&["auto", "per_loop", "last_loop"]),
+        true,
+        false,
+        Some("HIPFIRE_DORY_RECURRENT_KV_CACHE_MODE"),
+        "Dory recurrent KV cache mode; auto preserves the checkpoint mode (default per_loop). per_loop keeps an independent KV per recurrent pass; last_loop reuses the physical cache with each loop overwriting the current absolute position."
     ),
     field!(
         "hardware.deepseek4_compute_placement",
@@ -4719,9 +4778,7 @@ pub fn mtp_effective_mode_name(raw: &str, measured_ar_floor: bool) -> &'static s
 /// The shared log line for an `auto` MTP that a producer without a measured AR
 /// floor declines, worded once for every route (sequential, slots, daemon).
 pub fn mtp_no_floor_decline_line(model: &str) -> String {
-    format!(
-        "  {model} MTP: off by default (no measured AR floor); opt in with --spec mtp"
-    )
+    format!("  {model} MTP: off by default (no measured AR floor); opt in with --spec mtp")
 }
 
 /// One MTP-over-host-spill verdict, shared by the qwen35 and qwen4 arming
@@ -7102,7 +7159,10 @@ mod tests {
         // (mode, producer declared a measured AR floor) -> admitted.
         for floor in [false, true] {
             assert!(!mtp_mode_admits(MtpMode::Off, floor), "off never admits");
-            assert!(mtp_mode_admits(MtpMode::On, floor), "explicit on always admits");
+            assert!(
+                mtp_mode_admits(MtpMode::On, floor),
+                "explicit on always admits"
+            );
         }
         assert!(
             !mtp_mode_admits(MtpMode::Auto, false),
@@ -7137,7 +7197,10 @@ mod tests {
                 let effective = mtp_effective_mode(mode, floor);
                 // The effective mode admits exactly what the gate admits.
                 assert_eq!(effective != MtpMode::Off, mtp_mode_admits(mode, floor));
-                assert_eq!(mtp_effective_mode_name(mode.name(), floor), effective.name());
+                assert_eq!(
+                    mtp_effective_mode_name(mode.name(), floor),
+                    effective.name()
+                );
             }
         }
         assert_eq!(mtp_effective_mode(MtpMode::Auto, false), MtpMode::Off);
@@ -7151,7 +7214,8 @@ mod tests {
         // admitted mode. Auto + floor + fully resident arms; auto + floor +
         // spill on a non-admitted arch declines; explicit on arms over both.
         let arms = |mode: MtpMode, floor: bool, blobs: usize, arch: &str, admitted: &[&str]| {
-            mtp_mode_admits(mode, floor) && mtp_host_spill_policy(mode, blobs, arch, admitted).attach
+            mtp_mode_admits(mode, floor)
+                && mtp_host_spill_policy(mode, blobs, arch, admitted).attach
         };
         assert!(arms(MtpMode::Auto, true, 0, "gfx1100", &[]));
         assert!(!arms(MtpMode::Auto, true, 8, "gfx1100", &[]));

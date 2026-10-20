@@ -916,6 +916,8 @@ fn load(model: &str) -> Result<(Ctx, Tokenizer, Value)> {
             card_cap: 0,
         }),
         deepseek4_compute_placement: Default::default(),
+        dory_loops: None,
+        dory_recurrent_kv_cache_mode: None,
         deepseek4_experts_per_token: None,
         draft_path: None,
         vision_path: None,

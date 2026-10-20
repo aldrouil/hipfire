@@ -44,9 +44,26 @@ through `DoryCarrier` (architecture 19). A BF16 directory needs the original
 config, tokenizer and chat template beside `model.safetensors`; HFQM embeds
 them. There is no registry pull tag for this route.
 
-The normalized-GPT forward executes **one recurrent pass**, including input
-reinjection, even when the checkpoint declares two loops. The load log states
-the effective loop count. Original BF16 weights stay BF16 on the GPU; HFQM
+The normalized-GPT forward runs the 8-layer input block once, the shared
+20-layer recurrent block **N times**, and the 8-layer output block once.
+The input-block output is reinjected into every recurrent pass. These are
+transformer blocks; the checkpoint stores each as separate attention and MLP
+sublayers, giving the physical split **16 / 40 / 16**.
+At each pass, `h = justnorm(state + input_h)` enters the recurrent block and
+`state = justnorm(h)` leaves it; initially `state = input_h`. Here `justnorm`
+uses the L2 sum (`x / sqrt(sum(x*x) + 1e-6)`), not RMSNorm. All passes keep the
+same absolute token/RoPE position; only the completed token advances it.
+
+`model.dory_loops` selects **1–4 loops**; unset keeps the checkpoint count
+(two for the published checkpoint). `model.dory_recurrent_kv_cache_mode`
+selects `per_loop` or `last_loop`; `auto` preserves the checkpoint policy,
+defaulting to `per_loop` when absent. Both settings take effect on model
+load, and the load log reports the resolved values. Changing either setting
+on the same model path causes serve to reload instead of reusing incompatible
+KV state. Invalid recurrence settings are rejected before model teardown;
+allocation failure does not silently reduce the requested context.
+
+Original BF16 weights stay BF16 on the GPU; HFQM
 projection matrices retain their encoded precision and the Q8 embedding
 table stays resident. Supported bodies are MQ3V2, MQ4V2, MQ5V2, MQ6V2,
 MQ8 and Q8F16; see [Dory quantization](QUANTIZE.md#nemotron-dory)
@@ -54,11 +71,12 @@ for XT, Base and Pro recipes.
 Activations are F32. KV presets are `auto` (Q8), `q8`, `fwht2`, `fwht3`
 and `fwht4`; the FWHT presets compress K and retain Q8 V. Deprecated
 `asym`/`turbo` spellings are refused. This is an eager, single-GPU text-only
-AR route: no multi-loop execution, speculation, tools, offload, or batching.
+AR route: no speculation, tools, offload, or batching.
 
 Set `--max-seq` explicitly for available VRAM. Original BF16 weights occupy
-about 7.95 GB; quantized artifacts are smaller. For the shipped 36 attention
-layers, four KV heads and head dimension 256, logical KV payload is:
+about 7.95 GB; quantized artifacts are smaller. The following baseline is
+for one loop or `last_loop` caching: 36 attention caches, four KV heads and
+head dimension 256.
 
 | KV preset | K encoding | V encoding | Bytes per context token |
 |---|---|---|---:|
@@ -68,19 +86,41 @@ layers, four KV heads and head dimension 256, logical KV payload is:
 | `fwht4` | FWHT 4-bit | Q8 | 58,176 |
 
 These counts include codec headers, not allocator padding or scratch.
+`per_loop` gives every recurrent pass independent history, with
+`16 + 20 * N` attention caches; multiply the baseline payload by
+`(16 + 20 * N) / 36`. `last_loop` keeps 36 caches regardless of N: every
+pass replaces the current token's K/V, while preceding tokens retain
+their final-pass K/V. Thus pass i sees pass-i K/V for the current position
+and final-pass K/V for older positions.
+
+Native prefill is tokenwise. With `last_loop`, this is **not equivalent to
+upstream vLLM's chunk-prefill schedule**: within an upstream chunk, pass 0
+of a later token sees pass-0 K/V for earlier tokens in that chunk; here those
+earlier tokens already hold final-pass K/V. The numerical oracle follows
+hipfire's tokenwise schedule, not an upstream chunk-logit identity claim.
+`per_loop` has independent histories and does not have this scheduling
+dependency. The weights remain shared in both policies; extra loops do not
+allocate another model.
+
 Native Dory loads use the legacy KV backend; explicit `vmm` is not admitted.
 Context is not silently reduced.
 
 ```bash
 hipfire quantize ./dory-bf16 --format mq4v2 -o dory-4b.mq4v2.hfq
+HIPFIRE_DORY_LOOPS=3 HIPFIRE_DORY_RECURRENT_KV_CACHE_MODE=per_loop \
 HIPFIRE_DEVICES=gfx1201 hipfire run ./dory-4b.mq4v2.hfq \
   --max-seq 2048 --kv-mode auto --spec off -t 0 -n 256 \
   "Name the capital of France in one sentence."
 ```
 
 Pass `./dory-bf16` instead of the HFQM filename to run the original weights.
+Persist these controls with `hipfire config set model.dory_loops 3` and
+`hipfire config set model.dory_recurrent_kv_cache_mode per_loop`. Reset the
+count to `null` and the policy to `auto` to retain checkpoint defaults.
 
-The native daemon was smoke-tested with two sequential requests on gfx1201;
+
+The original single-loop native daemon was smoke-tested with two sequential
+requests on gfx1201;
 the France request completed with “The capital of France is Paris.”
 Reasoning controls are not advertised on this initial route: the model thinks
 by default, and that text is emitted in the ordinary content stream. A short
@@ -100,6 +140,11 @@ an internal numerical reference, not a production preset. Quantized KV is
 checked against a same-codec CPU reference; `dory_kv_probe` covers all heads,
 full/sliding attention at positions 1023–1025, overwrite and reset. This is
 numerical bring-up evidence, not a throughput or product-admission claim.
+Multi-loop F32-KV validation on gfx1201 uses the same Q8 weight artifact on
+the independent CPU reference and native GPU path: loops 1–4 under both
+cache policies matched all 16 reference top-1 IDs in each of eight comparisons.
+The largest reported absolute logit difference was `1.3e-4`, below the unchanged
+`2e-2` limit. This validates recurrence numerics, not task quality.
 
 Packed KV is not bit-identical between the independent CPU and GPU model
 walks: projection rounding and FWHT summation order can cross discrete
@@ -108,6 +153,19 @@ but exceeded the strict full-model logit tolerance. Exact-input attention
 replay isolates these effects; an observed FWHT4 threshold crossing changed
 one packed K code and amplified the attention difference. Do not describe
 packed-KV full-model CPU/GPU logits as numerically identical.
+
+A bounded local loop-count comparison used the committed prompts
+[`dory_multiloop_sched.txt`](../benchmarks/prompts/dory_multiloop_sched.txt)
+and [`dory_multiloop_ledger.txt`](../benchmarks/prompts/dory_multiloop_ledger.txt):
+a complete dependency-scheduler repair and a multi-page ledger reconciliation.
+With the same Q8 weights, `per_loop`/Q8 KV and greedy sampling, both tasks
+exhausted an 8,192-token output cap at every loop count without final answers.
+A two-loop sampled scheduler pilot also exhausted 16,000 tokens; the sampled
+ledger pilot ended without a saved result, with no termination cause established.
+The comparison is **inconclusive**, not evidence of quality scaling or a
+reproduction of NVIDIA's benchmark scores. Raw local receipts and the one-off
+evaluation tools are retained in the ignored research artifacts; they are not
+a new supported benchmark surface.
 
 Equations follow
 [the Dory vLLM implementation](https://github.com/vllm-project/vllm/blob/55076950b6c155f384d6766d63563c3bc20a0e3f/vllm/model_executor/models/dory.py);

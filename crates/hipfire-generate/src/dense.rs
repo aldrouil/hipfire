@@ -7736,7 +7736,7 @@ pub fn generate_qwen2(
     }
 }
 
-/// Dory (arch_id=19, hipfire-arch-dory) single-loop native AR generate.
+/// Dory (arch_id=19, hipfire-arch-dory) multi-loop native AR generate.
 ///
 /// Shaped after [`generate_qwen2`] with dory specifics:
 ///
@@ -7949,7 +7949,7 @@ pub fn generate_dory(
         false,
     );
     // Cold reset AFTER gen_start (gen_start must precede all GPU work that
-    // could fail): stateless single-loop forward, no prefix reuse.
+    // could fail): stateless multi-loop forward, no prefix reuse.
     {
         let b = match m.dory_mut() {
             Some(b) => b,
@@ -8010,6 +8010,7 @@ pub fn generate_dory(
     let mut rng = deepseek4::sampling::Xorshift::new(request_seed as u64);
     let top_k = top_k.unwrap_or(0) as usize;
     let mut generated_count: usize = 0;
+    let mut decoded_eot = false;
     let decode_t0 = Instant::now();
     let mut text_stream = TokenTextStream::new();
     let mut next_tok =
@@ -8024,6 +8025,7 @@ pub fn generate_dory(
             break;
         }
         if stop_set.contains(&next_tok) {
+            decoded_eot = true;
             break;
         }
         let frag = {
@@ -8074,6 +8076,7 @@ pub fn generate_dory(
         "type": "done",
         "id": id,
         "tokens": generated_count,
+        "finish_reason": crate::common::length_or_stop(generated_count, max_tokens, decoded_eot),
         "tok_s": (tok_s * 100.0).round() / 100.0,
         "prefill_ms": prefill_ms,
         "total_ms": total_ms,

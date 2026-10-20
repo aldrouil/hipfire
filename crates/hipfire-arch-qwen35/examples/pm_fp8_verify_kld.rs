@@ -52,7 +52,8 @@ use std::fmt::Write as _;
 type R<T> = Result<T, Box<dyn std::error::Error>>;
 
 const W: usize = 16;
-const DEFAULT_MODEL: &str = "/home/kaden/qcal/release-0.4.0/fp8-tp-ep-geo/models/qwen3.8-27b.mq4-xts";
+const DEFAULT_MODEL: &str =
+    "/home/kaden/qcal/release-0.4.0/fp8-tp-ep-geo/models/qwen3.8-27b.mq4-xts";
 const DEFAULT_SEQS: &str = "/home/kaden/qcal/release-0.4.2/cb/fp8verify/kld_seqs.json";
 
 #[derive(serde::Deserialize)]
@@ -82,8 +83,23 @@ fn row_stats(r: &[f32], c: &[f32]) -> RowStat {
         kld += la.exp() * (la - lb);
         max_abs = max_abs.max((a as f64 - b as f64).abs());
     }
-    let am = |v: &[f32]| v.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |acc, (i, &x)| if x > acc.1 { (i, x) } else { acc }).0;
-    RowStat { kld: kld.max(0.0), top1_same: am(r) == am(c), max_abs }
+    let am = |v: &[f32]| {
+        v.iter()
+            .enumerate()
+            .fold((0usize, f32::NEG_INFINITY), |acc, (i, &x)| {
+                if x > acc.1 {
+                    (i, x)
+                } else {
+                    acc
+                }
+            })
+            .0
+    };
+    RowStat {
+        kld: kld.max(0.0),
+        top1_same: am(r) == am(c),
+        max_abs,
+    }
 }
 
 fn pct(v: &mut [f64], p: f64) -> f64 {
@@ -116,7 +132,15 @@ struct PairAcc {
 /// Verify head over the captured post-norm hidden rows: MQ rotate, then the
 /// FP8 verify lm_head (`fp8`) or the F16 exact verify lm_head with the scope
 /// off. Returns `rows * m` logits (row stride = `w_out.m`).
-fn head_logits(gpu: &mut Gpu, w_out: &llama::WeightTensor, hidden: &GpuTensor, rot: &GpuTensor, logits: &GpuTensor, rows: usize, fp8: bool) -> R<Vec<f32>> {
+fn head_logits(
+    gpu: &mut Gpu,
+    w_out: &llama::WeightTensor,
+    hidden: &GpuTensor,
+    rot: &GpuTensor,
+    logits: &GpuTensor,
+    rows: usize,
+    fp8: bool,
+) -> R<Vec<f32>> {
     let (k, m) = (w_out.k, w_out.m);
     llama::rotate_x_mq_batched_for(gpu, w_out, hidden, rot, k, rows)?;
     let prev = gpu.fp8_verify_scope;
@@ -131,7 +155,10 @@ fn head_logits(gpu: &mut Gpu, w_out: &llama::WeightTensor, hidden: &GpuTensor, r
     gpu.hip.device_synchronize()?;
     let mut raw = vec![0u8; rows * m * 4];
     gpu.hip.memcpy_dtoh_at(&mut raw, &logits.buf, 0)?;
-    Ok(raw.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
+    Ok(raw
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect())
 }
 
 fn main() {
@@ -165,7 +192,8 @@ fn run() -> R<()> {
     std::fs::create_dir_all(&out)?;
     let seqs: Vec<Seq> = serde_json::from_str(&std::fs::read_to_string(&seqs_path)?)?;
     let hfq = HfqFile::open(std::path::Path::new(&model))?;
-    let tok = Tokenizer::from_hfq_metadata(&hfq.metadata_json).map_err(|e| format!("tokenizer: {e:?}"))?;
+    let tok = Tokenizer::from_hfq_metadata(&hfq.metadata_json)
+        .map_err(|e| format!("tokenizer: {e:?}"))?;
     drop(hfq);
 
     let mut gpu = Gpu::init()?;
@@ -177,8 +205,14 @@ fn run() -> R<()> {
     let mut lc = LoadCtx {
         path: &model,
         max_seq: 4096,
-        sequence: Some(SequenceHint { model_ctx: 4096, automatic: true, card_cap: 0 }),
+        sequence: Some(SequenceHint {
+            model_ctx: 4096,
+            automatic: true,
+            card_cap: 0,
+        }),
         deepseek4_compute_placement: Default::default(),
+        dory_loops: None,
+        dory_recurrent_kv_cache_mode: None,
         deepseek4_experts_per_token: None,
         draft_path: None,
         vision_path: None,
@@ -228,7 +262,18 @@ fn run() -> R<()> {
         gpu.fp8_verify_scope = false;
         b.dn_state.reset(&mut gpu)?;
         qwen35::forward_prefill_batch(
-            &mut gpu, &b.weights, &b.config, &p, 0, &mut b.kv_cache, &mut b.dn_state, &b.scratch, None, None, None, None,
+            &mut gpu,
+            &b.weights,
+            &b.config,
+            &p,
+            0,
+            &mut b.kv_cache,
+            &mut b.dn_state,
+            &b.scratch,
+            None,
+            None,
+            None,
+            None,
         )?;
         let mut pos = p.len();
         for w in 0..nw {
@@ -237,19 +282,52 @@ fn run() -> R<()> {
             // FP8 trunk (scope on), then both heads on its hidden rows.
             gpu.fp8_verify_scope = true;
             let r = qwen35::forward_prefill_batch_capture_hidden(
-                &mut gpu, &b.weights, &b.config, toks, pos, &mut b.kv_cache, &mut b.dn_state, &b.scratch, &hidden,
+                &mut gpu,
+                &b.weights,
+                &b.config,
+                toks,
+                pos,
+                &mut b.kv_cache,
+                &mut b.dn_state,
+                &b.scratch,
+                &hidden,
             );
             gpu.fp8_verify_scope = false;
             r?;
             let l_fp8 = head_logits(&mut gpu, &b.weights.output, &hidden, &rot, &logits, W, true)?;
-            let l_fp8trunk = head_logits(&mut gpu, &b.weights.output, &hidden, &rot, &logits, W, false)?;
+            let l_fp8trunk = head_logits(
+                &mut gpu,
+                &b.weights.output,
+                &hidden,
+                &rot,
+                &logits,
+                W,
+                false,
+            )?;
             // F16 trunk (restored state, scope off), F16 and FP8 heads.
             snap.restore_to(&mut b.dn_state, &mut gpu)?;
             qwen35::forward_prefill_batch_capture_hidden(
-                &mut gpu, &b.weights, &b.config, toks, pos, &mut b.kv_cache, &mut b.dn_state, &b.scratch, &hidden,
+                &mut gpu,
+                &b.weights,
+                &b.config,
+                toks,
+                pos,
+                &mut b.kv_cache,
+                &mut b.dn_state,
+                &b.scratch,
+                &hidden,
             )?;
-            let l_f16 = head_logits(&mut gpu, &b.weights.output, &hidden, &rot, &logits, W, false)?;
-            let l_fp8head = head_logits(&mut gpu, &b.weights.output, &hidden, &rot, &logits, W, true)?;
+            let l_f16 = head_logits(
+                &mut gpu,
+                &b.weights.output,
+                &hidden,
+                &rot,
+                &logits,
+                W,
+                false,
+            )?;
+            let l_fp8head =
+                head_logits(&mut gpu, &b.weights.output, &hidden, &rot, &logits, W, true)?;
             let sets: [&Vec<f32>; 4] = [&l_f16, &l_fp8trunk, &l_fp8head, &l_fp8];
             for (pi, &(ra, ca, label)) in PAIRS.iter().enumerate() {
                 let mut wsum = 0f64;
@@ -257,7 +335,14 @@ fn run() -> R<()> {
                     let rr = &sets[ra][row * m_out..row * m_out + vocab];
                     let cc = &sets[ca][row * m_out..row * m_out + vocab];
                     let st = row_stats(rr, cc);
-                    let _ = writeln!(csv, "{si},{w},{row},{},{label},{:.6e},{},{:.4}", pos + row, st.kld, st.top1_same as u8, st.max_abs);
+                    let _ = writeln!(
+                        csv,
+                        "{si},{w},{row},{},{label},{:.6e},{},{:.4}",
+                        pos + row,
+                        st.kld,
+                        st.top1_same as u8,
+                        st.max_abs
+                    );
                     wsum += st.kld;
                     acc[pi].klds.push(st.kld);
                     acc[pi].maxabs.push(st.max_abs);
@@ -270,7 +355,11 @@ fn run() -> R<()> {
             pos += W;
         }
         let k0 = &acc[0].klds;
-        eprintln!("seq {si}: prompt {} tok, {nw} windows; running mean KLD f16->fp8 {:.4e}", p.len(), k0.iter().sum::<f64>() / k0.len() as f64);
+        eprintln!(
+            "seq {si}: prompt {} tok, {nw} windows; running mean KLD f16->fp8 {:.4e}",
+            p.len(),
+            k0.iter().sum::<f64>() / k0.len() as f64
+        );
     }
     if rows_total == 0 {
         return Err("no windows evaluated".into());
@@ -297,7 +386,12 @@ fn run() -> R<()> {
             pct(&mut a.win_mean.clone(), 0.99),
             pct(&mut a.win_mean, 1.0)
         );
-        let _ = writeln!(s, "{label} top-1 agreement {}/{rows_total} = {:.4}%", a.top1_same, 100.0 * a.top1_same as f64 / rows_total as f64);
+        let _ = writeln!(
+            s,
+            "{label} top-1 agreement {}/{rows_total} = {:.4}%",
+            a.top1_same,
+            100.0 * a.top1_same as f64 / rows_total as f64
+        );
         let _ = writeln!(
             s,
             "{label} max |dlogit|: median {:.4} p99 {:.4} max {:.4}",

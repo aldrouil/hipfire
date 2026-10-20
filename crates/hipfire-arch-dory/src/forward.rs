@@ -2,15 +2,11 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Dory one-loop forward pass (single-token decode, F32 activations, packed KV).
+//! Dory multi-loop forward pass (single-token decode, F32 activations, packed KV).
 //!
 //! Exact per-sublayer math (upstream `vllm/model_executor/models/dory.py`):
 //!
 //! - `justnorm(x) = x * rsqrt(sum(x²) + 1e-6)`, F32 accumulation, in place.
-//!   Implemented by composing the audited `l2_norm.hip` kernel
-//!   (`x *= rsqrt(sum(x²) + eps)`, eps passed as 1e-6) invoked with
-//!   `n_heads = 1` for whole-vector norms or the head count for headwise
-//!   norms — one launch per norm, no new kernels.
 //! - Attention sublayer on normalized input `u`:
 //!   `q = Wq u; k = Wk u; v = Wv u; g = Wg u` (weight codec × F32 input).
 //!   RoPE (neox halfsplit, in place, F32, ABSOLUTE position) with the
@@ -28,14 +24,20 @@
 //!   `o = Wdown m`.
 //! - Residual: `h' = slerp_norm(h, o, |alpha*alpha_scale|)`
 //!   `= justnorm(justnorm(h) + lr*(justnorm(o) - justnorm(h)))`.
-//! - Loop: input block → snapshot `input_h`; one recurrent pass with
-//!   `combined = justnorm(state + input_h)` reinjection at the recurrent
-//!   start and `state = justnorm(h)` at the recurrent end; output block.
+//! - Schedule: input block once → snapshot `input_h` → N recurrent passes
+//!   over the SHARED physical block (reinject `h = justnorm(state + input_h)`
+//!   at each pass start, `state = justnorm(h)` at each pass end; pass 0 runs
+//!   on post-input `h` directly; each non-final pass persists `state` into
+//!   `state_h`; the final pass normalizes in `h`) → output block once →
+//!   lm head once. Same absolute position every pass; `next_pos` advances
+//!   once per token. `per_loop` writes each pass to its own cache slice;
+//!   `last_loop` overwrites the same physical slots at the current position
+//!   each pass.
 //! - Head: `logits = (Wlm h_last) * (logit_scale / initializer_range)`
 //!   (no final norm after the output block).
 //!
-//! Decode-only bring-up: one token per call. Prefill is N sequential
-//! `forward_token` calls (non-final tokens with `compute_logits=false`
+//! Decode-only: one token per call. Prefill is N sequential
+//! `forward_token` calls (non-final tokens with `compute_logits=false`).
 use crate::dory::{DoryAttnWeights, DoryConfig, DoryMlpWeights, DoryState, DoryWeights};
 use crate::kv::{dory_kv_attend, dory_kv_prepare, dory_kv_write};
 use crate::spec_impl::DoryBundle;
@@ -106,16 +108,20 @@ fn slerp_residual(
 }
 
 /// Single attention sublayer + slerp residual, `h` updated in place.
-/// `layer_idx` is the PHYSICAL layer index (the packed `KvCache` carries a
-/// 72-slot mask; MLP slots hold placeholders). `pos` is the absolute
-/// position (`next_pos`); sliding reads trail it via `kv.rs` views.
+/// `layer_idx` is the PHYSICAL sublayer index (weights + RoPE theta select);
+/// `cache_layer` is the virtual [`DoryConfig::kv_layer_index`] slot the KV
+/// pair reads/writes (per-loop repeat vs shared physical slot). `pos` is the
+/// absolute position (`next_pos`, same for every recurrent pass); sliding
+/// reads trail it via `kv.rs` views. `loop_index` tags the lab trace row only.
 fn attn_sublayer(
     gpu: &mut Gpu,
     cfg: &DoryConfig,
     w: &DoryAttnWeights,
     st: &mut DoryState,
     layer_idx: usize,
+    cache_layer: usize,
     pos: usize,
+    loop_index: usize,
     is_full: bool,
 ) -> Result<(), String> {
     let n_heads = cfg.num_attention_heads;
@@ -136,10 +142,9 @@ fn attn_sublayer(
     // uploaded `pos` to `pos_buf` and `len-1` to `swa_pos_buf` — reuse the
     // prepared buffer here; no per-layer copy.
     hip(gpu.rope_f32(&st.q, &st.k, &st.pos_buf, n_heads, n_kv, hd, theta))?;
-    // 3. Headwise qk-norm after RoPE.
+    // 3. Headwise qk-norm after RoPE. q scaled by the folded (sqk*factor)²;
+    // k plain. Both precede the KV write so cached K is normalized too.
     justnorm_heads(gpu, &st.q, n_heads, hd)?;
-    // q *= (sqk*sqk_factor)² — folded once at load (reference order:
-    // justnorm then scale; square folded into the stored vector).
     hip(gpu.mul_f32(&st.q, &w.sqk, &st.q))?;
     justnorm_heads(gpu, &st.k, n_kv, hd)?;
     // LAB-ONLY trace: capture exact pre-cache q/k/v BEFORE the write and raw
@@ -158,11 +163,13 @@ fn attn_sublayer(
     // 4. KV write + flash attention through the ONE production helper pair
     // (packed Q8 / FWHT2/3/4 codecs; F32 reference when built as such).
     // Buffers are already prepared for this `pos` — no mapping/uploads here.
-    dory_kv_write(gpu, &st.kv, layer_idx, &st.k, &st.v, &st.pos_buf)?;
+    // `cache_layer` is the virtual recurrent slot; physical weights/theta
+    // select math, the cache slot selects storage.
+    dory_kv_write(gpu, &st.kv, cache_layer, &st.k, &st.v, &st.pos_buf)?;
     dory_kv_attend(
         gpu,
         &mut st.kv,
-        layer_idx,
+        cache_layer,
         &st.q,
         &st.attn_out,
         &st.attn_partials,
@@ -178,6 +185,8 @@ fn attn_sublayer(
         rows.push(crate::kv::KvTraceRow {
             position: pos,
             layer: layer_idx,
+            loop_index,
+            cache_layer,
             q: trace_q.expect("dory: kv_trace q missing"),
             k: trace_k.expect("dory: kv_trace k missing"),
             v: trace_v.expect("dory: kv_trace v missing"),
@@ -222,6 +231,7 @@ fn run_blocks(
     st: &mut DoryState,
     range: std::ops::Range<usize>,
     pos: usize,
+    loop_index: usize,
 ) -> Result<(), String> {
     for i in range {
         if cfg.is_attention[i] {
@@ -229,7 +239,8 @@ fn run_blocks(
             let w = weights.attn[i]
                 .as_ref()
                 .ok_or_else(|| format!("dory: attention weights missing at layer {i}"))?;
-            attn_sublayer(gpu, cfg, w, st, i, pos, is_full)?;
+            let cache_layer = cfg.kv_layer_index(i, loop_index);
+            attn_sublayer(gpu, cfg, w, st, i, cache_layer, pos, loop_index, is_full)?;
         } else {
             let w = weights.mlp[i]
                 .as_ref()
@@ -308,22 +319,37 @@ pub fn forward_token(
     }
     // ONE per-token KV prepare: VMM map + absolute pos + sliding len-1
     // uploads. Every attention layer below consumes these buffers — no
-    // per-layer mapping scans or position copies.
+    // per-layer mapping scans or position copies. Same absolute `pos` for
+    // every recurrent pass (prepare once, not per pass).
     let window = cfg.sliding_window;
     dory_kv_prepare(gpu, &mut st.kv, &st.pos_buf, &st.swa_pos_buf, pos, window)?;
-    run_blocks(gpu, cfg, weights, st, 0..n_in, pos)?;
+    // Input block once → snapshot `input_h`. No KV loop index on input/output
+    // (loop_index 0 tags their trace rows; `kv_layer_index` ignores it there).
+    run_blocks(gpu, cfg, weights, st, 0..n_in, pos, 0)?;
     hip(gpu.copy_d2d(&st.h, &st.input_h, h_dim * 4))?;
-    // Single recurrent loop with reinjection:
-    // combined = justnorm(state + input_h); end with state = justnorm(h).
-    hip(gpu.copy_d2d(&st.h, &st.state_h, h_dim * 4))?;
-    hip(gpu.copy_d2d(&st.state_h, &st.h, h_dim * 4))?;
-    hip(gpu.add_inplace_f32(&st.h, &st.input_h))?;
-    justnorm_all(gpu, &st.h)?;
-    run_blocks(gpu, cfg, weights, st, n_in..n_in + n_rec, pos)?;
-    hip(gpu.copy_d2d(&st.h, &st.state_h, h_dim * 4))?;
-    justnorm_all(gpu, &st.state_h)?;
-    hip(gpu.copy_d2d(&st.state_h, &st.h, h_dim * 4))?;
-    run_blocks(gpu, cfg, weights, st, n_in + n_rec..n_layers, pos)?;
+    // N recurrent passes over the SHARED physical block. `state_h` holds the
+    // normalized output of the latest NON-final pass only (nothing persists
+    // across tokens: every token rebuilds `input_h`/`state_h` from its own
+    // input block). Pass 0 reinjects directly on `h` (which still holds the
+    // post-input value == initial `state`); later passes restore `h` from
+    // `state_h` first. The final pass normalizes in place in `h`, so the
+    // output block runs on `h` with no extra persist/restore copies.
+    let n_loops = cfg.n_recurrent_loops;
+    for loop_index in 0..n_loops {
+        if loop_index > 0 {
+            hip(gpu.copy_d2d(&st.state_h, &st.h, h_dim * 4))?;
+        }
+        hip(gpu.add_inplace_f32(&st.h, &st.input_h))?;
+        justnorm_all(gpu, &st.h)?;
+        run_blocks(gpu, cfg, weights, st, n_in..n_in + n_rec, pos, loop_index)?;
+        if loop_index + 1 < n_loops {
+            hip(gpu.copy_d2d(&st.h, &st.state_h, h_dim * 4))?;
+            justnorm_all(gpu, &st.state_h)?;
+        } else {
+            justnorm_all(gpu, &st.h)?;
+        }
+    }
+    run_blocks(gpu, cfg, weights, st, n_in + n_rec..n_layers, pos, 0)?;
     if !compute_logits {
         st.next_pos = pos + 1;
         return Ok(None);

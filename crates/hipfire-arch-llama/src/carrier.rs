@@ -1220,6 +1220,8 @@ mod tests {
             max_seq: 8,
             sequence: None,
             deepseek4_compute_placement: Default::default(),
+            dory_loops: None,
+            dory_recurrent_kv_cache_mode: None,
             deepseek4_experts_per_token: None,
             draft_path: None,
             kv_mode_override: Some("q8"),

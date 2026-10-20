@@ -147,20 +147,32 @@ fn snapshot(
     for (layer, ty) in config.layer_types.iter().enumerate() {
         let p = format!("layer_{layer:02}");
         if *ty == LayerType::LinearAttention {
-            out.insert(format!("{p}/state_codes"), rec.item(gpu, &dn.s_matrices[la], state_n)?);
+            out.insert(
+                format!("{p}/state_codes"),
+                rec.item(gpu, &dn.s_matrices[la], state_n)?,
+            );
             out.insert(
                 format!("{p}/state_scales"),
                 rec.item(gpu, &dn.s_scales[la], dn.s_scales[la].numel() * 4)?,
             );
-            out.insert(format!("{p}/ef"), rec.item(gpu, &dn.s_ef_residual[la], state_n * 2)?);
+            out.insert(
+                format!("{p}/ef"),
+                rec.item(gpu, &dn.s_ef_residual[la], state_n * 2)?,
+            );
             out.insert(
                 format!("{p}/conv"),
                 rec.item(gpu, &dn.conv_states[la], dn.conv_states[la].numel() * 4)?,
             );
             la += 1;
         } else {
-            out.insert(format!("{p}/key"), rec.item(gpu, &kv.k_gpu[layer], addressed)?);
-            out.insert(format!("{p}/value"), rec.item(gpu, &kv.v_gpu[layer], addressed)?);
+            out.insert(
+                format!("{p}/key"),
+                rec.item(gpu, &kv.k_gpu[layer], addressed)?,
+            );
+            out.insert(
+                format!("{p}/value"),
+                rec.item(gpu, &kv.v_gpu[layer], addressed)?,
+            );
         }
     }
     Ok(Value::Object(out))
@@ -240,7 +252,8 @@ fn run(raw: &[String]) -> Result<()> {
     let prompt_text = std::str::from_utf8(&prompt_bytes)?;
     let hfq = HfqFile::open(Path::new(&model))?;
     let config = qwen35::config_from_hfq(&hfq)?;
-    let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json).map_err(|e| format!("{e:?}"))?;
+    let tokenizer =
+        Tokenizer::from_hfq_metadata(&hfq.metadata_json).map_err(|e| format!("{e:?}"))?;
     drop(hfq);
     let hfq_open_ms = ms(t0);
     let seed = tokenizer.encode(prompt_text);
@@ -276,7 +289,8 @@ fn run(raw: &[String]) -> Result<()> {
         )
         .into());
     }
-    if !matches!(dn.quant, qwen35::StateQuant::Q8) || dn.s_ef_residual.len() != dn.s_matrices.len() {
+    if !matches!(dn.quant, qwen35::StateQuant::Q8) || dn.s_ef_residual.len() != dn.s_matrices.len()
+    {
         return Err("G3 pins DeltaNet Q8 with EF residual".into());
     }
     if config.num_experts != 0 {
@@ -295,7 +309,11 @@ fn run(raw: &[String]) -> Result<()> {
         None => json!({ "dir": null, "ready_ms": null, "go_ms": null }),
     };
 
-    let mut rec = Recorder { dir: &out, keep_raw, raw_count: 0 };
+    let mut rec = Recorder {
+        dir: &out,
+        keep_raw,
+        raw_count: 0,
+    };
     let mut snapshots = Map::new();
     let mut logits_sha = Vec::with_capacity(gen);
     let mut generated = Vec::with_capacity(gen);
@@ -457,14 +475,21 @@ fn compare(raw: &[String]) -> Result<()> {
                     "base_len": x.len(), "candidate_len": y.len() })
         })
     };
-    diffs.extend(seq_diff("logits_sha256", &a["logits_sha256"], &b["logits_sha256"]));
+    diffs.extend(seq_diff(
+        "logits_sha256",
+        &a["logits_sha256"],
+        &b["logits_sha256"],
+    ));
     diffs.extend(seq_diff("tokens", &a["tokens"], &b["tokens"]));
     let empty = Map::new();
     let sa = a["snapshots"].as_object().unwrap_or(&empty);
     let sb = b["snapshots"].as_object().unwrap_or(&empty);
     let stages: std::collections::BTreeSet<&String> = sa.keys().chain(sb.keys()).collect();
     for stage in stages {
-        let (Some(xa), Some(xb)) = (sa.get(stage).and_then(Value::as_object), sb.get(stage).and_then(Value::as_object)) else {
+        let (Some(xa), Some(xb)) = (
+            sa.get(stage).and_then(Value::as_object),
+            sb.get(stage).and_then(Value::as_object),
+        ) else {
             diffs.push(json!({ "item": format!("snapshot/{stage}"), "missing": true }));
             continue;
         };
@@ -479,7 +504,8 @@ fn compare(raw: &[String]) -> Result<()> {
             let mut d = json!({ "item": format!("snapshot/{stage}/{name}") });
             if let (Some(p), Some(q)) = (ea, eb) {
                 if let (Some(rp), Some(rq)) = (p["raw"].as_str(), q["raw"].as_str()) {
-                    d["first_diff_byte"] = json!(raw_first_diff(&base_dir.join(rp), &cand_dir.join(rq))?);
+                    d["first_diff_byte"] =
+                        json!(raw_first_diff(&base_dir.join(rp), &cand_dir.join(rq))?);
                 }
             }
             diffs.push(d);
@@ -516,9 +542,11 @@ fn main() -> Result<()> {
         Some("compare") => compare(&args[1..]),
         Some("weights") => weights(&args[1..]),
         Some("compare-weights") => compare_weights(&args[1..]),
-        _ => Err("usage: run --model M --prompt FILE --max-seq N --out DIR [...] | compare BASE CAND \
+        _ => Err(
+            "usage: run --model M --prompt FILE --max-seq N --out DIR [...] | compare BASE CAND \
                   | weights --model M --out DIR [--max-seq N] | compare-weights BASE CAND"
-            .into()),
+                .into(),
+        ),
     }
 }
 
@@ -527,7 +555,9 @@ fn main() -> Result<()> {
 fn load_bundle(model: &str, max_seq: usize, gpu: &mut Gpu) -> Result<Qwen35Bundle> {
     let cask = CaskConfig::default();
     let qwen_default_q8 = !matches!(
-        hipfire_config::developer_var("HIPFIRE_QWEN_KV_DEFAULT_Q8").ok().as_deref(),
+        hipfire_config::developer_var("HIPFIRE_QWEN_KV_DEFAULT_Q8")
+            .ok()
+            .as_deref(),
         Some("0")
     );
     let mut lc = LoadCtx {
@@ -535,6 +565,8 @@ fn load_bundle(model: &str, max_seq: usize, gpu: &mut Gpu) -> Result<Qwen35Bundl
         max_seq,
         sequence: None,
         deepseek4_compute_placement: Default::default(),
+        dory_loops: None,
+        dory_recurrent_kv_cache_mode: None,
         deepseek4_experts_per_token: None,
         draft_path: None,
         vision_path: None,
@@ -566,7 +598,12 @@ fn load_bundle(model: &str, max_seq: usize, gpu: &mut Gpu) -> Result<Qwen35Bundl
 /// field 22), so a parent can pin pid identity.
 fn proc_starttime() -> Option<u64> {
     let stat = fs::read_to_string("/proc/self/stat").ok()?;
-    stat.rsplit_once(')')?.1.split_whitespace().nth(19)?.parse().ok()
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
 }
 
 /// G1: hash every visited dense tensor's accessible bytes, keyed by stable role.
@@ -598,7 +635,8 @@ fn weights(raw: &[String]) -> Result<()> {
     let typed = shared_weights::dense_typed_tensor_lengths(&bundle.weights, &bundle.config, &gpu)
         .map_err(|e| format!("dense_typed_tensor_lengths: {e}"))?;
     let mut tensors = Map::new();
-    let (mut unique, mut unique_typed, mut unique_alloc, mut slack_total) = (0usize, 0usize, 0usize, 0usize);
+    let (mut unique, mut unique_typed, mut unique_alloc, mut slack_total) =
+        (0usize, 0usize, 0usize, 0usize);
     let (mut tail_checked, mut tail_nonzero) = (0usize, 0usize);
     {
         let gpu_ref = &gpu;
@@ -609,7 +647,9 @@ fn weights(raw: &[String]) -> Result<()> {
                 .ok_or_else(|| err(format!("{role}: no typed length")))?;
             let allocated = tensor.buf.size();
             if typed_bytes > allocated {
-                return Err(err(format!("{role}: typed {typed_bytes} > allocated {allocated}")));
+                return Err(err(format!(
+                    "{role}: typed {typed_bytes} > allocated {allocated}"
+                )));
             }
             let mut host = vec![0u8; typed_bytes];
             gpu_ref.hip.memcpy_dtoh(&mut host, &tensor.buf)?;
@@ -623,13 +663,16 @@ fn weights(raw: &[String]) -> Result<()> {
             // Imported owners: the registered mapped extent must be the frozen
             // physical size, and [typed, physical) must read back all zero.
             let tail = if route == "import" && !borrowed {
-                let mapped = gpu_ref
-                    .vmm_mapped_bytes(tensor)
-                    .ok_or_else(|| err(format!("{role}: imported owner is not a registered VMM arena")))?;
+                let mapped = gpu_ref.vmm_mapped_bytes(tensor).ok_or_else(|| {
+                    err(format!(
+                        "{role}: imported owner is not a registered VMM arena"
+                    ))
+                })?;
                 let granularity = gpu_ref
                     .vmm_granularity(tensor)
                     .ok_or_else(|| err(format!("{role}: no VMM granularity")))?;
-                let expected = shared_weights::expected_physical_bytes(typed_bytes as u64, granularity as u64);
+                let expected =
+                    shared_weights::expected_physical_bytes(typed_bytes as u64, granularity as u64);
                 if expected != Some(mapped as u64) {
                     return Err(err(format!(
                         "{role}: mapped {mapped} != expected physical {expected:?} (typed {typed_bytes}, granularity {granularity})"
@@ -675,7 +718,12 @@ fn weights(raw: &[String]) -> Result<()> {
         bundle.weights.for_each_dense_tensor(&mut visit)?;
     }
     if tensors.len() != typed.len() {
-        return Err(format!("visited {} roles but typed map has {}", tensors.len(), typed.len()).into());
+        return Err(format!(
+            "visited {} roles but typed map has {}",
+            tensors.len(),
+            typed.len()
+        )
+        .into());
     }
     let (after_readback_free, _) = mem_free(&gpu)?;
     let identity = json!({ "pid": std::process::id(), "starttime_ticks": proc_starttime() });
@@ -696,7 +744,11 @@ fn weights(raw: &[String]) -> Result<()> {
             let deadline = Instant::now() + Duration::from_secs(3600);
             while !release.exists() {
                 if Instant::now() > deadline {
-                    return Err(format!("hold {} timed out (weights still mapped)", release.display()).into());
+                    return Err(format!(
+                        "hold {} timed out (weights still mapped)",
+                        release.display()
+                    )
+                    .into());
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -728,7 +780,10 @@ fn weights(raw: &[String]) -> Result<()> {
         "free_ok": free_result.is_ok(),
         "free_error": free_result.as_ref().err(),
     });
-    fs::write(out.join("weights.json"), serde_json::to_vec_pretty(&record)?)?;
+    fs::write(
+        out.join("weights.json"),
+        serde_json::to_vec_pretty(&record)?,
+    )?;
     eprintln!(
         "G1_WEIGHTS route={route} unique_owners={unique} unique_typed_bytes={unique_typed} \
          tail_checked={tail_checked} tail_nonzero={tail_nonzero}"
@@ -781,8 +836,10 @@ fn compare_weights(raw: &[String]) -> Result<()> {
             reasons.push("tail");
         }
         for reason in reasons {
-            diffs.push(json!({ "role": r, "reason": reason, "base": xv, "candidate": yv,
-                               "first_diff_byte": raw_diff }));
+            diffs.push(
+                json!({ "role": r, "reason": reason, "base": xv, "candidate": yv,
+                               "first_diff_byte": raw_diff }),
+            );
         }
     }
     let tail_nonzero = rb["tail_nonzero_owners"].as_u64().unwrap_or(0);
@@ -800,5 +857,9 @@ fn compare_weights(raw: &[String]) -> Result<()> {
             "diffs": diffs,
         }))?
     );
-    if equal { Ok(()) } else { Err("MISMATCH".into()) }
+    if equal {
+        Ok(())
+    } else {
+        Err("MISMATCH".into())
+    }
 }

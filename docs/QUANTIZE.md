@@ -145,8 +145,9 @@ including EOS IDs. It is self-contained rather than dependent on the source
 directory. The native Dory loader consumes the formats and tier recipes
 above directly, with resident quantized weights and F32 activations. KV
 presets are `auto` (Q8), `q8`, `fwht2`, `fwht3` and `fwht4`; the FWHT presets
-pack K at the selected width and retain Q8 V. Execution remains one recurrent
-loop. Non-Q8 fixed-tier embedding tables
+pack K at the selected width and retain Q8 V. Loop count and recurrent
+KV ownership are load-time settings, not quantization recipes; the same
+artifact supports 1–4 loops without duplicating weights. Non-Q8 fixed-tier embedding tables
 are explicitly refused by the loader; the standard XT/Base/Pro recipes
 all retain Q8 embeddings.
 

@@ -212,10 +212,11 @@ Curated weights are published under
 defaults, sidecars and provenance. To bring your own model, use
 `hipfire quantize`.
 
-Nemotron Dory 1.0 4B also has a native **single-loop** path for a local BF16
-safetensors directory (no pull tag yet). This is a correctness bring-up route,
-with F32 activations/KV, not a quantized or multi-loop release. See
-[local Dory support](docs/MODELS.md#local-nemotron-dory).
+Nemotron Dory 1.0 4B has a native local BF16/HFQM path with **1–4 recurrent
+loops**, configurable per-loop or last-loop KV ownership, and Q8/FWHT KV
+caches (no pull tag yet). The input/output blocks run once; only the shared
+recurrent block repeats. This is a correctness bring-up route, not a
+throughput claim. See [local Dory support](docs/MODELS.md#local-nemotron-dory).
 
 ### Qwen 3.8 Flash Next split-PLE tiers (0.4.3)
 

@@ -646,6 +646,8 @@ fn admit_and_load(
         path,
         max_seq,
         None,
+        None,
+        None,
         Deepseek4ComputePlacement::Single,
         None,
         None,

@@ -12,9 +12,10 @@
 //! every odd index `mlp`). Each layer holds exactly ONE mixer plus its
 //! `*_alpha` interpolation scale — not the standard attention+FFN block.
 //!
-//! Single-loop bring-up policy: `n_recurrent_loops` admits 1 or 2 and the
-//! forward always runs exactly ONE recurrent pass over layers
-//! `[n_input, n_input + n_recurrent)`. The carrier logs this at load time.
+//! Multi-loop recurrence policy: the forward runs exactly
+//! `n_recurrent_loops` (1..=4) passes over the shared physical recurrent
+//! block `[n_input, n_input + n_recurrent)`, with per-loop or last-loop KV
+//! semantics selected by `recurrent_kv_cache_mode`.
 //!
 //! Weight residency: native BF16 bytes upload verbatim and execute through
 //! `gemv_bf16_xf32` (F32 activations); HFQ packs ride their common quant
@@ -30,6 +31,7 @@
 //! stores split `q/k/v_proj` and `gate/up_proj`. The loader maps exact local
 //! names (never the packed names) and fails closed on any shape/dtype miss.
 
+use hipfire_config::DoryRecurrentKvCacheMode;
 use hipfire_runtime::llama::{EmbeddingFormat, WeightTensor};
 use hipfire_runtime::model_source::ModelSource;
 use hipfire_runtime::weight_backend::{dequant_weight_raw, load_embedding, MemoryTarget};
@@ -290,6 +292,12 @@ pub struct DoryConfig {
     pub is_full_attention: Vec<bool>,
     /// `n_input_layers` / `n_recurrent_layers` / `n_output_layers`.
     pub block_split: (usize, usize, usize),
+    /// Declared recurrent passes per token (checkpoint `n_recurrent_loops`,
+    /// 1..=4; runtime override via [`DoryConfig::apply_recurrence_overrides`]).
+    pub n_recurrent_loops: usize,
+    /// KV semantics across recurrent passes (checkpoint
+    /// `recurrent_kv_cache_mode`, default `per_loop`).
+    pub recurrent_kv_cache_mode: DoryRecurrentKvCacheMode,
     /// `ngpt_alpha_init / initializer_range` (host precompute of the
     /// per-step slerp scale in `slerp_alpha`).
     pub alpha_scale: f32,
@@ -364,14 +372,13 @@ pub fn config_from_value(inner: &serde_json::Value) -> Result<DoryConfig, String
         ));
     }
     let n_recurrent_loops = usize_req("n_recurrent_loops")?;
-    // One loop is the native policy regardless of the declared count: the
-    // checkpoint was trained multi-loop but bring-up runs exactly one
-    // recurrent pass (matches the local single-loop oracle). Admit the
-    // shipped 2-loop metadata AND a hypothetical 1-loop re-export; refuse
-    // anything else rather than silently running a mismatched schedule.
-    if n_recurrent_loops != 1 && n_recurrent_loops != 2 {
+    // Genuine multi-loop schedule: the checkpoint declares its trained
+    // recurrent depth and the forward runs exactly that many passes (llama.cpp
+    // PR30306 admits 1..=4). Anything else fails closed rather than silently
+    // running a mismatched schedule.
+    if !(1..=4).contains(&n_recurrent_loops) {
         return Err(format!(
-            "dory: unsupported n_recurrent_loops={n_recurrent_loops} (bring-up runs exactly one recurrent pass; admits 1 or 2)"
+            "dory: unsupported n_recurrent_loops={n_recurrent_loops} (admit 1..=4)"
         ));
     }
     let mt = inner
@@ -477,7 +484,7 @@ pub fn config_from_value(inner: &serde_json::Value) -> Result<DoryConfig, String
     // not just product checks).
     if head_dim != 256 {
         return Err(format!(
-            "dory: head_dim={head_dim} unsupported (bring-up supports exactly 256)"
+            "dory: head_dim={head_dim} unsupported (packed KV codecs need D256)"
         ));
     }
     let ngpt_alpha_init = req("ngpt_alpha_init")?
@@ -533,6 +540,27 @@ pub fn config_from_value(inner: &serde_json::Value) -> Result<DoryConfig, String
             "dory: tie_word_embeddings=true unsupported (checkpoint ships untied lm_head)".into(),
         );
     }
+    // Recurrent KV semantics: upstream `recurrent_kv_cache_mode`, absent =
+    // `per_loop` (upstream default). Present-but-unknown fails closed —
+    // never silently run a mismatched cache schedule.
+    let recurrent_kv_cache_mode = match inner.get("recurrent_kv_cache_mode") {
+        None => DoryRecurrentKvCacheMode::PerLoop,
+        Some(v) => {
+            let s = v.as_str().ok_or_else(|| {
+                "dory: config `recurrent_kv_cache_mode` must be a string (per_loop|last_loop)"
+                    .to_string()
+            })?;
+            match s {
+                "per_loop" => DoryRecurrentKvCacheMode::PerLoop,
+                "last_loop" => DoryRecurrentKvCacheMode::LastLoop,
+                other => {
+                    return Err(format!(
+                        "dory: unsupported recurrent_kv_cache_mode=`{other}` (admit per_loop|last_loop)"
+                    ));
+                }
+            }
+        }
+    };
     let mut eos_token_ids: Vec<u32> = inner.get("eos_token_id").map(parse_eos).unwrap_or_default();
     if eos_token_ids.is_empty() {
         eos_token_ids = vec![2, 11];
@@ -552,6 +580,8 @@ pub fn config_from_value(inner: &serde_json::Value) -> Result<DoryConfig, String
         is_attention,
         is_full_attention,
         block_split: (n_input, n_recurrent, n_output),
+        n_recurrent_loops,
+        recurrent_kv_cache_mode,
         alpha_scale,
         s_gate_factor,
         sqk_factor,
@@ -569,6 +599,107 @@ pub fn config_from_source(source: &dyn ModelSource) -> Result<DoryConfig, String
         .get("config")
         .ok_or_else(|| "dory: metadata_json missing `config` wrapper".to_string())?;
     config_from_value(inner)
+}
+
+impl DoryConfig {
+    /// Apply runtime recurrence overrides (`None` = keep checkpoint value).
+    /// Counts admit 1..=4; anything else fails closed. Validates after
+    /// applying so a bad checkpoint value also fails before GPU allocation.
+    pub fn apply_recurrence_overrides(
+        &mut self,
+        loops: Option<usize>,
+        mode: Option<DoryRecurrentKvCacheMode>,
+    ) -> Result<(), String> {
+        if let Some(n) = loops {
+            if !(1..=4).contains(&n) {
+                return Err(format!("dory: unsupported dory_loops={n} (admit 1..=4)"));
+            }
+            self.n_recurrent_loops = n;
+        }
+        if let Some(m) = mode {
+            self.recurrent_kv_cache_mode = m;
+        }
+        self.validate_recurrence()
+    }
+
+    /// Fail closed on out-of-range loop counts (checkpoint or override).
+    /// Call before any GPU allocation.
+    pub fn validate_recurrence(&self) -> Result<(), String> {
+        if !(1..=4).contains(&self.n_recurrent_loops) {
+            return Err(format!(
+                "dory: unsupported n_recurrent_loops={} (admit 1..=4)",
+                self.n_recurrent_loops
+            ));
+        }
+        Ok(())
+    }
+
+    /// Cache-layer index for physical sublayer `physical` on recurrent pass
+    /// `loop_index` (0-based; input/output passes use `loop_index == 0`).
+    ///
+    /// `per_loop` uses dense virtual indexing (equivalent to upstream sparse
+    /// `loop * 72` IDs): input physical `i` maps to `i`; recurrent `i` on
+    /// pass `l` maps to `i + l * n_rec` (the shared physical block repeats in
+    /// cache once per pass); output `i` maps to `i + (N-1) * n_rec` (shifted
+    /// past every recurrent repeat). `last_loop` is the identity map: every
+    /// pass overwrites the same physical slot at the current absolute pos;
+    /// only the final pass's rows persist for earlier tokens.
+    pub fn kv_layer_index(&self, physical: usize, loop_index: usize) -> usize {
+        debug_assert!(physical < self.num_hidden_layers);
+        match self.recurrent_kv_cache_mode {
+            DoryRecurrentKvCacheMode::LastLoop => physical,
+            DoryRecurrentKvCacheMode::PerLoop => {
+                let (n_in, n_rec, _) = self.block_split;
+                if physical < n_in {
+                    physical
+                } else if physical < n_in + n_rec {
+                    physical + loop_index * n_rec
+                } else {
+                    physical + (self.n_recurrent_loops - 1) * n_rec
+                }
+            }
+        }
+    }
+
+    /// Per-cache-layer attention mask over [`DoryConfig::kv_layer_count`]
+    /// slots: a cache slot carries KV iff its physical sublayer is attention
+    /// (MLP slots hold 1-element placeholders). Input slots map from their
+    /// physical index; recurrent repeat `l` maps from physical
+    /// `slot - l * n_rec`; output slots map from `slot - (N-1) * n_rec`.
+    pub fn kv_layer_mask(&self) -> Vec<bool> {
+        match self.recurrent_kv_cache_mode {
+            DoryRecurrentKvCacheMode::LastLoop => self.is_attention.clone(),
+            DoryRecurrentKvCacheMode::PerLoop => {
+                let (n_in, n_rec, _) = self.block_split;
+                let n = self.n_recurrent_loops;
+                let count = self.kv_layer_count();
+                let mut mask = Vec::with_capacity(count);
+                for slot in 0..count {
+                    let physical = if slot < n_in {
+                        slot
+                    } else if slot < n_in + n * n_rec {
+                        n_in + (slot - n_in) % n_rec
+                    } else {
+                        slot - (n - 1) * n_rec
+                    };
+                    debug_assert!(physical < self.is_attention.len());
+                    mask.push(self.is_attention[physical]);
+                }
+                mask
+            }
+        }
+    }
+
+    /// Total virtual cache layers: `72 + 40 * (N-1)` under `per_loop`
+    /// (input 16 + N*40 recurrent + output 16), `72` under `last_loop`.
+    pub fn kv_layer_count(&self) -> usize {
+        match self.recurrent_kv_cache_mode {
+            DoryRecurrentKvCacheMode::LastLoop => self.num_hidden_layers,
+            DoryRecurrentKvCacheMode::PerLoop => {
+                self.num_hidden_layers + (self.n_recurrent_loops - 1) * self.block_split.1
+            }
+        }
+    }
 }
 
 // ─── Weights ─────────────────────────────────────────────────────────────
@@ -1011,9 +1142,11 @@ pub fn load_weights_from_source(
 /// `attn_partials` (flash reduce scratch), `pos_buf` (absolute position for
 /// RoPE + KV write + full-attention reads), `swa_pos_buf` (sliding `len-1`
 /// for windowed reads — tiles derive `seq_len` from the buffer given), plus
-/// one packed `KvCache` over all 72 physical layers (MLP slots hold
-/// 1-element placeholders; address by PHYSICAL `layer_idx`, not attn
-/// ordinal).
+/// one packed `KvCache` over [`DoryConfig::kv_layer_count`] virtual cache
+/// slots (MLP slots hold 1-element placeholders; address by
+/// [`DoryConfig::kv_layer_index`], not physical `layer_idx` — the virtual
+/// slot repeats the shared recurrent block once per pass under `per_loop`,
+/// and aliases physical layers under `last_loop`).
 ///
 /// `max_seq` is the logical KV budget at allocation. Stale KV tails are
 /// ignored: `reset()` only rewinds `next_pos`; slots are overwritten in place.
@@ -1055,9 +1188,9 @@ pub struct DoryState {
     pub kv_trace: Option<Vec<crate::kv::KvTraceRow>>,
 }
 
-/// Default KV budget for bring-up. 2048 positions × 36 KV-carrying layers;
-/// packed Q8 ≈ 1.4 MB/layer (1088 B K+V/pos), FWHT tiers smaller — far below
-/// the F32 bring-up sizing this replaces.
+/// Default KV budget: 2048 positions × 36 KV-carrying slots at N=1 (more under
+/// `per_loop`: input 8 + 20*N recurrent + 8 output attention caches);
+/// packed Q8 ≈ 1.4 MB/layer (1088 B K+V/pos), FWHT tiers smaller.
 pub const DEFAULT_MAX_SEQ: usize = 2048;
 
 impl DoryState {
@@ -1098,7 +1231,8 @@ impl DoryState {
     }
 
     /// Production constructor: build the packed `KvCache` for `kv_mode` on
-    /// `backend` (physical 72-layer mask), with failure-safe teardown of
+    /// `backend` over the resolved [`DoryConfig::kv_layer_mask`] (virtual
+    /// cache slots, not physical layers), with failure-safe teardown of
     /// every owner on the first error.
     pub fn new_with_kv(
         gpu: &mut Gpu,
@@ -1118,6 +1252,7 @@ impl DoryState {
         kv_backend: hipfire_runtime::kv_backend::KvBackend,
         f32_reference: bool,
     ) -> Result<Self, String> {
+        cfg.validate_recurrence()?;
         if max_seq == 0 {
             return Err("dory: max_seq must be > 0".into());
         }
@@ -1131,7 +1266,11 @@ impl DoryState {
         let f = cfg.intermediate_size;
         let q = cfg.num_attention_heads * cfg.head_dim;
         let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
-        let is_kv_layer: Vec<bool> = cfg.is_attention.clone();
+        // Virtual cache mask over `kv_layer_count()` slots (input once,
+        // recurrent block repeated per pass under per_loop, output once;
+        // identity under last_loop). The F32 reference rides the same
+        // resolved mask so its slots agree with production indexing.
+        let is_kv_layer: Vec<bool> = cfg.kv_layer_mask();
         // Worst-case flash scratch: the FWHT/Q8 tile kernels read up to the
         // smallest certified tile (16) in the size ladder, so size partials
         // for tile 16 regardless of the arch default (oversize is harmless).
@@ -1142,7 +1281,7 @@ impl DoryState {
         let mut kv = if f32_reference {
             saddle_core::kv::KvCache::new_gpu(
                 gpu,
-                cfg.num_hidden_layers,
+                cfg.kv_layer_count(),
                 cfg.num_key_value_heads,
                 cfg.head_dim,
                 max_seq,
@@ -1394,27 +1533,35 @@ mod tests {
     }
 
     #[test]
-    fn shipped_topology_admits_with_one_loop_policy() {
+    fn shipped_topology_admits_with_checkpoint_loops_and_default_per_loop() {
         let cfg = config_from_value(&minimal_config_json()).expect("admits");
         assert_eq!(cfg.hidden_size, 2560);
         assert_eq!(cfg.num_hidden_layers, 72);
         assert_eq!(cfg.vocab_size, 131072);
         assert_eq!(cfg.block_split, (16, 40, 16));
+        assert_eq!(cfg.n_recurrent_loops, 2);
+        assert_eq!(
+            cfg.recurrent_kv_cache_mode,
+            DoryRecurrentKvCacheMode::PerLoop
+        );
         assert_eq!(cfg.sliding_window, 1024);
         assert!((cfg.alpha_scale - 0.05 / 0.0177).abs() < 1e-6);
         assert_eq!(cfg.is_attention.iter().filter(|&&b| b).count(), 36);
     }
 
     #[test]
-    fn loop_counts_one_and_two_admit() {
-        for loops in [1, 2] {
+    fn loop_counts_one_through_four_admit() {
+        for loops in [1, 2, 3, 4] {
             let mut v = minimal_config_json();
             v["n_recurrent_loops"] = serde_json::json!(loops);
-            assert!(config_from_value(&v).is_ok(), "loops={loops}");
+            let cfg = config_from_value(&v).expect("admits");
+            assert_eq!(cfg.n_recurrent_loops, loops);
         }
-        let mut v = minimal_config_json();
-        v["n_recurrent_loops"] = serde_json::json!(3);
-        assert!(config_from_value(&v).is_err());
+        for bad in [0, 5, 8] {
+            let mut v = minimal_config_json();
+            v["n_recurrent_loops"] = serde_json::json!(bad);
+            assert!(config_from_value(&v).is_err(), "loops={bad}");
+        }
     }
 
     #[test]
@@ -1462,5 +1609,189 @@ mod tests {
         let mut v = minimal_config_json();
         v["tie_word_embeddings"] = serde_json::json!(true);
         assert!(config_from_value(&v).is_err());
+    }
+
+    #[test]
+    fn bad_recurrent_kv_cache_mode_fails_closed() {
+        let mut v = minimal_config_json();
+        v["recurrent_kv_cache_mode"] = serde_json::Value::String("sparse".into());
+        assert!(config_from_value(&v).is_err());
+        let mut v = minimal_config_json();
+        v["recurrent_kv_cache_mode"] = serde_json::json!(2);
+        assert!(config_from_value(&v).is_err());
+    }
+
+    #[test]
+    fn last_loop_mode_parses() {
+        let mut v = minimal_config_json();
+        v["recurrent_kv_cache_mode"] = serde_json::Value::String("last_loop".into());
+        let cfg = config_from_value(&v).expect("admits");
+        assert_eq!(
+            cfg.recurrent_kv_cache_mode,
+            DoryRecurrentKvCacheMode::LastLoop
+        );
+    }
+
+    fn per_loop_cfg(loops: usize) -> DoryConfig {
+        let mut v = minimal_config_json();
+        v["n_recurrent_loops"] = serde_json::json!(loops);
+        config_from_value(&v).expect("admits")
+    }
+
+    fn last_loop_cfg(loops: usize) -> DoryConfig {
+        let mut v = minimal_config_json();
+        v["n_recurrent_loops"] = serde_json::json!(loops);
+        v["recurrent_kv_cache_mode"] = serde_json::Value::String("last_loop".into());
+        config_from_value(&v).expect("admits")
+    }
+
+    #[test]
+    fn per_loop_recurrent_slots_unique_input_output_noalias() {
+        // Shipped split: 16 input / 40 recurrent / 16 output physical, 20
+        // attention sublayers per recurrent repeat.
+        for loops in [1usize, 2, 3, 4] {
+            let cfg = per_loop_cfg(loops);
+            assert_eq!(cfg.kv_layer_count(), 72 + 40 * (loops - 1));
+            let mask = cfg.kv_layer_mask();
+            assert_eq!(mask.len(), cfg.kv_layer_count());
+            assert_eq!(mask.iter().filter(|&&b| b).count(), 36 + 20 * (loops - 1));
+            // Input/output cache slots never alias recurrent slots.
+            for i in 0..16usize {
+                assert_eq!(cfg.kv_layer_index(i, 0), i);
+                assert_eq!(cfg.kv_layer_index(56 + i, 0), 56 + i + (loops - 1) * 40);
+            }
+            // Recurrent repeats are pairwise disjoint across passes.
+            let mut seen = std::collections::HashSet::new();
+            for l in 0..loops {
+                for i in 16..56usize {
+                    let slot = cfg.kv_layer_index(i, l);
+                    assert_eq!(slot, i + l * 40);
+                    assert!(seen.insert(slot), "loops={loops} slot={slot}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn per_loop_mask_slots_track_physical_attention() {
+        let cfg = per_loop_cfg(3);
+        let mask = cfg.kv_layer_mask();
+        // Input region mirrors physical 0..16.
+        for i in 0..16usize {
+            assert_eq!(mask[i], cfg.is_attention[i]);
+        }
+        // Each recurrent repeat mirrors physical 16..56: even slot offsets
+        // (physical even sublayers) carry attention.
+        for l in 0..3usize {
+            for o in 0..40usize {
+                assert_eq!(mask[16 + l * 40 + o], cfg.is_attention[16 + o]);
+            }
+        }
+        // Output region mirrors physical 56..72 shifted past the repeats.
+        for i in 0..16usize {
+            assert_eq!(mask[16 + 3 * 40 + i], cfg.is_attention[56 + i]);
+        }
+    }
+
+    #[test]
+    fn last_loop_shares_only_recurrent_slots() {
+        for loops in [1usize, 2, 3, 4] {
+            let cfg = last_loop_cfg(loops);
+            assert_eq!(cfg.kv_layer_count(), 72);
+            assert_eq!(cfg.kv_layer_mask(), cfg.is_attention);
+            // Identity map for every layer and pass: every recurrent pass
+            // overwrites the same physical slot at the current position.
+            for l in 0..loops {
+                for i in 0..72usize {
+                    assert_eq!(cfg.kv_layer_index(i, l), i);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn kv_layer_counts_match_36_56_76_96_attention_slots() {
+        // Attention slots: 8 input + 20*N recurrent + 8 output.
+        for (loops, slots) in [(1usize, 36usize), (2, 56), (3, 76), (4, 96)] {
+            let per = per_loop_cfg(loops);
+            assert_eq!(per.kv_layer_count(), 72 + 40 * (loops - 1));
+            assert_eq!(per.kv_layer_mask().iter().filter(|&&b| b).count(), slots);
+            let last = last_loop_cfg(loops);
+            assert_eq!(last.kv_layer_count(), 72);
+            assert_eq!(last.kv_layer_mask().iter().filter(|&&b| b).count(), 36);
+        }
+    }
+
+    #[test]
+    fn recurrence_override_boundaries() {
+        let mut cfg = per_loop_cfg(2);
+        cfg.apply_recurrence_overrides(Some(4), None)
+            .expect("admits");
+        assert_eq!(cfg.n_recurrent_loops, 4);
+        assert_eq!(cfg.kv_layer_count(), 72 + 40 * 3);
+        cfg.apply_recurrence_overrides(Some(1), Some(DoryRecurrentKvCacheMode::LastLoop))
+            .expect("admits");
+        assert_eq!(cfg.n_recurrent_loops, 1);
+        assert_eq!(
+            cfg.recurrent_kv_cache_mode,
+            DoryRecurrentKvCacheMode::LastLoop
+        );
+        assert_eq!(cfg.kv_layer_count(), 72);
+        for bad in [0, 5] {
+            assert!(
+                cfg.apply_recurrence_overrides(Some(bad), None).is_err(),
+                "loops={bad}"
+            );
+        }
+        // None/None keeps checkpoint values.
+        cfg.apply_recurrence_overrides(None, None).expect("admits");
+        assert_eq!(cfg.n_recurrent_loops, 1);
+    }
+
+    #[test]
+    fn mask_len_always_matches_count_across_modes_and_overrides() {
+        // Sizing is a pure function of (split, loops, mode): `reset()` only
+        // rewinds `next_pos`/`compact_offset` and never reallocates, so the
+        // mask length must equal the count for every reachable config —
+        // otherwise a post-reset forward would address freed slots.
+        for loops in [1usize, 2, 3, 4] {
+            for mode in [
+                DoryRecurrentKvCacheMode::PerLoop,
+                DoryRecurrentKvCacheMode::LastLoop,
+            ] {
+                let mut cfg = per_loop_cfg(loops);
+                cfg.apply_recurrence_overrides(None, Some(mode))
+                    .expect("admits");
+                assert_eq!(cfg.kv_layer_mask().len(), cfg.kv_layer_count());
+            }
+        }
+    }
+
+    #[test]
+    fn non_recurrent_slots_ignore_loop_index_recurrent_do_not() {
+        // `kv_layer_index` takes `loop_index` only for the shared recurrent
+        // block: input/output slots are loop-independent under `per_loop`
+        // (and everything is under `last_loop`). A recurrent slot that
+        // ignored its pass would alias histories across passes; a
+        // non-recurrent slot that moved with the pass would strand writes
+        // outside the input/output caches.
+        for loops in [1usize, 2, 3, 4] {
+            let per = per_loop_cfg(loops);
+            for l in 0..loops {
+                for i in 0..16usize {
+                    assert_eq!(per.kv_layer_index(i, l), i);
+                    assert_eq!(per.kv_layer_index(56 + i, l), 56 + i + (loops - 1) * 40);
+                }
+                for i in 16..56usize {
+                    assert_eq!(per.kv_layer_index(i, l), i + l * 40);
+                }
+            }
+            let last = last_loop_cfg(loops);
+            for l in 0..loops {
+                for i in 0..72usize {
+                    assert_eq!(last.kv_layer_index(i, l), i);
+                }
+            }
+        }
     }
 }

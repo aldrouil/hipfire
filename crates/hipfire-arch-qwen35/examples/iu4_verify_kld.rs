@@ -61,8 +61,23 @@ fn row_stats(r: &[f32], c: &[f32]) -> RowStat {
         kld += la.exp() * (la - lb);
         max_abs = max_abs.max((a as f64 - b as f64).abs());
     }
-    let am = |v: &[f32]| v.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |acc, (i, &x)| if x > acc.1 { (i, x) } else { acc }).0;
-    RowStat { kld: kld.max(0.0), top1_same: am(r) == am(c), max_abs }
+    let am = |v: &[f32]| {
+        v.iter()
+            .enumerate()
+            .fold((0usize, f32::NEG_INFINITY), |acc, (i, &x)| {
+                if x > acc.1 {
+                    (i, x)
+                } else {
+                    acc
+                }
+            })
+            .0
+    };
+    RowStat {
+        kld: kld.max(0.0),
+        top1_same: am(r) == am(c),
+        max_abs,
+    }
 }
 
 fn pct(v: &mut [f64], p: f64) -> f64 {
@@ -101,7 +116,8 @@ fn run() -> R<()> {
     std::fs::create_dir_all(&out)?;
     let seqs: Vec<Seq> = serde_json::from_str(&std::fs::read_to_string(&seqs_path)?)?;
     let hfq = HfqFile::open(std::path::Path::new(&model))?;
-    let tok = Tokenizer::from_hfq_metadata(&hfq.metadata_json).map_err(|e| format!("tokenizer: {e:?}"))?;
+    let tok = Tokenizer::from_hfq_metadata(&hfq.metadata_json)
+        .map_err(|e| format!("tokenizer: {e:?}"))?;
     drop(hfq);
 
     let mut gpu = Gpu::init()?;
@@ -110,8 +126,14 @@ fn run() -> R<()> {
     let mut lc = LoadCtx {
         path: &model,
         max_seq: 4096,
-        sequence: Some(SequenceHint { model_ctx: 4096, automatic: true, card_cap: 0 }),
+        sequence: Some(SequenceHint {
+            model_ctx: 4096,
+            automatic: true,
+            card_cap: 0,
+        }),
         deepseek4_compute_placement: Default::default(),
+        dory_loops: None,
+        dory_recurrent_kv_cache_mode: None,
         deepseek4_experts_per_token: None,
         draft_path: None,
         vision_path: None,
@@ -149,7 +171,10 @@ fn run() -> R<()> {
         gpu.hip.device_synchronize()?;
         let mut raw = vec![0u8; rows * vocab * 4];
         gpu.hip.memcpy_dtoh_at(&mut raw, &logits.buf, 0)?;
-        Ok(raw.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
+        Ok(raw
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect())
     };
 
     let mut csv = String::from("seq,window,row,pos,kld,top1_same,max_abs_dlogit\n");
@@ -167,7 +192,18 @@ fn run() -> R<()> {
         // Fresh sequence: reset KV/state by re-prefilling from position 0.
         b.dn_state.reset(&mut gpu)?;
         qwen35::forward_prefill_batch(
-            &mut gpu, &b.weights, &b.config, &p, 0, &mut b.kv_cache, &mut b.dn_state, &b.scratch, None, None, None, None,
+            &mut gpu,
+            &b.weights,
+            &b.config,
+            &p,
+            0,
+            &mut b.kv_cache,
+            &mut b.dn_state,
+            &b.scratch,
+            None,
+            None,
+            None,
+            None,
         )?;
         let mut pos = p.len();
         for w in 0..nw {
@@ -175,20 +211,46 @@ fn run() -> R<()> {
             snap.save_from(&b.dn_state, &mut gpu)?;
             let prev = gpu.iu4_verify_enter(true);
             let r = qwen35::forward_prefill_batch_capture_hidden(
-                &mut gpu, &b.weights, &b.config, toks, pos, &mut b.kv_cache, &mut b.dn_state, &b.scratch, &hidden,
+                &mut gpu,
+                &b.weights,
+                &b.config,
+                toks,
+                pos,
+                &mut b.kv_cache,
+                &mut b.dn_state,
+                &b.scratch,
+                &hidden,
             );
             gpu.iu4_verify_exit(prev);
             r?;
             let lf = head_rows(&mut gpu, &b.weights.output, W)?;
             snap.restore_to(&mut b.dn_state, &mut gpu)?;
             qwen35::forward_prefill_batch_capture_hidden(
-                &mut gpu, &b.weights, &b.config, toks, pos, &mut b.kv_cache, &mut b.dn_state, &b.scratch, &hidden,
+                &mut gpu,
+                &b.weights,
+                &b.config,
+                toks,
+                pos,
+                &mut b.kv_cache,
+                &mut b.dn_state,
+                &b.scratch,
+                &hidden,
             )?;
             let lr = head_rows(&mut gpu, &b.weights.output, W)?;
             let mut wsum = 0f64;
             for row in 0..W {
-                let st = row_stats(&lr[row * vocab..(row + 1) * vocab], &lf[row * vocab..(row + 1) * vocab]);
-                let _ = writeln!(csv, "{si},{w},{row},{},{:.6e},{},{:.4}", pos + row, st.kld, st.top1_same as u8, st.max_abs);
+                let st = row_stats(
+                    &lr[row * vocab..(row + 1) * vocab],
+                    &lf[row * vocab..(row + 1) * vocab],
+                );
+                let _ = writeln!(
+                    csv,
+                    "{si},{w},{row},{},{:.6e},{},{:.4}",
+                    pos + row,
+                    st.kld,
+                    st.top1_same as u8,
+                    st.max_abs
+                );
                 wsum += st.kld;
                 klds.push(st.kld);
                 maxabs.push(st.max_abs);
@@ -199,7 +261,11 @@ fn run() -> R<()> {
             windows += 1;
             pos += W;
         }
-        eprintln!("seq {si}: prompt {} tok, {nw} windows; running mean KLD {:.4e}", p.len(), klds.iter().sum::<f64>() / klds.len() as f64);
+        eprintln!(
+            "seq {si}: prompt {} tok, {nw} windows; running mean KLD {:.4e}",
+            p.len(),
+            klds.iter().sum::<f64>() / klds.len() as f64
+        );
     }
     if rows_total == 0 {
         return Err("no windows evaluated".into());
@@ -207,14 +273,39 @@ fn run() -> R<()> {
     let mean = klds.iter().sum::<f64>() / rows_total as f64;
     let mut s = String::new();
     let _ = writeln!(s, "model {model}");
-    let _ = writeln!(s, "windows {windows} rows {rows_total} (W={W}, <= {wps} windows/seq)");
-    let _ = writeln!(s, "KLD(F16 || IU4) per row: mean {mean:.4e} median {:.4e} p90 {:.4e} p99 {:.4e} max {:.4e}",
-        pct(&mut klds.clone(), 0.5), pct(&mut klds.clone(), 0.9), pct(&mut klds.clone(), 0.99), pct(&mut klds, 1.0));
-    let _ = writeln!(s, "per-window mean KLD: median {:.4e} p99 {:.4e} max {:.4e}",
-        pct(&mut win_kld_mean.clone(), 0.5), pct(&mut win_kld_mean.clone(), 0.99), pct(&mut win_kld_mean, 1.0));
-    let _ = writeln!(s, "top-1 agreement {}/{} = {:.4}%", top1_same, rows_total, 100.0 * top1_same as f64 / rows_total as f64);
-    let _ = writeln!(s, "max |dlogit|: median {:.4} p99 {:.4} max {:.4}",
-        pct(&mut maxabs.clone(), 0.5), pct(&mut maxabs.clone(), 0.99), pct(&mut maxabs, 1.0));
+    let _ = writeln!(
+        s,
+        "windows {windows} rows {rows_total} (W={W}, <= {wps} windows/seq)"
+    );
+    let _ = writeln!(
+        s,
+        "KLD(F16 || IU4) per row: mean {mean:.4e} median {:.4e} p90 {:.4e} p99 {:.4e} max {:.4e}",
+        pct(&mut klds.clone(), 0.5),
+        pct(&mut klds.clone(), 0.9),
+        pct(&mut klds.clone(), 0.99),
+        pct(&mut klds, 1.0)
+    );
+    let _ = writeln!(
+        s,
+        "per-window mean KLD: median {:.4e} p99 {:.4e} max {:.4e}",
+        pct(&mut win_kld_mean.clone(), 0.5),
+        pct(&mut win_kld_mean.clone(), 0.99),
+        pct(&mut win_kld_mean, 1.0)
+    );
+    let _ = writeln!(
+        s,
+        "top-1 agreement {}/{} = {:.4}%",
+        top1_same,
+        rows_total,
+        100.0 * top1_same as f64 / rows_total as f64
+    );
+    let _ = writeln!(
+        s,
+        "max |dlogit|: median {:.4} p99 {:.4} max {:.4}",
+        pct(&mut maxabs.clone(), 0.5),
+        pct(&mut maxabs.clone(), 0.99),
+        pct(&mut maxabs, 1.0)
+    );
     print!("{s}");
     std::fs::write(format!("{out}/kld_rows.csv"), csv)?;
     std::fs::write(format!("{out}/summary.txt"), s)?;

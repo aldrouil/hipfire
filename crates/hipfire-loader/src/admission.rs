@@ -214,6 +214,14 @@ pub struct SourceAdmissionOptions {
     pub non_single_compute: bool,
     pub expert_count_override: bool,
     pub pflash: bool,
+    /// Dory-only staged recurrence override (`model.dory_loops` 1..=4).
+    /// `None` preserves the checkpoint default. Threaded from the daemon's
+    /// staged load params so `dory_recurrence_admission` validates the
+    /// exact controls the carrier will allocate, before teardown.
+    pub dory_loops: Option<usize>,
+    /// Dory-only staged KV-mode override (`auto` arrives as `None`).
+    /// Other carriers must ignore both fields.
+    pub dory_recurrent_kv_cache_mode: Option<hipfire_config::DoryRecurrentKvCacheMode>,
 }
 
 /// Return whether a per-load adaptive-KV value requests the active controller.
@@ -248,7 +256,11 @@ pub(crate) fn qwen4_native_mtp(
     let retained = hipfire_runtime::config::retained_redline_default(
         gpu_arch, "qwen4", path, pp, tp, ep, true,
     );
-    qwen4_native_mtp_for_floor(spec.mtp, retained, hipfire_arch_qwen4::MTP_MEASURED_AR_FLOOR)
+    qwen4_native_mtp_for_floor(
+        spec.mtp,
+        retained,
+        hipfire_arch_qwen4::MTP_MEASURED_AR_FLOOR,
+    )
 }
 
 /// [`qwen4_native_mtp`]'s policy with the retained-Redline fact and the
@@ -271,7 +283,9 @@ pub(crate) fn qwen4_native_mtp_for_floor(
                 .into(),
         ),
         MtpMode::On => Ok(true),
-        auto @ MtpMode::Auto => Ok(!retained && hipfire_config::mtp_mode_admits(auto, measured_ar_floor)),
+        auto @ MtpMode::Auto => {
+            Ok(!retained && hipfire_config::mtp_mode_admits(auto, measured_ar_floor))
+        }
     }
 }
 
@@ -481,7 +495,10 @@ pub fn qwen4_request_admission(
         ));
     }
     if native_mtp && !capabilities.native_mtp {
-        return Err("qwen4: native MTP is not supported by this model file; set speculation.mtp = off".into());
+        return Err(
+            "qwen4: native MTP is not supported by this model file; set speculation.mtp = off"
+                .into(),
+        );
     }
     if !effective_mesh.is_qwen4_admitted() {
         return Err(format!(
@@ -566,7 +583,10 @@ pub fn qwen4_ep_rank_devices(
                 "qwen4: logical expert parallelism emulation (topology.ep = {ep}) needs at least 1 visible device, 0 visible"
             ));
         }
-        Ok(hipfire_runtime::multi_gpu::alias_ids(&ids, physical_count as i32))
+        Ok(hipfire_runtime::multi_gpu::alias_ids(
+            &ids,
+            physical_count as i32,
+        ))
     } else if physical_count < ep {
         Err(format!(
             "qwen4: expert parallelism (topology.ep = {ep}) needs {ep} visible devices, {physical_count} visible"
@@ -1111,9 +1131,11 @@ pub fn classify_vision(
         // request or silently downgraded to text.
         QWEN4_ARCH_ID => {
             if has_vision_tensor {
-                Err("qwen4: this model file contains vision tensors, but Qwen4 loads text only; \
+                Err(
+                    "qwen4: this model file contains vision tensors, but Qwen4 loads text only; \
                      use the text-only build of the model"
-                    .into())
+                        .into(),
+                )
             } else {
                 Ok(false)
             }
@@ -1291,6 +1313,81 @@ fn admit_head_overlay(
         .map_err(|e| format!("head overlay '{path}': open failed: {e}"))?;
     hfq.attach_opened_head(ov, std::path::Path::new(path))?;
     Ok(())
+}
+/// Dory recurrence gate (arch_id 19): validate the STAGED overrides against
+/// the checkpoint's own config from the already-open source — no reopen, no
+/// mmap, no allocation. Applies `dory_loops` / `dory_recurrent_kv_cache_mode`
+/// through the same `apply_recurrence_overrides` the carrier runs before
+/// weights/state, so admission and allocation agree exactly. `None` loops
+/// keeps the checkpoint default; a malformed checkpoint also refuses here.
+/// Expanded-KV capacity is accounted centrally in `resolve_sequence`-style
+/// math at the call site below (`dory_kv_capacity`), never by shrinking
+/// `max_seq`.
+pub fn dory_recurrence_admission(
+    source: &ModelSource,
+    loops: Option<usize>,
+    mode: Option<hipfire_config::DoryRecurrentKvCacheMode>,
+) -> Result<hipfire_arch_dory::dory::DoryConfig, String> {
+    let meta: serde_json::Value = match source {
+        ModelSource::Hfq(hfq) => serde_json::from_str(&hfq.metadata_json)
+            .map_err(|e| format!("dory: HFQ metadata_json not valid JSON: {e}"))?,
+        ModelSource::Dir(dir) => serde_json::from_str(
+            hipfire_runtime::model_source::ModelSource::metadata_json(dir),
+        )
+        .map_err(|e| format!("dory: safetensors metadata_json not valid JSON: {e}"))?,
+    };
+    let inner = meta
+        .get("config")
+        .ok_or_else(|| "dory: metadata_json missing `config` wrapper".to_string())?;
+    let mut config = hipfire_arch_dory::dory::config_from_value(inner)
+        .map_err(|e| format!("dory: checkpoint config invalid: {e}"))?;
+    config
+        .apply_recurrence_overrides(loops, mode)
+        .map_err(|e| format!("dory: {e}"))?;
+    Ok(config)
+}
+
+/// Central expanded-KV capacity accounting for the resolved Dory config.
+/// Returns `(cache_layers, attn_cache_layers, bytes_per_token_per_attn_slot)`:
+/// virtual cache slots from `kv_layer_count()` (physical hybrid mask
+/// expanded by per_loop repetitions), attention-carrying slots by filtering
+/// the same mask (MLP slots ride 1-element placeholders), and the legacy
+/// packed bytes/token/attention-slot from the SHARED
+/// [`saddle_core::kv::SlotKvTierPlan::resolve`] for this tier+geometry
+/// (K+V summed; Dory V is Q8_0 — no duplicated byte table here, so the
+/// pricing can never drift from the `*_filtered` constructors).
+/// Dory is legacy-contiguous only (VMM refused at admission), so there is
+/// no reserve-vs-budget distinction. Pure math: no GPU, no allocation.
+/// Pricing only: callers log it and let the post-teardown constructor
+/// enforce fit (fails closed on OOM — never a silent `max_seq` shrink).
+/// Never compare against pre-teardown `free_vram_bytes`: the prior model
+/// is still resident there (false refusal on reload, weights ignored on
+/// first load).
+pub fn dory_kv_capacity(
+    config: &hipfire_arch_dory::dory::DoryConfig,
+    kv_mode: hipfire_runtime::kv_mode::KvMode,
+) -> (usize, usize, usize) {
+    let mask = config.kv_layer_mask();
+    let cache_layers = mask.len();
+    let attn_cache_layers = mask.iter().filter(|&&b| b).count();
+    // Shared authority: `SlotKvTierPlan` carries the exact K/V per-pos
+    // strides the contiguous constructors allocate (Q8 272+272, FWHT2
+    // 68+272, FWHT3 100+272, FWHT4 132+272 per head at D=256). Dory's
+    // admitted tiers are exactly the plan's rotated set, so `resolve`
+    // cannot fail here; a future geometry change fails closed, never
+    // silently prices zero.
+    let plan = saddle_core::kv::SlotKvTierPlan::resolve(
+        kv_mode,
+        config.num_key_value_heads,
+        config.head_dim,
+    )
+    .expect("dory: admitted KV tier must resolve a shared tier plan");
+    let bytes_per_token_per_attn_slot = plan.k_bytes_per_pos.saturating_add(plan.v_bytes_per_pos);
+    (
+        cache_layers,
+        attn_cache_layers,
+        bytes_per_token_per_attn_slot,
+    )
 }
 
 /// Resolve the single carrier that claims a source, refusing no-carrier and
@@ -2488,7 +2585,10 @@ pub fn admit_source_with_options(
                 .to_string(),
         )
     } else if !hints.vmm_runtime_available {
-        Some("this GPU runtime does not provide the virtual-memory (VMM) support the backend needs".to_string())
+        Some(
+            "this GPU runtime does not provide the virtual-memory (VMM) support the backend needs"
+                .to_string(),
+        )
     } else if let Some(reason) = hipfire_config::devices::vmm_kv_platform_refusal() {
         Some(reason)
     } else if gpu_arch != "gfx1201"
@@ -2795,6 +2895,41 @@ pub fn admit_source_with_options(
         }
     }
 
+    // Dory recurrence (arch_id 19): PRE-TEARDOWN this gate validates CONFIG
+    // ONLY (staged loops 1..=4 / KV mode / checkpoint shape via the exact
+    // `apply_recurrence_overrides` the carrier runs). It deliberately does
+    // NOT compare KV bytes against `free_vram_bytes` here: that reading is
+    // taken while the prior model is still resident, so a same-path reload
+    // would falsely refuse on reclaimable bytes, and a first load would
+    // ignore weights entirely. Allocation-time capacity is enforced
+    // post-teardown by the constructor itself (`*_filtered` fails closed on
+    // OOM — never a silent `max_seq` shrink); `dory_kv_capacity` below is
+    // the shared, log-only pricing of the same resolved geometry.
+    if arch_id == 19 {
+        let resolved = dory_recurrence_admission(
+            &source,
+            options.dory_loops,
+            options.dory_recurrent_kv_cache_mode,
+        )?;
+        // Resolve the KV tier through the same `resolve_dory_kv` the carrier
+        // uses so a bad tier refuses here with the prior model intact —
+        // pricing math (not a fit verdict) follows.
+        let tier = hipfire_arch_dory::kv::resolve_dory_kv(
+            hints
+                .kv_mode
+                .unwrap_or(hipfire_runtime::config::get().kv_mode.as_str()),
+            hints.kv_k,
+            hints.kv_v,
+            gpu_arch,
+            hints.qwen_default_q8,
+        )
+        .map_err(|e| format!("dory: {e}"))?;
+        let (cache_layers, attn_slots, per_slot) = dory_kv_capacity(&resolved, tier);
+        eprintln!(
+            "dory: admission: loops={} kv_cache_mode={} cache_layers={} attn_slots={} kv={:?} bytes_per_token_per_attn_slot={} (config validated pre-teardown; KV alloc preflights post-teardown against reclaimed VRAM)",
+            resolved.n_recurrent_loops, resolved.recurrent_kv_cache_mode, cache_layers, attn_slots, tier, per_slot,
+        );
+    }
     // One admitted mesh. Visible-device identity (HIP ordinal + PCI id + arch)
     // is bound here once; placement and carriers consume it and never reread
     // the raw pp/tp/ep request. Existing routes keep their rank order and
@@ -2916,7 +3051,11 @@ mod tests {
                 "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
             ] {
                 for qt in [44u8, 47, 48, 49, 50, 17] {
-                    assert_eq!(dflash_lm_head_refusal(Some(qt), arch), None, "{arch} qt={qt}");
+                    assert_eq!(
+                        dflash_lm_head_refusal(Some(qt), arch),
+                        None,
+                        "{arch} qt={qt}"
+                    );
                 }
             }
         }
@@ -2933,9 +3072,15 @@ mod tests {
         #[test]
         fn refusal_message_for_unknown_and_missing_lm_head() {
             let missing = dflash_lm_head_refusal(None, "gfx1030").expect("missing refuses");
-            assert!(missing.contains("no lm_head/embed_tokens tensor"), "{missing}");
+            assert!(
+                missing.contains("no lm_head/embed_tokens tensor"),
+                "{missing}"
+            );
             let other = dflash_lm_head_refusal(Some(45), "gfx1100").expect("qt45 refuses");
-            assert!(other.contains("quant_type=45") && other.contains("gfx1100"), "{other}");
+            assert!(
+                other.contains("quant_type=45") && other.contains("gfx1100"),
+                "{other}"
+            );
         }
     }
 
@@ -3495,7 +3640,9 @@ mod tests {
         assert_eq!(admit(1, 1, 1, true), Ok(()));
         for ep in [0, 9, 16] {
             assert!(
-                admit(1, 1, ep, false).unwrap_err().contains("topology.ep from 1 to 8"),
+                admit(1, 1, ep, false)
+                    .unwrap_err()
+                    .contains("topology.ep from 1 to 8"),
                 "ep {ep}"
             );
         }
@@ -3595,24 +3742,34 @@ mod tests {
                 );
             }
         }
-        assert_eq!(qwen4_ep_device_refusal(2, &ranks(2), &homogeneous("gfx1201", 4), all), Ok(()));
+        assert_eq!(
+            qwen4_ep_device_refusal(2, &ranks(2), &homogeneous("gfx1201", 4), all),
+            Ok(())
+        );
         // Too few devices.
-        assert!(qwen4_ep_device_refusal(4, &ranks(4), &homogeneous("gfx1201", 3), all)
-            .unwrap_err()
-            .contains("3 visible"));
+        assert!(
+            qwen4_ep_device_refusal(4, &ranks(4), &homogeneous("gfx1201", 3), all)
+                .unwrap_err()
+                .contains("3 visible")
+        );
         // A different admitted arch on rank 2 refuses (mixed) and names the ranks.
         let mut mixed = homogeneous("gfx1201", 4);
         mixed[2] = "gfx1100".to_string();
         let error = qwen4_ep_device_refusal(4, &ranks(4), &mixed, all).unwrap_err();
         assert!(
-            error.contains("same architecture") && error.contains("rank 2") && error.contains("gfx1100"),
+            error.contains("same architecture")
+                && error.contains("rank 2")
+                && error.contains("gfx1100"),
             "{error}"
         );
         // An unadmitted arch refuses even when homogeneous.
         for arch in ["gfx1151", "gfx1030", "gfx942", ""] {
             let error =
                 qwen4_ep_device_refusal(2, &ranks(2), &homogeneous(arch, 2), all).unwrap_err();
-            assert!(error.contains("gfx1100 or gfx1201") && error.contains("rank 0"), "{arch}: {error}");
+            assert!(
+                error.contains("gfx1100 or gfx1201") && error.contains("rank 0"),
+                "{arch}: {error}"
+            );
         }
         // An arch beyond the rank count is not part of the mesh.
         assert_eq!(qwen4_ep_device_refusal(2, &ranks(2), &mixed, all), Ok(()));
@@ -3652,10 +3809,15 @@ mod tests {
         // Four physical devices under six ranks: only distinct physical pairs
         // are probed, once each.
         let mut pairs = Vec::new();
-        qwen4_ep_device_refusal(6, &[0, 1, 2, 3, 0, 1], &homogeneous("gfx1100", 4), |a, b| {
-            pairs.push((a, b));
-            Ok(true)
-        })
+        qwen4_ep_device_refusal(
+            6,
+            &[0, 1, 2, 3, 0, 1],
+            &homogeneous("gfx1100", 4),
+            |a, b| {
+                pairs.push((a, b));
+                Ok(true)
+            },
+        )
         .unwrap();
         assert_eq!(pairs.len(), 12);
         // Aliased devices are still arch-checked.
@@ -4078,7 +4240,10 @@ mod tests {
     fn tp_geometry_checks_degree_and_devices_only() {
         let err_zero = tp_geometry_refusal(0, Some(4)).expect("tp=0 refuses");
         assert!(err_zero.contains("tp=0"), "reason: {err_zero}");
-        assert!(err_zero.contains("single GPU"), "names the remedy: {err_zero}");
+        assert!(
+            err_zero.contains("single GPU"),
+            "names the remedy: {err_zero}"
+        );
         let err = tp_geometry_refusal(99, Some(4)).expect("tp=99 refuses");
         assert!(err.contains("tp=99"), "reason: {err}");
         assert!(err.contains("device count=4"), "reason: {err}");
@@ -5389,7 +5554,8 @@ mod tests {
                 } else {
                     qsa_gathered_wmma_scratch_bytes(kv_heads, tokens).unwrap() as u64
                 };
-                let context = layers * config.qsa_context_arena_bytes(tokens, layout).unwrap() as u64;
+                let context =
+                    layers * config.qsa_context_arena_bytes(tokens, layout).unwrap() as u64;
                 (context, gather)
             }
         }
@@ -5647,10 +5813,7 @@ mod tests {
                 ..halo
             };
             assert_eq!(device_free_from(carve), Some(40_000 * MIB));
-            let discrete = DeviceMemory {
-                uma: false,
-                ..halo
-            };
+            let discrete = DeviceMemory { uma: false, ..halo };
             assert_eq!(device_free_from(discrete), Some(40_000 * MIB));
         }
     }
@@ -5840,8 +6003,7 @@ mod qwen4_pp_admission_tests {
         assert!(
             error.contains("topology.pp = 4")
                 && error.contains(MESH_TRANSPORT_ENV)
-                && error
-                    .contains("peer-to-peer transfers between the pipeline GPUs"),
+                && error.contains("peer-to-peer transfers between the pipeline GPUs"),
             "{error}"
         );
         // Edge ids are logical stage pairs.
@@ -5983,17 +6145,46 @@ mod qwen4_pp_admission_tests {
         };
         // Fully resident: the head stays attached unless explicitly off.
         for arch in ["gfx1100", "gfx1151", "gfx1201"] {
-            assert!(qwen4_mtp_with_host_mapped_experts(with(None), arch, 0), "{arch}");
-            assert!(qwen4_mtp_with_host_mapped_experts(with(Some(true)), arch, 0), "{arch}");
-            assert!(!qwen4_mtp_with_host_mapped_experts(with(Some(false)), arch, 0), "{arch}");
+            assert!(
+                qwen4_mtp_with_host_mapped_experts(with(None), arch, 0),
+                "{arch}"
+            );
+            assert!(
+                qwen4_mtp_with_host_mapped_experts(with(Some(true)), arch, 0),
+                "{arch}"
+            );
+            assert!(
+                !qwen4_mtp_with_host_mapped_experts(with(Some(false)), arch, 0),
+                "{arch}"
+            );
         }
         // Host-mapped experts: `auto` keeps the head only on the admitted gfx1201;
         // explicit `on` attaches everywhere; `off` never.
-        assert!(qwen4_mtp_with_host_mapped_experts(with(None), "gfx1201", 24));
-        assert!(!qwen4_mtp_with_host_mapped_experts(with(None), "gfx1100", 24));
-        assert!(!qwen4_mtp_with_host_mapped_experts(with(None), "gfx1151", 24));
-        assert!(qwen4_mtp_with_host_mapped_experts(with(Some(true)), "gfx1100", 24));
-        assert!(!qwen4_mtp_with_host_mapped_experts(with(Some(false)), "gfx1201", 24));
+        assert!(qwen4_mtp_with_host_mapped_experts(
+            with(None),
+            "gfx1201",
+            24
+        ));
+        assert!(!qwen4_mtp_with_host_mapped_experts(
+            with(None),
+            "gfx1100",
+            24
+        ));
+        assert!(!qwen4_mtp_with_host_mapped_experts(
+            with(None),
+            "gfx1151",
+            24
+        ));
+        assert!(qwen4_mtp_with_host_mapped_experts(
+            with(Some(true)),
+            "gfx1100",
+            24
+        ));
+        assert!(!qwen4_mtp_with_host_mapped_experts(
+            with(Some(false)),
+            "gfx1201",
+            24
+        ));
     }
 
     #[test]
@@ -6013,10 +6204,19 @@ mod qwen4_pp_admission_tests {
         assert_eq!(qwen4_native_mtp_for_floor(None, true, true), Ok(false));
         // Explicit `on` ignores the floor declaration; retained still refuses it.
         for floor in [false, true] {
-            assert_eq!(qwen4_native_mtp_for_floor(Some(true), false, floor), Ok(true));
+            assert_eq!(
+                qwen4_native_mtp_for_floor(Some(true), false, floor),
+                Ok(true)
+            );
             assert!(qwen4_native_mtp_for_floor(Some(true), true, floor).is_err());
-            assert_eq!(qwen4_native_mtp_for_floor(Some(false), false, floor), Ok(false));
-            assert_eq!(qwen4_native_mtp_for_floor(Some(false), true, floor), Ok(false));
+            assert_eq!(
+                qwen4_native_mtp_for_floor(Some(false), false, floor),
+                Ok(false)
+            );
+            assert_eq!(
+                qwen4_native_mtp_for_floor(Some(false), true, floor),
+                Ok(false)
+            );
         }
     }
 
@@ -6411,6 +6611,201 @@ mod qwen4_pp_admission_tests {
                     && !error.contains("config admission failed"),
                 "{error}"
             );
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_dir(path.parent().unwrap());
+        }
+    }
+
+    mod dory_recurrence_admission_tests {
+        use super::*;
+        use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqMemTensor};
+
+        const DORY_ARCH_ID: u32 = 19;
+
+        fn layer_types() -> serde_json::Value {
+            let mut layers = Vec::new();
+            for i in 0..72usize {
+                if i % 2 == 1 {
+                    layers.push(serde_json::Value::String("mlp".into()));
+                } else if i % 8 == 6 || i == 70 {
+                    layers.push(serde_json::Value::String("full_attention".into()));
+                } else {
+                    layers.push(serde_json::Value::String("sliding_attention".into()));
+                }
+            }
+            serde_json::Value::Array(layers)
+        }
+
+        fn dory_metadata() -> String {
+            serde_json::json!({
+                "config": {
+                    "model_type": "dory",
+                    "vocab_size": 131072,
+                    "hidden_size": 2560,
+                    "num_hidden_layers": 72,
+                    "intermediate_size": 7168,
+                    "num_attention_heads": 16,
+                    "num_key_value_heads": 4,
+                    "head_dim": 256,
+                    "sliding_window": 1024,
+                    "initializer_range": 0.0177,
+                    "ngpt_alpha_init": 0.05,
+                    "n_input_layers": 16,
+                    "n_recurrent_layers": 40,
+                    "n_output_layers": 16,
+                    "n_recurrent_loops": 2,
+                    "tie_word_embeddings": false,
+                    "rope_parameters": {
+                        "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0},
+                        "full_attention": {"rope_type": "default", "rope_theta": 10000000.0}
+                    },
+                    "layer_types": layer_types(),
+                }
+            })
+            .to_string()
+        }
+
+        fn write_dory(name: &str) -> std::path::PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "hipfire-dory-admit-{}-{}",
+                std::process::id(),
+                name
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join(format!("{name}.hfq"));
+            write_hfqm_package_mem(
+                &path,
+                DORY_ARCH_ID,
+                &dory_metadata(),
+                &[HfqMemTensor {
+                    name: "backbone.embeddings.weight".into(),
+                    quant_type: 1,
+                    shape: vec![4, 4],
+                    group_size: 0,
+                    data: vec![0u8; 32],
+                }],
+            )
+            .unwrap();
+            path
+        }
+
+        fn admit_dory(
+            path: &std::path::Path,
+            loops: Option<usize>,
+            mode: Option<hipfire_config::DoryRecurrentKvCacheMode>,
+        ) -> Result<SourceAdmission, String> {
+            admit_source_with_options(
+                path.to_str().unwrap(),
+                1,
+                1,
+                KvBackendRequest::Automatic,
+                None,
+                "gfx1201",
+                None,
+                "auto",
+                None,
+                64,
+                KvBackendHints::without_device(),
+                SourceAdmissionOptions {
+                    dory_loops: loops,
+                    dory_recurrent_kv_cache_mode: mode,
+                    ..Default::default()
+                },
+            )
+        }
+
+        #[test]
+        fn staged_loops_boundary_admits_one_through_four() {
+            let path = write_dory("loops-ok");
+            for loops in [1, 2, 3, 4] {
+                // Admission is read-only (no weights/GPU): valid staged
+                // loops resolve against the checkpoint and admit `Ok`.
+                admit_dory(&path, Some(loops), None)
+                    .unwrap_or_else(|err| panic!("loops={loops}: {err}"));
+            }
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_dir(path.parent().unwrap());
+        }
+
+        #[test]
+        fn staged_loops_zero_and_five_refuse_pre_teardown() {
+            let path = write_dory("loops-bad");
+            for loops in [0, 5] {
+                let err = match admit_dory(&path, Some(loops), None) {
+                    Err(err) => err,
+                    Ok(_) => panic!("loops={loops} must refuse"),
+                };
+                assert!(
+                    err.contains("dory") && err.contains(&loops.to_string()),
+                    "loops={loops}: {err}"
+                );
+            }
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_dir(path.parent().unwrap());
+        }
+
+        #[test]
+        fn checkpoint_defaults_admit_without_staged_overrides() {
+            let path = write_dory("loops-default");
+            // Checkpoint defaults (loops=2/per_loop) admit `Ok` with no
+            // staged overrides.
+            admit_dory(&path, None, None).unwrap_or_else(|err| panic!("defaults: {err}"));
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_dir(path.parent().unwrap());
+        }
+
+        #[test]
+        fn expanded_capacity_matches_physical_mask_times_repeats() {
+            use hipfire_config::DoryRecurrentKvCacheMode;
+            let path = write_dory("loops-cap");
+            let source = ModelSource::from_path(path.to_str().unwrap()).unwrap();
+            // per_loop N=1: 72 slots; N=2: 112; N=3: 152; N=4: 192.
+            // Attention slots: 36/56/76/96 (even physical sublayers carry KV).
+            for (loops, slots, attn) in [(1, 72, 36), (2, 112, 56), (3, 152, 76), (4, 192, 96)] {
+                let cfg = dory_recurrence_admission(
+                    &source,
+                    Some(loops),
+                    Some(DoryRecurrentKvCacheMode::PerLoop),
+                )
+                .expect("admits");
+                assert_eq!(cfg.kv_layer_count(), slots, "loops={loops}");
+                let (cache, attn_slots, per_slot) =
+                    dory_kv_capacity(&cfg, hipfire_runtime::kv_mode::KvMode::Q8);
+                assert_eq!(cache, slots, "loops={loops}");
+                assert_eq!(attn_slots, attn, "loops={loops}");
+                // Q8 at Hkv=4/D=256: (272+272)*4 = 2176 B/token/attn-slot
+                // (shared `SlotKvTierPlan`, not a local constant).
+                assert_eq!(per_slot, 2176, "loops={loops}");
+            }
+            // All admitted tiers price through the shared plan (no local
+            // byte table): FWHT2 (68+272)*4=1360, FWHT3 (100+272)*4=1488,
+            // FWHT4 (132+272)*4=1616.
+            let cfg2 = dory_recurrence_admission(
+                &source,
+                Some(2),
+                Some(DoryRecurrentKvCacheMode::PerLoop),
+            )
+            .expect("admits");
+            for (tier, per_slot) in [
+                (hipfire_runtime::kv_mode::KvMode::Fwht2, 1360),
+                (hipfire_runtime::kv_mode::KvMode::Fwht3, 1488),
+                (hipfire_runtime::kv_mode::KvMode::Fwht4, 1616),
+            ] {
+                let (cache, attn_slots, priced) = dory_kv_capacity(&cfg2, tier);
+                assert_eq!((cache, attn_slots), (112, 56), "{tier:?}");
+                assert_eq!(priced, per_slot, "{tier:?}");
+            }
+            // last_loop: always 72 slots / 36 attention slots.
+            let cfg = dory_recurrence_admission(
+                &source,
+                Some(4),
+                Some(DoryRecurrentKvCacheMode::LastLoop),
+            )
+            .expect("admits");
+            assert_eq!(cfg.kv_layer_count(), 72);
+            let (cache, attn_slots, _) =
+                dory_kv_capacity(&cfg, hipfire_runtime::kv_mode::KvMode::Q8);
+            assert_eq!((cache, attn_slots), (72, 36));
             let _ = std::fs::remove_file(&path);
             let _ = std::fs::remove_dir(path.parent().unwrap());
         }

@@ -119,6 +119,14 @@ pub struct LoadCtx<'a> {
     /// DeepSeek V4-only physical compute placement. The default is `Single`;
     /// other carriers must ignore it.
     pub deepseek4_compute_placement: hipfire_config::Deepseek4ComputePlacement,
+    /// Dory-only recurrent-block override: `Some(n)` runs the shared
+    /// recurrent block exactly `n` times (`I->R^n->O`; input reinjected
+    /// every loop, one state increment per token). `None` preserves the
+    /// checkpoint default (2); other carriers must ignore it.
+    pub dory_loops: Option<usize>,
+    /// Dory-only recurrent KV override. `None` (=`auto`) preserves the
+    /// checkpoint mode (default `PerLoop`); other carriers must ignore it.
+    pub dory_recurrent_kv_cache_mode: Option<hipfire_config::DoryRecurrentKvCacheMode>,
     /// DeepSeek V4-only routed-expert fanout override. `None` preserves the
     /// checkpoint value; other carriers must ignore it.
     pub deepseek4_experts_per_token: Option<usize>,

@@ -21,9 +21,12 @@
 //! start and `state = justnorm(h)` at the recurrent end; untied lm head
 //! with `logits * logit_scale/initializer_range` and no final norm.
 //!
-//! Bring-up policy: exactly ONE recurrent pass over
-//! `[n_input, n_input+n_recurrent)` (declared `n_recurrent_loops` admits 1
-//! or 2). Native BF16 weights stay BF16 on device (`gemv_bf16_xf32`);
+//! The input/output blocks run once; the shared recurrent block runs 1–4
+//! times with input reinjection on every pass (checkpoint default: two).
+//! `per_loop` owns distinct recurrent KV histories; `last_loop` overwrites
+//! the current token in shared histories. Absolute position advances only
+//! after the complete token forward. Native BF16 weights stay BF16 on device
+//! (`gemv_bf16_xf32`);
 //! HFQM quants ride the shared quant codecs; embeddings stay resident
 //! (BF16 verbatim / Q8 lookup). Activations are F32; KV is packed (see
 //! `crate::kv`: `auto`/Q8 default, FWHT2/3/4, F32 reference variant only).

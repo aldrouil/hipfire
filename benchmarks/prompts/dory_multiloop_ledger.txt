@@ -1,0 +1,133 @@
+Reconcile the Northwind clearing-house ledger below and report exact final
+balances, account statuses, and audit answers as structured JSON.
+
+## Precedence rules (normative, apply in this order)
+
+R1 — Order of application. Process pages 1 to 4 in order, top to bottom
+within each page. Skipped/voided/ignored lines (R2-R4) change nothing and
+leave no trace except in the audit counters.
+
+R2 — Duplicates. Any line whose event id has already appeared on any earlier
+line is ignored entirely (first occurrence wins), even if the repeated fields
+differ (a tampered retransmit is still just a duplicate). Each ignored repeat
+increments `audit.ignored_duplicates` by one. A CORRECTION line has its own
+fresh event id and is never itself a duplicate unless its own id repeats.
+
+R3 — Corrections. A line `En CORRECTION corrects Em: <replacement>` voids the
+original event Em (it is treated as if it never applied) and instead applies
+the replacement event at the CORRECTION's own position in the order. Each
+voided original increments `audit.voided_originals` by one. If several
+CORRECTIONs name the same original, only the LAST one (in page order) takes
+effect; each earlier correction for the same target is discarded and
+increments `audit.superseded_corrections` by one (it applies nothing). A
+CORRECTION naming an unknown event id is ignored and increments
+`audit.unknown_corrections_ignored` by one.
+
+R4 — Debit discipline. TRANSFER and FEE debit one account. A debit applied
+while its account is FROZEN is rejected (ignored). A debit that would drive
+the account balance below zero is rejected (insufficient funds). Every
+rejected debit increments `audit.rejected_debits` by one. Credits (incoming
+TRANSFER legs) always succeed, even into a FROZEN account. OPENING lines only
+set starting balances and cannot be rejected. FREEZE on an already-frozen
+account (or UNFREEZE on an active one) is a harmless no-op.
+
+R5 — Fees. Each applied FEE deducts its amount from the named account and
+adds the same amount to the FEES sink. The sink is never debited.
+
+R6 — Scope of "largest transfer". `audit.largest_effective_transfer` is the
+single successfully APPLIED transfer leg with the greatest amount among
+effective (non-voided, non-duplicate) TRANSFER events. Rejected debits,
+voided originals, superseded corrections, and unknown corrections are not
+candidates. Ties are impossible in this fixture.
+
+## Page 1 of 4 — opening balances and morning session
+
+The house opens four clearing accounts. All amounts are integer credits.
+OPENING lines set each account's starting balance exactly once.
+
+E001 OPENING account=ALPHA amount=10000
+E002 OPENING account=BRAVO amount=8000
+E003 OPENING account=CHARLIE amount=5000
+E004 OPENING account=DELTA amount=12000
+E005 TRANSFER from=ALPHA to=BRAVO amount=1500
+E006 TRANSFER from=BRAVO to=CHARLIE amount=2000
+E007 TRANSFER from=CHARLIE to=DELTA amount=1000
+E008 FEE account=ALPHA amount=100
+E009 TRANSFER from=DELTA to=ALPHA amount=3000
+E010 TRANSFER from=BRAVO to=DELTA amount=500
+
+## Page 2 of 4 — afternoon session (retransmitted after a line fault, so one row repeats verbatim)
+
+The operations desk freezes CHARLIE pending document review, keeps posting
+around it, then unfreezes it. The retransmitted E005 row below is a
+byte-identical repeat caused by the line fault.
+
+E011 FREEZE account=CHARLIE
+E012 TRANSFER from=ALPHA to=CHARLIE amount=700
+E013 TRANSFER from=CHARLIE to=BRAVO amount=400
+E014 FEE account=BRAVO amount=200
+E005 TRANSFER from=ALPHA to=BRAVO amount=1500
+E016 TRANSFER from=DELTA to=BRAVO amount=2500
+E017 UNFREEZE account=CHARLIE
+E018 TRANSFER from=CHARLIE to=BRAVO amount=400
+E019 FEE account=CHARLIE amount=50
+E020 TRANSFER from=ALPHA to=DELTA amount=2000
+
+## Page 3 of 4 — corrections desk (two amount disputes and one unknown reference)
+
+The corrections desk voids and replaces disputed originals. The E026 line
+names an event id that never appears anywhere in pages 1-4.
+
+E021 CORRECTION corrects E009: TRANSFER from=DELTA to=ALPHA amount=2300
+E022 TRANSFER from=BRAVO to=ALPHA amount=1000
+E023 CORRECTION corrects E006: TRANSFER from=BRAVO to=CHARLIE amount=1200
+E024 TRANSFER from=CHARLIE to=ALPHA amount=300
+E014 FEE account=BRAVO amount=200
+E026 CORRECTION corrects E999: TRANSFER from=ALPHA to=BRAVO amount=10
+E027 FREEZE account=DELTA
+E028 TRANSFER from=DELTA to=CHARLIE amount=900
+E029 FEE account=DELTA amount=150
+E030 UNFREEZE account=DELTA
+
+## Page 4 of 4 — evening session (double correction, overdraft attempt, tampered repeat)
+
+Risk flags two issues: the Delta desk disputes correction E032 with a second
+correction for the same original; BRAVO draws a transfer far beyond its
+balance. The repeated E021 row is a normal retransmit (identical fields).
+The repeated E007 row arrives with an altered amount field (tampered in
+transit) — under R2 it is still only a duplicate. BRAVO is frozen near the
+close and stays frozen.
+
+E031 TRANSFER from=DELTA to=CHARLIE amount=900
+E032 CORRECTION corrects E016: TRANSFER from=DELTA to=BRAVO amount=1800
+E033 CORRECTION corrects E016: TRANSFER from=DELTA to=BRAVO amount=1500
+E034 TRANSFER from=BRAVO to=DELTA amount=12000
+E021 CORRECTION corrects E009: TRANSFER from=DELTA to=ALPHA amount=2300
+E035 FEE account=ALPHA amount=75
+E036 TRANSFER from=ALPHA to=CHARLIE amount=1200
+E037 FREEZE account=BRAVO
+E038 TRANSFER from=BRAVO to=CHARLIE amount=100
+E039 TRANSFER from=CHARLIE to=DELTA amount=600
+E007 TRANSFER from=CHARLIE to=DELTA amount=9999
+
+## Required output (exact schema)
+
+Respond with a single ```json fenced code block containing exactly this
+object shape (keys exactly as shown; all amounts integers, statuses one of
+"ACTIVE", "FROZEN"). Do not emit any other code blocks.
+
+{
+  "balances": {"ALPHA": 0, "BRAVO": 0, "CHARLIE": 0, "DELTA": 0, "FEES": 0},
+  "statuses": {"ALPHA": "ACTIVE", "BRAVO": "ACTIVE", "CHARLIE": "ACTIVE", "DELTA": "ACTIVE"},
+  "audit": {
+    "ignored_duplicates": 0,
+    "voided_originals": 0,
+    "rejected_debits": 0,
+    "unknown_corrections_ignored": 0,
+    "superseded_corrections": 0,
+    "largest_effective_transfer": {"event_id": "E000", "amount": 0, "from": "X", "to": "Y"}
+  }
+}
+
+Replace every placeholder value with the reconciled figure. Work through the
+pages in order; duplicates, corrections, freezes, and rejections all matter.

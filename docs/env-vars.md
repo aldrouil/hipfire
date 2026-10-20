@@ -366,6 +366,16 @@ refused at load under PP; Single and EP session behavior is unchanged.
 | `HIPFIRE_EMBED_PHASE` | `1` prints the per-phase timing of one `embed` request | `assemble \| encode \| mask+normalize \| serialize+write`, on stderr. **Its own knob, deliberately not `HIPFIRE_EMBED_DEBUG`**: that one also arms the encoder's per-layer finite `trace()`, which syncs the GPU every layer and inflated the same measurement from 334 ms to 678 ms — the first reading of it was wrong for exactly that reason. |
 | `HIPFIRE_EMBED_DEBUG` | `1` traces the embedding encoder | Prints a per-layer finite-value trace of the residual stream (absmax + non-finite count) and the VRAM free/total after load. Downloads one tensor per call, so it is strictly a debugging path — it is what localized a weight-format bug that NaN'd the last rows of every projection. |
 
+### Dory (arch 19)
+
+| Variable | Default / sense | Notes |
+|---|---|---|
+| `HIPFIRE_DORY_LOOPS` | Unset retains checkpoint count (two for the published model); integer 1–4 | Typed alias for `model.dory_loops`. Only the shared recurrent block repeats; input/output blocks run once. Resolved at load, not per token. |
+| `HIPFIRE_DORY_RECURRENT_KV_CACHE_MODE` | `auto` retains checkpoint policy, missing policy → `per_loop`; override `per_loop` or `last_loop` | Typed alias for `model.dory_recurrent_kv_cache_mode`. Controls history ownership, not KV encoding. `per_loop` expands recurrent caches; `last_loop` overwrites the current token's slot. See [Dory scheduling and memory](MODELS.md#local-nemotron-dory). |
+
+Changing either resolved load override on a resident model path causes serve
+to reload. KV encoding remains the separate `memory.kv_cache` setting.
+
 ### Vision tower sidecar
 
 | Variable | Default / sense | Notes |
@@ -792,7 +802,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1664
+**Count:** 1666
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -934,8 +944,8 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_CONV_QKNORM_SHAPE` | crates/hipfire-arch-qwen35/src/qwen35/forward.rs, crates/rdna-compute/src/norm.rs | developer |
 | `HIPFIRE_CONV_SCALAR_PREP` | crates/hipfire-arch-qwen35/src/qwen35/forward.rs | developer |
 | `HIPFIRE_CPU_EXEC_TRACE` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs, crates/hipfire-arch-qwen35/src/serve_engine.rs | developer |
-| `HIPFIRE_CPU_EXPERT_PIN` | crates/hipfire-cpu/src/splice_pool.rs, crates/hipfire-dispatch/src/cpu_exec.rs | developer |
-| `HIPFIRE_CPU_EXPERT_THREADS` | crates/hipfire-arch-qwen4/examples/qwen4_cpu_split_parity.rs, crates/hipfire-dispatch/src/cpu_exec.rs | developer |
+| `HIPFIRE_CPU_EXPERT_PIN` | crates/hipfire-cpu/src/splice_pool.rs, crates/hipfire-dispatch/examples/d2_cpu_arm_bench.rs | developer |
+| `HIPFIRE_CPU_EXPERT_THREADS` | crates/hipfire-arch-qwen4/examples/qwen4_cpu_split_parity.rs, crates/hipfire-dispatch/examples/d2_cpu_arm_bench.rs | developer |
 | `HIPFIRE_CQN_BLOCK` | crates/rdna-compute/src/kernels.rs, crates/rdna-compute/src/rows_batched.rs | developer |
 | `HIPFIRE_CQN_KERNEL` | crates/rdna-compute/src/kernels.rs, crates/rdna-compute/src/rows_batched.rs | developer |
 | `HIPFIRE_CQN_SCALAR_PREP` | crates/rdna-compute/src/kernels.rs | developer |
@@ -1086,7 +1096,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_DETECTED_VRAM_GB` | scripts/_detect-gpu.sh | harness |
 | `HIPFIRE_DETERMINISTIC` | autoresearch/ar/certify/serve_runner.py, crates/hipfire-arch-qwen35/examples/qwen_dense_tp2_parity.rs | experimental |
 | `HIPFIRE_DEVICE` | crates/hipfire-arch-qwen35/tests/mtp_takeover_fill.rs, crates/hipfire-config/src/lib.rs | developer |
-| `HIPFIRE_DEVICES` | crates/hipfire-arch-qwen35/examples/prefill_ragged_oracle.rs, crates/hipfire-arch-qwen35/examples/shared_weight_state_oracle.rs | stable |
+| `HIPFIRE_DEVICES` | crates/hipfire-arch-dory/examples/dory_kv_probe.rs, crates/hipfire-arch-dory/examples/dory_parity.rs | stable |
 | `HIPFIRE_DFLASH_ADAPTIVE_B` | crates/hipfire-arch-qwen35/examples/cb_vmm_state_oracle.rs, crates/hipfire-arch-qwen35/src/dflash_spec.rs | developer |
 | `HIPFIRE_DFLASH_BLOCK` | crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_DFLASH_CHAT` | crates/hipfire-generate/src/ar.rs, crates/hipfire-generate/src/batch.rs | developer |
@@ -1133,6 +1143,8 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_DN_SNAPSHOT_BULK_OFF` | crates/hipfire-arch-qwen35/src/speculative.rs, crates/rdna-compute/src/feature_flags.rs | developer |
 | `HIPFIRE_DN_SNAPSHOT_FLIP` | crates/hipfire-arch-qwen35/examples/cb_vmm_state_oracle.rs, crates/hipfire-arch-qwen35/src/speculative.rs | developer |
 | `HIPFIRE_DN_STATE_EF` | autoresearch/ar/certify/serve_runner.py, benchmarks/scripts/mq4v2_k5120_gfx1201_validate.sh | developer |
+| `HIPFIRE_DORY_LOOPS` | crates/hipfire-config/src/lib.rs | stable |
+| `HIPFIRE_DORY_RECURRENT_KV_CACHE_MODE` | crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_DOT2_GEMV` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | experimental |
 | `HIPFIRE_DOTS_FAULT` | crates/hipfire-generate/tests/vision_lifecycle_tests.rs | harness |
 | `HIPFIRE_DOTS_IMAGE` | crates/hipfire-generate/tests/vision_lifecycle_tests.rs | harness |
