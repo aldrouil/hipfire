@@ -10,6 +10,8 @@
 
 ## Unreleased (0.4.3)
 
+- **Dory thinking channels:** chat completions now report the rendered prompt's initial thinking state, so streaming and non-streaming responses separate reasoning into `reasoning_content` instead of leaking it into the answer. `enable_thinking=false` reaches the vendor Jinja template, and assistant history preserves reasoning. Thinking-token caps greater than one are explicitly refused because Dory does not implement forced reasoning closure; use `max_think_tokens=0` for uncapped thinking, or disable thinking.
+
 - **Dory latent recurrence:** native BF16 and HFQM loads now execute the shared recurrent block 1–4 times, including 3, while the input/output blocks run once and the input-block result is reinjected on every pass. `model.dory_loops` and `model.dory_recurrent_kv_cache_mode` resolve before allocation; defaults retain the checkpoint's loop count (two for the published model) and `per_loop` cache policy. Independent per-loop KV histories expand with the recurrent passes; `last_loop` overwrites the current token's slot and retains final-pass history. Serve reload identity includes both settings. Token positions advance once per token, and the independent oracle matches native tokenwise prefill (`last_loop` is not upstream chunk-prefill-logit-equivalent). Lab trace v2 identifies physical layer, loop and cache slot. Offload remains unsupported; no throughput claim.
   - Native Dory completion events distinguish EOS (`stop`) from the output-token limit (`length`), so incomplete reasoning is not mislabeled as a completed answer.
 
