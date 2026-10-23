@@ -64,15 +64,15 @@ impl ReasoningContract {
 }
 
 /// Whether serve forwards history `reasoning_content` for the architecture
-/// whose load handshake reports `arch`: Muse Glimmer, and the Qwen families
-/// whose template replays every history turn's reasoning inside `<think>`
+/// whose load handshake reports `arch`: Muse Glimmer, Dory, and the Qwen
+/// families whose template replays history reasoning inside `<think>`
 /// (Qwen3.5/3.6, and `qwen4` = Qwen3.8-Flash-Next). Without the field such a
 /// template renders an empty think block, which is neither what the client
 /// sent nor the prompt the turn was generated under. The loader's
 /// `thinking_contract_arches_forward_history_reasoning` test requires every
 /// carrier with a history-replaying reasoning contract to be covered here.
 pub fn arch_replays_history_reasoning(arch: &str) -> bool {
-    if arch == "muse_glimmer" {
+    if matches!(arch, "muse_glimmer" | "dory") {
         return true;
     }
     let lower = arch.to_ascii_lowercase();

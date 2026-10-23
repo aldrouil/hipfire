@@ -7775,6 +7775,19 @@ pub fn generate_dory(
     request_seed: u32,
 ) {
     use hipfire_runtime::prompt_frame::JinjaChatFrame;
+    // Dory supports the template toggle, not forced reasoning closure.
+    if max_think_tokens > 1 {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            "dory: thinking-token caps are unsupported; use max_think_tokens=0 for uncapped thinking or enable_thinking=false",
+            "validation",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return;
+    }
     if m.tokenizer.is_none() {
         emit_active_attempt_error(
             stdout,
@@ -7838,6 +7851,7 @@ pub fn generate_dory(
         (stop_set, template, bundle.state.max_seq)
     };
     // Prompt render — immutable borrows only; `prompt_ids` is owned.
+    let primed_think;
     let prompt_ids: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
         let frame = JinjaChatFrame {
@@ -7883,7 +7897,10 @@ pub fn generate_dory(
                 }
             };
             match frame.render_messages(messages_slice, None, None) {
-                Ok(rendered) => tokenizer.encode(&rendered),
+                Ok(rendered) => {
+                    primed_think = rendered.trim_end().ends_with("<think>");
+                    tokenizer.encode(&rendered)
+                }
                 Err(e) => {
                     emit_active_attempt_error(
                         stdout,
@@ -7899,7 +7916,10 @@ pub fn generate_dory(
             }
         } else {
             match frame.render() {
-                Ok(rendered) => tokenizer.encode(&rendered),
+                Ok(rendered) => {
+                    primed_think = rendered.trim_end().ends_with("<think>");
+                    tokenizer.encode(&rendered)
+                }
                 Err(e) => {
                     emit_active_attempt_error(
                         stdout,
@@ -7946,7 +7966,7 @@ pub fn generate_dory(
         crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::DoryAr),
         stdout,
         id,
-        false,
+        primed_think,
     );
     // Cold reset AFTER gen_start (gen_start must precede all GPU work that
     // could fail): stateless multi-loop forward, no prefix reuse.

@@ -6396,7 +6396,7 @@ mod registry_tests {
             );
             covered.push(label);
         }
-        for label in ["qwen3_5", "qwen3_5_moe", "qwen4", "muse_glimmer"] {
+        for label in ["qwen3_5", "qwen3_5_moe", "qwen4", "muse_glimmer", "dory"] {
             assert!(covered.contains(&label), "{label} not covered: {covered:?}");
         }
     }
@@ -6476,7 +6476,6 @@ mod registry_tests {
             }
         );
         assert_eq!(caps_of("cohere2moe"), text_only);
-        assert_eq!(caps_of("dory"), text_only);
         assert_eq!(
             caps_of("gemma4"),
             ArchCaps {

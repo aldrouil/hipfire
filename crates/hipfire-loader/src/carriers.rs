@@ -5882,12 +5882,11 @@ impl Carrier for DoryCarrier {
         Ok(())
     }
     fn caps(&self) -> saddle_core::caps::ArchCaps {
-        // Text-only multi-loop AR (qwen2 precedent): the Jinja
-        // template still renders `enable_thinking`, but no history-reasoning
-        // contract is advertised — serve does not forward reasoning_content
-        // for the `dory` label and this path has no think router.
+        // Vendor Jinja toggles <think>; the legacy stream router splits
+        // reasoning using the rendered prompt's started_in_think flag.
+        // Keep semantic v2 off until this producer emits semantic events.
         saddle_core::caps::ArchCaps {
-            reasoning_contract: saddle_core::caps::ReasoningContract::Unsupported,
+            reasoning_contract: saddle_core::caps::ReasoningContract::QwenJinja,
             supports_continuous_batch: false,
             supports_ep_batch: false,
             dflash: None,
