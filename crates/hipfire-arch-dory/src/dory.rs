@@ -7,10 +7,13 @@
 //! Model: `DoryForCausalLM` (`model_type: "dory"`, upstream reference
 //! `vllm/model_executor/models/dory.py` at
 //! `https://github.com/vllm-project/vllm/blob/55076950b6c155f384d6766d63563c3bc20a0e3f/vllm/model_executor/models/dory.py`).
-//! 72 physical sublayers strictly alternate attention / MLP (config
+//! Physical sublayers strictly alternate attention / MLP (config
 //! `layer_types`: every even index is `sliding_attention`/`full_attention`,
 //! every odd index `mlp`). Each layer holds exactly ONE mixer plus its
 //! `*_alpha` interpolation scale — not the standard attention+FFN block.
+//! The shipped checkpoint has 72 sublayers; native expanded layouts (76 in
+//! the expanded 44-recurrent model) are admitted on the same alternation,
+//! with the declared `layer_types` carrying the full/sliding placement.
 //!
 //! Multi-loop recurrence policy: the forward runs exactly
 //! `n_recurrent_loops` (1..=4) passes over the shared physical recurrent
@@ -465,17 +468,36 @@ pub fn config_from_value(inner: &serde_json::Value) -> Result<DoryConfig, String
             }
         }
     }
-    // Admission: exact shipped topology. Full attention sits at every
-    // i%8==6 (6..62 step 8, spanning all three blocks) plus layer 70.
+    // Admission is the checkpoint's own declared `layer_types`: a native
+    // Dory layout may place full/sliding attention on any even sublayer the
+    // checkpoint declares (the expanded 76-layer layout inserts pairs after
+    // layer 55 and shifts the output block, so a derived i%8 cadence would
+    // reject a valid model). The structural contract stays fail-closed:
+    // sublayers strictly alternate attention (even) / MLP (odd), and the
+    // three sections tile the layer axis in whole pairs with a nonempty
+    // shared recurrent block.
     for i in 0..num_hidden_layers {
-        let expect_full = is_attention[i] && (i % 8 == 6 || i == 70);
-        if is_attention[i] && is_full_attention[i] != expect_full {
+        let expect_attention = i % 2 == 0;
+        if is_attention[i] != expect_attention {
             return Err(format!(
-                "dory: layer {i} full/sliding kind differs from shipped topology"
+                "dory: layer {i} breaks attention/MLP alternation (`{}`, expected `{}`)",
+                layer_types[i],
+                if expect_attention { "attention" } else { "mlp" }
             ));
         }
-        if !is_attention[i] && (i % 2 != 1) {
-            return Err(format!("dory: layer {i} breaks attention/MLP alternation"));
+    }
+    if n_recurrent == 0 {
+        return Err("dory: n_recurrent_layers must be > 0".into());
+    }
+    for (key, count) in [
+        ("n_input_layers", n_input),
+        ("n_recurrent_layers", n_recurrent),
+        ("n_output_layers", n_output),
+    ] {
+        if count % 2 != 0 {
+            return Err(format!(
+                "dory: {key}={count} splits an attention/MLP pair; every block section must hold whole pairs"
+            ));
         }
     }
     // GQA geometry of the shipped checkpoint: q = 16×256 = 4096,
@@ -1532,6 +1554,24 @@ mod tests {
         })
     }
 
+    /// Stock 72-layer config with two native attention/MLP pairs inserted
+    /// after physical 55 (new 56..59, copies of 52..55) and the former
+    /// 56..71 shifted to 60..75 — the expanded 76-layer / 44-recurrent
+    /// layout. Full attention lands at 6..54 step 8, 58, 66 and 74.
+    fn expanded_76_config_json() -> serde_json::Value {
+        let mut v = minimal_config_json();
+        let mut lt = v["layer_types"].as_array().unwrap().clone();
+        let tail = lt.split_off(56);
+        for t in ["sliding_attention", "mlp", "full_attention", "mlp"] {
+            lt.push(serde_json::Value::String(t.into()));
+        }
+        lt.extend(tail);
+        v["num_hidden_layers"] = serde_json::json!(76);
+        v["n_recurrent_layers"] = serde_json::json!(44);
+        v["layer_types"] = serde_json::Value::Array(lt);
+        v
+    }
+
     #[test]
     fn shipped_topology_admits_with_checkpoint_loops_and_default_per_loop() {
         let cfg = config_from_value(&minimal_config_json()).expect("admits");
@@ -1598,10 +1638,107 @@ mod tests {
     }
 
     #[test]
-    fn swapped_sliding_full_fails_closed() {
+    fn declared_sliding_full_kinds_are_authoritative() {
+        // The checkpoint's declared `layer_types` decide sliding vs full;
+        // no index-derived cadence may override or reject them.
         let mut v = minimal_config_json();
         v["layer_types"][6] = serde_json::Value::String("sliding_attention".into());
-        assert!(config_from_value(&v).is_err());
+        let cfg = config_from_value(&v).expect("admits declared sliding");
+        assert!(!cfg.is_full_attention[6]);
+        let mut v = minimal_config_json();
+        v["layer_types"][8] = serde_json::Value::String("full_attention".into());
+        let cfg = config_from_value(&v).expect("admits declared full");
+        assert!(cfg.is_full_attention[8]);
+    }
+
+    #[test]
+    fn expanded_76_layer_layout_admits_and_keeps_declared_kinds() {
+        let v = expanded_76_config_json();
+        let cfg = config_from_value(&v).expect("expanded layout admits");
+        assert_eq!(cfg.num_hidden_layers, 76);
+        assert_eq!(cfg.block_split, (16, 44, 16));
+        // Exact declared kinds survive at the inserted pairs and the shifted
+        // output block.
+        let declared: Vec<bool> = v["layer_types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t.as_str() == Some("full_attention"))
+            .collect();
+        assert_eq!(cfg.is_full_attention, declared);
+        assert!(!cfg.is_full_attention[56]);
+        assert!(cfg.is_full_attention[58]);
+        assert!(!cfg.is_full_attention[62]);
+        assert!(cfg.is_full_attention[66] && cfg.is_full_attention[74]);
+        assert_eq!(
+            cfg.is_attention.iter().filter(|&&b| b).count(),
+            38,
+            "even sublayers are the 38 attention mixers"
+        );
+        // Cache sizing and indexing follow the declared counts: 38 + 22*N-1
+        // attention slots over 76 + 44*N-1 virtual layers.
+        for loops in 1..=4usize {
+            let mut v = expanded_76_config_json();
+            v["n_recurrent_loops"] = serde_json::json!(loops);
+            let c = config_from_value(&v).expect("admits");
+            assert_eq!(c.kv_layer_count(), 76 + 44 * (loops - 1));
+            let mask = c.kv_layer_mask();
+            assert_eq!(mask.len(), c.kv_layer_count());
+            assert_eq!(mask.iter().filter(|&&b| b).count(), 38 + 22 * (loops - 1));
+            for i in 0..16usize {
+                assert_eq!(c.kv_layer_index(i, 0), i);
+                assert_eq!(c.kv_layer_index(60 + i, 0), 60 + i + (loops - 1) * 44);
+            }
+            for l in 0..loops {
+                for i in 16..60usize {
+                    assert_eq!(c.kv_layer_index(i, l), i + l * 44);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_expanded_layouts_fail_closed() {
+        // Odd section counts split an attention/MLP pair.
+        let mut v = expanded_76_config_json();
+        v["n_input_layers"] = serde_json::json!(15);
+        v["n_output_layers"] = serde_json::json!(17);
+        let e = config_from_value(&v).expect_err("odd input section");
+        assert!(e.contains("n_input_layers=15"), "{e}");
+        let mut v = expanded_76_config_json();
+        v["n_recurrent_layers"] = serde_json::json!(43);
+        v["n_output_layers"] = serde_json::json!(17);
+        let e = config_from_value(&v).expect_err("odd recurrent section");
+        assert!(e.contains("n_recurrent_layers=43"), "{e}");
+        let mut v = expanded_76_config_json();
+        v["n_input_layers"] = serde_json::json!(17);
+        v["n_output_layers"] = serde_json::json!(15);
+        let e = config_from_value(&v).expect_err("odd output section");
+        assert!(e.contains("splits an attention/MLP pair"), "{e}");
+        // The shared recurrent block must not be empty.
+        let mut v = expanded_76_config_json();
+        v["n_recurrent_layers"] = serde_json::json!(0);
+        v["n_output_layers"] = serde_json::json!(60);
+        let e = config_from_value(&v).expect_err("empty recurrent block");
+        assert!(e.contains("n_recurrent_layers must be > 0"), "{e}");
+        // Alternation holds in both directions.
+        let mut v = expanded_76_config_json();
+        v["layer_types"][57] = serde_json::Value::String("sliding_attention".into());
+        let e = config_from_value(&v).expect_err("attention at odd index");
+        assert!(e.contains("alternation"), "{e}");
+        let mut v = expanded_76_config_json();
+        v["layer_types"][58] = serde_json::Value::String("mlp".into());
+        let e = config_from_value(&v).expect_err("mlp at even index");
+        assert!(e.contains("alternation"), "{e}");
+        // Declared length and kinds stay checked.
+        let mut v = expanded_76_config_json();
+        v["layer_types"].as_array_mut().unwrap().pop();
+        let e = config_from_value(&v).expect_err("short layer_types");
+        assert!(e.contains("layer_types len 75"), "{e}");
+        let mut v = expanded_76_config_json();
+        v["layer_types"][56] = serde_json::Value::String("mamba".into());
+        let e = config_from_value(&v).expect_err("unknown kind");
+        assert!(e.contains("unknown layer_type"), "{e}");
     }
 
     #[test]
