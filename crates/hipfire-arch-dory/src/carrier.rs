@@ -183,8 +183,11 @@ pub fn load_dory_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<DoryBundl
                 .apply_recurrence_overrides(dory_loops, dory_kv_cache_mode)
                 .map_err(|e| format!("dory: {e}"))?;
             eprintln!(
-                "dory: recurrence: loops={} kv_cache_mode={} (I->R^N->O: one input block, N shared recurrent passes, one output block; 36 transformer blocks = 72 physical sublayers)",
-                config.n_recurrent_loops, config.recurrent_kv_cache_mode,
+                "dory: recurrence: loops={} kv_cache_mode={} (I->R^N->O: one input block, N shared recurrent passes, one output block; {} transformer blocks = {} physical sublayers)",
+                config.n_recurrent_loops,
+                config.recurrent_kv_cache_mode,
+                config.is_attention.iter().filter(|&&attn| attn).count(),
+                config.num_hidden_layers,
             );
             let tokenizer =
                 hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(bridge.metadata_json())
@@ -222,8 +225,11 @@ pub fn load_dory_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<DoryBundl
                 .apply_recurrence_overrides(dory_loops, dory_kv_cache_mode)
                 .map_err(|e| format!("dory: {e}"))?;
             eprintln!(
-                "dory: recurrence: loops={} kv_cache_mode={} (I->R^N->O: one input block, N shared recurrent passes, one output block; 36 transformer blocks = 72 physical sublayers)",
-                config.n_recurrent_loops, config.recurrent_kv_cache_mode,
+                "dory: recurrence: loops={} kv_cache_mode={} (I->R^N->O: one input block, N shared recurrent passes, one output block; {} transformer blocks = {} physical sublayers)",
+                config.n_recurrent_loops,
+                config.recurrent_kv_cache_mode,
+                config.is_attention.iter().filter(|&&attn| attn).count(),
+                config.num_hidden_layers,
             );
             let tok_path = source.tokenizer_json_path().ok_or_else(|| {
                 format!(
