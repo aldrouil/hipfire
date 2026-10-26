@@ -372,6 +372,16 @@ refused at load under PP; Single and EP session behavior is unchanged.
 |---|---|---|
 | `HIPFIRE_DORY_LOOPS` | Unset retains checkpoint count (two for the published model); integer 1–4 | Typed alias for `model.dory_loops`. Only the shared recurrent block repeats; input/output blocks run once. Resolved at load, not per token. |
 | `HIPFIRE_DORY_RECURRENT_KV_CACHE_MODE` | `auto` retains checkpoint policy, missing policy → `per_loop`; override `per_loop` or `last_loop` | Typed alias for `model.dory_recurrent_kv_cache_mode`. Controls history ownership, not KV encoding. `per_loop` expands recurrent caches; `last_loop` overwrites the current token's slot. See [Dory scheduling and memory](MODELS.md#local-nemotron-dory). |
+| `HIPFIRE_DORY_GATE_SCALE` | unset = `1` (stock); nonnegative finite float, applied to physical sublayers 56–63 only | **Developer diagnostic** (env beats `developer.dory_gate_scale`). Multiplies the effective residual gate `s = \|alpha * alpha_scale\|` AFTER the abs on the sublayers the Stage4 expansion inserted (physical 56–63): `1` is the stock expression bit-for-bit, `0` zeroes those sublayers' residual contribution while their own residual normalization and KV behavior still run (it is **not** a skipped layer). Every other sublayer keeps its stock gate, and `sqk`, `s_gate`, `suv_*` and every matrix are untouched. A negative, non-finite or unparsable value fails the load instead of falling back to stock. |
+| `HIPFIRE_DORY_GATE_SOURCE` | unset = stock; path to an untrained Stage4 HFQ | **Developer diagnostic** (env beats `developer.dory_gate_source`). Replaces only the `attn_alpha`/`mlp_alpha` vectors of the sublayers the Stage4 expansion inserted (physical 56–63) with that pack's vectors (1-D `[hidden]`, BF16 widened exactly or exact F32); every matrix, embedding, output table and KV codec stay the loaded model's, and the pack's matrices are never read. Admitted only on the Stage4 layout (80 sublayers split 16/48/16) with matching geometry, `layer_types` placement and `ngpt_alpha_init`/`initializer_range`; any other model or pack fails the load closed with a diagnostic naming the mismatch or the offending vector. The load logs the path, the substituted sublayers and the resolved scale. |
+
+Both `HIPFIRE_DORY_GATE_*` knobs are resolved once per model load, before the
+first GPU allocation, and are reversible at the next process. They are not
+load overrides and do not enter the serve reload identity; the forward path is
+unchanged (no per-token work, no extra buffers). Any explicit value — including
+`HIPFIRE_DORY_GATE_SCALE=1`, which changes nothing — is admitted only on the
+Stage4 layout (80 sublayers, 16/48/16); unset is the only stock configuration
+accepted on any other Dory layout.
 
 Changing either resolved load override on a resident model path causes serve
 to reload. KV encoding remains the separate `memory.kv_cache` setting.
@@ -802,7 +812,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1666
+**Count:** 1668
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -1143,6 +1153,8 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_DN_SNAPSHOT_BULK_OFF` | crates/hipfire-arch-qwen35/src/speculative.rs, crates/rdna-compute/src/feature_flags.rs | developer |
 | `HIPFIRE_DN_SNAPSHOT_FLIP` | crates/hipfire-arch-qwen35/examples/cb_vmm_state_oracle.rs, crates/hipfire-arch-qwen35/src/speculative.rs | developer |
 | `HIPFIRE_DN_STATE_EF` | autoresearch/ar/certify/serve_runner.py, benchmarks/scripts/mq4v2_k5120_gfx1201_validate.sh | developer |
+| `HIPFIRE_DORY_GATE_SCALE` | crates/hipfire-arch-dory/src/dory.rs | developer |
+| `HIPFIRE_DORY_GATE_SOURCE` | crates/hipfire-arch-dory/src/dory.rs | developer |
 | `HIPFIRE_DORY_LOOPS` | crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_DORY_RECURRENT_KV_CACHE_MODE` | crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_DOT2_GEMV` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | experimental |

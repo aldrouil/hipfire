@@ -29,6 +29,16 @@
 //! `logit_scale`) are widened BF16 → F32 once at load (native) or consumed
 //! as exact-F32 HFQ scales. Activations are F32; KV is packed (see
 //! `crate::kv`: `auto`/Q8 default, FWHT2/3/4, F32 reference variant only).
+//! Load-time developer diagnostics (`[developer]` namespace; unset = stock,
+//! see `docs/env-vars.md`): `HIPFIRE_DORY_GATE_SCALE` multiplies the
+//! effective residual gate `s = |alpha * alpha_scale|` AFTER the abs on the
+//! Stage4-inserted sublayers only (56..64; never the raw alpha, `s_gate` or
+//! `suv_*`), and `HIPFIRE_DORY_GATE_SOURCE` swaps
+//! the `attn_alpha`/`mlp_alpha` vectors of only the sublayers the Stage4
+//! expansion inserted (physical 56..64) for an untrained pack's. Both resolve
+//! once before the first GPU allocation, keep every matrix from the loaded
+//! model, and reverse at the next process.
+//!
 //! Naming: local safetensors tensors are `backbone.*`; the vLLM reference
 //! packs QKV (`qkv_proj`) and gate/up (`gate_up_proj`) where the checkpoint
 //! stores split `q/k/v_proj` and `gate/up_proj`. The loader maps exact local
@@ -36,7 +46,7 @@
 
 use hipfire_config::DoryRecurrentKvCacheMode;
 use hipfire_runtime::llama::{EmbeddingFormat, WeightTensor};
-use hipfire_runtime::model_source::ModelSource;
+use hipfire_runtime::model_source::{ModelSource, TensorInfo};
 use hipfire_runtime::weight_backend::{dequant_weight_raw, load_embedding, MemoryTarget};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -92,8 +102,23 @@ fn load_vec_f32_mapped(
     n: usize,
     f: impl Fn(f32) -> f32,
 ) -> Result<GpuTensor, String> {
-    let (info, data) = source
-        .tensor_data(name)
+    let raw = decode_vec_f32(source, name, n)?;
+    let vals: Vec<f32> = raw.into_iter().map(f).collect();
+    gpu.upload_f32(&vals, &[n])
+        .map_err(|e| format!("dory: upload {name}: {e}"))
+}
+
+/// Metadata admission shared by every length-`n` nGPT per-vector scale: 1-D
+/// `[n]`, BF16 or F32. The gate-source substitution calls this for the
+/// loaded model's own vector too, so a replacement never hides a missing or
+/// malformed model tensor.
+fn vec_f32_meta<'a>(
+    source: &'a dyn ModelSource,
+    name: &str,
+    n: usize,
+) -> Result<&'a TensorInfo, String> {
+    let info = source
+        .tensor_info(name)
         .ok_or_else(|| format!("dory: tensor not found: {name}"))?;
     if info.shape != vec![n] {
         return Err(format!(
@@ -101,8 +126,23 @@ fn load_vec_f32_mapped(
             info.shape
         ));
     }
-    // Native BF16 dir bytes widen exactly (BF16 = upper F32 bits); HFQ
-    // nGPT scales ride exact F32 (qt=2) and are consumed verbatim.
+    if info.dtype != "BF16" && info.dtype != "F32" {
+        return Err(format!(
+            "dory: tensor {name} has dtype {} (expected BF16 or F32)",
+            info.dtype
+        ));
+    }
+    Ok(info)
+}
+
+/// Host-side widening of one per-vector scale: native BF16 dir bytes widen
+/// exactly (BF16 = upper F32 bits); HFQ nGPT scales ride exact F32 (qt=2) and
+/// are consumed verbatim.
+fn decode_vec_f32(source: &dyn ModelSource, name: &str, n: usize) -> Result<Vec<f32>, String> {
+    let info = vec_f32_meta(source, name, n)?;
+    let (_, data) = source
+        .tensor_data(name)
+        .ok_or_else(|| format!("dory: tensor not found: {name}"))?;
     let raw: Vec<f32> = if info.dtype == "BF16" {
         if data.len() != n * 2 {
             return Err(format!(
@@ -114,7 +154,7 @@ fn load_vec_f32_mapped(
         data.chunks_exact(2)
             .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
             .collect()
-    } else if info.dtype == "F32" {
+    } else {
         if data.len() != n * 4 {
             return Err(format!(
                 "dory: tensor {name} has {} bytes (expected {})",
@@ -125,16 +165,9 @@ fn load_vec_f32_mapped(
         data.chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect()
-    } else {
-        return Err(format!(
-            "dory: tensor {name} has dtype {} (expected BF16 or F32)",
-            info.dtype
-        ));
     };
     debug_assert_eq!(raw.len(), n);
-    let vals: Vec<f32> = raw.into_iter().map(f).collect();
-    gpu.upload_f32(&vals, &[n])
-        .map_err(|e| format!("dory: upload {name}: {e}"))
+    Ok(raw)
 }
 
 /// One BF16 per-vector scale widened to F32 on GPU (host-exact widening).
@@ -188,6 +221,343 @@ fn load_vec_f32_scaled(
     factor: f32,
 ) -> Result<GpuTensor, String> {
     load_vec_f32_mapped(source, gpu, name, n, |v| v * factor)
+}
+
+// ─── Developer load-time alpha-gate diagnostics ──────────────────────────
+//
+// Two `[developer]` knobs (unset = stock) for ablation experiments on the
+// residual interpolation gates: they are resolved ONCE at load, before the
+// first GPU allocation, and are reversible at the next process. Nothing is
+// added to the forward, the reload identity or a user config surface.
+
+/// Post-`abs` multiplier on the effective residual gate
+/// `s = |alpha * alpha_scale|`, applied only on the sublayers the Stage4
+/// expansion inserted (physical 56..64, [`stage4_inserted_layers`]); every
+/// other sublayer keeps `|alpha * alpha_scale|` exactly. Nonnegative and
+/// finite; `1` is the stock expression bit-for-bit, `0` zeroes those
+/// sublayers' residual contribution while their own residual normalization
+/// and KV behavior still run (it is not a skipped layer).
+pub const DORY_GATE_SCALE_ENV: &str = "HIPFIRE_DORY_GATE_SCALE";
+
+/// Untrained Stage4 HFQ whose `attn_alpha`/`mlp_alpha` vectors replace the
+/// loaded model's for the sublayers the Stage4 expansion inserted. Only those
+/// scale vectors are read: every matrix, embedding, output table and KV
+/// parameter stays the loaded model's.
+pub const DORY_GATE_SOURCE_ENV: &str = "HIPFIRE_DORY_GATE_SOURCE";
+
+/// Stock (pre-expansion) Dory: 72 sublayers split 16 input / 40 recurrent /
+/// 16 output — the layout every published dory checkpoint ships.
+const STOCK_DORY_LAYERS: usize = 72;
+const STOCK_DORY_SPLIT: (usize, usize, usize) = (16, 40, 16);
+/// Stage4 Dory: the recurrent block carries four extra attention/MLP pairs.
+const STAGE4_DORY_LAYERS: usize = 80;
+const STAGE4_DORY_SPLIT: (usize, usize, usize) = (16, 48, 16);
+const _: () =
+    assert!(STOCK_DORY_SPLIT.0 + STOCK_DORY_SPLIT.1 + STOCK_DORY_SPLIT.2 == STOCK_DORY_LAYERS);
+const _: () =
+    assert!(STAGE4_DORY_SPLIT.0 + STAGE4_DORY_SPLIT.1 + STAGE4_DORY_SPLIT.2 == STAGE4_DORY_LAYERS);
+// The expansion inserts whole attention/MLP pairs, so the substituted region
+// must hold an even number of sublayers.
+const _: () = assert!(
+    (STAGE4_DORY_SPLIT.0 + STAGE4_DORY_SPLIT.1 - STOCK_DORY_SPLIT.0 - STOCK_DORY_SPLIT.1) % 2 == 0
+);
+
+/// Physical sublayers that exist only in the Stage4 expansion: the stock
+/// recurrent block ends at `16 + 40 = 56`, the Stage4 block at `16 + 48 = 64`,
+/// and the extra pairs were inserted at the end of that block, so `56..64` is
+/// the checkpoint's new region (four attention + four MLP sublayers). Only
+/// these carry a gate-source substitution; the stock sublayers keep theirs.
+fn stage4_inserted_layers() -> std::ops::Range<usize> {
+    (STOCK_DORY_SPLIT.0 + STOCK_DORY_SPLIT.1)..(STAGE4_DORY_SPLIT.0 + STAGE4_DORY_SPLIT.1)
+}
+
+/// Resolved `HIPFIRE_DORY_GATE_*` state. [`DoryGatePlan::stock`] (scale `1`,
+/// no replacements) is the pre-ablation path: the loader calls the same
+/// expressions as before and opens nothing extra.
+struct DoryGatePlan {
+    scale: f32,
+    /// Raw (pre-`alpha_scale`, pre-gate-scale) alpha per physical sublayer;
+    /// `None` everywhere outside [`stage4_inserted_layers`].
+    replacements: Vec<Option<Vec<f32>>>,
+}
+
+impl DoryGatePlan {
+    fn stock() -> Self {
+        Self {
+            scale: 1.0,
+            replacements: Vec::new(),
+        }
+    }
+
+    fn replacement(&self, physical: usize) -> Option<&[f32]> {
+        self.replacements.get(physical).and_then(|v| v.as_deref())
+    }
+
+    /// Gate multiplier in effect for `physical`: the diagnostic scale only
+    /// inside the Stage4-inserted region, exactly `1` everywhere else, so a
+    /// stock sublayer's effective gate is never touched.
+    fn scale_for(&self, physical: usize) -> f32 {
+        if stage4_inserted_layers().contains(&physical) {
+            self.scale
+        } else {
+            1.0
+        }
+    }
+}
+
+/// Effective residual interpolation coefficient the forward consumes:
+/// `|alpha * alpha_scale|` and then the developer gate multiplier. `scale ==
+/// 1` returns the pre-ablation expression untouched (no multiply), so the
+/// default stays bit-identical.
+fn scale_alpha(v: f32, alpha_scale: f32, gate_scale: f32) -> f32 {
+    let effective = (v * alpha_scale).abs();
+    if gate_scale == 1.0 {
+        effective
+    } else {
+        effective * gate_scale
+    }
+}
+
+/// Parse [`DORY_GATE_SCALE_ENV`]: a nonnegative finite float. Anything else
+/// fails the load instead of silently falling back to stock, because a
+/// mistyped ablation knob would otherwise look like a null result.
+fn parse_gate_scale(raw: &str) -> Result<f32, String> {
+    let value: f32 = raw.trim().parse().map_err(|_| {
+        format!(
+            "dory: {DORY_GATE_SCALE_ENV}=`{raw}` is not a float (admit a finite value >= 0; unset for stock)"
+        )
+    })?;
+    if !value.is_finite() || value < 0.0 {
+        return Err(format!(
+            "dory: {DORY_GATE_SCALE_ENV}=`{raw}` must be finite and >= 0 (0 zeroes the residual gate; unset for stock)"
+        ));
+    }
+    Ok(value)
+}
+
+/// Parse [`DORY_GATE_SOURCE_ENV`]: a whitespace-trimmed path, where blank
+/// counts as unset so a harness can clear the knob without unsetting it.
+fn parse_gate_source(raw: &str) -> Option<std::path::PathBuf> {
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| std::path::PathBuf::from(trimmed))
+}
+
+fn gate_scale_from_env() -> Result<Option<f32>, String> {
+    match hipfire_config::developer_var(DORY_GATE_SCALE_ENV) {
+        Ok(raw) => parse_gate_scale(&raw).map(Some),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(e) => Err(format!(
+            "dory: {DORY_GATE_SCALE_ENV} is not valid UTF-8: {e}"
+        )),
+    }
+}
+
+fn gate_source_from_env() -> Result<Option<std::path::PathBuf>, String> {
+    match hipfire_config::developer_var(DORY_GATE_SOURCE_ENV) {
+        Ok(raw) => Ok(parse_gate_source(&raw)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(e) => Err(format!(
+            "dory: {DORY_GATE_SOURCE_ENV} is not valid UTF-8: {e}"
+        )),
+    }
+}
+
+/// The substitution is validated only against the Stage4 geometry it was
+/// built for: any other layout has different inserted indices, so it fails
+/// closed instead of guessing which layers are new.
+fn validate_stage4_gate_layout(cfg: &DoryConfig) -> Result<(), String> {
+    if cfg.num_hidden_layers != STAGE4_DORY_LAYERS || cfg.block_split != STAGE4_DORY_SPLIT {
+        return Err(format!(
+            "dory: {DORY_GATE_SOURCE_ENV} is admitted only on the Stage4 layout \
+             ({STAGE4_DORY_LAYERS} sublayers split {STAGE4_DORY_SPLIT:?}); this model has \
+             {} sublayers split {:?}",
+            cfg.num_hidden_layers, cfg.block_split
+        ));
+    }
+    Ok(())
+}
+
+/// The gate source must describe the same net as the loaded model, or the
+/// substituted vectors would not mean what the model's effective gate means.
+fn validate_gate_source_geometry(main: &DoryConfig, src: &DoryConfig) -> Result<(), String> {
+    let mismatch = |field: &str, src_value: String, main_value: String| {
+        format!("dory: {DORY_GATE_SOURCE_ENV} {field}={src_value} != model {main_value}")
+    };
+    for (field, a, b) in [
+        ("hidden_size", main.hidden_size, src.hidden_size),
+        (
+            "num_hidden_layers",
+            main.num_hidden_layers,
+            src.num_hidden_layers,
+        ),
+        (
+            "intermediate_size",
+            main.intermediate_size,
+            src.intermediate_size,
+        ),
+        (
+            "num_attention_heads",
+            main.num_attention_heads,
+            src.num_attention_heads,
+        ),
+        (
+            "num_key_value_heads",
+            main.num_key_value_heads,
+            src.num_key_value_heads,
+        ),
+        ("head_dim", main.head_dim, src.head_dim),
+        ("vocab_size", main.vocab_size, src.vocab_size),
+        ("sliding_window", main.sliding_window, src.sliding_window),
+    ] {
+        if a != b {
+            return Err(mismatch(field, b.to_string(), a.to_string()));
+        }
+    }
+    if main.block_split != src.block_split {
+        return Err(mismatch(
+            "block_split",
+            format!("{:?}", src.block_split),
+            format!("{:?}", main.block_split),
+        ));
+    }
+    if main.is_attention != src.is_attention {
+        return Err(mismatch(
+            "layer_types (attention/MLP placement)",
+            "different".into(),
+            "this model's".into(),
+        ));
+    }
+    if main.is_full_attention != src.is_full_attention {
+        return Err(mismatch(
+            "layer_types (full/sliding attention)",
+            "different".into(),
+            "this model's".into(),
+        ));
+    }
+    // Alpha semantics: the reference gate is `|alpha * ngpt_alpha_init /
+    // initializer_range|`, so both checkpoints must fold the same constant.
+    if main.alpha_scale.to_bits() != src.alpha_scale.to_bits() {
+        return Err(mismatch(
+            "alpha semantics (ngpt_alpha_init/initializer_range)",
+            src.alpha_scale.to_string(),
+            main.alpha_scale.to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Read the untrained gate source's alpha vectors for the inserted sublayers.
+/// Only `attn_alpha`/`mlp_alpha` are read; the pack's matrices are never
+/// touched, so this is a read-only, single-file operation.
+fn load_gate_source(
+    cfg: &DoryConfig,
+    path: &std::path::Path,
+) -> Result<Vec<Option<Vec<f32>>>, String> {
+    let context = |detail: String| format!("dory: {DORY_GATE_SOURCE_ENV}={path:?}: {detail}");
+    let hfq = hipfire_runtime::hfq::HfqFile::open(path)
+        .map_err(|e| context(format!("open failed: {e}")))?;
+    if hfq.arch_id != 19 {
+        return Err(context(format!(
+            "arch_id={} (expected 19=dory)",
+            hfq.arch_id
+        )));
+    }
+    let bridge = hipfire_runtime::hfq::HfqModelSource::from_hfq(hfq);
+    let src_cfg = config_from_source(&bridge).map_err(|e| context(e))?;
+    validate_gate_source_geometry(cfg, &src_cfg)?;
+    let mut replacements: Vec<Option<Vec<f32>>> = vec![None; cfg.num_hidden_layers];
+    for physical in stage4_inserted_layers() {
+        let name = if cfg.is_attention[physical] {
+            format!("backbone.layers.{physical}.attn_alpha")
+        } else {
+            format!("backbone.layers.{physical}.mlp_alpha")
+        };
+        let raw = decode_vec_f32(&bridge, &name, cfg.hidden_size).map_err(|e| context(e))?;
+        if let Some(bad) = raw.iter().position(|v| !v.is_finite()) {
+            return Err(context(format!(
+                "{name}[{bad}] is not finite: a non-finite gate would poison every residual"
+            )));
+        }
+        replacements[physical] = Some(raw);
+    }
+    Ok(replacements)
+}
+
+/// Resolve both developer knobs once, before the first GPU allocation.
+fn resolve_gate_plan(cfg: &DoryConfig) -> Result<DoryGatePlan, String> {
+    let scale = gate_scale_from_env()?;
+    let source = gate_source_from_env()?;
+    if scale.is_none() && source.is_none() {
+        return Ok(DoryGatePlan::stock());
+    }
+    // Any explicit diagnostic — including an explicit `1` — is admitted only
+    // on the Stage4 layout, because that is the only layout whose inserted
+    // region this ablation was validated against.
+    validate_stage4_gate_layout(cfg)?;
+    let scale = scale.unwrap_or(1.0);
+    let Some(path) = source else {
+        eprintln!(
+            "dory: developer diagnostic: {DORY_GATE_SCALE_ENV}={scale} multiplies the \
+             effective residual gate |alpha*alpha_scale| after the abs on physical sublayers \
+             {}..={} only; other sublayers, matrices, residual normalization and KV unchanged",
+            stage4_inserted_layers().start,
+            stage4_inserted_layers().end - 1
+        );
+        return Ok(DoryGatePlan {
+            scale,
+            replacements: Vec::new(),
+        });
+    };
+    let replacements = load_gate_source(cfg, &path)?;
+    let inserted = stage4_inserted_layers();
+    eprintln!(
+        "dory: developer diagnostic: {DORY_GATE_SOURCE_ENV}={path:?} replaces \
+         attn_alpha/mlp_alpha for physical sublayers {}..={} only (every matrix stays the \
+         loaded model's); {DORY_GATE_SCALE_ENV}={scale}",
+        inserted.start,
+        inserted.end - 1
+    );
+    Ok(DoryGatePlan {
+        scale,
+        replacements,
+    })
+}
+
+/// Upload one residual alpha vector: the gate source's raw vector for an
+/// inserted Stage4 sublayer when configured, else `name` from the loaded
+/// model, then the effective-gate transform. The diagnostic scale is folded
+/// only where [`DoryGatePlan::scale_for`] returns it; with a gate multiplier
+/// of `1` this is exactly the pre-ablation `load_vec_f32_scaled_abs` call.
+fn load_alpha_vec(
+    source: &dyn ModelSource,
+    gate: &DoryGatePlan,
+    physical: usize,
+    name: &str,
+    n: usize,
+    alpha_scale: f32,
+    gpu: &mut Gpu,
+) -> Result<GpuTensor, String> {
+    let gate_scale = gate.scale_for(physical);
+    let Some(raw) = gate.replacement(physical) else {
+        return if gate_scale == 1.0 {
+            load_vec_f32_scaled_abs(source, gpu, name, n, alpha_scale)
+        } else {
+            load_vec_f32_mapped(source, gpu, name, n, |v| {
+                scale_alpha(v, alpha_scale, gate_scale)
+            })
+        };
+    };
+    // Even when the vector is replaced, the loaded model's own tensor must be
+    // present and well formed: the loader's fail-closed contract covers every
+    // tensor it names, so a corrupt pack never passes silently.
+    vec_f32_meta(source, name, n)?;
+    debug_assert_eq!(raw.len(), n);
+    let vals: Vec<f32> = raw
+        .iter()
+        .map(|&v| scale_alpha(v, alpha_scale, gate_scale))
+        .collect();
+    gpu.upload_f32(&vals, &[n])
+        .map_err(|e| format!("dory: upload {name}: {e}"))
 }
 fn load_linear_bf16(
     source: &dyn ModelSource,
@@ -915,6 +1285,11 @@ pub fn load_weights_from_source(
             }
         }
     }
+    // Developer gate diagnostics (`HIPFIRE_DORY_GATE_*`) resolve here, before
+    // the first allocation: an out-of-scope layout, a mismatched gate source
+    // or a bad scale must abort with nothing resident. Unset knobs return the
+    // stock plan and open no extra file.
+    let gate = resolve_gate_plan(cfg)?;
     let h = cfg.hidden_size;
     let v = cfg.vocab_size;
     let mut parts = LoadParts {
@@ -1045,12 +1420,14 @@ pub fn load_weights_from_source(
                     attn_fail!(e, wq.free_all(gpu); wk.free_all(gpu); wv.free_all(gpu); wo.free_all(gpu); wg.free_all(gpu); let _ = gpu.free_tensor(sqk);)
                 }
             };
-            let alpha = match load_vec_f32_scaled_abs(
+            let alpha = match load_alpha_vec(
                 source,
-                gpu,
+                &gate,
+                i,
                 &format!("backbone.layers.{i}.attn_alpha"),
                 h,
                 cfg.alpha_scale,
+                gpu,
             ) {
                 Ok(t) => t,
                 Err(e) => {
@@ -1116,12 +1493,14 @@ pub fn load_weights_from_source(
                     mlp_fail!(e, w_gate.free_all(gpu); w_up.free_all(gpu); w_down.free_all(gpu); let _ = gpu.free_tensor(suv_gate);)
                 }
             };
-            let alpha = match load_vec_f32_scaled_abs(
+            let alpha = match load_alpha_vec(
                 source,
-                gpu,
+                &gate,
+                i,
                 &format!("backbone.layers.{i}.mlp_alpha"),
                 h,
                 cfg.alpha_scale,
+                gpu,
             ) {
                 Ok(t) => t,
                 Err(e) => {
@@ -1930,5 +2309,293 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ─── Developer alpha-gate diagnostics ────────────────────────────────
+
+    /// Stage4 layout: four attention/MLP pairs inserted after physical 55
+    /// (the new 56..63 region `HIPFIRE_DORY_GATE_SOURCE` substitutes), the
+    /// stock 56..71 tail shifted to 64..79.
+    fn stage4_80_config_json() -> serde_json::Value {
+        let mut v = minimal_config_json();
+        let mut lt = v["layer_types"].as_array().unwrap().clone();
+        let tail = lt.split_off(56);
+        for t in [
+            "sliding_attention",
+            "mlp",
+            "full_attention",
+            "mlp",
+            "sliding_attention",
+            "mlp",
+            "sliding_attention",
+            "mlp",
+        ] {
+            lt.push(serde_json::Value::String(t.into()));
+        }
+        lt.extend(tail);
+        v["num_hidden_layers"] = serde_json::json!(80);
+        v["n_recurrent_layers"] = serde_json::json!(48);
+        v["layer_types"] = serde_json::Value::Array(lt);
+        v
+    }
+
+    #[test]
+    fn stage4_inserted_layers_are_the_expansion_pairs_only() {
+        assert_eq!(stage4_inserted_layers(), 56..64);
+    }
+
+    #[test]
+    fn gate_scale_scope_is_the_inserted_region_only() {
+        let plan = DoryGatePlan {
+            scale: 2.0,
+            replacements: Vec::new(),
+        };
+        // Inside the inserted region the diagnostic multiplies the effective
+        // gate; outside it the multiplier is exactly 1, so the stock
+        // expression runs unchanged — including the adjacent stock
+        // sublayers at 55 (last stock recurrent) and 64 (first shifted
+        // output sublayer).
+        assert_eq!(plan.scale_for(56), 2.0);
+        assert_eq!(plan.scale_for(63), 2.0);
+        for physical in [0, 16, 55, 64, 79, 80] {
+            assert_eq!(plan.scale_for(physical), 1.0, "physical {physical}");
+        }
+        // Composed through the fold: 55 is bit-identical to the pre-ablation
+        // expression, 56 takes the scaled coefficient.
+        let alpha_scale = 0.05f32 / 0.0177f32;
+        let raw = 0.0006681768f32;
+        assert_eq!(
+            scale_alpha(raw, alpha_scale, plan.scale_for(55)).to_bits(),
+            (raw * alpha_scale).abs().to_bits()
+        );
+        assert_eq!(
+            scale_alpha(raw, alpha_scale, plan.scale_for(56)),
+            (raw * alpha_scale).abs() * 2.0
+        );
+        // An explicit scale of 1 (still a validated diagnostic) touches
+        // nothing anywhere.
+        let neutral = DoryGatePlan {
+            scale: 1.0,
+            replacements: Vec::new(),
+        };
+        for physical in [55, 56, 63, 64] {
+            assert_eq!(neutral.scale_for(physical), 1.0, "physical {physical}");
+        }
+        assert_eq!(DoryGatePlan::stock().scale_for(56), 1.0);
+    }
+
+    #[test]
+    fn gate_scale_parse_admits_nonnegative_finite_only() {
+        for (raw, want) in [("0", 0.0f32), ("1", 1.0), ("2.5", 2.5), (" 0.125 ", 0.125)] {
+            assert_eq!(
+                parse_gate_scale(raw).expect(raw).to_bits(),
+                want.to_bits(),
+                "raw={raw:?}"
+            );
+        }
+        for bad in [
+            "", "-1", "-0.5", "nan", "NaN", "inf", "-inf", "1e999", "abc", "1,0",
+        ] {
+            let err = parse_gate_scale(bad).expect_err(&format!("raw={bad:?}"));
+            assert!(err.contains(DORY_GATE_SCALE_ENV), "{err}");
+        }
+    }
+
+    #[test]
+    fn gate_source_parse_trims_and_treats_blank_as_unset() {
+        assert_eq!(parse_gate_source(""), None);
+        assert_eq!(parse_gate_source("  \t "), None);
+        assert_eq!(
+            parse_gate_source(" /tmp/gates.mq8 "),
+            Some(std::path::PathBuf::from("/tmp/gates.mq8"))
+        );
+    }
+
+    #[test]
+    fn effective_gate_transform_preserves_stock_expression_and_boundaries() {
+        // Shipped alpha semantics: ngpt_alpha_init 0.05 / initializer_range
+        // 0.0177, folded to f32 at config parse.
+        let alpha_scale = 0.05f32 / 0.0177f32;
+        // The untrained Stage4 gate vector: raw 3.54e-06 (exact-F32 HFQ
+        // scale), effective |raw * alpha_scale| = 1.0000000656873453e-05.
+        assert_eq!(
+            scale_alpha(3.54e-06, alpha_scale, 1.0).to_bits(),
+            0x3727_c5ad
+        );
+        // scale == 1 is the pre-ablation expression bit-for-bit, both signs
+        // and the signed-zero input included.
+        for v in [-0.0029907227f32, -3.54e-06, 0.0, 0.12695312] {
+            assert_eq!(
+                scale_alpha(v, alpha_scale, 1.0).to_bits(),
+                (v * alpha_scale).abs().to_bits(),
+                "v={v}"
+            );
+        }
+        // scale == 0 zeroes the coefficient exactly (the forward still runs
+        // residual normalization and KV; the layer is not skipped).
+        assert_eq!(
+            scale_alpha(-0.12695312, alpha_scale, 0.0).to_bits(),
+            0.0f32.to_bits()
+        );
+        // Any other scale multiplies AFTER the abs, never the raw alpha.
+        let v = -0.12695312f32;
+        assert_eq!(
+            scale_alpha(v, alpha_scale, 2.0),
+            (v * alpha_scale).abs() * 2.0
+        );
+        assert_eq!(
+            scale_alpha(v, alpha_scale, 0.25),
+            (v * alpha_scale).abs() * 0.25
+        );
+    }
+
+    #[test]
+    fn gate_source_layout_gate_admits_only_stage4_expansion() {
+        let stock = config_from_value(&minimal_config_json()).expect("stock admits");
+        let err =
+            validate_stage4_gate_layout(&stock).expect_err("72-sublayer stock is out of scope");
+        assert!(err.contains(DORY_GATE_SOURCE_ENV), "{err}");
+        assert!(err.contains("Stage4"), "{err}");
+        let wider = config_from_value(&expanded_76_config_json()).expect("76 admits");
+        assert!(validate_stage4_gate_layout(&wider).is_err());
+        let stage4 = config_from_value(&stage4_80_config_json()).expect("stage4 admits");
+        assert_eq!(stage4.block_split, (16, 48, 16));
+        validate_stage4_gate_layout(&stage4).expect("the Stage4 layout is the admitted one");
+    }
+
+    #[test]
+    fn gate_source_must_match_model_geometry_and_alpha_semantics() {
+        let main = config_from_value(&stage4_80_config_json()).expect("stage4 admits");
+        let same = config_from_value(&stage4_80_config_json()).expect("stage4 admits");
+        validate_gate_source_geometry(&main, &same).expect("identical geometry admits");
+
+        let mut v = stage4_80_config_json();
+        v["intermediate_size"] = serde_json::json!(6144);
+        let bad = config_from_value(&v).expect("a geometry-only change still parses");
+        let err =
+            validate_gate_source_geometry(&main, &bad).expect_err("intermediate_size differs");
+        assert!(err.contains("intermediate_size"), "{err}");
+
+        let mut v = stage4_80_config_json();
+        v["ngpt_alpha_init"] = serde_json::json!(0.04);
+        let bad = config_from_value(&v).expect("an alpha-init change still parses");
+        let err = validate_gate_source_geometry(&main, &bad).expect_err("alpha_scale differs");
+        assert!(err.contains("alpha semantics"), "{err}");
+    }
+
+    #[test]
+    fn gate_replacement_scope_is_the_inserted_region_only() {
+        let mut replacements: Vec<Option<Vec<f32>>> = vec![None; 80];
+        for physical in stage4_inserted_layers() {
+            replacements[physical] = Some(vec![3.54e-06; 3]);
+        }
+        let plan = DoryGatePlan {
+            scale: 1.0,
+            replacements,
+        };
+        for physical in stage4_inserted_layers() {
+            assert_eq!(
+                plan.replacement(physical).map(<[f32]>::len),
+                Some(3),
+                "physical {physical}"
+            );
+        }
+        // Stock sublayers and out-of-range indices never pick up a
+        // substitution: 55 is the last stock recurrent sublayer, 64 the
+        // first shifted stock output sublayer.
+        for physical in [0, 16, 55, 64, 79, 80] {
+            assert!(plan.replacement(physical).is_none(), "physical {physical}");
+        }
+        let stock = DoryGatePlan::stock();
+        assert_eq!(stock.scale, 1.0);
+        assert!(stock.replacement(56).is_none());
+    }
+
+    /// Minimal in-memory `ModelSource` for the per-vector admission checks.
+    struct VecSource {
+        tensors: Vec<(TensorInfo, Vec<u8>)>,
+    }
+
+    impl ModelSource for VecSource {
+        fn metadata_json(&self) -> &str {
+            "{}"
+        }
+        fn arch_id(&self) -> u32 {
+            19
+        }
+        fn quant_config(&self) -> Option<&hipfire_runtime::model_source::QuantConfig> {
+            None
+        }
+        fn tensor_data(&self, name: &str) -> Option<(&TensorInfo, &[u8])> {
+            self.tensors
+                .iter()
+                .find(|(info, _)| info.name == name)
+                .map(|(info, bytes)| (info, bytes.as_slice()))
+        }
+        fn tensor_info(&self, name: &str) -> Option<&TensorInfo> {
+            self.tensors
+                .iter()
+                .find(|(info, _)| info.name == name)
+                .map(|(info, _)| info)
+        }
+        fn tensor_names(&self) -> Vec<&str> {
+            self.tensors
+                .iter()
+                .map(|(info, _)| info.name.as_str())
+                .collect()
+        }
+        fn path(&self) -> &std::path::Path {
+            std::path::Path::new("<memory>")
+        }
+    }
+
+    fn vec_source(name: &str, dtype: &str, shape: Vec<usize>, bytes: Vec<u8>) -> VecSource {
+        VecSource {
+            tensors: vec![(
+                TensorInfo {
+                    name: name.to_string(),
+                    dtype: dtype.to_string(),
+                    shape,
+                    quant_type: 2,
+                    data_offset: 0,
+                    data_size: bytes.len(),
+                },
+                bytes,
+            )],
+        }
+    }
+
+    #[test]
+    fn alpha_vector_admission_requires_1d_bf16_or_f32() {
+        let f32_bytes: Vec<u8> = [0.5f32, -3.54e-06, 0.0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let src = vec_source("a.alpha", "F32", vec![3], f32_bytes);
+        assert_eq!(
+            decode_vec_f32(&src, "a.alpha", 3).expect("admits"),
+            vec![0.5, -3.54e-06, 0.0]
+        );
+        // A 2-D matrix is not an nGPT per-vector scale.
+        let src = vec_source("a.alpha", "F32", vec![1, 3], vec![0u8; 12]);
+        assert!(decode_vec_f32(&src, "a.alpha", 3).is_err());
+        // Wrong length for the declared hidden width.
+        let src = vec_source("a.alpha", "F32", vec![2], vec![0u8; 12]);
+        assert!(decode_vec_f32(&src, "a.alpha", 3).is_err());
+        // Only the two exactly-widenable dtypes.
+        let src = vec_source("a.alpha", "F16", vec![3], vec![0u8; 6]);
+        assert!(decode_vec_f32(&src, "a.alpha", 3).is_err());
+        // Payload length must match the dtype width.
+        let src = vec_source("a.alpha", "BF16", vec![3], vec![0u8; 4]);
+        assert!(decode_vec_f32(&src, "a.alpha", 3).is_err());
+        // Missing tensor.
+        let src = vec_source("a.alpha", "F32", vec![3], vec![0u8; 12]);
+        assert!(decode_vec_f32(&src, "b.alpha", 3).is_err());
+        // BF16 widens to the upper F32 bits (exact, no rounding).
+        let src = vec_source("a.alpha", "BF16", vec![1], 0x3f80u16.to_le_bytes().to_vec());
+        assert_eq!(
+            decode_vec_f32(&src, "a.alpha", 1).expect("admits"),
+            vec![1.0]
+        );
     }
 }
